@@ -30,11 +30,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the AI model for transcription
-print("Loading Whisper model... This might take a moment.")
-# Using the 'tiny.en' model for English-only and less memory
-model = whisper.load_model("tiny.en") # Corrected: 'mmodel' changed to 'model'
-print("Model loaded successfully!")
+# Global variable to store the model
+model = None
+
+async def get_whisper_model():
+    global model
+    if model is None:
+        print("Loading Whisper model... This might take a moment.")
+        # Using the 'tiny.en' model for English-only and less memory
+        model = whisper.load_model("tiny.en")
+        print("Model loaded successfully!")
+    return model
 
 # Store transcription jobs in memory (for simplicity, reset on server restart)
 jobs = {}
@@ -68,7 +74,9 @@ async def transcribe_file(file: UploadFile = File(...)):
         
         # Transcribe the audio/video
         print(f"Starting transcription for {file.filename}")
-        result = model.transcribe(tmp_path)
+        # Get the model (loads it if not already loaded)
+        whisper_model = await get_whisper_model()
+        result = whisper_model.transcribe(tmp_path)
         
         # Clean up the temporary file
         os.unlink(tmp_path)
