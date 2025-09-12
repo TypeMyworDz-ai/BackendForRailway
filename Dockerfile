@@ -1,24 +1,20 @@
-# Use a specific Python base image (e.g., 3.10-slim-buster or 3.11-slim-bullseye)
-FROM python:3.10-slim-bullseye
+# Use an official Python runtime as a parent image
+FROM python:3.9-slim-buster
 
-# Set working directory
+# Set the working directory in the container
 WORKDIR /app
 
-# Install ffmpeg for audio/video processing
-# This uses apt-get because the base image is Debian-based (bullseye)
-RUN apt-get update && apt-get install -y ffmpeg
+# Copy the current directory contents into the container at /app
+COPY . /app
 
-# Copy requirements.txt (now empty, but good practice to keep)
-COPY requirements.txt .
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Python dependencies explicitly
-RUN pip install --no-cache-dir fastapi uvicorn python-dotenv openai-whisper torch==2.1.0 numpy==1.24.4 python-multipart
-
-# Copy the rest of your application code
-COPY . .
-
-# Expose the port Uvicorn will run on
+# Make port 8000 available to the world outside this container
 EXPOSE 8000
 
-# Command to run the application, using shell form for environment variable expansion
-uvicorn main:app --host 0.0.0.0 --port "$PORT"
+# Define environment variable for the port
+ENV PORT 8000
+
+# Run uvicorn when the container launches
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "$PORT"]
