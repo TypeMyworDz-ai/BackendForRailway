@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 import whisper
 import tempfile
 import os
@@ -17,9 +18,8 @@ app = FastAPI(title="Transcription Service")
 # IMPORTANT: Adjust origins for your specific frontend deployment URLs
 origins = [
     "http://localhost:3000",                  # Your local React app
-    "https://typemywordzaiapp-git-main-james-gitukus-projects.vercel.app",    # Your Vercel preview frontend URL (if still active)
-    "https://typemywordzspeechai.vercel.app", # YOUR NEW, CORRECT LIVE VERCEL URL
-    # Add any other frontend URLs that need to access this backend
+    "https://typemywordzaiapp-git-main-james-gitukus-projects.vercel.app",    # Your Vercel preview frontend URL
+    "https://typemywordzspeechai.vercel.app", # Your live Vercel URL
 ]
 
 app.add_middleware(
@@ -48,6 +48,19 @@ jobs = {}
 @app.get("/")
 async def root():
     return {"message": "Transcription Service is running!"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/favicon.ico")
+async def favicon():
+    # If you have a favicon.ico in static/, serve it
+    # Otherwise, return 204 No Content to avoid 404
+    favicon_path = "static/favicon.ico"
+    if os.path.exists(favicon_path):
+        return FileResponse(favicon_path)
+    return Response(status_code=204)
 
 @app.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...)):

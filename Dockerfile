@@ -13,11 +13,11 @@ RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Make port 8000 available to the world outside this container
+# Make port 8000 available (informational, Railway overrides this)
 EXPOSE 8000
 
-# Define environment variable for the port
-ENV PORT 8000
+# Define environment variable for the port (fallback for local dev)
+ENV PORT=8000
 
-# Run uvicorn when the container launches
-CMD ["/bin/sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
+# Run Uvicorn directly using exec form
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "$PORT"]
