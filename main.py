@@ -1,5 +1,7 @@
 import logging
 import sys
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import whisper
@@ -26,9 +28,35 @@ logger.info("Loading environment variables...")
 load_dotenv()
 logger.info("Environment variables loaded successfully")
 
+# Background task to monitor application health
+async def health_monitor():
+    logger.info("Starting health monitor background task")
+    while True:
+        try:
+            import psutil
+            memory_info = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=1)
+            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
+            await asyncio.sleep(30)  # Log every 30 seconds
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+            await asyncio.sleep(30)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Application lifespan startup")
+    # Start background health monitoring
+    health_task = asyncio.create_task(health_monitor())
+    logger.info("Health monitor task created")
+    yield
+    # Shutdown
+    logger.info("Application lifespan shutdown")
+    health_task.cancel()
+
 # Create the FastAPI app
 logger.info("Creating FastAPI app...")
-app = FastAPI(title="Transcription Service")
+app = FastAPI(title="Transcription Service", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
 # Add CORS middleware
