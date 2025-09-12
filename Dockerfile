@@ -16,8 +16,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Make port 8000 available (informational, Railway overrides this)
 EXPOSE 8000
 
-# Define environment variable for the port (fallback for local dev)
-ENV PORT=8000
-
-# Run Uvicorn directly using exec form
+# Run Uvicorn directly using exec form, relying on Railway's PORT
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "$PORT"]

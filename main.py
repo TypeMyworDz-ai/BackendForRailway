@@ -7,9 +7,14 @@ import os
 import uuid
 from datetime import datetime
 from dotenv import load_dotenv
+import logging
 
 # Load environment variables (like OPENAI_API_KEY)
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Create the FastAPI app
 app = FastAPI(title="Transcription Service")
@@ -36,10 +41,10 @@ model = None
 async def get_whisper_model():
     global model
     if model is None:
-        print("Loading Whisper model... This might take a moment.")
+        logger.info("Loading Whisper model... This might take a moment.")
         # Using the 'tiny.en' model for English-only and less memory
         model = whisper.load_model("tiny.en")
-        print("Model loaded successfully!")
+        logger.info("Model loaded successfully!")
     return model
 
 # Store transcription jobs in memory (for simplicity, reset on server restart)
@@ -86,7 +91,7 @@ async def transcribe_file(file: UploadFile = File(...)):
             tmp_path = tmp.name
         
         # Transcribe the audio/video
-        print(f"Starting transcription for {file.filename}")
+        logger.info(f"Starting transcription for {file.filename}")
         # Get the model (loads it if not already loaded)
         whisper_model = await get_whisper_model()
         result = whisper_model.transcribe(tmp_path)
@@ -102,7 +107,7 @@ async def transcribe_file(file: UploadFile = File(...)):
             "completed_at": datetime.now().isoformat()
         })
         
-        print(f"Transcription completed for {file.filename}")
+        logger.info(f"Transcription completed for {file.filename}")
         
     except Exception as e:
         # If something goes wrong
@@ -111,7 +116,7 @@ async def transcribe_file(file: UploadFile = File(...)):
             "error": str(e),
             "completed_at": datetime.now().isoformat()
         })
-        print(f"Transcription failed: {str(e)}")
+        logger.error(f"Transcription failed: {str(e)}")
     
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
