@@ -59,18 +59,21 @@ logger.info("Creating FastAPI app...")
 app = FastAPI(title="Transcription Service", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
-# Add CORS middleware
+# Add CORS middleware - Updated with all possible Vercel URLs
 logger.info("Setting up CORS middleware...")
 origins = [
     "http://localhost:3000",                  # Your local React app
     "https://typemywordzaiapp-git-main-james-gitukus-projects.vercel.app",    # Your Vercel preview frontend URL (if still active)
     "https://typemywordzspeechai.vercel.app", # YOUR NEW, CORRECT LIVE VERCEL URL
+    "https://typemywordzspeechai-o03e6tjj3-james-gitukus-projects.vercel.app", # Current deployment URL from error
+    "https://*.vercel.app",                   # Allow all Vercel preview deployments
+    "https://typemywordzspeechai-*.vercel.app", # Allow all your project's Vercel URLs
     # Add any other frontend URLs that need to access this backend
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # Allow all origins for now to fix the issue
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
