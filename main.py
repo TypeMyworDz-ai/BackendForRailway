@@ -4,12 +4,12 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import whisper
 import tempfile
 import os
 import uuid
 from datetime import datetime
 from dotenv import load_dotenv
+import requests # Import the requests library
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -23,9 +23,13 @@ logger = logging.getLogger(__name__)
 
 logger.info("=== STARTING FASTAPI APPLICATION ===")
 
-# Load environment variables (like OPENAI_API_KEY)
+# Load environment variables
 logger.info("Loading environment variables...")
 load_dotenv()
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+if not ASSEMBLYAI_API_KEY:
+    logger.error("ASSEMBLYAI_API_KEY environment variable not set!")
+    sys.exit(1) # Exit if API key is missing
 logger.info("Environment variables loaded successfully")
 
 # Background task to monitor application health
@@ -80,41 +84,6 @@ app.add_middleware(
 )
 logger.info("CORS middleware configured successfully")
 
-# Global variable to store the model
-model = None
-
-async def get_whisper_model():
-    global model
-    logger.info("get_whisper_model() called")
-    if model is None:
-        try:
-            logger.info("Model is None, attempting to load Whisper model...")
-            logger.info("Loading Whisper model 'tiny.en'... This might take a moment.")
-            
-            # Check available memory before loading
-            import psutil
-            memory_info = psutil.virtual_memory()
-            logger.info(f"Available memory before model load: {memory_info.available / (1024**3):.2f} GB")
-            logger.info(f"Memory usage percentage: {memory_info.percent}%")
-            
-            model = whisper.load_model("tiny.en")
-            logger.info("Whisper model loaded successfully!")
-            
-            # Check memory after loading
-            memory_info_after = psutil.virtual_memory()
-            logger.info(f"Available memory after model load: {memory_info_after.available / (1024**3):.2f} GB")
-            logger.info(f"Memory usage percentage after load: {memory_info_after.percent}%")
-            
-        except Exception as e:
-            logger.error(f"CRITICAL ERROR loading Whisper model: {str(e)}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Full traceback: {traceback.format_exc()}")
-            raise e
-    else:
-        logger.info("Model already loaded, returning existing model")
-    return model
-
 # Store transcription jobs in memory (for simplicity, reset on server restart)
 jobs = {}
 logger.info("Jobs dictionary initialized")
@@ -141,7 +110,8 @@ async def transcribe_file(file: UploadFile = File(...)):
     jobs[job_id] = {
         "status": "processing",
         "filename": file.filename,
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now().isoformat(),
+        "assemblyai_id": None # To store AssemblyAI transcription ID
     }
     logger.info(f"Job {job_id} initialized with status 'processing'")
     
@@ -154,28 +124,46 @@ async def transcribe_file(file: UploadFile = File(...)):
             tmp_path = tmp.name
         logger.info(f"File saved to temporary path: {tmp_path}")
         
-        # Transcribe the audio/video
-        logger.info(f"Starting transcription for {file.filename}")
-        # Get the model (loads it if not already loaded)
-        logger.info("Calling get_whisper_model()...")
-        whisper_model = await get_whisper_model()
-        logger.info("Whisper model obtained, starting transcription...")
+        # === AssemblyAI Integration ===
+        logger.info("Sending audio to AssemblyAI for transcription...")
+        headers = {
+            "authorization": ASSEMBLYAI_API_KEY,
+            "content-type": "application/json"
+        }
         
-        result = whisper_model.transcribe(tmp_path)
-        logger.info(f"Transcription completed for {file.filename}")
+        # Upload audio file to AssemblyAI
+        upload_endpoint = "https://api.assemblyai.com/v2/upload"
+        with open(tmp_path, "rb") as f:
+            upload_response = requests.post(upload_endpoint, headers=headers, data=f)
         
+        if upload_response.status_code != 200:
+            logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
+            raise HTTPException(status_code=500, detail="Failed to upload audio to AssemblyAI")
+        
+        upload_url = upload_response.json()["upload_url"]
+        logger.info(f"Audio uploaded to AssemblyAI: {upload_url}")
+
+        # Start transcription
+        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+        json_data = {
+            "audio_url": upload_url,
+            "language_code": "en_us" # Explicitly set language code
+        }
+        
+        transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
+        
+        if transcript_response.status_code != 200:
+            logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
+            raise HTTPException(status_code=500, detail="Failed to start transcription on AssemblyAI")
+        
+        transcript_id = transcript_response.json()["id"]
+        jobs[job_id]["assemblyai_id"] = transcript_id
+        logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
+        # === End AssemblyAI Integration ===
+
         # Clean up the temporary file
         logger.info(f"Cleaning up temporary file: {tmp_path}")
         os.unlink(tmp_path)
-        
-        # Update job with results
-        jobs[job_id].update({
-            "status": "completed",
-            "transcription": result["text"],
-            "language": result["language"],
-            "completed_at": datetime.now().isoformat()
-        })
-        logger.info(f"Job {job_id} completed successfully")
         
     except Exception as e:
         # If something goes wrong
@@ -200,7 +188,47 @@ async def get_job_status(job_id: str):
         logger.warning(f"Job ID {job_id} not found")
         raise HTTPException(status_code=404, detail="Job not found")
     
-    return jobs[job_id]
+    job_data = jobs[job_id]
+    
+    # If transcription is still processing, poll AssemblyAI for status
+    if job_data["status"] == "processing" and job_data["assemblyai_id"]:
+        logger.info(f"Polling AssemblyAI for status of transcript ID: {job_data['assemblyai_id']}")
+        headers = {"authorization": ASSEMBLYAI_API_KEY}
+        transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{job_data['assemblyai_id']}"
+        
+        response = requests.get(transcript_endpoint, headers=headers)
+        
+        if response.status_code != 200:
+            logger.error(f"AssemblyAI status check failed: {response.status_code} - {response.text}")
+            job_data.update({
+                "status": "failed",
+                "error": "Failed to get status from AssemblyAI",
+                "completed_at": datetime.now().isoformat()
+            })
+            return job_data
+        
+        assemblyai_result = response.json()
+        
+        if assemblyai_result["status"] == "completed":
+            logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
+            job_data.update({
+                "status": "completed",
+                "transcription": assemblyai_result["text"],
+                "language": assemblyai_result["language_code"],
+                "completed_at": datetime.now().isoformat()
+            })
+        elif assemblyai_result["status"] == "failed":
+            logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
+            job_data.update({
+                "status": "failed",
+                "error": assemblyai_result.get("error", "Transcription failed on AssemblyAI"),
+                "completed_at": datetime.now().isoformat()
+            })
+        # If status is still 'queued' or 'processing', do nothing, frontend will poll again
+        else:
+            logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} status: {assemblyai_result['status']}")
+
+    return job_data
 
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
