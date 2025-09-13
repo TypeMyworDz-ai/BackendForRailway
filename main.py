@@ -27,6 +27,7 @@ logger.info("=== STARTING FASTAPI APPLICATION ===")
 logger.info("Loading environment variables...")
 load_dotenv()
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}") # Debug line
 if not ASSEMBLYAI_API_KEY:
     logger.error("ASSEMBLYAI_API_KEY environment variable not set!")
     sys.exit(1) # Exit if API key is missing
