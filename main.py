@@ -2,7 +2,7 @@ import logging
 import sys
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks # Import BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response # Import Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.cors import CORSMiddleware
 import tempfile
@@ -65,7 +65,7 @@ logger.info("Creating FastAPI app...")
 app = FastAPI(title="Transcription Service", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
-# Add CORS middleware - Updated with all possible Vercel URLs
+# Add CORS middleware - Keep this for initial setup, but we'll also manually add headers
 logger.info("Setting up CORS middleware with explicit origins...")
 origins = [
     "http://localhost:3000",                  # Your local React app
@@ -160,12 +160,14 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
 
 
 @app.get("/")
-async def root():
+async def root(response: Response): # Add Response parameter
+    response.headers["Access-Control-Allow-Origin"] = "*" # Explicitly add CORS header
     logger.info("Root endpoint called")
     return {"message": "Transcription Service is running!"}
 
 @app.post("/transcribe")
-async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()): # Add BackgroundTasks
+async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks(), response: Response = Response()): # Add Response parameter
+    response.headers["Access-Control-Allow-Origin"] = "*" # Explicitly add CORS header
     logger.info(f"Transcribe endpoint called with file: {file.filename}")
     
     # Check if file is audio or video
@@ -206,7 +208,8 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
 @app.get("/status/{job_id}")
-async def get_job_status(job_id: str):
+async def get_job_status(job_id: str, response: Response): # Add Response parameter
+    response.headers["Access-Control-Allow-Origin"] = "*" # Explicitly add CORS header
     logger.info(f"Status check for job ID: {job_id}")
     if job_id not in jobs:
         logger.warning(f"Job ID {job_id} not found")
