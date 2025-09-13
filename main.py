@@ -2,14 +2,15 @@ import logging
 import sys
 import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks # Import BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.cors import CORSMiddleware
 import tempfile
 import os
 import uuid
 from datetime import datetime
 from dotenv import load_dotenv
-import requests # Import the requests library
+import requests
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -65,20 +66,19 @@ app = FastAPI(title="Transcription Service", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
 # Add CORS middleware - Updated with all possible Vercel URLs
-logger.info("Setting up CORS middleware...")
+logger.info("Setting up CORS middleware with explicit origins...")
 origins = [
     "http://localhost:3000",                  # Your local React app
-    "https://typemywordzaiapp-git-main-james-gitukus-projects.vercel.app",    # Your Vercel preview frontend URL (if still active)
     "https://typemywordzspeechai.vercel.app", # YOUR NEW, CORRECT LIVE VERCEL URL
-    "https://typemywordzspeechai-o03e6tjj3-james-gitukus-projects.vercel.app", # Current deployment URL from error
-    "https://*.vercel.app",                   # Allow all Vercel preview deployments
-    "https://typemywordzspeechai-*.vercel.app", # Allow all your project's Vercel URLs
-    # Add any other frontend URLs that need to access this backend
+    "https://typemywordzspeechai-o03e6tjj3-james-gitukus-projects.vercel.app", # Specific deployment URL
+    "https://typemywordzspeechai-*.vercel.app", # All preview deployments for your project
+    "https://*.vercel.app",                   # All Vercel deployments (more permissive)
+    "*" # Allow all for debugging, but be cautious in production
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for now to fix the issue
+    allow_origins=origins, # Use the explicit list of origins
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,13 +89,83 @@ logger.info("CORS middleware configured successfully")
 jobs = {}
 logger.info("Jobs dictionary initialized")
 
+# Background task to handle AssemblyAI transcription
+async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
+    logger.info(f"Background task started for job ID: {job_id}")
+    job_data = jobs[job_id]
+
+    try:
+        # === AssemblyAI Integration ===
+        logger.info(f"Background task: Sending audio {filename} to AssemblyAI for transcription...")
+        headers = {
+            "authorization": ASSEMBLYAI_API_KEY,
+            "content-type": "application/json"
+        }
+        
+        # Upload audio file to AssemblyAI
+        upload_endpoint = "https://api.assemblyai.com/v2/upload"
+        with open(tmp_path, "rb") as f:
+            upload_response = requests.post(upload_endpoint, headers=headers, data=f)
+        
+        if upload_response.status_code != 200:
+            logger.error(f"Background task: AssemblyAI upload failed for {filename}: {upload_response.status_code} - {upload_response.text}")
+            job_data.update({
+                "status": "failed",
+                "error": "Failed to upload audio to AssemblyAI",
+                "completed_at": datetime.now().isoformat()
+            })
+            return
+        
+        upload_url = upload_response.json()["upload_url"]
+        logger.info(f"Background task: Audio uploaded to AssemblyAI: {upload_url}")
+
+        # Start transcription
+        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+        json_data = {
+            "audio_url": upload_url,
+            "language_code": "en_us" # Explicitly set language code
+        }
+        
+        transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
+        
+        if transcript_response.status_code != 200:
+            logger.error(f"Background task: AssemblyAI transcription start failed for {filename}: {transcript_response.status_code} - {transcript_response.text}")
+            job_data.update({
+                "status": "failed",
+                "error": "Failed to start transcription on AssemblyAI",
+                "completed_at": datetime.now().isoformat()
+            })
+            return
+        
+        transcript_id = transcript_response.json()["id"]
+        job_data["assemblyai_id"] = transcript_id
+        logger.info(f"Background task: AssemblyAI transcription started with ID: {transcript_id}")
+        # === End AssemblyAI Integration ===
+
+    except Exception as e:
+        logger.error(f"Background task: ERROR during AssemblyAI integration for job {job_id}: {str(e)}")
+        import traceback
+        logger.error(f"Background task: Full traceback: {traceback.format_exc()}")
+        job_data.update({
+            "status": "failed",
+            "error": "Internal server error during transcription initiation",
+            "completed_at": datetime.now().isoformat()
+        })
+    finally:
+        # Clean up the temporary file in background task
+        if os.path.exists(tmp_path):
+            logger.info(f"Background task: Cleaning up temporary file: {tmp_path}")
+            os.unlink(tmp_path)
+        logger.info(f"Background task completed for job ID: {job_id}")
+
+
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
     return {"message": "Transcription Service is running!"}
 
 @app.post("/transcribe")
-async def transcribe_file(file: UploadFile = File(...)):
+async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()): # Add BackgroundTasks
     logger.info(f"Transcribe endpoint called with file: {file.filename}")
     
     # Check if file is audio or video
@@ -109,77 +179,30 @@ async def transcribe_file(file: UploadFile = File(...)):
     
     # Initialize job status
     jobs[job_id] = {
-        "status": "processing",
+        "status": "processing", # Initial status
         "filename": file.filename,
         "created_at": datetime.now().isoformat(),
-        "assemblyai_id": None # To store AssemblyAI transcription ID
+        "assemblyai_id": None 
     }
     logger.info(f"Job {job_id} initialized with status 'processing'")
     
+    # Save the uploaded file temporarily immediately
     try:
-        # Save the uploaded file temporarily
         logger.info(f"Saving uploaded file {file.filename} temporarily...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
         logger.info(f"File saved to temporary path: {tmp_path}")
-        
-        # === AssemblyAI Integration ===
-        logger.info("Sending audio to AssemblyAI for transcription...")
-        headers = {
-            "authorization": ASSEMBLYAI_API_KEY,
-            "content-type": "application/json"
-        }
-        
-        # Upload audio file to AssemblyAI
-        upload_endpoint = "https://api.assemblyai.com/v2/upload"
-        with open(tmp_path, "rb") as f:
-            upload_response = requests.post(upload_endpoint, headers=headers, data=f)
-        
-        if upload_response.status_code != 200:
-            logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
-            raise HTTPException(status_code=500, detail="Failed to upload audio to AssemblyAI")
-        
-        upload_url = upload_response.json()["upload_url"]
-        logger.info(f"Audio uploaded to AssemblyAI: {upload_url}")
-
-        # Start transcription
-        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
-        json_data = {
-            "audio_url": upload_url,
-            "language_code": "en_us" # Explicitly set language code
-        }
-        
-        transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
-        
-        if transcript_response.status_code != 200:
-            logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
-            raise HTTPException(status_code=500, detail="Failed to start transcription on AssemblyAI")
-        
-        transcript_id = transcript_response.json()["id"]
-        jobs[job_id]["assemblyai_id"] = transcript_id
-        logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
-        # === End AssemblyAI Integration ===
-
-        # Clean up the temporary file
-        logger.info(f"Cleaning up temporary file: {tmp_path}")
-        os.unlink(tmp_path)
-        
     except Exception as e:
-        # If something goes wrong
-        logger.error(f"ERROR in transcription for job {job_id}: {str(e)}")
-        logger.error(f"Exception type: {type(e).__name__}")
-        import traceback
-        logger.error(f"Full traceback: {traceback.format_exc()}")
-        
-        jobs[job_id].update({
-            "status": "failed",
-            "error": str(e),
-            "completed_at": datetime.now().isoformat()
-        })
-        logger.info(f"Job {job_id} marked as failed")
+        logger.error(f"ERROR saving temporary file for job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to save temporary file")
+
+    # Add the heavy processing to a background task
+    background_tasks.add_task(process_transcription_job, job_id, tmp_path, file.filename)
     
+    # Return immediate response
+    logger.info(f"Returning immediate response for job ID: {job_id}")
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
 @app.get("/status/{job_id}")
