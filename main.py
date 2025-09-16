@@ -55,7 +55,8 @@ if not ASSEMBLYAI_API_KEY:
     sys.exit(1)
 
 logger.info("Environment variables loaded successfully")
-# FIXED: Enhanced audio compression function with proper size reduction
+
+# FIXED: Ultra aggressive compression function
 def compress_audio_for_transcription(input_path: str, output_path: str = None) -> tuple[str, dict]:
     """Compress audio file optimally for AssemblyAI transcription"""
     if output_path is None:
@@ -73,47 +74,44 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
         audio = AudioSegment.from_file(input_path)
         logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
         
-        # AGGRESSIVE compression for transcription:
-        # 1. Convert to mono (reduces size by ~50%)
+        # ULTRA AGGRESSIVE compression for transcription:
+        # 1. Convert to mono
         if audio.channels > 1:
             audio = audio.set_channels(1)
             logger.info("Converted to mono audio")
         
-        # 2. Reduce sample rate significantly for speech
-        target_sample_rate = 16000  # Much lower for speech recognition
-        if audio.frame_rate > target_sample_rate:
-            audio = audio.set_frame_rate(target_sample_rate)
-            logger.info(f"Reduced sample rate from original to {target_sample_rate} Hz")
+        # 2. Drastically reduce sample rate for speech
+        target_sample_rate = 8000  # Even lower - telephone quality
+        audio = audio.set_frame_rate(target_sample_rate)
+        logger.info(f"Reduced sample rate to {target_sample_rate} Hz")
         
-        # 3. Apply normalization
+        # 3. Reduce volume slightly to avoid clipping during compression
+        audio = audio - 3  # Reduce by 3dB
+        
+        # 4. Apply normalization
         audio = audio.normalize()
         logger.info("Applied audio normalization")
         
-        # 4. Export with very aggressive compression settings
-        try:
-            audio.export(
-                output_path, 
-                format="mp3",
-                bitrate="32k",  # Very low bitrate for maximum compression
-                parameters=[
-                    "-q:a", "9",    # Lowest quality = highest compression
-                    "-ac", "1",     # Force mono
-                    "-ar", str(target_sample_rate),  # Force low sample rate
-                    "-compression_level", "10"  # Maximum compression
-                ]
-            )
-            logger.info("Used aggressive compression settings")
-        except Exception as ffmpeg_error:
-            logger.warning(f"Advanced compression failed: {ffmpeg_error}")
-            # Fallback to basic export with low bitrate
-            audio.export(output_path, format="mp3", bitrate="32k")
-            logger.info("Used basic compression fallback")
+        # 5. Export with ULTRA aggressive compression settings
+        audio.export(
+            output_path, 
+            format="mp3",
+            bitrate="16k",  # Extremely low bitrate
+            parameters=[
+                "-q:a", "9",    # Lowest quality = highest compression
+                "-ac", "1",     # Force mono
+                "-ar", str(target_sample_rate),  # Force very low sample rate
+                "-compression_level", "10",  # Maximum compression
+                "-joint_stereo", "0",  # Disable joint stereo
+                "-reservoir", "0"  # Disable bit reservoir
+            ]
+        )
+        logger.info("Used ultra-aggressive compression settings")
         
-        # FIXED: Calculate compression stats properly
+        # Calculate compression stats
         if os.path.exists(output_path):
             output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
             
-            # Proper calculation - always show reduction or increase
             size_difference = input_size - output_size
             if input_size > 0:
                 compression_ratio = (size_difference / input_size) * 100
@@ -128,7 +126,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
                 "duration_seconds": len(audio) / 1000.0
             }
             
-            logger.info(f"Compression result:")
+            logger.info(f"Ultra compression result:")
             logger.info(f"  Original: {stats['original_size_mb']} MB")
             logger.info(f"  Processed: {stats['compressed_size_mb']} MB")
             if size_difference > 0:
@@ -140,7 +138,33 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
         
     except Exception as e:
         logger.error(f"Error compressing audio: {e}")
-        raise
+        # If compression fails, try basic fallback
+        try:
+            audio = AudioSegment.from_file(input_path)
+            # Basic fallback compression
+            audio = audio.set_channels(1)  # Mono
+            audio = audio.set_frame_rate(8000)  # Very low sample rate
+            audio.export(output_path, format="mp3", bitrate="16k")
+            
+            # Recalculate stats for fallback
+            output_size = os.path.getsize(output_path) / (1024 * 1024)
+            size_difference = input_size - output_size
+            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
+            
+            stats = {
+                "original_size_mb": round(input_size, 2),
+                "compressed_size_mb": round(output_size, 2),
+                "compression_ratio_percent": round(compression_ratio, 1),
+                "size_reduction_mb": round(size_difference, 2),
+                "duration_seconds": len(audio) / 1000.0
+            }
+            
+            logger.info("Used fallback compression")
+            return output_path, stats
+            
+        except Exception as fallback_error:
+            logger.error(f"Fallback compression also failed: {fallback_error}")
+            raise
 
 def compress_audio_for_download(input_path: str, output_path: str = None, quality: str = "high") -> str:
     """Compress audio file for download with different quality options"""
@@ -236,6 +260,7 @@ logger.info("CORS middleware configured successfully")
 # Store transcription jobs in memory
 jobs = {}
 logger.info("Jobs dictionary initialized")
+
 # FIXED: Background task to handle AssemblyAI transcription using HTTP API
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
     logger.info(f"Background task started for job ID: {job_id}")
@@ -327,7 +352,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
-    return {"message": "Enhanced Transcription Service with Audio Compression is running!"}
+    return {"message": "Enhanced Transcription Service with Ultra Audio Compression is running!"}
 
 @app.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
