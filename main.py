@@ -6,7 +6,6 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
 from datetime import datetime
@@ -56,7 +55,6 @@ if not ASSEMBLYAI_API_KEY:
     sys.exit(1)
 
 logger.info("Environment variables loaded successfully")
-
 # FIXED: Enhanced audio compression function with proper size reduction
 def compress_audio_for_transcription(input_path: str, output_path: str = None) -> tuple[str, dict]:
     """Compress audio file optimally for AssemblyAI transcription"""
@@ -111,33 +109,32 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
             audio.export(output_path, format="mp3", bitrate="32k")
             logger.info("Used basic compression fallback")
         
-        # Calculate compression stats - FIXED CALCULATION
+        # FIXED: Calculate compression stats properly
         if os.path.exists(output_path):
             output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
             
-            # CORRECT calculation
-            if output_size < input_size:
-                compression_ratio = ((input_size - output_size) / input_size) * 100
-                is_compressed = True
+            # Proper calculation - always show reduction or increase
+            size_difference = input_size - output_size
+            if input_size > 0:
+                compression_ratio = (size_difference / input_size) * 100
             else:
-                compression_ratio = ((output_size - input_size) / input_size) * 100
-                is_compressed = False
+                compression_ratio = 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
                 "compressed_size_mb": round(output_size, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
-                "is_compressed": is_compressed,
+                "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
             }
             
             logger.info(f"Compression result:")
             logger.info(f"  Original: {stats['original_size_mb']} MB")
             logger.info(f"  Processed: {stats['compressed_size_mb']} MB")
-            if is_compressed:
-                logger.info(f"  Size reduction: {stats['compression_ratio_percent']}%")
+            if size_difference > 0:
+                logger.info(f"  Size reduction: {stats['compression_ratio_percent']}% ({stats['size_reduction_mb']} MB saved)")
             else:
-                logger.info(f"  Size increase: {stats['compression_ratio_percent']}%")
+                logger.info(f"  Size increase: {abs(stats['compression_ratio_percent'])}% ({abs(stats['size_reduction_mb'])} MB added)")
         
         return output_path, stats
         
@@ -225,20 +222,11 @@ logger.info("Creating FastAPI app...")
 app = FastAPI(title="Transcription Service", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
-# Add CORS middleware
-logger.info("Setting up CORS middleware with explicit origins...")
-origins = [
-    "http://localhost:3000",
-    "https://typemywordzspeechai.vercel.app",
-    "https://typemywordzspeechai-o03e6tjj3-james-gitukus-projects.vercel.app",
-    "https://typemywordzspeechai-*.vercel.app",
-    "https://*.vercel.app",
-    "*"
-]
-
+# FIXED: Add CORS middleware with proper configuration
+logger.info("Setting up CORS middleware...")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # Allow all origins for development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -248,7 +236,6 @@ logger.info("CORS middleware configured successfully")
 # Store transcription jobs in memory
 jobs = {}
 logger.info("Jobs dictionary initialized")
-
 # FIXED: Background task to handle AssemblyAI transcription using HTTP API
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
     logger.info(f"Background task started for job ID: {job_id}")
@@ -272,16 +259,20 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         with open(compressed_path, "rb") as f:
             upload_response = requests.post(upload_endpoint, headers=headers, data=f)
         
+        logger.info(f"AssemblyAI upload response status: {upload_response.status_code}")
+        logger.info(f"AssemblyAI upload response: {upload_response.text}")
+        
         if upload_response.status_code != 200:
             logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
             job_data.update({
                 "status": "failed",
-                "error": "Failed to upload audio to AssemblyAI",
+                "error": f"Failed to upload audio to AssemblyAI: {upload_response.text}",
                 "completed_at": datetime.now().isoformat()
             })
             return
         
-        audio_url = upload_response.json()["upload_url"]
+        upload_result = upload_response.json()
+        audio_url = upload_result["upload_url"]
         logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
 
         # Start transcription using HTTP API
@@ -296,16 +287,20 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         
         transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
         
+        logger.info(f"AssemblyAI transcription start response status: {transcript_response.status_code}")
+        logger.info(f"AssemblyAI transcription start response: {transcript_response.text}")
+        
         if transcript_response.status_code != 200:
             logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
             job_data.update({
                 "status": "failed",
-                "error": "Failed to start transcription on AssemblyAI",
+                "error": f"Failed to start transcription on AssemblyAI: {transcript_response.text}",
                 "completed_at": datetime.now().isoformat()
             })
             return
         
-        transcript_id = transcript_response.json()["id"]
+        transcript_result = transcript_response.json()
+        transcript_id = transcript_result["id"]
         job_data["assemblyai_id"] = transcript_id
         logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
         
@@ -320,7 +315,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         logger.error(f"Background task: Full traceback: {traceback.format_exc()}")
         job_data.update({
             "status": "failed",
-            "error": "Internal server error during transcription",
+            "error": f"Internal server error during transcription: {str(e)}",
             "completed_at": datetime.now().isoformat()
         })
     finally:
@@ -330,14 +325,12 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
             os.unlink(tmp_path)
         logger.info(f"Background task completed for job ID: {job_id}")
 @app.get("/")
-async def root(response: Response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+async def root():
     logger.info("Root endpoint called")
     return {"message": "Enhanced Transcription Service with Audio Compression is running!"}
 
 @app.post("/transcribe")
-async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks(), response: Response = Response()):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
     logger.info(f"Transcribe endpoint called with file: {file.filename}")
     
     # Check if file is audio or video
@@ -382,8 +375,7 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
 
 @app.get("/status/{job_id}")
-async def get_job_status(job_id: str, response: Response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+async def get_job_status(job_id: str):
     logger.info(f"Status check for job ID: {job_id}")
     if job_id not in jobs:
         logger.warning(f"Job ID {job_id} not found")
@@ -397,43 +389,51 @@ async def get_job_status(job_id: str, response: Response):
         headers = {"authorization": ASSEMBLYAI_API_KEY}
         transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{job_data['assemblyai_id']}"
         
-        response_data = requests.get(transcript_endpoint, headers=headers)
+        try:
+            response_data = requests.get(transcript_endpoint, headers=headers)
+            
+            if response_data.status_code != 200:
+                logger.error(f"AssemblyAI status check failed: {response_data.status_code} - {response_data.text}")
+                job_data.update({
+                    "status": "failed",
+                    "error": f"Failed to get status from AssemblyAI: {response_data.text}",
+                    "completed_at": datetime.now().isoformat()
+                })
+                return job_data
+            
+            assemblyai_result = response_data.json()
+            
+            if assemblyai_result["status"] == "completed":
+                logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
+                job_data.update({
+                    "status": "completed",
+                    "transcription": assemblyai_result["text"],
+                    "language": assemblyai_result["language_code"],
+                    "completed_at": datetime.now().isoformat()
+                })
+            elif assemblyai_result["status"] == "error":
+                logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
+                job_data.update({
+                    "status": "failed",
+                    "error": assemblyai_result.get("error", "Transcription failed on AssemblyAI"),
+                    "completed_at": datetime.now().isoformat()
+                })
+            else:
+                logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} status: {assemblyai_result['status']}")
         
-        if response_data.status_code != 200:
-            logger.error(f"AssemblyAI status check failed: {response_data.status_code} - {response_data.text}")
+        except Exception as e:
+            logger.error(f"Error polling AssemblyAI status: {str(e)}")
             job_data.update({
                 "status": "failed",
-                "error": "Failed to get status from AssemblyAI",
+                "error": f"Error checking transcription status: {str(e)}",
                 "completed_at": datetime.now().isoformat()
             })
-            return job_data
-        
-        assemblyai_result = response_data.json()
-        
-        if assemblyai_result["status"] == "completed":
-            logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
-            job_data.update({
-                "status": "completed",
-                "transcription": assemblyai_result["text"],
-                "language": assemblyai_result["language_code"],
-                "completed_at": datetime.now().isoformat()
-            })
-        elif assemblyai_result["status"] == "error":
-            logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
-            job_data.update({
-                "status": "failed",
-                "error": assemblyai_result.get("error", "Transcription failed on AssemblyAI"),
-                "completed_at": datetime.now().isoformat()
-            })
-        else:
-            logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} status: {assemblyai_result['status']}")
 
     return job_data
 
 @app.post("/compress-download")
-async def compress_download(file: UploadFile = File(...), quality: str = "high", response: Response = Response()):
+async def compress_download(file: UploadFile = File(...), quality: str = "high"):
     """Endpoint to compress audio files for download"""
-    response.headers["Access-Control-Allow-Origin"] = "*"
     logger.info(f"Compress download endpoint called with file: {file.filename}, quality: {quality}")
     
     if not file.content_type.startswith(('audio/', 'video/')):
