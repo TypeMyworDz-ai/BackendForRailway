@@ -29,6 +29,7 @@
         .btn-record { background-color: #e74c3c; color: white; }
         .btn-stop { background-color: #34495e; color: white; }
         .btn-download { background-color: #3498db; color: white; }
+        .btn-upload { background-color: #27ae60; color: white; }
         .format-selection {
             margin: 20px 0;
             padding: 15px;
@@ -41,6 +42,22 @@
             border-radius: 3px;
             border: 1px solid #bdc3c7;
         }
+        .transcription-box {
+            border: 1px solid #ddd;
+            padding: 15px;
+            min-height: 100px;
+            background: #f9f9f9;
+            border-radius: 5px;
+            white-space: pre-wrap;
+        }
+        .status-message {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .status-processing { background-color: #fff3cd; color: #856404; }
+        .status-completed { background-color: #d4edda; color: #155724; }
+        .status-failed { background-color: #f8d7da; color: #721c24; }
     </style>
 </head>
 <body>
@@ -64,6 +81,7 @@
             </div>
             
             <button id="downloadBtn" class="btn btn-download" disabled>📥 Download Recording</button>
+            <button id="transcribeRecordingBtn" class="btn btn-upload" disabled>🎯 Transcribe Recording</button>
             
             <div id="recordingStatus"></div>
         </div>
@@ -72,13 +90,14 @@
         <div class="upload-section">
             <h2>📁 Or Upload Audio File</h2>
             <input type="file" id="fileInput" accept="audio/*,video/*">
-            <button id="uploadBtn" class="btn">📤 Upload & Transcribe</button>
+            <button id="uploadBtn" class="btn btn-upload">📤 Upload & Transcribe</button>
         </div>
 
         <!-- Results Section -->
         <div class="results-section">
             <h2>📝 Transcription Results</h2>
-            <div id="transcriptionResult" style="border: 1px solid #ddd; padding: 15px; min-height: 100px; background: #f9f9f9;">
+            <div id="transcriptionStatus"></div>
+            <div id="transcriptionResult" class="transcription-box">
                 Your transcription will appear here...
             </div>
         </div>
@@ -87,18 +106,29 @@
     <script>
         let mediaRecorder;
         let recordedChunks = [];
-        let currentRecordingId = null;
+        let currentRecordingBlob = null;
+        let currentJobId = null;
 
         // Get DOM elements
         const startBtn = document.getElementById('startRecordingBtn');
         const stopBtn = document.getElementById('stopRecordingBtn');
         const downloadBtn = document.getElementById('downloadBtn');
+        const transcribeRecordingBtn = document.getElementById('transcribeRecordingBtn');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const fileInput = document.getElementById('fileInput');
         const statusDiv = document.getElementById('recordingStatus');
+        const transcriptionStatusDiv = document.getElementById('transcriptionStatus');
+        const transcriptionResultDiv = document.getElementById('transcriptionResult');
+
+        // Your Railway backend URL
+        const BACKEND_URL = 'https://web-production-5eab.up.railway.app';
 
         // Recording functionality
         startBtn.addEventListener('click', startRecording);
         stopBtn.addEventListener('click', stopRecording);
         downloadBtn.addEventListener('click', handleDownload);
+        transcribeRecordingBtn.addEventListener('click', transcribeRecording);
+        uploadBtn.addEventListener('click', uploadFile);
 
         async function startRecording() {
             try {
@@ -114,13 +144,12 @@
                 };
                 
                 mediaRecorder.onstop = function() {
-                    // Create a blob from recorded chunks
-                    const blob = new Blob(recordedChunks, { type: 'audio/wav' });
-                    currentRecordingId = 'recording_' + Date.now();
+                    currentRecordingBlob = new Blob(recordedChunks, { type: 'audio/wav' });
                     
-                    // Enable download button
+                    // Enable buttons
                     downloadBtn.disabled = false;
-                    statusDiv.innerHTML = '<p style="color: green;">✅ Recording saved! Ready to download.</p>';
+                    transcribeRecordingBtn.disabled = false;
+                    statusDiv.innerHTML = '<p style="color: green;">✅ Recording saved! Ready to download or transcribe.</p>';
                 };
                 
                 mediaRecorder.start();
@@ -139,8 +168,6 @@
         function stopRecording() {
             if (mediaRecorder && mediaRecorder.state === 'recording') {
                 mediaRecorder.stop();
-                
-                // Stop all tracks
                 mediaRecorder.stream.getTracks().forEach(track => track.stop());
                 
                 // Update UI
@@ -150,23 +177,16 @@
         }
 
         function handleDownload() {
-            const format = document.getElementById('audioFormat').value;
-            downloadRecording(format);
-        }
-
-        function downloadRecording(format = 'mp3') {
-            if (!currentRecordingId) {
+            if (!currentRecordingBlob) {
                 alert('No recording available to download');
                 return;
             }
             
-            // For now, we'll create a simple download
-            // In step 3, we'll connect this to your Flask backend
-            const blob = new Blob(recordedChunks, { type: 'audio/wav' });
-            const url = URL.createObjectURL(blob);
+            const format = document.getElementById('audioFormat').value;
+            const url = URL.createObjectURL(currentRecordingBlob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `recording_${currentRecordingId}.${format}`;
+            a.download = `recording_${Date.now()}.${format}`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
@@ -175,7 +195,87 @@
             statusDiv.innerHTML = '<p style="color: blue;">📥 Download started!</p>';
         }
 
-        console.log("Transcribe page loaded with recording functionality");
+        async function transcribeRecording() {
+            if (!currentRecordingBlob) {
+                alert('No recording available to transcribe');
+                return;
+            }
+
+            await transcribeAudioBlob(currentRecordingBlob, 'recording.wav');
+        }
+
+        async function uploadFile() {
+            const file = fileInput.files[0];
+            if (!file) {
+                alert('Please select a file first');
+                return;
+            }
+
+            await transcribeAudioBlob(file, file.name);
+        }
+
+        async function transcribeAudioBlob(audioBlob, filename) {
+            try {
+                transcriptionStatusDiv.innerHTML = '<div class="status-message status-processing">🔄 Uploading and starting transcription...</div>';
+                transcriptionResultDiv.textContent = 'Processing...';
+
+                const formData = new FormData();
+                formData.append('file', audioBlob, filename);
+
+                const response = await fetch(`${BACKEND_URL}/transcribe`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const result = await response.json();
+                currentJobId = result.job_id;
+
+                transcriptionStatusDiv.innerHTML = '<div class="status-message status-processing">⏳ Transcription in progress...</div>';
+                
+                // Poll for status
+                pollTranscriptionStatus();
+
+            } catch (error) {
+                console.error('Transcription error:', error);
+                transcriptionStatusDiv.innerHTML = '<div class="status-message status-failed">❌ Error starting transcription</div>';
+                transcriptionResultDiv.textContent = `Error: ${error.message}`;
+            }
+        }
+
+        async function pollTranscriptionStatus() {
+            if (!currentJobId) return;
+
+            try {
+                const response = await fetch(`${BACKEND_URL}/status/${currentJobId}`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const status = await response.json();
+
+                if (status.status === 'completed') {
+                    transcriptionStatusDiv.innerHTML = '<div class="status-message status-completed">✅ Transcription completed!</div>';
+                    transcriptionResultDiv.textContent = status.transcription;
+                } else if (status.status === 'failed') {
+                    transcriptionStatusDiv.innerHTML = '<div class="status-message status-failed">❌ Transcription failed</div>';
+                    transcriptionResultDiv.textContent = `Error: ${status.error}`;
+                } else {
+                    // Still processing, poll again
+                    setTimeout(pollTranscriptionStatus, 2000);
+                }
+
+            } catch (error) {
+                console.error('Status check error:', error);
+                transcriptionStatusDiv.innerHTML = '<div class="status-message status-failed">❌ Error checking status</div>';
+            }
+        }
+
+        console.log("Transcribe page loaded with Railway FastAPI integration");
     </script>
 </body>
 </html>
