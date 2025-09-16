@@ -1,12 +1,13 @@
 import logging
 import sys
 import asyncio
+import subprocess
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.cors import CORSMiddleware
 import tempfile
-import os
 import uuid
 from datetime import datetime
 from dotenv import load_dotenv
@@ -25,6 +26,26 @@ logger = logging.getLogger(__name__)
 
 logger.info("=== STARTING FASTAPI APPLICATION ===")
 
+# Install ffmpeg if not available
+def install_ffmpeg():
+    try:
+        # Test if ffmpeg is available
+        subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
+        logger.info("ffmpeg is already installed")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.info("Installing ffmpeg...")
+        try:
+            # Try to install ffmpeg on Ubuntu/Debian (Railway uses Ubuntu)
+            subprocess.run(['apt-get', 'update'], check=True)
+            subprocess.run(['apt-get', 'install', '-y', 'ffmpeg'], check=True)
+            logger.info("ffmpeg installed successfully")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to install ffmpeg: {e}")
+            # Continue without ffmpeg - basic conversion will still work
+
+# Install ffmpeg on startup
+install_ffmpeg()
+
 # Load environment variables
 logger.info("Loading environment variables...")
 load_dotenv()
@@ -34,7 +55,6 @@ if not ASSEMBLYAI_API_KEY:
     logger.error("ASSEMBLYAI_API_KEY environment variable not set!")
     sys.exit(1)
 logger.info("Environment variables loaded successfully")
-
 # Audio conversion function with optimized compression
 def convert_to_mp3(input_path: str, output_path: str = None) -> str:
     """Convert audio file to MP3 format with optimized compression"""
@@ -45,8 +65,13 @@ def convert_to_mp3(input_path: str, output_path: str = None) -> str:
     try:
         logger.info(f"Converting {input_path} to optimized MP3 format...")
         
+        # Get original file size
+        input_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
+        logger.info(f"Original file size: {input_size:.2f} MB")
+        
         # Load audio file
         audio = AudioSegment.from_file(input_path)
+        logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
         
         # Optimize for smaller file size:
         # 1. Convert to mono (reduces size by ~50%)
@@ -59,27 +84,34 @@ def convert_to_mp3(input_path: str, output_path: str = None) -> str:
             audio = audio.set_frame_rate(22050)  # Good for speech
             logger.info(f"Reduced sample rate to 22050 Hz")
         
-        # 3. Export with lower bitrate and optimized settings
-        audio.export(
-            output_path, 
-            format="mp3",
-            bitrate="64k",      # Lower bitrate (was 128k)
-            parameters=[
-                "-q:a", "9",     # Lowest quality (highest compression)
-                "-ac", "1",      # Force mono
-                "-ar", "22050"   # Force sample rate
-            ]
-        )
+        # 3. Try advanced export with ffmpeg parameters first
+        try:
+            audio.export(
+                output_path, 
+                format="mp3",
+                bitrate="64k",
+                parameters=[
+                    "-q:a", "9",     # Lowest quality (highest compression)
+                    "-ac", "1",      # Force mono
+                    "-ar", "22050"   # Force sample rate
+                ]
+            )
+            logger.info("Used advanced ffmpeg compression")
+        except Exception as ffmpeg_error:
+            logger.warning(f"Advanced compression failed: {ffmpeg_error}")
+            # Fallback to basic export
+            audio.export(output_path, format="mp3", bitrate="64k")
+            logger.info("Used basic compression fallback")
         
-        # Log file sizes for comparison
-        input_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
-        output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
-        compression_ratio = (1 - output_size/input_size) * 100
-        
-        logger.info(f"Compression complete:")
-        logger.info(f"  Original: {input_size:.2f} MB")
-        logger.info(f"  Compressed: {output_size:.2f} MB")
-        logger.info(f"  Size reduction: {compression_ratio:.1f}%")
+        # Log compression results
+        if os.path.exists(output_path):
+            output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+            compression_ratio = (1 - output_size/input_size) * 100 if input_size > 0 else 0
+            
+            logger.info(f"Compression complete:")
+            logger.info(f"  Original: {input_size:.2f} MB")
+            logger.info(f"  Compressed: {output_size:.2f} MB")
+            logger.info(f"  Size reduction: {compression_ratio:.1f}%")
         
         return output_path
         
@@ -141,7 +173,6 @@ logger.info("CORS middleware configured successfully")
 # Store transcription jobs in memory
 jobs = {}
 logger.info("Jobs dictionary initialized")
-
 # Background task to handle AssemblyAI transcription
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
     logger.info(f"Background task started for job ID: {job_id}")
@@ -217,7 +248,6 @@ async def root(response: Response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     logger.info("Root endpoint called")
     return {"message": "Transcription Service is running!"}
-
 @app.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks(), response: Response = Response()):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -252,25 +282,16 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         
         logger.info(f"Original file saved to: {original_tmp_path}")
         
-        # Handle MP3 conversion
+        # Handle MP3 conversion - ALWAYS optimize for size
         file_extension = os.path.splitext(file.filename)[1].lower()
-
-        if file_extension == '.mp3':
-            # File is already MP3, but optimize it for smaller size
-            mp3_tmp_path = original_tmp_path.replace('.mp3', '_optimized.mp3')
-            convert_to_mp3(original_tmp_path, mp3_tmp_path)
-            
-            # Clean up original file
-            os.unlink(original_tmp_path)
-            logger.info(f"MP3 file optimized for size: {mp3_tmp_path}")
-        else:
-            # Convert to optimized MP3
-            mp3_tmp_path = original_tmp_path.replace(os.path.splitext(original_tmp_path)[1], '.mp3')
-            convert_to_mp3(original_tmp_path, mp3_tmp_path)
-            
-            # Clean up original file only if conversion was needed
-            os.unlink(original_tmp_path)
-            logger.info(f"Original file cleaned up, optimized MP3 file ready: {mp3_tmp_path}")
+        mp3_tmp_path = original_tmp_path.replace(os.path.splitext(original_tmp_path)[1], '_optimized.mp3')
+        
+        # Always convert/optimize to get smaller files
+        convert_to_mp3(original_tmp_path, mp3_tmp_path)
+        
+        # Clean up original file
+        os.unlink(original_tmp_path)
+        logger.info(f"Optimized MP3 file ready: {mp3_tmp_path}")
         
     except Exception as e:
         logger.error(f"ERROR processing file for job {job_id}: {str(e)}")
@@ -282,7 +303,6 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     # Return immediate response
     logger.info(f"Returning immediate response for job ID: {job_id}")
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
-
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str, response: Response):
     response.headers["Access-Control-Allow-Origin"] = "*"
