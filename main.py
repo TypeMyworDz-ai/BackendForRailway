@@ -13,7 +13,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 import requests
 from pydub import AudioSegment
-import assemblyai as aai
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -56,10 +55,9 @@ if not ASSEMBLYAI_API_KEY:
     logger.error("ASSEMBLYAI_API_KEY environment variable not set!")
     sys.exit(1)
 
-# Configure AssemblyAI
-aai.settings.api_key = ASSEMBLYAI_API_KEY
 logger.info("Environment variables loaded successfully")
-# Enhanced audio compression function
+
+# FIXED: Enhanced audio compression function with proper size reduction
 def compress_audio_for_transcription(input_path: str, output_path: str = None) -> tuple[str, dict]:
     """Compress audio file optimally for AssemblyAI transcription"""
     if output_path is None:
@@ -77,59 +75,69 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
         audio = AudioSegment.from_file(input_path)
         logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
         
-        # Optimize for transcription (balance size vs quality):
+        # AGGRESSIVE compression for transcription:
         # 1. Convert to mono (reduces size by ~50%)
         if audio.channels > 1:
             audio = audio.set_channels(1)
             logger.info("Converted to mono audio")
         
-        # 2. Optimize sample rate for speech recognition
-        target_sample_rate = 16000  # Optimal for speech recognition
-        if audio.frame_rate != target_sample_rate:
+        # 2. Reduce sample rate significantly for speech
+        target_sample_rate = 16000  # Much lower for speech recognition
+        if audio.frame_rate > target_sample_rate:
             audio = audio.set_frame_rate(target_sample_rate)
-            logger.info(f"Optimized sample rate to {target_sample_rate} Hz")
+            logger.info(f"Reduced sample rate from original to {target_sample_rate} Hz")
         
-        # 3. Apply audio normalization for better transcription
-        normalized_audio = audio.normalize()
+        # 3. Apply normalization
+        audio = audio.normalize()
         logger.info("Applied audio normalization")
         
-        # 4. Export with optimized settings for transcription
+        # 4. Export with very aggressive compression settings
         try:
-            normalized_audio.export(
+            audio.export(
                 output_path, 
                 format="mp3",
-                bitrate="64k",  # Good balance for speech
+                bitrate="32k",  # Very low bitrate for maximum compression
                 parameters=[
-                    "-q:a", "2",    # Good quality for speech
+                    "-q:a", "9",    # Lowest quality = highest compression
                     "-ac", "1",     # Force mono
-                    "-ar", str(target_sample_rate),  # Force sample rate
-                    "-af", "highpass=f=80,lowpass=f=8000"  # Filter for speech frequencies
+                    "-ar", str(target_sample_rate),  # Force low sample rate
+                    "-compression_level", "10"  # Maximum compression
                 ]
             )
-            logger.info("Used optimized compression with audio filtering")
+            logger.info("Used aggressive compression settings")
         except Exception as ffmpeg_error:
             logger.warning(f"Advanced compression failed: {ffmpeg_error}")
-            # Fallback to basic export
-            normalized_audio.export(output_path, format="mp3", bitrate="64k")
+            # Fallback to basic export with low bitrate
+            audio.export(output_path, format="mp3", bitrate="32k")
             logger.info("Used basic compression fallback")
         
-        # Calculate compression stats
+        # Calculate compression stats - FIXED CALCULATION
         if os.path.exists(output_path):
             output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
-            compression_ratio = (1 - output_size/input_size) * 100 if input_size > 0 else 0
+            
+            # CORRECT calculation
+            if output_size < input_size:
+                compression_ratio = ((input_size - output_size) / input_size) * 100
+                is_compressed = True
+            else:
+                compression_ratio = ((output_size - input_size) / input_size) * 100
+                is_compressed = False
             
             stats = {
                 "original_size_mb": round(input_size, 2),
                 "compressed_size_mb": round(output_size, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
+                "is_compressed": is_compressed,
                 "duration_seconds": len(audio) / 1000.0
             }
             
-            logger.info(f"Compression complete:")
+            logger.info(f"Compression result:")
             logger.info(f"  Original: {stats['original_size_mb']} MB")
-            logger.info(f"  Compressed: {stats['compressed_size_mb']} MB")
-            logger.info(f"  Size reduction: {stats['compression_ratio_percent']}%")
-            logger.info(f"  Duration: {stats['duration_seconds']:.1f} seconds")
+            logger.info(f"  Processed: {stats['compressed_size_mb']} MB")
+            if is_compressed:
+                logger.info(f"  Size reduction: {stats['compression_ratio_percent']}%")
+            else:
+                logger.info(f"  Size increase: {stats['compression_ratio_percent']}%")
         
         return output_path, stats
         
@@ -148,18 +156,18 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
         
         audio = AudioSegment.from_file(input_path)
         
-        # Quality settings
+        # Quality settings - FIXED to ensure compression
         if quality == "high":
-            bitrate = "192k"
+            bitrate = "128k"  # Reduced from 192k
             sample_rate = 44100
             channels = 2 if audio.channels > 1 else 1
         elif quality == "medium":
-            bitrate = "128k"
-            sample_rate = 44100
-            channels = 2 if audio.channels > 1 else 1
+            bitrate = "96k"   # Reduced from 128k
+            sample_rate = 22050  # Reduced sample rate
+            channels = 1      # Force mono
         else:  # low quality
-            bitrate = "96k"
-            sample_rate = 22050
+            bitrate = "64k"
+            sample_rate = 16000
             channels = 1
         
         # Apply settings
@@ -174,7 +182,7 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
             format="mp3",
             bitrate=bitrate,
             parameters=[
-                "-q:a", "2",
+                "-q:a", "2" if quality == "high" else "5",
                 "-ac", str(channels),
                 "-ar", str(sample_rate)
             ]
@@ -240,7 +248,8 @@ logger.info("CORS middleware configured successfully")
 # Store transcription jobs in memory
 jobs = {}
 logger.info("Jobs dictionary initialized")
-# Background task to handle AssemblyAI transcription
+
+# FIXED: Background task to handle AssemblyAI transcription using HTTP API
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
     logger.info(f"Background task started for job ID: {job_id}")
     job_data = jobs[job_id]
@@ -255,49 +264,55 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         # Update job with compression stats
         job_data["compression_stats"] = compression_stats
         
-        # Upload compressed audio to AssemblyAI using the new SDK
+        # Upload compressed audio to AssemblyAI using HTTP API
         logger.info("Uploading compressed audio to AssemblyAI...")
-        audio_url = aai.upload_file(compressed_path)
-        logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
-
-        # Configure transcription settings
-        config = aai.TranscriptionConfig(
-            audio_url=audio_url,
-            language_code="en_us",
-            punctuate=True,
-            format_text=True,
-            speaker_labels=False,  # Can be enabled if needed
-            auto_highlights=False,
-            sentiment_analysis=False
-        )
+        headers = {"authorization": ASSEMBLYAI_API_KEY}
+        upload_endpoint = "https://api.assemblyai.com/v2/upload"
         
-        # Start transcription
-        transcriber = aai.Transcriber()
-        transcript = transcriber.transcribe(config)
+        with open(compressed_path, "rb") as f:
+            upload_response = requests.post(upload_endpoint, headers=headers, data=f)
         
-        if transcript.status == aai.TranscriptStatus.error:
-            logger.error(f"AssemblyAI transcription failed: {transcript.error}")
+        if upload_response.status_code != 200:
+            logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
             job_data.update({
                 "status": "failed",
-                "error": f"Transcription failed: {transcript.error}",
+                "error": "Failed to upload audio to AssemblyAI",
                 "completed_at": datetime.now().isoformat()
             })
-        else:
-            logger.info(f"Transcription completed successfully for job {job_id}")
+            return
+        
+        audio_url = upload_response.json()["upload_url"]
+        logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
+
+        # Start transcription using HTTP API
+        headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+        json_data = {
+            "audio_url": audio_url,
+            "language_code": "en_us",
+            "punctuate": True,
+            "format_text": True
+        }
+        
+        transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
+        
+        if transcript_response.status_code != 200:
+            logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
             job_data.update({
-                "status": "completed",
-                "transcription": transcript.text,
-                "language": "en_us",
-                "confidence": transcript.confidence if hasattr(transcript, 'confidence') else None,
+                "status": "failed",
+                "error": "Failed to start transcription on AssemblyAI",
                 "completed_at": datetime.now().isoformat()
             })
+            return
+        
+        transcript_id = transcript_response.json()["id"]
+        job_data["assemblyai_id"] = transcript_id
+        logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
         
         # Clean up compressed file
         if os.path.exists(compressed_path):
             os.unlink(compressed_path)
             logger.info(f"Cleaned up compressed file: {compressed_path}")
-        
-        # === End Enhanced AssemblyAI Integration ===
 
     except Exception as e:
         logger.error(f"Background task: ERROR during transcription for job {job_id}: {str(e)}")
@@ -375,7 +390,44 @@ async def get_job_status(job_id: str, response: Response):
         raise HTTPException(status_code=404, detail="Job not found")
     
     job_data = jobs[job_id]
-    logger.info(f"Returning status for job {job_id}: {job_data['status']}")
+    
+    # If transcription is still processing, poll AssemblyAI for status
+    if job_data["status"] == "processing" and job_data["assemblyai_id"]:
+        logger.info(f"Polling AssemblyAI for status of transcript ID: {job_data['assemblyai_id']}")
+        headers = {"authorization": ASSEMBLYAI_API_KEY}
+        transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{job_data['assemblyai_id']}"
+        
+        response_data = requests.get(transcript_endpoint, headers=headers)
+        
+        if response_data.status_code != 200:
+            logger.error(f"AssemblyAI status check failed: {response_data.status_code} - {response_data.text}")
+            job_data.update({
+                "status": "failed",
+                "error": "Failed to get status from AssemblyAI",
+                "completed_at": datetime.now().isoformat()
+            })
+            return job_data
+        
+        assemblyai_result = response_data.json()
+        
+        if assemblyai_result["status"] == "completed":
+            logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
+            job_data.update({
+                "status": "completed",
+                "transcription": assemblyai_result["text"],
+                "language": assemblyai_result["language_code"],
+                "completed_at": datetime.now().isoformat()
+            })
+        elif assemblyai_result["status"] == "error":
+            logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
+            job_data.update({
+                "status": "failed",
+                "error": assemblyai_result.get("error", "Transcription failed on AssemblyAI"),
+                "completed_at": datetime.now().isoformat()
+            })
+        else:
+            logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} status: {assemblyai_result['status']}")
+
     return job_data
 
 @app.post("/compress-download")
