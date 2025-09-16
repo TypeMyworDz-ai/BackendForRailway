@@ -35,20 +35,54 @@ if not ASSEMBLYAI_API_KEY:
     sys.exit(1)
 logger.info("Environment variables loaded successfully")
 
-# Audio conversion function
+# Audio conversion function with optimized compression
 def convert_to_mp3(input_path: str, output_path: str = None) -> str:
-    """Convert audio file to MP3 format"""
+    """Convert audio file to MP3 format with optimized compression"""
     if output_path is None:
         base_name = os.path.splitext(input_path)[0]
         output_path = f"{base_name}.mp3"
     
     try:
-        logger.info(f"Converting {input_path} to MP3 format...")
-        # Load audio file and convert to MP3
+        logger.info(f"Converting {input_path} to optimized MP3 format...")
+        
+        # Load audio file
         audio = AudioSegment.from_file(input_path)
-        audio.export(output_path, format="mp3", bitrate="128k")
-        logger.info(f"Successfully converted to MP3: {output_path}")
+        
+        # Optimize for smaller file size:
+        # 1. Convert to mono (reduces size by ~50%)
+        if audio.channels > 1:
+            audio = audio.set_channels(1)
+            logger.info("Converted to mono audio")
+        
+        # 2. Reduce sample rate for voice (reduces size significantly)
+        if audio.frame_rate > 22050:
+            audio = audio.set_frame_rate(22050)  # Good for speech
+            logger.info(f"Reduced sample rate to 22050 Hz")
+        
+        # 3. Export with lower bitrate and optimized settings
+        audio.export(
+            output_path, 
+            format="mp3",
+            bitrate="64k",      # Lower bitrate (was 128k)
+            parameters=[
+                "-q:a", "9",     # Lowest quality (highest compression)
+                "-ac", "1",      # Force mono
+                "-ar", "22050"   # Force sample rate
+            ]
+        )
+        
+        # Log file sizes for comparison
+        input_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
+        output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+        compression_ratio = (1 - output_size/input_size) * 100
+        
+        logger.info(f"Compression complete:")
+        logger.info(f"  Original: {input_size:.2f} MB")
+        logger.info(f"  Compressed: {output_size:.2f} MB")
+        logger.info(f"  Size reduction: {compression_ratio:.1f}%")
+        
         return output_path
+        
     except Exception as e:
         logger.error(f"Error converting to MP3: {e}")
         raise
@@ -222,17 +256,21 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         file_extension = os.path.splitext(file.filename)[1].lower()
 
         if file_extension == '.mp3':
-            # File is already MP3, use it directly
-            mp3_tmp_path = original_tmp_path
-            logger.info(f"File is already MP3, using original: {mp3_tmp_path}")
+            # File is already MP3, but optimize it for smaller size
+            mp3_tmp_path = original_tmp_path.replace('.mp3', '_optimized.mp3')
+            convert_to_mp3(original_tmp_path, mp3_tmp_path)
+            
+            # Clean up original file
+            os.unlink(original_tmp_path)
+            logger.info(f"MP3 file optimized for size: {mp3_tmp_path}")
         else:
-            # Convert to MP3
+            # Convert to optimized MP3
             mp3_tmp_path = original_tmp_path.replace(os.path.splitext(original_tmp_path)[1], '.mp3')
             convert_to_mp3(original_tmp_path, mp3_tmp_path)
             
             # Clean up original file only if conversion was needed
             os.unlink(original_tmp_path)
-            logger.info(f"Original file cleaned up, MP3 file ready: {mp3_tmp_path}")
+            logger.info(f"Original file cleaned up, optimized MP3 file ready: {mp3_tmp_path}")
         
     except Exception as e:
         logger.error(f"ERROR processing file for job {job_id}: {str(e)}")
