@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Transcription</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .btn {
+            padding: 10px 20px;
+            margin: 10px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        .btn-record { background-color: #e74c3c; color: white; }
+        .btn-stop { background-color: #34495e; color: white; }
+        .btn-download { background-color: #3498db; color: white; }
+        .format-selection {
+            margin: 20px 0;
+            padding: 15px;
+            background-color: #ecf0f1;
+            border-radius: 5px;
+        }
+        .format-dropdown {
+            padding: 8px;
+            margin-left: 10px;
+            border-radius: 3px;
+            border: 1px solid #bdc3c7;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Audio Transcription App</h1>
+        
+        <!-- Record Audio Section -->
+        <div class="record-section">
+            <h2>🎤 Record Audio</h2>
+            
+            <button id="startRecordingBtn" class="btn btn-record">🔴 Start Recording</button>
+            <button id="stopRecordingBtn" class="btn btn-stop" disabled>⏹️ Stop Recording</button>
+            
+            <!-- Format Selection Dropdown -->
+            <div class="format-selection">
+                <label for="audioFormat"><strong>Download Format:</strong></label>
+                <select id="audioFormat" class="format-dropdown">
+                    <option value="mp3" selected>MP3 (Default)</option>
+                    <option value="wav">WAV</option>
+                </select>
+            </div>
+            
+            <button id="downloadBtn" class="btn btn-download" disabled>📥 Download Recording</button>
+            
+            <div id="recordingStatus"></div>
+        </div>
+
+        <!-- Upload File Section -->
+        <div class="upload-section">
+            <h2>📁 Or Upload Audio File</h2>
+            <input type="file" id="fileInput" accept="audio/*,video/*">
+            <button id="uploadBtn" class="btn">📤 Upload & Transcribe</button>
+        </div>
+
+        <!-- Results Section -->
+        <div class="results-section">
+            <h2>📝 Transcription Results</h2>
+            <div id="transcriptionResult" style="border: 1px solid #ddd; padding: 15px; min-height: 100px; background: #f9f9f9;">
+                Your transcription will appear here...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let mediaRecorder;
+        let recordedChunks = [];
+        let currentRecordingId = null;
+
+        // Get DOM elements
+        const startBtn = document.getElementById('startRecordingBtn');
+        const stopBtn = document.getElementById('stopRecordingBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const statusDiv = document.getElementById('recordingStatus');
+
+        // Recording functionality
+        startBtn.addEventListener('click', startRecording);
+        stopBtn.addEventListener('click', stopRecording);
+        downloadBtn.addEventListener('click', handleDownload);
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                mediaRecorder = new MediaRecorder(stream);
+                recordedChunks = [];
+                
+                mediaRecorder.ondataavailable = function(event) {
+                    if (event.data.size > 0) {
+                        recordedChunks.push(event.data);
+                    }
+                };
+                
+                mediaRecorder.onstop = function() {
+                    // Create a blob from recorded chunks
+                    const blob = new Blob(recordedChunks, { type: 'audio/wav' });
+                    currentRecordingId = 'recording_' + Date.now();
+                    
+                    // Enable download button
+                    downloadBtn.disabled = false;
+                    statusDiv.innerHTML = '<p style="color: green;">✅ Recording saved! Ready to download.</p>';
+                };
+                
+                mediaRecorder.start();
+                
+                // Update UI
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusDiv.innerHTML = '<p style="color: red;">🔴 Recording in progress...</p>';
+                
+            } catch (error) {
+                console.error('Error accessing microphone:', error);
+                statusDiv.innerHTML = '<p style="color: red;">❌ Error: Could not access microphone</p>';
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                
+                // Stop all tracks
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                
+                // Update UI
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+        }
+
+        function handleDownload() {
+            const format = document.getElementById('audioFormat').value;
+            downloadRecording(format);
+        }
+
+        function downloadRecording(format = 'mp3') {
+            if (!currentRecordingId) {
+                alert('No recording available to download');
+                return;
+            }
+            
+            // For now, we'll create a simple download
+            // In step 3, we'll connect this to your Flask backend
+            const blob = new Blob(recordedChunks, { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `recording_${currentRecordingId}.${format}`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            statusDiv.innerHTML = '<p style="color: blue;">📥 Download started!</p>';
+        }
+
+        console.log("Transcribe page loaded with recording functionality");
+    </script>
+</body>
+</html>
