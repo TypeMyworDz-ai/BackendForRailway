@@ -207,7 +207,7 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     }
     logger.info(f"Job {job_id} initialized with status 'processing'")
     
-    # Save the uploaded file temporarily and convert to MP3
+    # Save the uploaded file temporarily and handle MP3 conversion
     try:
         logger.info(f"Saving uploaded file {file.filename} temporarily...")
         # Save original file
@@ -218,13 +218,21 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         
         logger.info(f"Original file saved to: {original_tmp_path}")
         
-        # Convert to MP3
-        mp3_tmp_path = original_tmp_path.replace(os.path.splitext(original_tmp_path)[1], '.mp3')
-        convert_to_mp3(original_tmp_path, mp3_tmp_path)
-        
-        # Clean up original file
-        os.unlink(original_tmp_path)
-        logger.info(f"Original file cleaned up, MP3 file ready: {mp3_tmp_path}")
+        # Handle MP3 conversion
+        file_extension = os.path.splitext(file.filename)[1].lower()
+
+        if file_extension == '.mp3':
+            # File is already MP3, use it directly
+            mp3_tmp_path = original_tmp_path
+            logger.info(f"File is already MP3, using original: {mp3_tmp_path}")
+        else:
+            # Convert to MP3
+            mp3_tmp_path = original_tmp_path.replace(os.path.splitext(original_tmp_path)[1], '.mp3')
+            convert_to_mp3(original_tmp_path, mp3_tmp_path)
+            
+            # Clean up original file only if conversion was needed
+            os.unlink(original_tmp_path)
+            logger.info(f"Original file cleaned up, MP3 file ready: {mp3_tmp_path}")
         
     except Exception as e:
         logger.error(f"ERROR processing file for job {job_id}: {str(e)}")
