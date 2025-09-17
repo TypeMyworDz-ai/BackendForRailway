@@ -261,17 +261,29 @@ logger.info("CORS middleware configured successfully")
 jobs = {}
 logger.info("Jobs dictionary initialized")
 
-# FIXED: Background task to handle AssemblyAI transcription using HTTP API
+# FIXED: Background task to handle AssemblyAI transcription using HTTP API with cancellation support
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
     logger.info(f"Background task started for job ID: {job_id}")
     job_data = jobs[job_id]
 
     try:
+        # Check if job was cancelled before processing
+        if job_data.get("status") == "cancelled":
+            logger.info(f"Job {job_id} was cancelled before processing started")
+            return
+
         # === Enhanced AssemblyAI Integration with Compression ===
         logger.info(f"Background task: Processing audio {filename} for transcription...")
         
         # Compress audio for optimal transcription
         compressed_path, compression_stats = compress_audio_for_transcription(tmp_path)
+        
+        # Check cancellation again after compression
+        if job_data.get("status") == "cancelled":
+            logger.info(f"Job {job_id} was cancelled during compression")
+            if os.path.exists(compressed_path):
+                os.unlink(compressed_path)
+            return
         
         # Update job with compression stats
         job_data["compression_stats"] = compression_stats
@@ -286,6 +298,13 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         
         logger.info(f"AssemblyAI upload response status: {upload_response.status_code}")
         logger.info(f"AssemblyAI upload response: {upload_response.text}")
+        
+        # Check cancellation after upload
+        if job_data.get("status") == "cancelled":
+            logger.info(f"Job {job_id} was cancelled after upload")
+            if os.path.exists(compressed_path):
+                os.unlink(compressed_path)
+            return
         
         if upload_response.status_code != 200:
             logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
@@ -314,6 +333,13 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         
         logger.info(f"AssemblyAI transcription start response status: {transcript_response.status_code}")
         logger.info(f"AssemblyAI transcription start response: {transcript_response.text}")
+        
+        # Final cancellation check before setting AssemblyAI ID
+        if job_data.get("status") == "cancelled":
+            logger.info(f"Job {job_id} was cancelled before AssemblyAI transcription started")
+            if os.path.exists(compressed_path):
+                os.unlink(compressed_path)
+            return
         
         if transcript_response.status_code != 200:
             logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
@@ -349,6 +375,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
             logger.info(f"Background task: Cleaning up original temporary file: {tmp_path}")
             os.unlink(tmp_path)
         logger.info(f"Background task completed for job ID: {job_id}")
+
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
@@ -398,7 +425,6 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     # Return immediate response
     logger.info(f"Returning immediate response for job ID: {job_id}")
     return {"job_id": job_id, "status": jobs[job_id]["status"]}
-
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     logger.info(f"Status check for job ID: {job_id}")
@@ -407,6 +433,11 @@ async def get_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     
     job_data = jobs[job_id]
+    
+    # If job is cancelled, return cancelled status immediately
+    if job_data["status"] == "cancelled":
+        logger.info(f"Job {job_id} was cancelled, returning cancelled status")
+        return job_data
     
     # If transcription is still processing, poll AssemblyAI for status
     if job_data["status"] == "processing" and job_data["assemblyai_id"]:
@@ -427,6 +458,11 @@ async def get_job_status(job_id: str):
                 return job_data
             
             assemblyai_result = response_data.json()
+            
+            # Check if job was cancelled while AssemblyAI was processing
+            if job_data["status"] == "cancelled":
+                logger.info(f"Job {job_id} was cancelled during AssemblyAI processing")
+                return job_data
             
             if assemblyai_result["status"] == "completed":
                 logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
@@ -455,6 +491,39 @@ async def get_job_status(job_id: str):
             })
 
     return job_data
+
+@app.post("/cancel/{job_id}")
+async def cancel_job(job_id: str):
+    """Cancel a transcription job"""
+    logger.info(f"Cancel request received for job ID: {job_id}")
+    
+    if job_id not in jobs:
+        logger.warning(f"Cancel request: Job ID {job_id} not found")
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_data = jobs[job_id]
+    
+    try:
+        # If the job has an AssemblyAI ID, we can't really cancel it on their end
+        # But we can mark it as cancelled in our system
+        if job_data["assemblyai_id"]:
+            logger.info(f"Marking AssemblyAI job {job_data['assemblyai_id']} as cancelled")
+            # Note: AssemblyAI doesn't have a cancel endpoint, so the job will continue
+            # but we won't return the results
+        
+        # Update job status to cancelled
+        job_data.update({
+            "status": "cancelled",
+            "cancelled_at": datetime.now().isoformat(),
+            "error": "Job was cancelled by user"
+        })
+        
+        logger.info(f"Job {job_id} marked as cancelled")
+        return {"message": "Job cancelled successfully", "job_id": job_id}
+        
+    except Exception as e:
+        logger.error(f"Error cancelling job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to cancel job: {str(e)}")
 
 @app.post("/compress-download")
 async def compress_download(file: UploadFile = File(...), quality: str = "high"):
@@ -494,6 +563,42 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
     except Exception as e:
         logger.error(f"Error compressing file for download: {e}")
         raise HTTPException(status_code=500, detail="Failed to compress audio file")
+
+@app.delete("/cleanup")
+async def cleanup_old_jobs():
+    """Clean up old completed/failed/cancelled jobs"""
+    logger.info("Cleanup endpoint called")
+    
+    current_time = datetime.now()
+    jobs_to_remove = []
+    
+    for job_id, job_data in jobs.items():
+        # Remove jobs older than 1 hour
+        created_at = datetime.fromisoformat(job_data["created_at"])
+        age_hours = (current_time - created_at).total_seconds() / 3600
+        
+        if age_hours > 1 and job_data["status"] in ["completed", "failed", "cancelled"]:
+            jobs_to_remove.append(job_id)
+    
+    for job_id in jobs_to_remove:
+        del jobs[job_id]
+        logger.info(f"Cleaned up old job: {job_id}")
+    
+    return {"message": f"Cleaned up {len(jobs_to_remove)} old jobs", "remaining_jobs": len(jobs)}
+
+@app.get("/jobs")
+async def list_jobs():
+    """List all current jobs for debugging"""
+    logger.info("Jobs list endpoint called")
+    return {
+        "total_jobs": len(jobs),
+        "jobs": {job_id: {
+            "status": job_data["status"],
+            "filename": job_data.get("filename", "unknown"),
+            "created_at": job_data["created_at"],
+            "assemblyai_id": job_data.get("assemblyai_id")
+        } for job_id, job_data in jobs.items()}
+    }
 
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
