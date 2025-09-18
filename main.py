@@ -56,14 +56,25 @@ if not ASSEMBLYAI_API_KEY:
 
 logger.info("Environment variables loaded successfully")
 
-# FIXED: Ultra aggressive compression function
-def compress_audio_for_transcription(input_path: str, output_path: str = None) -> tuple[str, dict]:
-    """Compress audio file optimally for AssemblyAI transcription"""
+# ENHANCED: Job tracking with better cancellation support
+jobs = {}
+active_background_tasks = {}  # Track background tasks for cancellation
+cancellation_flags = {}  # Track cancellation flags for each job
+
+logger.info("Enhanced job tracking initialized")
+# ENHANCED: Ultra aggressive compression function with cancellation checks
+def compress_audio_for_transcription(input_path: str, output_path: str = None, job_id: str = None) -> tuple[str, dict]:
+    """Compress audio file optimally for AssemblyAI transcription with cancellation support"""
     if output_path is None:
         base_name = os.path.splitext(input_path)[0]
         output_path = f"{base_name}_compressed.mp3"
     
     try:
+        # Check for cancellation before starting
+        if job_id and cancellation_flags.get(job_id, False):
+            logger.info(f"Job {job_id} cancelled during compression setup")
+            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+            
         logger.info(f"Compressing {input_path} for transcription...")
         
         # Get original file size
@@ -73,6 +84,11 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
         # Load audio file
         audio = AudioSegment.from_file(input_path)
         logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
+        
+        # Check for cancellation after loading
+        if job_id and cancellation_flags.get(job_id, False):
+            logger.info(f"Job {job_id} cancelled during audio loading")
+            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
         # ULTRA AGGRESSIVE compression for transcription:
         # 1. Convert to mono
@@ -85,12 +101,22 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
         audio = audio.set_frame_rate(target_sample_rate)
         logger.info(f"Reduced sample rate to {target_sample_rate} Hz")
         
+        # Check for cancellation after sample rate conversion
+        if job_id and cancellation_flags.get(job_id, False):
+            logger.info(f"Job {job_id} cancelled during sample rate conversion")
+            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+        
         # 3. Reduce volume slightly to avoid clipping during compression
         audio = audio - 3  # Reduce by 3dB
         
         # 4. Apply normalization
         audio = audio.normalize()
         logger.info("Applied audio normalization")
+        
+        # Final cancellation check before export
+        if job_id and cancellation_flags.get(job_id, False):
+            logger.info(f"Job {job_id} cancelled before export")
+            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
         # 5. Export with ULTRA aggressive compression settings
         audio.export(
@@ -136,10 +162,21 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
         
         return output_path, stats
         
+    except asyncio.CancelledError:
+        logger.info(f"Compression cancelled for job {job_id}")
+        # Clean up partial files
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        raise
+        
     except Exception as e:
         logger.error(f"Error compressing audio: {e}")
         # If compression fails, try basic fallback
         try:
+            # Check cancellation before fallback
+            if job_id and cancellation_flags.get(job_id, False):
+                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+                
             audio = AudioSegment.from_file(input_path)
             # Basic fallback compression
             audio = audio.set_channels(1)  # Mono
@@ -161,6 +198,12 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None) -
             
             logger.info("Used fallback compression")
             return output_path, stats
+            
+        except asyncio.CancelledError:
+            logger.info(f"Fallback compression cancelled for job {job_id}")
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+            raise
             
         except Exception as fallback_error:
             logger.error(f"Fallback compression also failed: {fallback_error}")
@@ -215,75 +258,35 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
     except Exception as e:
         logger.error(f"Error compressing audio for download: {e}")
         raise
-# Background task to monitor application health
-async def health_monitor():
-    logger.info("Starting health monitor background task")
-    while True:
-        try:
-            import psutil
-            memory_info = psutil.virtual_memory()
-            cpu_percent = psutil.cpu_percent(interval=1)
-            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
-            await asyncio.sleep(30)  # Log every 30 seconds
-        except Exception as e:
-            logger.error(f"Health monitor error: {e}")
-            await asyncio.sleep(30)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Application lifespan startup")
-    # Start background health monitoring
-    health_task = asyncio.create_task(health_monitor())
-    logger.info("Health monitor task created")
-    yield
-    # Shutdown
-    logger.info("Application lifespan shutdown")
-    health_task.cancel()
-
-# Create the FastAPI app
-logger.info("Creating FastAPI app...")
-app = FastAPI(title="Transcription Service", lifespan=lifespan)
-logger.info("FastAPI app created successfully")
-
-# FIXED: Add CORS middleware with proper configuration
-logger.info("Setting up CORS middleware...")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-logger.info("CORS middleware configured successfully")
-
-# Store transcription jobs in memory
-jobs = {}
-logger.info("Jobs dictionary initialized")
-
-# FIXED: Background task to handle AssemblyAI transcription using HTTP API with cancellation support
+# ENHANCED: Background task with comprehensive cancellation support
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
     logger.info(f"Background task started for job ID: {job_id}")
     job_data = jobs[job_id]
+    
+    # Store the task reference for potential cancellation
+    active_background_tasks[job_id] = asyncio.current_task()
+    # Initialize cancellation flag
+    cancellation_flags[job_id] = False
 
     try:
+        # ENHANCED: Multiple cancellation checkpoints with detailed logging
+        def check_cancellation():
+            if cancellation_flags.get(job_id, False) or job_data.get("status") == "cancelled":
+                logger.info(f"Job {job_id} was cancelled - stopping processing")
+                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+            return True
+
         # Check if job was cancelled before processing
-        if job_data.get("status") == "cancelled":
-            logger.info(f"Job {job_id} was cancelled before processing started")
-            return
+        check_cancellation()
 
         # === Enhanced AssemblyAI Integration with Compression ===
         logger.info(f"Background task: Processing audio {filename} for transcription...")
         
-        # Compress audio for optimal transcription
-        compressed_path, compression_stats = compress_audio_for_transcription(tmp_path)
+        # Compress audio for optimal transcription with cancellation support
+        compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
         
         # Check cancellation again after compression
-        if job_data.get("status") == "cancelled":
-            logger.info(f"Job {job_id} was cancelled during compression")
-            if os.path.exists(compressed_path):
-                os.unlink(compressed_path)
-            return
+        check_cancellation()
         
         # Update job with compression stats
         job_data["compression_stats"] = compression_stats
@@ -293,6 +296,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         headers = {"authorization": ASSEMBLYAI_API_KEY}
         upload_endpoint = "https://api.assemblyai.com/v2/upload"
         
+        # Check cancellation before upload
+        check_cancellation()
+        
         with open(compressed_path, "rb") as f:
             upload_response = requests.post(upload_endpoint, headers=headers, data=f)
         
@@ -300,11 +306,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         logger.info(f"AssemblyAI upload response: {upload_response.text}")
         
         # Check cancellation after upload
-        if job_data.get("status") == "cancelled":
-            logger.info(f"Job {job_id} was cancelled after upload")
-            if os.path.exists(compressed_path):
-                os.unlink(compressed_path)
-            return
+        check_cancellation()
         
         if upload_response.status_code != 200:
             logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
@@ -318,6 +320,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         upload_result = upload_response.json()
         audio_url = upload_result["upload_url"]
         logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
+
+        # Check cancellation before starting transcription
+        check_cancellation()
 
         # Start transcription using HTTP API
         headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
@@ -335,11 +340,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         logger.info(f"AssemblyAI transcription start response: {transcript_response.text}")
         
         # Final cancellation check before setting AssemblyAI ID
-        if job_data.get("status") == "cancelled":
-            logger.info(f"Job {job_id} was cancelled before AssemblyAI transcription started")
-            if os.path.exists(compressed_path):
-                os.unlink(compressed_path)
-            return
+        check_cancellation()
         
         if transcript_response.status_code != 200:
             logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
@@ -360,6 +361,21 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
             os.unlink(compressed_path)
             logger.info(f"Cleaned up compressed file: {compressed_path}")
 
+    except asyncio.CancelledError:
+        logger.info(f"Background task for job {job_id} was cancelled")
+        # Update job status to cancelled if not already set
+        if job_data.get("status") != "cancelled":
+            job_data.update({
+                "status": "cancelled",
+                "cancelled_at": datetime.now().isoformat(),
+                "error": "Job was cancelled by user"
+            })
+        # Clean up any files
+        if 'compressed_path' in locals() and os.path.exists(compressed_path):
+            os.unlink(compressed_path)
+            logger.info(f"Cleaned up compressed file after cancellation: {compressed_path}")
+        raise  # Re-raise to properly cancel the task
+        
     except Exception as e:
         logger.error(f"Background task: ERROR during transcription for job {job_id}: {str(e)}")
         import traceback
@@ -374,12 +390,85 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         if os.path.exists(tmp_path):
             logger.info(f"Background task: Cleaning up original temporary file: {tmp_path}")
             os.unlink(tmp_path)
+        
+        # Remove from active tasks and cancellation flags
+        if job_id in active_background_tasks:
+            del active_background_tasks[job_id]
+        if job_id in cancellation_flags:
+            del cancellation_flags[job_id]
+            
         logger.info(f"Background task completed for job ID: {job_id}")
+
+# Background task to monitor application health
+async def health_monitor():
+    logger.info("Starting health monitor background task")
+    while True:
+        try:
+            import psutil
+            memory_info = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=1)
+            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
+            logger.info(f"Active jobs: {len(jobs)}, Active background tasks: {len(active_background_tasks)}, Cancellation flags: {len(cancellation_flags)}")
+            await asyncio.sleep(30)  # Log every 30 seconds
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+            await asyncio.sleep(30)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Application lifespan startup")
+    # Start background health monitoring
+    health_task = asyncio.create_task(health_monitor())
+    logger.info("Health monitor task created")
+    yield
+    # Shutdown
+    logger.info("Application lifespan shutdown")
+    health_task.cancel()
+    # Cancel all active background tasks
+    for job_id, task in active_background_tasks.items():
+        if not task.done():
+            logger.info(f"Cancelling background task for job {job_id}")
+            cancellation_flags[job_id] = True
+            task.cancel()
+    # Clear all tracking dictionaries
+    jobs.clear()
+    active_background_tasks.clear()
+    cancellation_flags.clear()
+    logger.info("All background tasks cancelled and cleanup complete")
+# Create the FastAPI app
+logger.info("Creating FastAPI app...")
+app = FastAPI(title="Enhanced Transcription Service with Job Cancellation", lifespan=lifespan)
+logger.info("FastAPI app created successfully")
+
+# Add CORS middleware with proper configuration
+logger.info("Setting up CORS middleware...")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+logger.info("CORS middleware configured successfully")
 
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
-    return {"message": "Enhanced Transcription Service with Ultra Audio Compression is running!"}
+    return {
+        "message": "Enhanced Transcription Service with Ultra Audio Compression and Job Cancellation is running!",
+        "features": [
+            "Ultra-aggressive audio compression",
+            "Proper job cancellation",
+            "Background task management",
+            "Real-time status tracking"
+        ],
+        "stats": {
+            "active_jobs": len(jobs),
+            "background_tasks": len(active_background_tasks),
+            "cancellation_flags": len(cancellation_flags)
+        }
+    }
 
 @app.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
@@ -394,14 +483,19 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
     job_id = str(uuid.uuid4())
     logger.info(f"Created job ID: {job_id}")
     
-    # Initialize job status
+    # Initialize job status with enhanced tracking
     jobs[job_id] = {
         "status": "processing",
         "filename": file.filename,
         "created_at": datetime.now().isoformat(),
         "assemblyai_id": None,
-        "compression_stats": None
+        "compression_stats": None,
+        "file_size_mb": 0,
+        "content_type": file.content_type
     }
+    
+    # Initialize cancellation flag
+    cancellation_flags[job_id] = False
     logger.info(f"Job {job_id} initialized with status 'processing'")
     
     # Save the uploaded file temporarily
@@ -413,18 +507,33 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
             tmp.write(content)
             tmp_path = tmp.name
         
-        logger.info(f"File saved to: {tmp_path}")
+        # Calculate and store file size
+        file_size_mb = len(content) / (1024 * 1024)
+        jobs[job_id]["file_size_mb"] = round(file_size_mb, 2)
+        
+        logger.info(f"File saved to: {tmp_path} (Size: {file_size_mb:.2f} MB)")
         
     except Exception as e:
         logger.error(f"ERROR processing file for job {job_id}: {str(e)}")
+        # Clean up job tracking
+        if job_id in jobs:
+            del jobs[job_id]
+        if job_id in cancellation_flags:
+            del cancellation_flags[job_id]
         raise HTTPException(status_code=500, detail="Failed to process audio file")
 
     # Add the processing to background task
     background_tasks.add_task(process_transcription_job, job_id, tmp_path, file.filename)
     
-    # Return immediate response
+    # Return immediate response with enhanced info
     logger.info(f"Returning immediate response for job ID: {job_id}")
-    return {"job_id": job_id, "status": jobs[job_id]["status"]}
+    return {
+        "job_id": job_id, 
+        "status": jobs[job_id]["status"],
+        "filename": file.filename,
+        "file_size_mb": jobs[job_id]["file_size_mb"],
+        "created_at": jobs[job_id]["created_at"]
+    }
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     logger.info(f"Status check for job ID: {job_id}")
@@ -435,8 +544,9 @@ async def get_job_status(job_id: str):
     job_data = jobs[job_id]
     
     # If job is cancelled, return cancelled status immediately
-    if job_data["status"] == "cancelled":
+    if job_data["status"] == "cancelled" or cancellation_flags.get(job_id, False):
         logger.info(f"Job {job_id} was cancelled, returning cancelled status")
+        job_data["status"] = "cancelled"  # Ensure status is set correctly
         return job_data
     
     # If transcription is still processing, poll AssemblyAI for status
@@ -446,6 +556,16 @@ async def get_job_status(job_id: str):
         transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{job_data['assemblyai_id']}"
         
         try:
+            # Check for cancellation before making API call
+            if cancellation_flags.get(job_id, False):
+                logger.info(f"Job {job_id} was cancelled during status check")
+                job_data.update({
+                    "status": "cancelled",
+                    "cancelled_at": datetime.now().isoformat(),
+                    "error": "Job was cancelled by user"
+                })
+                return job_data
+            
             response_data = requests.get(transcript_endpoint, headers=headers)
             
             if response_data.status_code != 200:
@@ -460,8 +580,13 @@ async def get_job_status(job_id: str):
             assemblyai_result = response_data.json()
             
             # Check if job was cancelled while AssemblyAI was processing
-            if job_data["status"] == "cancelled":
+            if cancellation_flags.get(job_id, False) or job_data["status"] == "cancelled":
                 logger.info(f"Job {job_id} was cancelled during AssemblyAI processing")
+                job_data.update({
+                    "status": "cancelled",
+                    "cancelled_at": datetime.now().isoformat(),
+                    "error": "Job was cancelled by user"
+                })
                 return job_data
             
             if assemblyai_result["status"] == "completed":
@@ -470,7 +595,9 @@ async def get_job_status(job_id: str):
                     "status": "completed",
                     "transcription": assemblyai_result["text"],
                     "language": assemblyai_result["language_code"],
-                    "completed_at": datetime.now().isoformat()
+                    "completed_at": datetime.now().isoformat(),
+                    "word_count": len(assemblyai_result["text"].split()) if assemblyai_result["text"] else 0,
+                    "duration_seconds": assemblyai_result.get("audio_duration", 0)
                 })
             elif assemblyai_result["status"] == "error":
                 logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
@@ -481,6 +608,8 @@ async def get_job_status(job_id: str):
                 })
             else:
                 logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} status: {assemblyai_result['status']}")
+                # Update job with current AssemblyAI status for better tracking
+                job_data["assemblyai_status"] = assemblyai_result["status"]
         
         except Exception as e:
             logger.error(f"Error polling AssemblyAI status: {str(e)}")
@@ -494,7 +623,7 @@ async def get_job_status(job_id: str):
 
 @app.post("/cancel/{job_id}")
 async def cancel_job(job_id: str):
-    """Cancel a transcription job"""
+    """Enhanced cancel endpoint with comprehensive job termination"""
     logger.info(f"Cancel request received for job ID: {job_id}")
     
     if job_id not in jobs:
@@ -504,12 +633,22 @@ async def cancel_job(job_id: str):
     job_data = jobs[job_id]
     
     try:
-        # If the job has an AssemblyAI ID, we can't really cancel it on their end
-        # But we can mark it as cancelled in our system
-        if job_data["assemblyai_id"]:
-            logger.info(f"Marking AssemblyAI job {job_data['assemblyai_id']} as cancelled")
-            # Note: AssemblyAI doesn't have a cancel endpoint, so the job will continue
-            # but we won't return the results
+        # Set cancellation flag immediately
+        cancellation_flags[job_id] = True
+        logger.info(f"Cancellation flag set for job {job_id}")
+        
+        # Cancel the background task if it's still running
+        if job_id in active_background_tasks:
+            task = active_background_tasks[job_id]
+            if not task.done():
+                logger.info(f"Cancelling active background task for job {job_id}")
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=2.0)  # Wait up to 2 seconds for graceful cancellation
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    logger.info(f"Background task for job {job_id} cancelled (timeout/cancelled)")
+            else:
+                logger.info(f"Background task for job {job_id} was already completed")
         
         # Update job status to cancelled
         job_data.update({
@@ -518,13 +657,29 @@ async def cancel_job(job_id: str):
             "error": "Job was cancelled by user"
         })
         
-        logger.info(f"Job {job_id} marked as cancelled")
-        return {"message": "Job cancelled successfully", "job_id": job_id}
+        # Note about AssemblyAI: We can't actually cancel jobs on AssemblyAI's end
+        # but we mark them as cancelled in our system and ignore the results
+        if job_data.get("assemblyai_id"):
+            logger.info(f"AssemblyAI job {job_data['assemblyai_id']} cannot be cancelled on their end, but marked as cancelled in our system")
+            job_data["assemblyai_note"] = "AssemblyAI job continues but results will be ignored"
+        
+        logger.info(f"Job {job_id} successfully cancelled")
+        return {
+            "message": "Job cancelled successfully", 
+            "job_id": job_id,
+            "cancelled_at": job_data["cancelled_at"],
+            "previous_status": job_data.get("previous_status", "processing")
+        }
         
     except Exception as e:
         logger.error(f"Error cancelling job {job_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to cancel job: {str(e)}")
-
+        # Even if there's an error, mark the job as cancelled
+        job_data.update({
+            "status": "cancelled",
+            "cancelled_at": datetime.now().isoformat(),
+            "error": f"Job cancelled with errors: {str(e)}"
+        })
+        raise HTTPException(status_code=500, detail=f"Job cancelled but with errors: {str(e)}")
 @app.post("/compress-download")
 async def compress_download(file: UploadFile = File(...), quality: str = "high"):
     """Endpoint to compress audio files for download"""
@@ -566,11 +721,13 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
 
 @app.delete("/cleanup")
 async def cleanup_old_jobs():
-    """Clean up old completed/failed/cancelled jobs"""
+    """Enhanced cleanup endpoint with better job management"""
     logger.info("Cleanup endpoint called")
     
     current_time = datetime.now()
     jobs_to_remove = []
+    tasks_to_cancel = []
+    flags_to_remove = []
     
     for job_id, job_data in jobs.items():
         # Remove jobs older than 1 hour
@@ -579,33 +736,183 @@ async def cleanup_old_jobs():
         
         if age_hours > 1 and job_data["status"] in ["completed", "failed", "cancelled"]:
             jobs_to_remove.append(job_id)
+            
+            # Also clean up related tracking
+            if job_id in active_background_tasks:
+                task = active_background_tasks[job_id]
+                if not task.done():
+                    tasks_to_cancel.append((job_id, task))
+                    
+            if job_id in cancellation_flags:
+                flags_to_remove.append(job_id)
     
+    # Cancel old background tasks
+    for job_id, task in tasks_to_cancel:
+        try:
+            task.cancel()
+            logger.info(f"Cancelled old background task for job: {job_id}")
+        except Exception as e:
+            logger.error(f"Error cancelling old task {job_id}: {e}")
+    
+    # Remove old jobs and tracking data
     for job_id in jobs_to_remove:
         del jobs[job_id]
         logger.info(f"Cleaned up old job: {job_id}")
+        
+    for job_id in flags_to_remove:
+        if job_id in active_background_tasks:
+            del active_background_tasks[job_id]
+        if job_id in cancellation_flags:
+            del cancellation_flags[job_id]
     
-    return {"message": f"Cleaned up {len(jobs_to_remove)} old jobs", "remaining_jobs": len(jobs)}
+    cleanup_stats = {
+        "jobs_removed": len(jobs_to_remove),
+        "tasks_cancelled": len(tasks_to_cancel),
+        "flags_cleared": len(flags_to_remove),
+        "remaining_jobs": len(jobs),
+        "active_tasks": len(active_background_tasks),
+        "active_flags": len(cancellation_flags)
+    }
+    
+    logger.info(f"Cleanup completed: {cleanup_stats}")
+    return {
+        "message": f"Cleaned up {len(jobs_to_remove)} old jobs",
+        "stats": cleanup_stats
+    }
 
 @app.get("/jobs")
 async def list_jobs():
-    """List all current jobs for debugging"""
+    """Enhanced jobs list endpoint with better information"""
     logger.info("Jobs list endpoint called")
-    return {
-        "total_jobs": len(jobs),
-        "jobs": {job_id: {
+    
+    job_summary = {}
+    for job_id, job_data in jobs.items():
+        job_summary[job_id] = {
             "status": job_data["status"],
             "filename": job_data.get("filename", "unknown"),
             "created_at": job_data["created_at"],
-            "assemblyai_id": job_data.get("assemblyai_id")
-        } for job_id, job_data in jobs.items()}
+            "file_size_mb": job_data.get("file_size_mb", 0),
+            "assemblyai_id": job_data.get("assemblyai_id"),
+            "assemblyai_status": job_data.get("assemblyai_status"),
+            "has_background_task": job_id in active_background_tasks,
+            "is_cancellation_flagged": cancellation_flags.get(job_id, False),
+            "word_count": job_data.get("word_count"),
+            "duration_seconds": job_data.get("duration_seconds")
+        }
+    
+    return {
+        "total_jobs": len(jobs),
+        "active_background_tasks": len(active_background_tasks),
+        "cancellation_flags": len(cancellation_flags),
+        "jobs": job_summary,
+        "system_stats": {
+            "jobs_by_status": {
+                status: len([j for j in jobs.values() if j["status"] == status])
+                for status in ["processing", "completed", "failed", "cancelled"]
+            }
+        }
     }
 
+@app.get("/health")
+async def health_check():
+    """Enhanced health check endpoint"""
+    logger.info("Health check endpoint called")
+    
+    try:
+        import psutil
+        memory_info = psutil.virtual_memory()
+        cpu_percent = psutil.cpu_percent(interval=1)
+        
+        health_data = {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "system": {
+                "memory_percent": memory_info.percent,
+                "cpu_percent": cpu_percent,
+                "available_ram_gb": round(memory_info.available / (1024**3), 2)
+            },
+            "application": {
+                "total_jobs": len(jobs),
+                "active_background_tasks": len(active_background_tasks),
+                "cancellation_flags": len(cancellation_flags),
+                "jobs_by_status": {
+                    status: len([j for j in jobs.values() if j["status"] == status])
+                    for status in ["processing", "completed", "failed", "cancelled"]
+                }
+            }
+        }
+        
+        return health_data
+        
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
+
+# Final validation and startup logging
+logger.info("Performing final system validation...")
+logger.info(f"AssemblyAI API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"Job tracking systems initialized:")
+logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
+logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
+logger.info(f"  - Cancellation flags: {len(cancellation_flags)} flags")
+
+# Log all available endpoints
+logger.info("Available API endpoints:")
+logger.info("  POST /transcribe - Start new transcription job")
+logger.info("  GET /status/{job_id} - Check job status")
+logger.info("  POST /cancel/{job_id} - Cancel transcription job")
+logger.info("  POST /compress-download - Compress audio for download")
+logger.info("  GET /jobs - List all jobs")
+logger.info("  GET /health - System health check")
+logger.info("  DELETE /cleanup - Clean up old jobs")
+logger.info("  GET / - Root endpoint with service info")
 
 # Run this if the file is executed directly
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"Starting on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host = os.environ.get("HOST", "0.0.0.0")
+    
+    logger.info(f"Starting enhanced transcription service on {host}:{port}")
+    logger.info("🚀 ENHANCED FEATURES ENABLED:")
+    logger.info("  ✅ Ultra-aggressive audio compression (16k bitrate, 8kHz)")
+    logger.info("  ✅ Comprehensive job cancellation system")
+    logger.info("  ✅ Background task management with proper cleanup")
+    logger.info("  ✅ Real-time status tracking with AssemblyAI polling")
+    logger.info("  ✅ Enhanced error handling and recovery")
+    logger.info("  ✅ System health monitoring every 30 seconds")
+    logger.info("  ✅ Automatic cleanup of old jobs (1+ hours)")
+    logger.info("  ✅ Detailed logging and debugging support")
+    logger.info("  ✅ CORS enabled for frontend integration")
+    logger.info("  ✅ Multiple cancellation checkpoints during processing")
+    
+    logger.info("🔧 TECHNICAL IMPROVEMENTS:")
+    logger.info("  - Cancellation flags prevent race conditions")
+    logger.info("  - Background tasks are properly tracked and cancelled")
+    logger.info("  - File cleanup happens even on cancellation")
+    logger.info("  - AssemblyAI jobs continue but results are ignored when cancelled")
+    logger.info("  - Enhanced status endpoint with detailed job information")
+    logger.info("  - Comprehensive health monitoring and system stats")
+    
+    try:
+        uvicorn.run(
+            app, 
+            host=host, 
+            port=port,
+            log_level="info",
+            access_log=True,
+            reload=False,  # Disable reload in production
+            workers=1      # Single worker to maintain job state consistency
+        )
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        sys.exit(1)
+else:
+    logger.info("Application loaded as module")
+    logger.info("Ready to handle requests with enhanced job cancellation support")
