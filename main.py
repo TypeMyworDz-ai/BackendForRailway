@@ -81,12 +81,13 @@ logger.info("Environment variables loaded successfully")
 class PaystackVerificationRequest(BaseModel):
     reference: str
 
+# UPDATED: Added country_code to initialization request
 class PaystackInitializationRequest(BaseModel):
     email: str
-    amount: float
-    currency: str = "USD"
+    amount: float # This is the base USD amount
     plan_name: str
     user_id: str
+    country_code: str # NEW: For dynamic currency and channels
     callback_url: str
 
 class PaystackWebhookRequest(BaseModel):
@@ -303,6 +304,44 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
     except Exception as e:
         logger.error(f"Error compressing audio for download: {e}")
         raise
+# --- NEW: Currency Conversion and Channel Mapping Logic ---
+USD_TO_LOCAL_RATES = {
+    'KE': 145.0,  # 1 USD to KES (example rate, actual rates fluctuate)
+    'NG': 1500.0, # 1 USD to NGN (example rate, highly volatile)
+    'GH': 15.0,   # 1 USD to GHS (example rate)
+    'ZA': 19.0,   # 1 USD to ZAR (example rate)
+    # For 'OTHER_AFRICA' or unsupported countries, we default to USD
+}
+
+COUNTRY_CURRENCY_MAP = {
+    'KE': 'KES',
+    'NG': 'NGN',
+    'GH': 'GHS',
+    'ZA': 'ZAR',
+    'OTHER_AFRICA': 'USD', # Default for others
+}
+
+COUNTRY_CHANNELS_MAP = {
+    'KE': ['mobile_money', 'card'],
+    'NG': ['bank', 'ussd', 'mobile_money', 'card'],
+    'GH': ['mobile_money', 'card'],
+    'ZA': ['eft', 'card'],
+    'OTHER_AFRICA': ['card'], # Default for others
+}
+
+def get_local_amount_and_currency(base_usd_amount: float, country_code: str) -> tuple[float, str]:
+    currency = COUNTRY_CURRENCY_MAP.get(country_code, 'USD')
+    if currency == 'USD':
+        return base_usd_amount, 'USD'
+    
+    rate = USD_TO_LOCAL_RATES.get(country_code, 1.0) # Default to 1 if no rate found
+    local_amount = round(base_usd_amount * rate, 2)
+    return local_amount, currency
+
+def get_payment_channels(country_code: str) -> list[str]:
+    return COUNTRY_CHANNELS_MAP.get(country_code, ['card']) # Default to card if country not mapped
+# --- END NEW LOGIC ---
+
 # Paystack helper functions
 async def verify_paystack_payment(reference: str) -> dict:
     """Verify Paystack payment using reference"""
@@ -628,18 +667,23 @@ async def root():
         }
     }
 
-# NEW: Paystack payment initialization endpoint (MISSING FROM YOUR ORIGINAL CODE)
+# UPDATED: Paystack payment initialization endpoint
 @app.post("/api/initialize-paystack-payment")
 async def initialize_paystack_payment(request: PaystackInitializationRequest):
-    """Initialize Paystack payment"""
-    logger.info(f"Initializing Paystack payment for {request.email}: {request.amount} {request.currency}")
+    """Initialize Paystack payment with dynamic currency and channels"""
+    logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
     
     if not PAYSTACK_SECRET_KEY:
+        logger.error("❌ PAYSTACK_SECRET_KEY is not set in environment variables.")
         raise HTTPException(status_code=500, detail="Paystack configuration missing")
     
     try:
-        # Convert amount to kobo for Paystack
-        amount_kobo = int(request.amount * 100)
+        # Determine local amount and currency
+        local_amount, local_currency = get_local_amount_and_currency(request.amount, request.country_code)
+        payment_channels = get_payment_channels(request.country_code)
+
+        # Convert local amount to kobo for Paystack
+        amount_kobo = int(local_amount * 100) # Paystack always expects amount in minor unit
         
         headers = {
             'Authorization': f'Bearer {PAYSTACK_SECRET_KEY}',
@@ -649,21 +693,32 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         payload = {
             'email': request.email,
             'amount': amount_kobo,
-            'currency': request.currency,
+            'currency': local_currency, # Use dynamically determined local currency
             'callback_url': request.callback_url,
+            'channels': payment_channels, # Use dynamically determined channels
             'metadata': {
                 'plan': request.plan_name,
                 'user_id': request.user_id,
+                'country_code': request.country_code, # Pass original country code
+                'base_usd_amount': request.amount, # Store original USD amount
                 'custom_fields': [
                     {
                         'display_name': "Plan Type",
                         'variable_name': "plan_type",
                         'value': request.plan_name
+                    },
+                    {
+                        'display_name': "Country",
+                        'variable_name': "country",
+                        'value': request.country_code
                     }
                 ]
             }
         }
         
+        logger.info(f"DEBUG: Paystack payload for {request.country_code}: Amount={local_amount} {local_currency}, Channels={payment_channels}")
+        logger.info(f"DEBUG: Sending payload to Paystack: {payload}")
+
         response = requests.post(
             'https://api.paystack.co/transaction/initialize',
             headers=headers,
@@ -677,16 +732,18 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
             return {
                 'status': True,
                 'authorization_url': result['data']['authorization_url'],
-                'reference': result['data']['reference']
+                'reference': result['data']['reference'],
+                'local_amount': local_amount, # Return for frontend info if needed
+                'local_currency': local_currency
             }
         else:
             logger.error(f"❌ Paystack API error: {response.status_code} - {response.text}")
             raise HTTPException(status_code=response.status_code, detail=f"Paystack API error: {response.text}")
             
     except Exception as e:
-        logger.error(f"❌ Error initializing Paystack payment: {str(e)}")
+        import traceback
+        logger.error(f"❌ Error initializing Paystack payment: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
-
 @app.post("/api/verify-payment")
 async def verify_payment(request: PaystackVerificationRequest):
     """Verify Paystack payment and update user credits"""
@@ -752,6 +809,7 @@ async def verify_payment(request: PaystackVerificationRequest):
             status_code=500, 
             detail=f"Payment verification failed: {str(e)}"
         )
+
 @app.post("/api/paystack-webhook")
 async def paystack_webhook(request: Request):
     """Handle Paystack webhook events"""
@@ -816,7 +874,6 @@ async def paystack_webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Error processing Paystack webhook: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Webhook processing failed: {str(e)}")
-
 @app.get("/api/paystack-status")
 async def paystack_status():
     """Get Paystack integration status"""
@@ -834,7 +891,8 @@ async def paystack_status():
         "supported_plans": [
             "24 Hours Pro Access",
             "5 Days Pro Access"
-        ]
+        ],
+        "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES # NEW: Expose rates for frontend debug/info
     }
 
 @app.post("/transcribe")
