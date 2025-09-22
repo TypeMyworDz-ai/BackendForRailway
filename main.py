@@ -5,7 +5,7 @@ import subprocess
 import os
 import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form # NEW: Import Form
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional # NEW: Import Optional
 import httpx # NEW: for making HTTP requests to Render Whisper service
 
 # Configure logging to be very verbose
@@ -156,7 +156,7 @@ async def analyze_audio_characteristics(audio_path: str) -> dict:
         }
 
 # NEW: Function to select the transcription model
-def select_transcription_model(audio_analysis: dict) -> str:
+def select_transcription_model(audio_analysis: dict, requested_language: Optional[str]) -> str:
     # Example logic:
     # Use Whisper for longer audio, potentially lower quality, or non-English
     # Use AssemblyAI for shorter, high-quality English audio (assuming it's faster/cheaper for that)
@@ -165,16 +165,19 @@ def select_transcription_model(audio_analysis: dict) -> str:
     long_audio_threshold_seconds = 120 # 2 minutes
     low_quality_threshold = 0.5
 
+    # Prioritize requested language if it's not English for Whisper
+    if requested_language and requested_language != "en":
+        return "whisper"
+
     if audio_analysis["duration_seconds"] > long_audio_threshold_seconds or \
-       audio_analysis["quality_score"] < low_quality_threshold or \
-       audio_analysis["language"] != "en": # Assuming AssemblyAI is primarily English for this example
+       audio_analysis["quality_score"] < low_quality_threshold:
         return "whisper"
     else:
         return "assemblyai"
 
 # NEW: Function to call the Render Whisper service
-async def transcribe_with_whisper(job_id: str, audio_path: str, filename: str) -> str:
-    logger.info(f"Using Whisper service for job {job_id} on {RENDER_WHISPER_URL}")
+async def transcribe_with_whisper(job_id: str, audio_path: str, filename: str, language_code: Optional[str]) -> str:
+    logger.info(f"Using Whisper service for job {job_id} on {RENDER_WHISPER_URL} with language: {language_code}")
     job_data = jobs[job_id]
 
     if not RENDER_WHISPER_URL:
@@ -185,12 +188,17 @@ async def transcribe_with_whisper(job_id: str, audio_path: str, filename: str) -
             with open(audio_path, "rb") as f:
                 files = {"file": (filename, f.read(), job_data["content_type"])}
                 
+                # Add language to form data if provided
+                data = {}
+                if language_code:
+                    data["language"] = language_code
+
                 # Check for cancellation before sending request
                 if cancellation_flags.get(job_id, False):
                     logger.info(f"Job {job_id} cancelled before sending to Whisper")
                     raise asyncio.CancelledError(f"Job {job_id} was cancelled")
 
-                response = await client.post(f"{RENDER_WHISPER_URL}/transcribe", files=files)
+                response = await client.post(f"{RENDER_WHISPER_URL}/transcribe", files=files, data=data) # NEW: Pass data
             
             response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
             result = response.json()
@@ -576,8 +584,8 @@ async def health_monitor():
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
 # Background task with comprehensive cancellation support
-async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
-    logger.info(f"Background task started for job ID: {job_id}")
+async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str]): # NEW: Add language_code
+    logger.info(f"Background task started for job ID: {job_id} with language: {language_code}")
     job_data = jobs[job_id]
     
     # Store the task reference for potential cancellation
@@ -598,16 +606,17 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
 
         # NEW: Analyze audio characteristics to decide model
         audio_analysis = await analyze_audio_characteristics(tmp_path)
-        selected_model = select_transcription_model(audio_analysis)
+        selected_model = select_transcription_model(audio_analysis, language_code) # NEW: Pass requested_language
         job_data["selected_model"] = selected_model # Store which model was chosen
         logger.info(f"Audio analysis for job {job_id}: {audio_analysis}")
         logger.info(f"Selected model for job {job_id}: {selected_model}")
 
         transcription_text = ""
+        final_language = language_code if language_code else audio_analysis["language"] # Use requested or detected
 
         if selected_model == "whisper":
             # Call the Render Whisper service
-            transcription_text = await transcribe_with_whisper(job_id, tmp_path, filename)
+            transcription_text = await transcribe_with_whisper(job_id, tmp_path, filename, final_language) # NEW: Pass final_language
         else: # selected_model == "assemblyai"
             # === Enhanced AssemblyAI Integration with Compression ===
             logger.info(f"Background task: Processing audio {filename} for AssemblyAI transcription...")
@@ -659,7 +668,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
             transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
             json_data = {
                 "audio_url": audio_url,
-                "language_code": "en_us",
+                "language_code": final_language, # NEW: Pass final_language
                 "punctuate": True,
                 "format_text": True
             }
@@ -695,7 +704,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         job_data.update({
             "status": "completed",
             "transcription": transcription_text,
-            "language": audio_analysis["language"], # Use detected language from analysis
+            "language": final_language, # Use selected/detected language
             "completed_at": datetime.now().isoformat(),
             "word_count": len(transcription_text.split()) if transcription_text else 0,
             "duration_seconds": audio_analysis["duration_seconds"] # Use duration from analysis
@@ -887,7 +896,7 @@ async def verify_payment(request: PaystackVerificationRequest):
         if verification_result['status'] == 'success':
             # Payment verified successfully
             email = verification_result['email']
-            plan_name = verification_result['plan']
+            plan_name = verification_result['plan'] # Get the actual plan name from metadata
             amount = verification_result['amount']
             currency = verification_result['currency']
             
@@ -975,7 +984,7 @@ async def paystack_webhook(request: Request):
             amount = data.get('amount', 0) / 100  # Convert from kobo
             currency = data.get('currency')
             reference = data.get('reference')
-            plan_name = data.get('metadata', {}).get('plan', 'Unknown')
+            plan_name = data.get('metadata', {}).get('plan', 'Unknown') # Get the actual plan name from metadata
             
             logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}")
             
@@ -1027,8 +1036,12 @@ async def paystack_status():
     }
 
 @app.post("/transcribe")
-async def transcribe_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
-    logger.info(f"Transcribe endpoint called with file: {file.filename}")
+async def transcribe_file(
+    file: UploadFile = File(...),
+    language_code: Optional[str] = Form("en"), # NEW: Language code from frontend
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    logger.info(f"Transcribe endpoint called with file: {file.filename}, requested language: {language_code}")
     
     # Check if file is audio or video
     if not file.content_type.startswith(('audio/', 'video/')):
@@ -1048,7 +1061,8 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         "compression_stats": None,
         "file_size_mb": 0,
         "content_type": file.content_type,
-        "selected_model": "none" # NEW: Track which model was selected
+        "selected_model": "none", # NEW: Track which model was selected
+        "requested_language": language_code # NEW: Store requested language
     }
     
     # Initialize cancellation flag
@@ -1080,7 +1094,7 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         raise HTTPException(status_code=500, detail="Failed to process audio file")
 
     # Add the processing to background task
-    background_tasks.add_task(process_transcription_job, job_id, tmp_path, file.filename)
+    background_tasks.add_task(process_transcription_job, job_id, tmp_path, file.filename, language_code) # NEW: Pass language_code
     
     # Return immediate response with enhanced info
     logger.info(f"Returning immediate response for job ID: {job_id}")
@@ -1358,7 +1372,8 @@ async def list_jobs():
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
             "word_count": job_data.get("word_count"),
             "duration_seconds": job_data.get("duration_seconds"),
-            "selected_model": job_data.get("selected_model", "none") # NEW: Include selected model
+            "selected_model": job_data.get("selected_model", "none"), # NEW: Include selected model
+            "requested_language": job_data.get("requested_language", "en") # NEW: Include requested language
         }
     
     return {
@@ -1469,6 +1484,7 @@ if __name__ == "__main__":
     logger.info("  ✅ Subscription management endpoints (via Paystack/future 2Checkout)")
     logger.info("  ✅ Multi-currency support (NGN, KES, GHS, ZAR, USD)")
     logger.info("  ✅ Intelligent model switching (AssemblyAI/Whisper)") # NEW feature
+    logger.info("  ✅ Language selection for transcription") # NEW feature
     
     logger.info("🔧 TECHNICAL IMPROVEMENTS:")
     logger.info("  - Cancellation flags prevent race conditions")
@@ -1481,6 +1497,7 @@ if __name__ == "__main__":
     logger.info("  - Secure webhook signature verification (TODO)")
     logger.info("  - Single payment system for global coverage (Paystack first, then 2Checkout)")
     logger.info("  - Dynamic model selection based on audio characteristics") # NEW improvement
+    logger.info("  - Explicit language passing to transcription services") # NEW improvement
     
     try:
         uvicorn.run(
@@ -1498,4 +1515,3 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info("Ready to handle requests with enhanced job cancellation & Paystack payment support")
-    
