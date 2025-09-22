@@ -15,6 +15,7 @@ import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
+import httpx # NEW: for making HTTP requests to Render Whisper service
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -51,6 +52,7 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 load_dotenv()
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL") # NEW: Render Whisper URL
 
 # Paystack environment variables
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
@@ -58,6 +60,7 @@ PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
 
 logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}") # NEW log
 logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
 
@@ -108,6 +111,110 @@ active_background_tasks = {}  # Track background tasks for cancellation
 cancellation_flags = {}  # Track cancellation flags for each job
 
 logger.info("Enhanced job tracking initialized")
+
+# NEW: Function to analyze audio characteristics
+async def analyze_audio_characteristics(audio_path: str) -> dict:
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        duration_seconds = len(audio) / 1000.0
+        
+        # Simple quality estimation: check for silence or very low volume
+        # This is a basic heuristic, more advanced analysis would use ML
+        if audio.dBFS < -50: # Very low volume, possibly silence or very noisy
+            quality_score = 0.1
+        elif audio.dBFS < -30: # Low volume
+            quality_score = 0.4
+        else:
+            quality_score = 0.8 # Decent volume
+            
+        # Basic language detection (placeholder, actual implementation is complex)
+        # For a real app, you'd use a dedicated library or API here
+        language = "unknown" # Default
+        if duration_seconds > 5 and audio.dBFS > -40: # Only try to guess if there's enough non-silent audio
+            # Placeholder for actual language detection logic
+            # e.g., using a small pre-trained model or a service
+            pass # For now, we'll keep it simple
+
+        return {
+            "duration_seconds": duration_seconds,
+            "quality_score": quality_score,
+            "language": language,
+            "channels": audio.channels,
+            "sample_rate": audio.frame_rate,
+            "size_mb": os.path.getsize(audio_path) / (1024 * 1024)
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing audio characteristics: {e}")
+        return {
+            "duration_seconds": 0,
+            "quality_score": 0,
+            "language": "unknown",
+            "channels": 0,
+            "sample_rate": 0,
+            "size_mb": 0,
+            "error": str(e)
+        }
+
+# NEW: Function to select the transcription model
+def select_transcription_model(audio_analysis: dict) -> str:
+    # Example logic:
+    # Use Whisper for longer audio, potentially lower quality, or non-English
+    # Use AssemblyAI for shorter, high-quality English audio (assuming it's faster/cheaper for that)
+
+    # Thresholds (you can tune these)
+    long_audio_threshold_seconds = 120 # 2 minutes
+    low_quality_threshold = 0.5
+
+    if audio_analysis["duration_seconds"] > long_audio_threshold_seconds or \
+       audio_analysis["quality_score"] < low_quality_threshold or \
+       audio_analysis["language"] != "en": # Assuming AssemblyAI is primarily English for this example
+        return "whisper"
+    else:
+        return "assemblyai"
+
+# NEW: Function to call the Render Whisper service
+async def transcribe_with_whisper(job_id: str, audio_path: str, filename: str) -> str:
+    logger.info(f"Using Whisper service for job {job_id} on {RENDER_WHISPER_URL}")
+    job_data = jobs[job_id]
+
+    if not RENDER_WHISPER_URL:
+        raise HTTPException(status_code=500, detail="Render Whisper URL not configured")
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client: # Increased timeout for transcription
+            with open(audio_path, "rb") as f:
+                files = {"file": (filename, f.read(), job_data["content_type"])}
+                
+                # Check for cancellation before sending request
+                if cancellation_flags.get(job_id, False):
+                    logger.info(f"Job {job_id} cancelled before sending to Whisper")
+                    raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+
+                response = await client.post(f"{RENDER_WHISPER_URL}/transcribe", files=files)
+            
+            response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+            result = response.json()
+            
+            if result.get("status") == "completed":
+                logger.info(f"Whisper transcription completed for job {job_id}")
+                return result["transcript"]
+            else:
+                logger.error(f"Whisper service returned non-completed status: {result}")
+                raise Exception(f"Whisper service error: {result.get('error', 'Unknown error')}")
+
+    except asyncio.CancelledError:
+        logger.info(f"Whisper transcription for job {job_id} was cancelled.")
+        raise
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error from Whisper service for job {job_id}: {e.response.status_code} - {e.response.text}")
+        raise Exception(f"Whisper service HTTP error: {e.response.status_code} - {e.response.text}")
+    except httpx.RequestError as e:
+        logger.error(f"Network error calling Whisper service for job {job_id}: {e}")
+        raise Exception(f"Whisper service network error: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error calling Whisper service for job {job_id}: {e}")
+        raise
+
 # Ultra aggressive compression function with cancellation checks
 def compress_audio_for_transcription(input_path: str, output_path: str = None, job_id: str = None) -> tuple[str, dict]:
     """Compress audio file optimally for AssemblyAI transcription with cancellation support"""
@@ -489,87 +596,110 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str):
         # Check if job was cancelled before processing
         check_cancellation()
 
-        # === Enhanced AssemblyAI Integration with Compression ===
-        logger.info(f"Background task: Processing audio {filename} for transcription...")
-        
-        # Compress audio for optimal transcription with cancellation support
-        compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-        
-        # Check cancellation again after compression
-        check_cancellation()
-        
-        # Update job with compression stats
-        job_data["compression_stats"] = compression_stats
-        
-        # Upload compressed audio to AssemblyAI using HTTP API
-        logger.info("Uploading compressed audio to AssemblyAI...")
-        headers = {"authorization": ASSEMBLYAI_API_KEY}
-        upload_endpoint = "https://api.assemblyai.com/v2/upload"
-        
-        # Check cancellation before upload
-        check_cancellation()
-        
-        with open(compressed_path, "rb") as f:
-            upload_response = requests.post(upload_endpoint, headers=headers, data=f)
-        
-        logger.info(f"AssemblyAI upload response status: {upload_response.status_code}")
-        logger.info(f"AssemblyAI upload response: {upload_response.text}")
-        
-        # Check cancellation after upload
-        check_cancellation()
-        
-        if upload_response.status_code != 200:
-            logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
-            job_data.update({
-                "status": "failed",
-                "error": f"Failed to upload audio to AssemblyAI: {upload_response.text}",
-                "completed_at": datetime.now().isoformat()
-            })
-            return
-        
-        upload_result = upload_response.json()
-        audio_url = upload_result["upload_url"]
-        logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
+        # NEW: Analyze audio characteristics to decide model
+        audio_analysis = await analyze_audio_characteristics(tmp_path)
+        selected_model = select_transcription_model(audio_analysis)
+        job_data["selected_model"] = selected_model # Store which model was chosen
+        logger.info(f"Audio analysis for job {job_id}: {audio_analysis}")
+        logger.info(f"Selected model for job {job_id}: {selected_model}")
 
-        # Check cancellation before starting transcription
-        check_cancellation()
+        transcription_text = ""
 
-        # Start transcription using HTTP API
-        headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
-        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
-        json_data = {
-            "audio_url": audio_url,
-            "language_code": "en_us",
-            "punctuate": True,
-            "format_text": True
-        }
-        
-        transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
-        
-        logger.info(f"AssemblyAI transcription start response status: {transcript_response.status_code}")
-        logger.info(f"AssemblyAI transcription start response: {transcript_response.text}")
-        
-        # Final cancellation check before setting AssemblyAI ID
-        check_cancellation()
-        
-        if transcript_response.status_code != 200:
-            logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
-            job_data.update({
-                "status": "failed",
-                "error": f"Failed to start transcription on AssemblyAI: {transcript_response.text}",
-                "completed_at": datetime.now().isoformat()
-            })
-            return
-        
-        transcript_result = transcript_response.json()
-        transcript_id = transcript_result["id"]
-        job_data["assemblyai_id"] = transcript_id
-        logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
-        
-        # Clean up compressed file
-        if os.path.exists(compressed_path):
-            os.unlink(compressed_path)
-            logger.info(f"Cleaned up compressed file: {compressed_path}")
+        if selected_model == "whisper":
+            # Call the Render Whisper service
+            transcription_text = await transcribe_with_whisper(job_id, tmp_path, filename)
+        else: # selected_model == "assemblyai"
+            # === Enhanced AssemblyAI Integration with Compression ===
+            logger.info(f"Background task: Processing audio {filename} for AssemblyAI transcription...")
+            
+            # Compress audio for optimal transcription with cancellation support
+            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+            
+            # Check cancellation again after compression
+            check_cancellation()
+            
+            # Update job with compression stats
+            job_data["compression_stats"] = compression_stats
+            
+            # Upload compressed audio to AssemblyAI using HTTP API
+            logger.info("Uploading compressed audio to AssemblyAI...")
+            headers = {"authorization": ASSEMBLYAI_API_KEY}
+            upload_endpoint = "https://api.assemblyai.com/v2/upload"
+            
+            # Check cancellation before upload
+            check_cancellation()
+            
+            with open(compressed_path, "rb") as f:
+                upload_response = requests.post(upload_endpoint, headers=headers, data=f)
+            
+            logger.info(f"AssemblyAI upload response status: {upload_response.status_code}")
+            logger.info(f"AssemblyAI upload response: {upload_response.text}")
+            
+            # Check cancellation after upload
+            check_cancellation()
+            
+            if upload_response.status_code != 200:
+                logger.error(f"AssemblyAI upload failed: {upload_response.status_code} - {upload_response.text}")
+                job_data.update({
+                    "status": "failed",
+                    "error": f"Failed to upload audio to AssemblyAI: {upload_response.text}",
+                    "completed_at": datetime.now().isoformat()
+                })
+                return
+            
+            upload_result = upload_response.json()
+            audio_url = upload_result["upload_url"]
+            logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
+
+            # Check cancellation before starting transcription
+            check_cancellation()
+
+            # Start transcription using HTTP API
+            headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+            transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+            json_data = {
+                "audio_url": audio_url,
+                "language_code": "en_us",
+                "punctuate": True,
+                "format_text": True
+            }
+            
+            transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
+            
+            logger.info(f"AssemblyAI transcription start response status: {transcript_response.status_code}")
+            logger.info(f"AssemblyAI transcription start response: {transcript_response.text}")
+            
+            # Final cancellation check before setting AssemblyAI ID
+            check_cancellation()
+            
+            if transcript_response.status_code != 200:
+                logger.error(f"AssemblyAI transcription start failed: {transcript_response.status_code} - {transcript_response.text}")
+                job_data.update({
+                    "status": "failed",
+                    "error": f"Failed to start transcription on AssemblyAI: {transcript_response.text}",
+                    "completed_at": datetime.now().isoformat()
+                })
+                return
+            
+            transcript_result = transcript_response.json()
+            transcript_id = transcript_result["id"]
+            job_data["assemblyai_id"] = transcript_id
+            logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
+            
+            # Clean up compressed file
+            if 'compressed_path' in locals() and os.path.exists(compressed_path):
+                os.unlink(compressed_path)
+                logger.info(f"Cleaned up compressed file: {compressed_path}")
+
+        # Update job status with transcription result
+        job_data.update({
+            "status": "completed",
+            "transcription": transcription_text,
+            "language": audio_analysis["language"], # Use detected language from analysis
+            "completed_at": datetime.now().isoformat(),
+            "word_count": len(transcription_text.split()) if transcription_text else 0,
+            "duration_seconds": audio_analysis["duration_seconds"] # Use duration from analysis
+        })
 
     except asyncio.CancelledError:
         logger.info(f"Background task for job {job_id} was cancelled")
@@ -658,7 +788,8 @@ async def root():
             "Background task management",
             "Real-time status tracking",
             "Paystack payment integration",
-            "Subscription management"
+            "Subscription management",
+            "Intelligent model switching (AssemblyAI/Whisper)" # NEW feature
         ],
         "stats": {
             "active_jobs": len(jobs),
@@ -916,7 +1047,8 @@ async def transcribe_file(file: UploadFile = File(...), background_tasks: Backgr
         "assemblyai_id": None,
         "compression_stats": None,
         "file_size_mb": 0,
-        "content_type": file.content_type
+        "content_type": file.content_type,
+        "selected_model": "none" # NEW: Track which model was selected
     }
     
     # Initialize cancellation flag
@@ -975,8 +1107,10 @@ async def get_job_status(job_id: str):
         job_data["status"] = "cancelled"  # Ensure status is set correctly
         return job_data
     
-    # If transcription is still processing, poll AssemblyAI for status
-    if job_data["status"] == "processing" and job_data["assemblyai_id"]:
+    # If transcription is still processing via AssemblyAI, poll AssemblyAI for status
+    # Note: For Whisper, the transcription is synchronous within the background task,
+    # so once it returns from transcribe_with_whisper, the job status will be "completed".
+    if job_data["status"] == "processing" and job_data.get("selected_model") == "assemblyai" and job_data.get("assemblyai_id"):
         logger.info(f"Polling AssemblyAI for status of transcript ID: {job_data['assemblyai_id']}")
         headers = {"authorization": ASSEMBLYAI_API_KEY}
         transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{job_data['assemblyai_id']}"
@@ -1223,7 +1357,8 @@ async def list_jobs():
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
             "word_count": job_data.get("word_count"),
-            "duration_seconds": job_data.get("duration_seconds")
+            "duration_seconds": job_data.get("duration_seconds"),
+            "selected_model": job_data.get("selected_model", "none") # NEW: Include selected model
         }
     
     return {
@@ -1268,7 +1403,8 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "paystack_configured": bool(PAYSTACK_SECRET_KEY)
+                "paystack_configured": bool(PAYSTACK_SECRET_KEY),
+                "render_whisper_configured": bool(RENDER_WHISPER_URL) # NEW: Include Whisper config status
             }
         }
         
@@ -1287,6 +1423,7 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 # Final validation and startup logging
 logger.info("Performing final system validation...")
 logger.info(f"AssemblyAI API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"Render Whisper URL configured: {bool(RENDER_WHISPER_URL)}") # NEW log
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
@@ -1295,7 +1432,7 @@ logger.info(f"  - Cancellation flags: {len(cancellation_flags)} flags")
 
 # Log all available endpoints
 logger.info("Available API endpoints:")
-logger.info("  POST /transcribe - Start new transcription job")
+logger.info("  POST /transcribe - Start new transcription job (with intelligent model switching)") # UPDATED description
 logger.info("  GET /status/{job_id} - Check job status")
 logger.info("  POST /cancel/{job_id} - Cancel transcription job")
 logger.info("  POST /compress-download - Compress audio for download")
@@ -1331,6 +1468,7 @@ if __name__ == "__main__":
     logger.info("  ✅ Webhook handling for payment events")
     logger.info("  ✅ Subscription management endpoints (via Paystack/future 2Checkout)")
     logger.info("  ✅ Multi-currency support (NGN, KES, GHS, ZAR, USD)")
+    logger.info("  ✅ Intelligent model switching (AssemblyAI/Whisper)") # NEW feature
     
     logger.info("🔧 TECHNICAL IMPROVEMENTS:")
     logger.info("  - Cancellation flags prevent race conditions")
@@ -1342,6 +1480,7 @@ if __name__ == "__main__":
     logger.info("  - Paystack payment verification and webhook handling")
     logger.info("  - Secure webhook signature verification (TODO)")
     logger.info("  - Single payment system for global coverage (Paystack first, then 2Checkout)")
+    logger.info("  - Dynamic model selection based on audio characteristics") # NEW improvement
     
     try:
         uvicorn.run(
@@ -1359,3 +1498,4 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info("Ready to handle requests with enhanced job cancellation & Paystack payment support")
+    
