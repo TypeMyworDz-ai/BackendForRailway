@@ -1313,5 +1313,5 @@ if __name__ == "__main__":
         sys.exit(1)
 else:
     logger.info("Application loaded as module")
-    logger.info("Ready to handle requests with enhanced job cancellation & Paystack payment support")
+    logger.info( "Ready to handle requests with enhanced job cancellation & Paystack payment support")
     
