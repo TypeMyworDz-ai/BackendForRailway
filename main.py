@@ -1314,3 +1314,4 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info("Ready to handle requests with enhanced job cancellation & Paystack payment support")
+    
