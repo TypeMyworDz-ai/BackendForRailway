@@ -15,7 +15,12 @@ import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
-import httpx # Still needed for potential future external calls, or if you re-add external services
+import httpx
+# NEW IMPORT for python-docx
+from docx import Document
+from docx.shared import Inches
+from io import BytesIO
+from fastapi.responses import StreamingResponse
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -91,6 +96,11 @@ class CreditUpdateRequest(BaseModel):
     currency: str
     duration_hours: Optional[int] = None
     duration_days: Optional[int] = None
+
+# NEW: Request model for formatted Word download
+class FormattedWordDownloadRequest(BaseModel):
+    transcription_html: str
+    filename: Optional[str] = "transcription.docx"
 
 jobs = {}
 active_background_tasks = {}
@@ -239,7 +249,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -909,6 +919,68 @@ async def transcribe_assemblyai_fallback(
         "created_at": jobs[job_id]["created_at"],
         "selected_model": "assemblyai"
     }
+
+# NEW ENDPOINT: Generate formatted Word document
+@app.post("/generate-formatted-word")
+async def generate_formatted_word(request: FormattedWordDownloadRequest):
+    logger.info(f"Generating formatted Word document for {request.filename}")
+    try:
+        document = Document()
+        # Split the HTML by lines to process each utterance
+        lines = request.transcription_html.split('\n')
+        
+        for line in lines:
+            if line.strip(): # Process non-empty lines
+                p = document.add_paragraph()
+                
+                # Check for <strong>Speaker X:</strong> pattern
+                if '<strong>Speaker ' in line and '</strong>:' in line:
+                    parts = line.split('<strong>Speaker ', 1) # Split once to get content before first tag
+                    
+                    if len(parts) > 1:
+                        # Add any text before the first speaker tag as normal text
+                        if parts[0].strip():
+                            p.add_run(parts[0].strip())
+
+                        speaker_and_text = parts[1]
+                        
+                        # Find the end of the </strong> tag
+                        end_speaker_tag_index = speaker_and_text.find('</strong>:')
+                        if end_speaker_tag_index != -1:
+                            speaker_label = "Speaker " + speaker_and_text[:end_speaker_tag_index].strip() + ":"
+                            remaining_text = speaker_and_text[end_speaker_tag_index + len('</strong>:'):].strip()
+
+                            # Add speaker label as bold
+                            run = p.add_run(speaker_label)
+                            run.bold = True
+                            
+                            # Add the rest of the text as normal
+                            if remaining_text:
+                                p.add_run(" " + remaining_text)
+                        else:
+                            # Fallback if </strong> is not found correctly, add as plain text
+                            p.add_run(line)
+                    else:
+                        # No <strong> tag found in the line, add as plain text
+                        p.add_run(line)
+                else:
+                    # No <strong> tag found in the line, add as plain text
+                    p.add_run(line)
+
+        # Save document to a BytesIO object
+        file_stream = BytesIO()
+        document.save(file_stream)
+        file_stream.seek(0) # Rewind to the beginning of the stream
+
+        return StreamingResponse(
+            file_stream,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename={request.filename}"}
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating formatted Word document: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate formatted Word document: {str(e)}")
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     logger.info(f"Status check for job ID: {job_id}")
@@ -984,7 +1056,7 @@ async def get_job_status(job_id: str):
                             # For any other speakers, convert letter to number (F=6, G=7, etc.)
                             speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
                         
-                        # FIXED: Use HTML bold tags instead of markdown asterisks
+                        # Use HTML strong tags
                         formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
                     transcription_text = formatted_transcript.strip()
 
@@ -1261,6 +1333,8 @@ logger.info("  GET /jobs - List all jobs")
 logger.info("  GET /health - System health check")
 logger.info("  DELETE /cleanup - Clean up old jobs")
 logger.info("  GET / - Root endpoint with service info")
+# NEW ENDPOINT added to this list
+logger.info("  POST /generate-formatted-word - Generate formatted Word document with speaker labels")
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
@@ -1287,6 +1361,7 @@ if __name__ == "__main__":
     logger.info("  ✅ Language selection for transcription")
     logger.info("  ✅ Streamlined plan management (Pro, 24hr, 5-day, Free)")
     logger.info("  ✅ Speaker tags with HTML bold formatting: <strong>Speaker 1:</strong>, <strong>Speaker 2:</strong>, etc.")
+    logger.info("  ✅ NEW: Formatted Word document download with bold speaker tags")
     
     logger.info("🔧 TECHNICAL IMPROVEMENTS:")
     logger.info("  - Cancellation flags prevent race conditions")
@@ -1303,6 +1378,7 @@ if __name__ == "__main__":
     logger.info("  - Simplified plan logic without 'business' tier")
     logger.info("  - Fixed subscription logic: expired users get 0 minutes, not 30")
     logger.info("  - FIXED: Speaker tags now use HTML <strong> tags instead of markdown asterisks")
+    logger.info("  - NEW: Backend endpoint for generating formatted Word documents")
     
     try:
         uvicorn.run(
