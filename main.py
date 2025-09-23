@@ -530,7 +530,12 @@ async def process_assemblyai_job(job_id: str, tmp_path: str, filename: str, lang
             "audio_url": audio_url,
             "language_code": language_code, # Use requested language
             "punctuate": True,
-            "format_text": True
+            "format_text": True,
+            "speaker_labels": True,          # NEW: Enable speaker diarization
+            "language_detection": True,      # NEW: Enable automatic language detection
+            "speech_model": "best",          # NEW: Use the best speech model for accuracy
+            "word_boost": []                 # NEW: Placeholder for custom vocabulary
+            # PII Redaction is explicitly NOT included as requested
         }
         
         transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
@@ -642,8 +647,8 @@ async def root():
         "features": [
             "Paystack payment integration",
             "Subscription management",
-            "Render Whisper for priority transcription", # NEW feature
-            "AssemblyAI for fallback transcription", # NEW feature
+            "AssemblyAI for priority transcription", # UPDATED feature
+            "Render Whisper for fallback transcription", # UPDATED feature
             "Language selection for transcription"
         ],
         "stats": {
@@ -983,13 +988,24 @@ async def get_job_status(job_id: str):
             
             if assemblyai_result["status"] == "completed":
                 logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
+                # --- NEW: Retrieve speaker_labels if available ---
+                transcription_text = assemblyai_result["text"]
+                if assemblyai_result.get("speaker_labels"):
+                    # Format with speaker labels
+                    formatted_transcript = ""
+                    for utterance in assemblyai_result["utterances"]:
+                        formatted_transcript += f"Speaker {utterance['speaker']}: {utterance['text']}\n"
+                    transcription_text = formatted_transcript.strip()
+                # --- END NEW ---
+
                 job_data.update({
                     "status": "completed",
-                    "transcription": assemblyai_result["text"],
+                    "transcription": transcription_text, # Use formatted_transcript if available
                     "language": assemblyai_result["language_code"],
                     "completed_at": datetime.now().isoformat(),
                     "word_count": len(assemblyai_result["text"].split()) if assemblyai_result["text"] else 0,
-                    "duration_seconds": assemblyai_result.get("audio_duration", 0)
+                    "duration_seconds": assemblyai_result.get("audio_duration", 0),
+                    "speaker_labels": assemblyai_result.get("speaker_labels") # Store speaker labels
                 })
             elif assemblyai_result["status"] == "error":
                 logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
@@ -1280,7 +1296,7 @@ if __name__ == "__main__":
     logger.info("  ✅ Webhook handling for payment events")
     logger.info("  ✅ Subscription management endpoints (via Paystack/future 2Checkout)")
     logger.info("  ✅ Multi-currency support (NGN, KES, GHS, ZAR, USD)")
-    logger.info("  ✅ Frontend orchestrates Render Whisper priority and Railway AssemblyAI fallback") # NEW feature
+    logger.info("  ✅ AssemblyAI for priority transcription, Render Whisper for fallback") # UPDATED feature description
     logger.info("  ✅ Language selection for transcription")
     logger.info("  ✅ Streamlined plan management (Pro, 24hr, 5-day, Free)")
     
@@ -1314,4 +1330,3 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info( "Ready to handle requests with enhanced job cancellation & Paystack payment support")
-    
