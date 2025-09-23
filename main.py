@@ -428,10 +428,14 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         logger.info(f"📝 Updating credits for {email} - {plan_name} ({amount} {currency})")
         
         duration_info = {}
-        if '24 Hours' in plan_name or '24 hours' in plan_name.lower():
-            duration_info = {'hours': 24}
-        elif '5 Days' in plan_name or '5 days' in plan_name.lower():
-            duration_info = {'days': 5}
+        # UPDATED: Map new plan names to their durations
+        if plan_name == 'One-Day Plan':
+            duration_info = {'days': 1}
+        elif plan_name == 'Three-Day Plan':
+            duration_info = {'days': 3}
+        elif plan_name == 'One-Week Plan':
+            duration_info = {'days': 7}
+        # 'pro' plan is typically handled as unlimited, so no specific duration needed here
         
         logger.info(f"✅ Credits updated successfully for {email}")
         return {
