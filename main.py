@@ -471,8 +471,8 @@ async def health_monitor():
             await asyncio.sleep(30)
 
 # NEW: process_assemblyai_job for fallback
-async def process_assemblyai_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str]):
-    logger.info(f"Background task started for AssemblyAI job ID: {job_id} with language: {language_code}")
+async def process_assemblyai_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool):
+    logger.info(f"Background task started for AssemblyAI job ID: {job_id} with language: {language_code}, speaker_labels_enabled: {speaker_labels_enabled}")
     job_data = jobs[job_id]
     
     active_background_tasks[job_id] = asyncio.current_task()
@@ -531,10 +531,10 @@ async def process_assemblyai_job(job_id: str, tmp_path: str, filename: str, lang
             "language_code": language_code, # Use requested language
             "punctuate": True,
             "format_text": True,
-            "speaker_labels": True,          # NEW: Enable speaker diarization
+            "speaker_labels": speaker_labels_enabled, # Use the boolean value from frontend
             # Removed "language_detection": True, as it conflicts with language_code
-            "speech_model": "best",          # NEW: Use the best speech model for accuracy
-            "word_boost": []                 # NEW: Placeholder for custom vocabulary
+            "speech_model": "best",          # Use the best speech model for accuracy
+            "word_boost": []                 # Placeholder for custom vocabulary
             # PII Redaction is explicitly NOT included as requested
         }
         
@@ -875,9 +875,10 @@ async def paystack_status():
 async def transcribe_assemblyai_fallback(
     file: UploadFile = File(...),
     language_code: Optional[str] = Form("en"),
+    speaker_labels_enabled: bool = Form(False), # NEW: Receive speaker_labels_enabled from frontend
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    logger.info(f"AssemblyAI Fallback endpoint called with file: {file.filename}, requested language: {language_code}")
+    logger.info(f"AssemblyAI Fallback endpoint called with file: {file.filename}, requested language: {language_code}, speaker_labels_enabled: {speaker_labels_enabled}")
     
     if not file.content_type.startswith(('audio/', 'video/')):
         logger.warning(f"Invalid file type: {file.content_type}")
@@ -895,7 +896,8 @@ async def transcribe_assemblyai_fallback(
         "file_size_mb": 0,
         "content_type": file.content_type,
         "selected_model": "assemblyai", # Explicitly set to assemblyai
-        "requested_language": language_code
+        "requested_language": language_code,
+        "speaker_labels_enabled": speaker_labels_enabled # Store speaker labels setting
     }
     
     cancellation_flags[job_id] = False
@@ -921,7 +923,7 @@ async def transcribe_assemblyai_fallback(
             del cancellation_flags[job_id]
         raise HTTPException(status_code=500, detail="Failed to process audio file for AssemblyAI fallback")
 
-    background_tasks.add_task(process_assemblyai_job, job_id, tmp_path, file.filename, language_code) # Use the specific AssemblyAI processing task
+    background_tasks.add_task(process_assemblyai_job, job_id, tmp_path, file.filename, language_code, speaker_labels_enabled) # Pass speaker_labels_enabled
     
     logger.info(f"Returning immediate response for AssemblyAI fallback job ID: {job_id}")
     return {
@@ -988,19 +990,17 @@ async def get_job_status(job_id: str):
             
             if assemblyai_result["status"] == "completed":
                 logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
-                # --- NEW: Retrieve speaker_labels if available ---
+                # Retrieve speaker_labels if available and enabled by user
                 transcription_text = assemblyai_result["text"]
-                if assemblyai_result.get("speaker_labels"):
-                    # Format with speaker labels
+                if job_data.get("speaker_labels_enabled") and assemblyai_result.get("speaker_labels"):
                     formatted_transcript = ""
                     for utterance in assemblyai_result["utterances"]:
                         formatted_transcript += f"Speaker {utterance['speaker']}: {utterance['text']}\n"
                     transcription_text = formatted_transcript.strip()
-                # --- END NEW ---
 
                 job_data.update({
                     "status": "completed",
-                    "transcription": transcription_text, # Use formatted_transcript if available
+                    "transcription": transcription_text,
                     "language": assemblyai_result["language_code"],
                     "completed_at": datetime.now().isoformat(),
                     "word_count": len(assemblyai_result["text"].split()) if assemblyai_result["text"] else 0,
