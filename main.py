@@ -963,12 +963,12 @@ async def get_job_status(job_id: str):
             
             if assemblyai_result["status"] == "completed":
                 logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
-                # UPDATED: Handle speaker labels with "Speaker 1:", "Speaker 2:", etc. format and bold formatting
+                # FIXED: Handle speaker labels with "Speaker 1:", "Speaker 2:", etc. format and HTML bold formatting
                 transcription_text = assemblyai_result["text"]
                 if job_data.get("speaker_labels_enabled") and assemblyai_result.get("utterances"):
                     formatted_transcript = ""
                     for utterance in assemblyai_result["utterances"]:
-                        # Convert Speaker A, B, C to Speaker 1, 2, 3 and make bold
+                        # Convert Speaker A, B, C to Speaker 1, 2, 3 and make bold with HTML
                         speaker_letter = utterance['speaker']
                         if speaker_letter == 'A':
                             speaker_num = '1'
@@ -984,8 +984,8 @@ async def get_job_status(job_id: str):
                             # For any other speakers, convert letter to number (F=6, G=7, etc.)
                             speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
                         
-                        # Add bold formatting using markdown-style **bold**
-                        formatted_transcript += f"**Speaker {speaker_num}:** {utterance['text']}\n"
+                        # FIXED: Use HTML bold tags instead of markdown asterisks
+                        formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
                     transcription_text = formatted_transcript.strip()
 
                 job_data.update({
@@ -1286,7 +1286,7 @@ if __name__ == "__main__":
     logger.info("  ✅ AssemblyAI for priority transcription, Render Whisper for fallback")
     logger.info("  ✅ Language selection for transcription")
     logger.info("  ✅ Streamlined plan management (Pro, 24hr, 5-day, Free)")
-    logger.info("  ✅ Speaker tags with 'Speaker 1:', 'Speaker 2:', etc. format and bold styling")
+    logger.info("  ✅ Speaker tags with HTML bold formatting: <strong>Speaker 1:</strong>, <strong>Speaker 2:</strong>, etc.")
     
     logger.info("🔧 TECHNICAL IMPROVEMENTS:")
     logger.info("  - Cancellation flags prevent race conditions")
@@ -1302,7 +1302,7 @@ if __name__ == "__main__":
     logger.info("  - Explicit language passing to transcription services")
     logger.info("  - Simplified plan logic without 'business' tier")
     logger.info("  - Fixed subscription logic: expired users get 0 minutes, not 30")
-    logger.info("  - Speaker tags now display as 'Speaker 1:', 'Speaker 2:', etc. in bold")
+    logger.info("  - FIXED: Speaker tags now use HTML <strong> tags instead of markdown asterisks")
     
     try:
         uvicorn.run(
