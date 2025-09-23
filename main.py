@@ -992,7 +992,8 @@ async def get_job_status(job_id: str):
                 logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
                 # Retrieve speaker_labels if available and enabled by user
                 transcription_text = assemblyai_result["text"]
-                if job_data.get("speaker_labels_enabled") and assemblyai_result.get("speaker_labels"):
+                # MODIFIED: Check for 'utterances' directly when speaker_labels_enabled is True
+                if job_data.get("speaker_labels_enabled") and assemblyai_result.get("utterances"):
                     formatted_transcript = ""
                     for utterance in assemblyai_result["utterances"]:
                         formatted_transcript += f"Speaker {utterance['speaker']}: {utterance['text']}\n"
@@ -1005,7 +1006,7 @@ async def get_job_status(job_id: str):
                     "completed_at": datetime.now().isoformat(),
                     "word_count": len(assemblyai_result["text"].split()) if assemblyai_result["text"] else 0,
                     "duration_seconds": assemblyai_result.get("audio_duration", 0),
-                    "speaker_labels": assemblyai_result.get("speaker_labels") # Store speaker labels
+                    "speaker_labels": job_data.get("speaker_labels_enabled") and bool(assemblyai_result.get("utterances")) # Store if speaker labels were requested AND present
                 })
             elif assemblyai_result["status"] == "error":
                 logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
