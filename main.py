@@ -16,11 +16,12 @@ from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
 import httpx
-# NEW IMPORT for python-docx
+# NEW IMPORTS for python-docx and regex
 from docx import Document
 from docx.shared import Inches
 from io import BytesIO
 from fastapi.responses import StreamingResponse
+import re # Added for robust HTML parsing
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -929,43 +930,30 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
         # Split the HTML by lines to process each utterance
         lines = request.transcription_html.split('\n')
         
+        # Regex to find speaker tags: <strong>Speaker X:</strong>
+        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)< /strong>(.*)')
+        
         for line in lines:
             if line.strip(): # Process non-empty lines
                 p = document.add_paragraph()
                 
-                # Check for <strong>Speaker X:</strong> pattern
-                if '<strong>Speaker ' in line and '</strong>:' in line:
-                    parts = line.split('<strong>Speaker ', 1) # Split once to get content before first tag
+                match = speaker_tag_pattern.match(line)
+                if match:
+                    speaker_label_text = match.group(1)
+                    remaining_text = match.group(2).strip()
+
+                    # Add speaker label as bold
+                    run = p.add_run(speaker_label_text)
+                    run.bold = True
                     
-                    if len(parts) > 1:
-                        # Add any text before the first speaker tag as normal text
-                        if parts[0].strip():
-                            p.add_run(parts[0].strip())
-
-                        speaker_and_text = parts[1]
-                        
-                        # Find the end of the </strong> tag
-                        end_speaker_tag_index = speaker_and_text.find('</strong>:')
-                        if end_speaker_tag_index != -1:
-                            speaker_label = "Speaker " + speaker_and_text[:end_speaker_tag_index].strip() + ":"
-                            remaining_text = speaker_and_text[end_speaker_tag_index + len('</strong>:'):].strip()
-
-                            # Add speaker label as bold
-                            run = p.add_run(speaker_label)
-                            run.bold = True
-                            
-                            # Add the rest of the text as normal
-                            if remaining_text:
-                                p.add_run(" " + remaining_text)
-                        else:
-                            # Fallback if </strong> is not found correctly, add as plain text
-                            p.add_run(line)
-                    else:
-                        # No <strong> tag found in the line, add as plain text
-                        p.add_run(line)
+                    # Add the rest of the text as normal
+                    if remaining_text:
+                        p.add_run(" " + remaining_text)
                 else:
-                    # No <strong> tag found in the line, add as plain text
-                    p.add_run(line)
+                    # No speaker tag found, add as plain text (stripping any other HTML tags)
+                    clean_line = re.sub(r'<[^>]*>', '', line).strip() # Strip all HTML tags
+                    if clean_line:
+                        p.add_run(clean_line)
 
         # Save document to a BytesIO object
         file_stream = BytesIO()
@@ -1396,3 +1384,4 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info("Ready to handle requests with enhanced job cancellation & Paystack payment support")
+    
