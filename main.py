@@ -250,7 +250,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -481,7 +481,7 @@ async def process_assemblyai_job(job_id: str, tmp_path: str, filename: str, lang
     try:
         def check_cancellation():
             if cancellation_flags.get(job_id, False) or job_data.get("status") == "cancelled":
-                logger.info(f"AssemblyAI Job {job_id} was cancelled - stopping processing")
+                logger.info(f"Job {job_id} was cancelled - stopping processing")
                 raise asyncio.CancelledError(f"Job {job_id} was cancelled")
             return True
 
