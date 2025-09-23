@@ -532,7 +532,7 @@ async def process_assemblyai_job(job_id: str, tmp_path: str, filename: str, lang
             "punctuate": True,
             "format_text": True,
             "speaker_labels": True,          # NEW: Enable speaker diarization
-            "language_detection": True,      # NEW: Enable automatic language detection
+            # Removed "language_detection": True, as it conflicts with language_code
             "speech_model": "best",          # NEW: Use the best speech model for accuracy
             "word_boost": []                 # NEW: Placeholder for custom vocabulary
             # PII Redaction is explicitly NOT included as requested
