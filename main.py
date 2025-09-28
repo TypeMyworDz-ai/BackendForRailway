@@ -479,10 +479,10 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
-# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and `httpx.Client` for synchronous calls)
+# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and aggressive proxy handling)
 def _transcribe_openai_sync(audio_path: str, language_code: str, openai_api_key: str) -> dict:
     """Synchronous helper for OpenAI Whisper to be used with asyncio.to_thread."""
-    # Temporarily remove proxy environment variables to prevent injection into OpenAI client
+    # Aggressively remove proxy environment variables to prevent injection into OpenAI client
     # Store original values to restore them later.
     original_http_proxy = os.environ.pop('HTTP_PROXY', None)
     original_https_proxy = os.environ.pop('HTTPS_PROXY', None)
@@ -602,7 +602,7 @@ async def transcribe_with_render_whisper(audio_path: str, language_code: str, jo
         
         check_cancellation()
 
-        # UPDATED: Directly pass file content using 'files' parameter
+        # UPDATED: Directly pass file content using 'files' parameter, avoiding httpx.FormData
         with open(audio_path, "rb") as f:
             files = {'file': (os.path.basename(audio_path), f.read(), 'audio/mpeg')}
             data = {'language_code': language_code}
@@ -792,24 +792,24 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # SMART MODEL SELECTION LOGIC (UPDATED for three-tier fallback)
+        # SMART MODEL SELECTION LOGIC (UPDATED for three-tier fallback and new order)
         service_tier_1 = None
         service_tier_2 = None
         service_tier_3 = None
         
-        # LOGIC: OpenAI primary for <=10min, AssemblyAI primary for >10min. Render is always secondary fallback.
+        # NEW LOGIC:
+        # Audios 10 mins and less: OpenAI API (1st) -> Render (2nd) -> AssemblyAI (3rd)
+        # Audios 11 mins and above: AssemblyAI (1st) -> OpenAI API (2nd) -> Render (3rd)
         if duration_minutes <= 10:
-            # For <=10 min audio: OpenAI API (1st) -> Render (2nd) -> AssemblyAI (3rd)
             service_tier_1 = "openai"
             service_tier_2 = "render"
             service_tier_3 = "assemblyai"
             logger.info(f"🎯 Audio ≤10min: Primary=OpenAI, Fallback1=Render, Fallback2=AssemblyAI")
         else:
-            # For >10 min audio: AssemblyAI (1st) -> Render (2nd) -> OpenAI API (3rd)
             service_tier_1 = "assemblyai"
-            service_tier_2 = "render"
-            service_tier_3 = "openai"
-            logger.info(f"🎯 Audio >10min: Primary=AssemblyAI, Fallback1=Render, Fallback2=OpenAI")
+            service_tier_2 = "openai"
+            service_tier_3 = "render"
+            logger.info(f"🎯 Audio >10min: Primary=AssemblyAI, Fallback1=OpenAI, Fallback2=Render")
 
         # Determine AssemblyAI model based on user plan
         def get_assemblyai_model(plan: str) -> str:
@@ -1075,7 +1075,7 @@ async def root():
         ],
         "logic": {
             "audio_10min_or_less": "Primary=OpenAI, Fallback1=Render, Fallback2=AssemblyAI",
-            "audio_over_10min": "Primary=AssemblyAI, Fallback1=Render, Fallback2=OpenAI",
+            "audio_over_10min": "Primary=AssemblyAI, Fallback1=OpenAI, Fallback2=Render", # UPDATED logic description
             "free_users_assemblyai": "AssemblyAI nano model",
             "paid_users_assemblyai": "AssemblyAI best model"
         },
@@ -1378,7 +1378,7 @@ async def transcribe_audio(
         "file_size_mb": jobs[job_id]["file_size_mb"],
         "duration_minutes": duration_minutes,
         "created_at": jobs[job_id]["created_at"],
-        "logic_used": "≤10min: OpenAI→Render→AssemblyAI, >10min: AssemblyAI→Render→OpenAI" # UPDATED logic description
+        "logic_used": "≤10min: OpenAI→Render→AssemblyAI, >10min: AssemblyAI→OpenAI→Render" # UPDATED logic description
     }
 
 # NEW ENDPOINT: Generate formatted Word document
@@ -1648,16 +1648,16 @@ async def health_check():
             "integrations": {
                 "openai_configured": bool(OPENAI_API_KEY),
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "render_whisper_configured": bool(RENDER_WHISPER_URL), # NEW
+                "render_whisper_configured": bool(RENDER_WHISPER_URL),
                 "paystack_configured": bool(PAYSTACK_SECRET_KEY)
             },
             "transcription_logic": {
-                "audio_10min_or_less": "OpenAI Whisper primary → Render Fallback → AssemblyAI Fallback", # UPDATED logic description
-                "audio_over_10min": "AssemblyAI primary → Render Fallback → OpenAI Whisper Fallback", # UPDATED logic description
+                "audio_10min_or_less": "OpenAI Whisper primary → Render Fallback → AssemblyAI Fallback",
+                "audio_over_10min": "AssemblyAI primary → OpenAI Whisper Fallback → Render Fallback", # UPDATED logic description
                 "free_users_assemblyai": "nano model ($0.12/hour)",
                 "paid_users_assemblyai": "best model ($0.27/hour)",
                 "openai_whisper": "whisper-1 model ($0.006/minute)",
-                "render_whisper": "self-hosted Whisper" # NEW
+                "render_whisper": "self-hosted Whisper"
             }
         }
         
@@ -1676,7 +1676,7 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"OpenAI API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"AssemblyAI API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"Render Whisper URL configured: {bool(RENDER_WHISPER_URL)}") # NEW
+logger.info(f"Render Whisper URL configured: {bool(RENDER_WHISPER_URL)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
@@ -1707,9 +1707,9 @@ if __name__ == "__main__":
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
     logger.info("  ✅ OpenAI Whisper API integration (replaces Render backend)")
-    logger.info("  ✅ Render Whisper backend re-integrated as fallback") # NEW
-    logger.info("  ✅ Smart service selection: ≤10min→OpenAI→Render→AssemblyAI, >10min→AssemblyAI→Render→OpenAI") # UPDATED logic description
-    logger.info("  ✅ Three-tier automatic fallback between OpenAI, Render and AssemblyAI") # NEW
+    logger.info("  ✅ Render Whisper backend re-integrated as fallback")
+    logger.info("  ✅ Smart service selection: ≤10min→OpenAI→Render→AssemblyAI, >10min→AssemblyAI→OpenAI→Render") # UPDATED logic description
+    logger.info("  ✅ Three-tier automatic fallback between OpenAI, Render and AssemblyAI")
     logger.info("  ✅ Speaker diarization for OpenAI and AssemblyAI")
     logger.info("  ✅ Dynamic AssemblyAI model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
@@ -1720,14 +1720,14 @@ if __name__ == "__main__":
     logger.info("  ✅ Formatted Word document generation")
     
     logger.info("🔧 TRANSCRIPTION LOGIC:")
-    logger.info("  - Audio ≤10 minutes: OpenAI Whisper primary, Render fallback, AssemblyAI fallback") # UPDATED logic description
-    logger.info("  - Audio >10 minutes: AssemblyAI primary, Render fallback, OpenAI Whisper fallback") # UPDATED logic description
+    logger.info("  - Audio ≤10 minutes: OpenAI Whisper primary, Render fallback, AssemblyAI fallback")
+    logger.info("  - Audio >10 minutes: AssemblyAI primary, OpenAI Whisper fallback, Render fallback") # UPDATED logic description
     logger.info("  - Free users: AssemblyAI nano model ($0.12/hour)")
     logger.info("  - Paid users: AssemblyAI best model ($0.27/hour)")
     logger.info("  - OpenAI Whisper: whisper-1 model ($0.006/minute = $0.36/hour)")
-    logger.info("  - Render Whisper: self-hosted Whisper (variable cost)") # NEW
+    logger.info("  - Render Whisper: self-hosted Whisper (variable cost)")
     logger.info("  - OpenAI and AssemblyAI support speaker labels with HTML formatting")
-    logger.info("  - Render Whisper typically does NOT support speaker labels") # NEW
+    logger.info("  - Render Whisper typically does NOT support speaker labels")
     
     try:
         uvicorn.run(
