@@ -24,6 +24,8 @@ from fastapi.responses import StreamingResponse
 import re # Added for robust HTML parsing
 # NEW: OpenAI import
 import openai
+# NEW: Import OpenAI client for version >= 1.0.0
+from openai import OpenAI
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -67,14 +69,13 @@ logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK
 logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
 
 if not ASSEMBLYAI_API_KEY:
-    logger.error("ASSEMBLYAI_API_KEY environment variable not set! AssemblyAI fallback will not work.")
+    logger.error("ASSEMBLYAI_API_KEY environment variable not set! AssemblyAI will not work as primary or fallback.")
 
 if not OPENAI_API_KEY:
-    logger.error("OPENAI_API_KEY environment variable not set! OpenAI Whisper will not work.")
+    logger.error("OPENAI_API_KEY environment variable not set! OpenAI Whisper will not work as primary or fallback.")
 else:
-    # Configure OpenAI
-    openai.api_key = OPENAI_API_KEY
-    logger.info("OpenAI API key configured successfully")
+    # Configure OpenAI - direct key is used when client is instantiated
+    logger.info("OpenAI API key found and will be configured with client instantiation.")
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -257,7 +258,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -474,7 +475,7 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
-# NEW: OpenAI Whisper transcription function
+# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0)
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "en", job_id: str = None) -> dict:
     """Transcribe audio using OpenAI Whisper API with speaker diarization"""
     try:
@@ -491,13 +492,16 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
         file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
         logger.info(f"OpenAI Whisper: Processing {file_size_mb:.2f} MB audio file")
         
+        # NEW: Instantiate OpenAI client for version >= 1.0.0
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        
         # Open and transcribe the audio file
         with open(audio_path, "rb") as audio_file:
             check_cancellation()
             
-            # Use OpenAI Whisper API with speaker timestamps
+            # Use new OpenAI API syntax (client.audio.transcriptions.create)
             transcript = await asyncio.to_thread(
-                openai.Audio.transcribe,
+                client.audio.transcriptions.create, # Updated API call
                 model="whisper-1",
                 file=audio_file,
                 language=language_code if language_code != "en" else None,  # Let Whisper auto-detect for English
@@ -509,7 +513,7 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
         
         # Process the transcript for speaker diarization simulation
         transcription_text = transcript.text
-        segments = transcript.get('segments', [])
+        segments = getattr(transcript, 'segments', []) # Use getattr for safe access
         
         # Simple speaker diarization simulation based on pauses
         if segments and len(segments) > 1:
@@ -540,8 +544,8 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
         return {
             "status": "completed",
             "transcription": final_transcript,
-            "language": transcript.get('language', language_code),
-            "duration": transcript.get('duration', 0),
+            "language": getattr(transcript, 'language', language_code), # Use getattr for safe access
+            "duration": getattr(transcript, 'duration', 0), # Use getattr for safe access
             "word_count": len(transcription_text.split()) if transcription_text else 0,
             "segments_count": len(segments),
             "has_speaker_labels": len(segments) > 1  # Indicate if we added speaker labels
@@ -699,7 +703,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # SMART MODEL SELECTION LOGIC
+        # SMART MODEL SELECTION LOGIC (UPDATED for 10 min threshold and fallbacks)
         primary_service = None
         fallback_service = None
         
@@ -727,6 +731,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             "primary_service": primary_service,
             "fallback_service": fallback_service,
             "assemblyai_model": assemblyai_model,
+            "openai_model": "whisper-1", # Explicitly state OpenAI model
             "duration_minutes": duration_minutes
         })
 
@@ -734,26 +739,36 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         transcription_result = None
         
         if primary_service == "openai":
-            try:
-                logger.info(f"🚀 Attempting OpenAI Whisper (primary) for job {job_id}")
-                transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
-                job_data["primary_service_used"] = "openai"
-                job_data["primary_service_success"] = True
-            except Exception as openai_error:
-                logger.error(f"❌ OpenAI Whisper (primary) failed: {openai_error}")
-                job_data["primary_service_error"] = str(openai_error)
+            if not OPENAI_API_KEY:
+                logger.error(f"OpenAI API Key not configured, skipping OpenAI primary for job {job_id}")
+                job_data["primary_service_error"] = "OpenAI API Key not configured"
                 job_data["primary_service_success"] = False
+            else:
+                try:
+                    logger.info(f"🚀 Attempting OpenAI Whisper (primary) for job {job_id}")
+                    transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                    job_data["primary_service_used"] = "openai"
+                    job_data["primary_service_success"] = True
+                except Exception as openai_error:
+                    logger.error(f"❌ OpenAI Whisper (primary) failed: {openai_error}")
+                    job_data["primary_service_error"] = str(openai_error)
+                    job_data["primary_service_success"] = False
         
         elif primary_service == "assemblyai":
-            try:
-                logger.info(f"🚀 Attempting AssemblyAI (primary) with {assemblyai_model} model for job {job_id}")
-                transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
-                job_data["primary_service_used"] = "assemblyai"
-                job_data["primary_service_success"] = True
-            except Exception as assemblyai_error:
-                logger.error(f"❌ AssemblyAI (primary) failed: {assemblyai_error}")
-                job_data["primary_service_error"] = str(assemblyai_error)
+            if not ASSEMBLYAI_API_KEY:
+                logger.error(f"AssemblyAI API Key not configured, skipping AssemblyAI primary for job {job_id}")
+                job_data["primary_service_error"] = "AssemblyAI API Key not configured"
                 job_data["primary_service_success"] = False
+            else:
+                try:
+                    logger.info(f"🚀 Attempting AssemblyAI (primary) with {assemblyai_model} model for job {job_id}")
+                    transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                    job_data["primary_service_used"] = "assemblyai"
+                    job_data["primary_service_success"] = True
+                except Exception as assemblyai_error:
+                    logger.error(f"❌ AssemblyAI (primary) failed: {assemblyai_error}")
+                    job_data["primary_service_error"] = str(assemblyai_error)
+                    job_data["primary_service_success"] = False
 
         check_cancellation()
 
@@ -762,26 +777,36 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.warning(f"⚠️ Primary service failed, trying fallback ({fallback_service}) for job {job_id}")
             
             if fallback_service == "openai":
-                try:
-                    logger.info(f"🔄 Attempting OpenAI Whisper (fallback) for job {job_id}")
-                    transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
-                    job_data["fallback_service_used"] = "openai"
-                    job_data["fallback_service_success"] = True
-                except Exception as openai_fallback_error:
-                    logger.error(f"❌ OpenAI Whisper (fallback) failed: {openai_fallback_error}")
-                    job_data["fallback_service_error"] = str(openai_fallback_error)
+                if not OPENAI_API_KEY:
+                    logger.error(f"OpenAI API Key not configured, skipping OpenAI fallback for job {job_id}")
+                    job_data["fallback_service_error"] = "OpenAI API Key not configured"
                     job_data["fallback_service_success"] = False
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting OpenAI Whisper (fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                        job_data["fallback_service_used"] = "openai"
+                        job_data["fallback_service_success"] = True
+                    except Exception as openai_fallback_error:
+                        logger.error(f"❌ OpenAI Whisper (fallback) failed: {openai_fallback_error}")
+                        job_data["fallback_service_error"] = str(openai_fallback_error)
+                        job_data["fallback_service_success"] = False
             
             elif fallback_service == "assemblyai":
-                try:
-                    logger.info(f"🔄 Attempting AssemblyAI (fallback) with {assemblyai_model} model for job {job_id}")
-                    transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
-                    job_data["fallback_service_used"] = "assemblyai"
-                    job_data["fallback_service_success"] = True
-                except Exception as assemblyai_fallback_error:
-                    logger.error(f"❌ AssemblyAI (fallback) failed: {assemblyai_fallback_error}")
-                    job_data["fallback_service_error"] = str(assemblyai_fallback_error)
+                if not ASSEMBLYAI_API_KEY:
+                    logger.error(f"AssemblyAI API Key not configured, skipping AssemblyAI fallback for job {job_id}")
+                    job_data["fallback_service_error"] = "AssemblyAI API Key not configured"
                     job_data["fallback_service_success"] = False
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting AssemblyAI (fallback) with {assemblyai_model} model for job {job_id}")
+                        transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        job_data["fallback_service_used"] = "assemblyai"
+                        job_data["fallback_service_success"] = True
+                    except Exception as assemblyai_fallback_error:
+                        logger.error(f"❌ AssemblyAI (fallback) failed: {assemblyai_fallback_error}")
+                        job_data["fallback_service_error"] = str(assemblyai_fallback_error)
+                        job_data["fallback_service_success"] = False
 
         check_cancellation()
 
@@ -836,7 +861,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             del cancellation_flags[job_id]
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
@@ -868,6 +892,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS middleware configured successfully")
+
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
@@ -885,8 +910,8 @@ async def root():
         "logic": {
             "audio_10min_or_less": "OpenAI Whisper primary, AssemblyAI fallback",
             "audio_over_10min": "AssemblyAI primary, OpenAI Whisper fallback",
-            "free_users": "AssemblyAI nano model",
-            "paid_users": "AssemblyAI best model"
+            "free_users_assemblyai": "AssemblyAI nano model",
+            "paid_users_assemblyai": "AssemblyAI best model"
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1252,7 +1277,6 @@ async def get_job_status(job_id: str):
         job_data["status"] = "cancelled"
     
     return job_data
-
 @app.post("/cancel/{job_id}")
 async def cancel_job(job_id: str):
     logger.info(f"Cancel request received for job ID: {job_id}")
@@ -1476,7 +1500,6 @@ async def health_check():
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
-
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
 logger.info("Performing final system validation...")
