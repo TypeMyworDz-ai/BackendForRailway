@@ -487,7 +487,8 @@ async def transcribe_with_render_whisper(audio_path: str, language_code: str, jo
     """Transcribe audio using the self-hosted Render Whisper backend."""
     if not RENDER_WHISPER_URL:
         logger.error(f"{TYPEMYWORDZ2_NAME} URL not configured, skipping {TYPEMYWORDZ2_NAME} for job {job_id}")
-        raise Exception(f"{TYPEMYWORDZ2_NAME} URL not configured")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ2_NAME} URL not configured") # Changed to HTTPException
+        # raise Exception(f"{TYPEMYWORDZ2_NAME} URL not configured") # Old line
 
     try:
         logger.info(f"Starting {TYPEMYWORDZ2_NAME} transcription for job {job_id}")
@@ -585,7 +586,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             upload_response = requests.post(upload_endpoint, headers=headers, data=f)
         
         if upload_response.status_code != 200:
-            raise Exception(f"Failed to upload audio to {TYPEMYWORDZ1_NAME}: {upload_response.text}")
+            raise HTTPException(status_code=500, detail=f"Failed to upload audio to {TYPEMYWORDZ1_NAME}: {upload_response.text}") # Changed to HTTPException
+            # raise Exception(f"Failed to upload audio to {TYPEMYWORDZ1_NAME}: {upload_response.text}") # Old line
         
         upload_result = upload_response.json()
         audio_url = upload_result["upload_url"]
@@ -609,7 +611,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
         transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
         
         if transcript_response.status_code != 200:
-            raise Exception(f"Failed to start transcription on {TYPEMYWORDZ1_NAME}: {transcript_response.text}")
+            raise HTTPException(status_code=500, detail=f"Failed to start transcription on {TYPEMYWORDZ1_NAME}: {transcript_response.text}") # Changed to HTTPException
+            # raise Exception(f"Failed to start transcription on {TYPEMYWORDZ1_NAME}: {transcript_response.text}") # Old line
         
         transcript_result = transcript_response.json()
         transcript_id = transcript_result["id"]
@@ -629,7 +632,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             status_response = requests.get(f"https://api.assemblyai.com/v2/transcript/{transcript_id}", headers={"authorization": ASSEMBLYAI_API_KEY})
             
             if status_response.status_code != 200:
-                raise Exception(f"Failed to get status from {TYPEMYWORDZ1_NAME}: {status_response.text}")
+                raise HTTPException(status_code=500, detail=f"Failed to get status from {TYPEMYWORDZ1_NAME}: {status_response.text}") # Changed to HTTPException
+                # raise Exception(f"Failed to get status from {TYPEMYWORDZ1_NAME}: {status_response.text}") # Old line
             
             status_result = status_response.json()
             
@@ -668,7 +672,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                     "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances"))
                 }
             elif status_result["status"] == "error":
-                raise Exception(status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}"))
+                raise HTTPException(status_code=500, detail=status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}")) # Changed to HTTPException
+                # raise Exception(status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}")) # Old line
             else:
                 logger.info(f"{TYPEMYWORDZ1_NAME} status: {status_result['status']}")
                 continue
@@ -682,9 +687,9 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "status": "failed",
             "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
         }
-# UPDATED: process_transcription_job - NEW unified function with three-tier fallback
+# UPDATED: process_transcription_job - NEW unified function with two-tier fallback logic
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float):
-    """Unified transcription processing with smart model selection and three-tier fallback."""
+    """Unified transcription processing with smart model selection and two-tier fallback."""
     logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}")
     job_data = jobs[job_id]
     
@@ -700,27 +705,27 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # SMART MODEL SELECTION LOGIC (UPDATED for two-tier fallback, removing OpenAI)
+        # SMART MODEL SELECTION LOGIC (UPDATED for two-tier fallback, removing OpenAI, and new thresholds)
         service_tier_1 = None
         service_tier_2 = None
         
         # NEW LOGIC:
         # 1. All files with speaker tags requirements are handled by TypeMyworDz1 (AssemblyAI)
-        # 2. Files <=10min without speaker tags: TypeMyworDz2 (Render) -> TypeMyworDz1 (AssemblyAI)
-        # 3. Files >10min without speaker tags: TypeMyworDz1 (AssemblyAI) -> TypeMyworDz2 (Render)
+        # 2. Files <5min without speaker tags: TypeMyworDz2 (Render) -> TypeMyworDz1 (AssemblyAI)
+        # 3. Files >=5min without speaker tags: TypeMyworDz1 (AssemblyAI) -> TypeMyworDz2 (Render)
 
         if speaker_labels_enabled:
             service_tier_1 = "assemblyai" # TypeMyworDz1 for speaker tags
             service_tier_2 = "render" # Fallback to TypeMyworDz2
             logger.info(f"🎯 Speaker tags requested: Primary={TYPEMYWORDZ1_NAME}, Fallback={TYPEMYWORDZ2_NAME}")
-        elif duration_minutes <= 10:
+        elif duration_minutes < 5: # Changed threshold to < 5 minutes
             service_tier_1 = "render" # TypeMyworDz2 for short audio without speaker tags
             service_tier_2 = "assemblyai" # TypeMyworDz1 fallback
-            logger.info(f"🎯 Audio ≤10min (no speaker tags): Primary={TYPEMYWORDZ2_NAME}, Fallback={TYPEMYWORDZ1_NAME}")
-        else: # duration_minutes > 10 and no speaker tags
+            logger.info(f"🎯 Audio <5min (no speaker tags): Primary={TYPEMYWORDZ2_NAME}, Fallback={TYPEMYWORDZ1_NAME}")
+        else: # duration_minutes >= 5 and no speaker tags (Changed threshold to >= 5 minutes)
             service_tier_1 = "assemblyai" # TypeMyworDz1 for long audio without speaker tags
             service_tier_2 = "render" # TypeMyworDz2 fallback
-            logger.info(f"🎯 Audio >10min (no speaker tags): Primary={TYPEMYWORDZ1_NAME}, Fallback={TYPEMYWORDZ2_NAME}")
+            logger.info(f"🎯 Audio >=5min (no speaker tags): Primary={TYPEMYWORDZ1_NAME}, Fallback={TYPEMYWORDZ2_NAME}")
 
         # Determine AssemblyAI model based on user plan
         def get_assemblyai_model(plan: str) -> str:
@@ -734,9 +739,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         job_data.update({
             "service_tier_1": service_tier_1,
             "service_tier_2": service_tier_2,
-            # REMOVED: service_tier_3
             "assemblyai_model": assemblyai_model,
-            # REMOVED: openai_model
             "duration_minutes": duration_minutes
         })
 
@@ -816,27 +819,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # --- ATTEMPT TIER 3 SERVICE (FALLBACK 2) if Tier 1 and Tier 2 failed ---
-        # With OpenAI removed, Tier 3 will now be a direct fallback if Tier 1 and 2 fail
-        # This means Tier 3 will be either Render or AssemblyAI depending on previous tiers
+        # --- NO MORE TIERS ---
+        # Since we only have two active services, if T1 and T2 failed, it means both failed.
         if not transcription_result or transcription_result.get("status") == "failed":
-            logger.warning(f"⚠️ Tier 1 and Tier 2 services failed, trying Tier 3 fallback for job {job_id}")
-
-            # Determine the remaining service for Tier 3
-            remaining_service = None
-            if service_tier_1 == "render" and service_tier_2 == "assemblyai":
-                # If short audio, primary Render, fallback1 AssemblyAI, then no more tiers
-                # This branch should ideally not be hit with only two services.
-                pass
-            elif service_tier_1 == "assemblyai" and service_tier_2 == "render":
-                # If long audio, primary AssemblyAI, fallback1 Render, then no more tiers
-                # This branch should ideally not be hit with only two services.
-                pass
-            
-            # Since we only have two active services, if T1 and T2 failed, it means both failed.
-            # No need for a separate T3 call, as the overall failure will be caught below.
-            # However, for robustness and clear logging, we can keep this structure if a third service is ever re-added.
-            logger.error(f"❌ No more active transcription services to try for job {job_id}.")
+            logger.error(f"❌ All active transcription services failed for job {job_id}.")
             services_attempted.append("no_more_tiers_available")
 
         check_cancellation()
@@ -851,10 +837,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 "word_count": transcription_result.get("word_count", 0),
                 "duration_seconds": transcription_result.get("duration", 0),
                 "speaker_labels": transcription_result.get("has_speaker_labels", False),
-                "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used"))
+                "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used")) # UPDATED for two tiers
             })
         else:
-            logger.error(f"❌ All transcription services failed for job {job_id}. Services attempted: {services_attempted}")
+            logger.error(f"❌ All active transcription services failed for job {job_id}. Services attempted: {services_attempted}")
             job_data.update({
                 "status": "failed",
                 "error": f"All active transcription services failed. Services attempted: {', '.join(services_attempted)}",
@@ -939,8 +925,8 @@ async def root():
         ],
         "logic": {
             "speaker_tags_enabled": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED logic description
-            "audio_10min_or_less_no_speaker_tags": f"Primary={TYPEMYWORDZ2_NAME} → {TYPEMYWORDZ1_NAME} Fallback", # UPDATED logic description
-            "audio_over_10min_no_speaker_tags": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED logic description
+            "audio_less_than_5min_no_speaker_tags": f"Primary={TYPEMYWORDZ2_NAME} → {TYPEMYWORDZ1_NAME} Fallback", # UPDATED logic description
+            "audio_5min_and_above_no_speaker_tags": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED logic description
             "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model", # Use codename
             "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model" # Use codename
         },
@@ -978,8 +964,8 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
             'channels': payment_channels,
             'metadata': {
                 'plan': request.plan_name,
-                'user_id': request.user_id,
-                'country_code': request.country_code,
+                'user_id': currentUser.uid,
+                'country_code': countryCode,
                 'base_usd_amount': request.amount,
                 'custom_fields': [
                     {
@@ -1243,7 +1229,7 @@ async def transcribe_audio(
         "file_size_mb": jobs[job_id]["file_size_mb"],
         "duration_minutes": duration_minutes,
         "created_at": jobs[job_id]["created_at"],
-        "logic_used": f"SpeakerTags:{TYPEMYWORDZ1_NAME}→{TYPEMYWORDZ2_NAME}, ≤10min:{TYPEMYWORDZ2_NAME}→{TYPEMYWORDZ1_NAME}, >10min:{TYPEMYWORDZ1_NAME}→{TYPEMYWORDZ2_NAME}" # UPDATED logic description
+        "logic_used": f"SpeakerTags:{TYPEMYWORDZ1_NAME}→{TYPEMYWORDZ2_NAME}, <5min:{TYPEMYWORDZ2_NAME}→{TYPEMYWORDZ1_NAME}, >=5min:{TYPEMYWORDZ1_NAME}→{TYPEMYWORDZ2_NAME}" # UPDATED logic description
     }
 
 # NEW ENDPOINT: Generate formatted Word document
@@ -1518,8 +1504,8 @@ async def health_check():
             },
             "transcription_logic": {
                 "speaker_tags_enabled": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
-                "audio_10min_or_less_no_speaker_tags": f"Primary={TYPEMYWORDZ2_NAME} → {TYPEMYWORDZ1_NAME} Fallback",
-                "audio_over_10min_no_speaker_tags": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
+                "audio_less_than_5min_no_speaker_tags": f"Primary={TYPEMYWORDZ2_NAME} → {TYPEMYWORDZ1_NAME} Fallback",
+                "audio_5min_and_above_no_speaker_tags": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
                 "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model ($0.27/hour)",
                 # REMOVED: openai_whisper
@@ -1587,8 +1573,8 @@ if __name__ == "__main__":
     
     logger.info("🔧 TRANSCRIPTION LOGIC:")
     logger.info(f"  - Files with speaker tags: {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback")
-    logger.info(f"  - Audio ≤10 minutes (no speaker tags): {TYPEMYWORDZ2_NAME} primary → {TYPEMYWORDZ1_NAME} fallback")
-    logger.info(f"  - Audio >10 minutes (no speaker tags): {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback")
+    logger.info(f"  - Audio <5 minutes (no speaker tags): {TYPEMYWORDZ2_NAME} primary → {TYPEMYWORDZ1_NAME} fallback")
+    logger.info(f"  - Audio >=5 minutes (no speaker tags): {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model ($0.12/hour)")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model ($0.27/hour)")
     # REMOVED: OpenAI Whisper logic
