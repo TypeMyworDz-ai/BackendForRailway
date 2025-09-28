@@ -40,9 +40,9 @@ logger = logging.getLogger(__name__)
 logger.info("=== STARTING FASTAPI APPLICATION ===")
 
 # Define codenames for services
-MODEL_A_NAME = "ModelA (AssemblyAI)"
-MODEL_B_NAME = "ModelB (OpenAI Whisper)" # OpenAI is still defined but will be deprioritized
-MODEL_C_NAME = "ModelC (Render Whisper)"
+MODEL_A_NAME = "ModelA"
+MODEL_B_NAME = "ModelB" # OpenAI is still defined but will be deprioritized
+MODEL_C_NAME = "ModelC"
 
 # Install ffmpeg if not available
 def install_ffmpeg():
