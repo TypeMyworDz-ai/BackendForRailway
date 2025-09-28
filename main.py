@@ -1,3 +1,7 @@
+# ====================================================================================================
+# Updated main.py - Part 1: Imports and Global Anthropic Client Setup
+# ====================================================================================================
+
 import logging
 import sys
 import asyncio
@@ -14,7 +18,7 @@ from dotenv import load_dotenv
 import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List # Added List for new models
 import httpx # Keep httpx import for Render backend calls
 # NEW IMPORTS for python-docx and regex
 from docx import Document
@@ -22,8 +26,7 @@ from docx.shared import Inches
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re # Added for robust HTML parsing
-# REMOVED: OpenAI import openai
-# REMOVED: Import OpenAI client from openai
+import anthropic # ADDED: Anthropic client library
 
 # Configure logging to be very verbose
 logging.basicConfig(
@@ -39,8 +42,8 @@ logger.info("=== STARTING FASTAPI APPLICATION ===")
 
 # Define codenames for services (UPDATED)
 TYPEMYWORDZ1_NAME = "TypeMyworDz1"
-# REMOVED: MODEL_B_NAME
 TYPEMYWORDZ2_NAME = "TypeMyworDz2"
+TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # ADDED: Codename for Anthropic AI
 
 # Install ffmpeg if not available
 def install_ffmpeg():
@@ -60,26 +63,30 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 load_dotenv()
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-# REMOVED: OPENAI_API_KEY
 RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL")
+
+# ADDED: Load Anthropic API Key
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
 
 logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}")
-# REMOVED: logger.info(f"Attempted to load OPENAI_API_KEY. Value found: {bool(OPENAI_API_KEY)}")
 logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}")
+logger.info(f"Attempted to load ANTHROPIC_API_KEY. Value found: {bool(ANTHROPIC_API_KEY)}") # ADDED
 logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
 
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
 
-# REMOVED: OpenAI API key checks and logs
-
 if not RENDER_WHISPER_URL:
     logger.warning(f"{TYPEMYWORDZ2_NAME} URL environment variable not set! {TYPEMYWORDZ2_NAME} will not be available as a fallback.")
+
+# ADDED: Check for Anthropic API Key
+if not ANTHROPIC_API_KEY:
+    logger.warning(f"{TYPEMYWORDZ_AI_NAME} API Key environment variable not set! {TYPEMYWORDZ_AI_NAME} features will be disabled.")
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -88,6 +95,23 @@ if PAYSTACK_SECRET_KEY:
     logger.info("Paystack configuration found - payment verification enabled")
 else:
     logger.warning("Paystack configuration missing - payment verification disabled")
+
+logger.info("Environment variables loaded successfully")
+
+# ADDED: Anthropic Client Initialization
+claude_client = None
+if ANTHROPIC_API_KEY:
+    try:
+        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        logger.info(f"{TYPEMYWORDZ_AI_NAME} client initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing {TYPEMYWORDZ_AI_NAME} client: {e}")
+else:
+    logger.warning(f"{TYPEMYWORDZ_AI_NAME} API key is missing, Claude client will not be initialized.")
+
+# ====================================================================================================
+# END Updated main.py - Part 1
+# ====================================================================================================
 
 logger.info("Environment variables loaded successfully")
 
