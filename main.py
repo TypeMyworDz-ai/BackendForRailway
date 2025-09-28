@@ -15,6 +15,7 @@ import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
+# NEW: Import httpx for explicit client creation
 import httpx
 # NEW IMPORTS for python-docx and regex
 from docx import Document
@@ -475,7 +476,7 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
-# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0)
+# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and `proxies` fix)
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "en", job_id: str = None) -> dict:
     """Transcribe audio using OpenAI Whisper API with speaker diarization"""
     try:
@@ -492,8 +493,11 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
         file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
         logger.info(f"OpenAI Whisper: Processing {file_size_mb:.2f} MB audio file")
         
-        # NEW: Instantiate OpenAI client for version >= 1.0.0
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        # NEW: Instantiate OpenAI client for version >= 1.0.0, explicitly handling HTTPX client
+        # This resolves the 'unexpected keyword argument proxies' error.
+        # httpx will automatically pick up proxy settings from environment variables.
+        async_client = httpx.AsyncClient() 
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=async_client)
         
         # Open and transcribe the audio file
         with open(audio_path, "rb") as audio_file:
@@ -707,13 +711,12 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         primary_service = None
         fallback_service = None
         
+        # LOGIC: OpenAI primary for <=10min, AssemblyAI primary for >10min. Both act as fallback.
         if duration_minutes <= 10:
-            # For ≤10 min audio: OpenAI Whisper primary, AssemblyAI fallback
             primary_service = "openai"
             fallback_service = "assemblyai"
             logger.info(f"🎯 Audio ≤10min: Using OpenAI Whisper primary, AssemblyAI fallback")
         else:
-            # For >10 min audio: AssemblyAI primary, OpenAI Whisper fallback
             primary_service = "assemblyai"
             fallback_service = "openai"
             logger.info(f"🎯 Audio >10min: Using AssemblyAI primary, OpenAI Whisper fallback")
@@ -1359,6 +1362,7 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
     except Exception as e:
         logger.error(f"Error compressing file for download: {e}")
         raise HTTPException(status_code=500, detail="Failed to compress audio file")
+
 @app.delete("/cleanup")
 async def cleanup_old_jobs():
     logger.info("Cleanup endpoint called")
@@ -1500,6 +1504,7 @@ async def health_check():
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
 logger.info("Performing final system validation...")
