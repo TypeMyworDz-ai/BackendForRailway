@@ -590,69 +590,71 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
             "error": f"{MODEL_B_NAME} transcription failed: {str(e)}" # Use codename
         }
 
-# NEW: Render Whisper transcription function (UPDATED for httpx.FormData fix)
+# NEW: Render Whisper transcription function (UPDATED to handle trailing slash in URL)
 async def transcribe_with_render_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Transcribe audio using the self-hosted Render Whisper backend."""
     if not RENDER_WHISPER_URL:
-        logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} for job {job_id}") # Use codename
-        raise Exception(f"{MODEL_C_NAME} URL not configured") # Use codename
+        logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} for job {job_id}")
+        raise Exception(f"{MODEL_C_NAME} URL not configured")
 
     try:
-        logger.info(f"Starting {MODEL_C_NAME} transcription for job {job_id}") # Use codename
+        logger.info(f"Starting {MODEL_C_NAME} transcription for job {job_id}")
         
         def check_cancellation():
             if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {MODEL_C_NAME} processing") # Use codename
+                logger.info(f"Job {job_id} was cancelled during {MODEL_C_NAME} processing")
                 raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
         check_cancellation()
 
-        # UPDATED: Directly pass file content using 'files' parameter, avoiding httpx.FormData
+        # UPDATED: Remove trailing slash from RENDER_WHISPER_URL before appending '/transcribe'
+        render_base_url = RENDER_WHISPER_URL.rstrip('/') 
+
         with open(audio_path, "rb") as f:
             files = {'file': (os.path.basename(audio_path), f.read(), 'audio/mpeg')}
             data = {'language_code': language_code}
 
-            # Send request to Render Whisper backend
             async with httpx.AsyncClient() as client:
-                response = await client.post(f"{RENDER_WHISPER_URL}transcribe", files=files, data=data, timeout=300.0) # 5 min timeout
-                response.raise_for_status() # Raise an exception for HTTP errors
+                # Use the stripped base URL
+                response = await client.post(f"{render_base_url}/transcribe", files=files, data=data, timeout=300.0) # 5 min timeout
+                response.raise_for_status()
 
         result = response.json()
         
         if result.get("status") == "completed" and result.get("transcript"):
             transcription_text = result["transcript"]
-            logger.info(f"{MODEL_C_NAME} transcription completed for job {job_id}") # Use codename
+            logger.info(f"{MODEL_C_NAME} transcription completed for job {job_id}")
             return {
                 "status": "completed",
                 "transcription": transcription_text,
                 "language": result.get("language", language_code),
-                "duration": result.get("duration", 0), # Render Whisper might not return duration
+                "duration": result.get("duration", 0),
                 "word_count": len(transcription_text.split()) if transcription_text else 0,
-                "has_speaker_labels": False # Render Whisper typically doesn't provide speaker labels
+                "has_speaker_labels": False
             }
         else:
-            raise Exception(f"{MODEL_C_NAME} returned an incomplete or failed status: {result}") # Use codename
+            raise Exception(f"{MODEL_C_NAME} returned an incomplete or failed status: {result}")
 
     except asyncio.CancelledError:
-        logger.info(f"{MODEL_C_NAME} transcription cancelled for job {job_id}") # Use codename
+        logger.info(f"{MODEL_C_NAME} transcription cancelled for job {job_id}")
         raise
     except httpx.HTTPStatusError as e:
-        logger.error(f"{MODEL_C_NAME} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}") # Use codename
+        logger.error(f"{MODEL_C_NAME} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
         return {
             "status": "failed",
-            "error": f"{MODEL_C_NAME} HTTP error: {e.response.status_code} - {e.response.text}" # Use codename
+            "error": f"{MODEL_C_NAME} HTTP error: {e.response.status_code} - {e.response.text}"
         }
     except httpx.RequestError as e:
-        logger.error(f"{MODEL_C_NAME} network error for job {job_id}: {e}") # Use codename
+        logger.error(f"{MODEL_C_NAME} network error for job {job_id}: {e}")
         return {
             "status": "failed",
-            "error": f"{MODEL_C_NAME} network error: {e}" # Use codename
+            "error": f"{MODEL_C_NAME} network error: {e}"
         }
     except Exception as e:
-        logger.error(f"{MODEL_C_NAME} transcription failed for job {job_id}: {str(e)}") # Use codename
+        logger.error(f"{MODEL_C_NAME} transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{MODEL_C_NAME} transcription failed: {str(e)}" # Use codename
+            "error": f"{MODEL_C_NAME} transcription failed: {str(e)}"
         }
 
 # NEW: AssemblyAI transcription function
