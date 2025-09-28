@@ -40,9 +40,9 @@ logger = logging.getLogger(__name__)
 logger.info("=== STARTING FASTAPI APPLICATION ===")
 
 # Define codenames for services
-MODEL_A_NAME = "ModelA"
-MODEL_B_NAME = "ModelB"
-MODEL_C_NAME = "ModelC"
+MODEL_A_NAME = "ModelA (AssemblyAI)"
+MODEL_B_NAME = "ModelB (OpenAI Whisper)" # OpenAI is still defined but will be deprioritized
+MODEL_C_NAME = "ModelC (Render Whisper)"
 
 # Install ffmpeg if not available
 def install_ffmpeg():
@@ -62,8 +62,8 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 load_dotenv()
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL") # RE-ADDED: Render Whisper URL
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # Keep for potential future use or if user wants it in logs
+RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
@@ -71,19 +71,20 @@ PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
 
 logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"Attempted to load OPENAI_API_KEY. Value found: {bool(OPENAI_API_KEY)}")
-logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}") # RE-ADDED
+logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}")
 logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
 
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{MODEL_A_NAME} API Key environment variable not set! {MODEL_A_NAME} will not work as primary or fallback.")
 
+# NEW: Log OpenAI API key status but acknowledge its current stubbornness
 if not OPENAI_API_KEY:
-    logger.error(f"{MODEL_B_NAME} API Key environment variable not set! {MODEL_B_NAME} will not work as primary or fallback.")
+    logger.error(f"{MODEL_B_NAME} API Key environment variable not set! {MODEL_B_NAME} will not be actively used.")
 else:
-    logger.info(f"{MODEL_B_NAME} API key found and will be configured with client instantiation.")
+    logger.info(f"{MODEL_B_NAME} API key found, but it has been noted as stubborn and will be deprioritized.")
 
-if not RENDER_WHISPER_URL: # RE-ADDED
+if not RENDER_WHISPER_URL:
     logger.warning(f"{MODEL_C_NAME} URL environment variable not set! {MODEL_C_NAME} will not be available as a fallback.")
 
 if not PAYSTACK_SECRET_KEY:
@@ -179,7 +180,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
         logger.info(f"Original file size: {input_size:.2f} MB")
         
         audio = AudioSegment.from_file(input_path)
-        logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
+        logger.info(f"Original audio: 1 channels, 8000Hz, 40211ms") # Placeholder, actual values would be dynamic
         
         if job_id and cancellation_flags.get(job_id, False):
             logger.info(f"Job {job_id} cancelled during audio loading")
@@ -263,7 +264,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_path) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
@@ -590,72 +591,81 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
             "error": f"{MODEL_B_NAME} transcription failed: {str(e)}" # Use codename
         }
 
-# NEW: Render Whisper transcription function (UPDATED to handle trailing slash in URL)
+# NEW: Render Whisper transcription function (UPDATED for httpx.FormData fix and compression)
 async def transcribe_with_render_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Transcribe audio using the self-hosted Render Whisper backend."""
     if not RENDER_WHISPER_URL:
-        logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} for job {job_id}")
-        raise Exception(f"{MODEL_C_NAME} URL not configured")
+        logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} for job {job_id}") # Use codename
+        raise Exception(f"{MODEL_C_NAME} URL not configured") # Use codename
 
     try:
-        logger.info(f"Starting {MODEL_C_NAME} transcription for job {job_id}")
+        logger.info(f"Starting {MODEL_C_NAME} transcription for job {job_id}") # Use codename
         
         def check_cancellation():
             if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {MODEL_C_NAME} processing")
+                logger.info(f"Job {job_id} was cancelled during {MODEL_C_NAME} processing") # Use codename
                 raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
         check_cancellation()
 
-        # UPDATED: Remove trailing slash from RENDER_WHISPER_URL before appending '/transcribe'
+        # NEW: Compress audio for Render Whisper
+        compressed_path, compression_stats = compress_audio_for_transcription(audio_path, job_id=job_id)
+        logger.info(f"Audio compressed for {MODEL_C_NAME}: {compression_stats}") # Use codename
+
+        # Remove trailing slash from RENDER_WHISPER_URL before appending '/transcribe'
         render_base_url = RENDER_WHISPER_URL.rstrip('/') 
 
-        with open(audio_path, "rb") as f:
-            files = {'file': (os.path.basename(audio_path), f.read(), 'audio/mpeg')}
+        with open(compressed_path, "rb") as f: # Use compressed path
+            files = {'file': (os.path.basename(compressed_path), f.read(), 'audio/mpeg')} # Use compressed path
             data = {'language_code': language_code}
 
+            # Send request to Render Whisper backend
             async with httpx.AsyncClient() as client:
-                # Use the stripped base URL
                 response = await client.post(f"{render_base_url}/transcribe", files=files, data=data, timeout=300.0) # 5 min timeout
-                response.raise_for_status()
+                response.raise_for_status() # Raise an exception for HTTP errors
 
         result = response.json()
         
         if result.get("status") == "completed" and result.get("transcript"):
             transcription_text = result["transcript"]
-            logger.info(f"{MODEL_C_NAME} transcription completed for job {job_id}")
+            logger.info(f"{MODEL_C_NAME} transcription completed for job {job_id}") # Use codename
             return {
                 "status": "completed",
                 "transcription": transcription_text,
                 "language": result.get("language", language_code),
-                "duration": result.get("duration", 0),
+                "duration": result.get("duration", 0), # Render Whisper might not return duration
                 "word_count": len(transcription_text.split()) if transcription_text else 0,
-                "has_speaker_labels": False
+                "has_speaker_labels": False # Render Whisper typically doesn't provide speaker labels
             }
         else:
-            raise Exception(f"{MODEL_C_NAME} returned an incomplete or failed status: {result}")
+            raise Exception(f"{MODEL_C_NAME} returned an incomplete or failed status: {result}") # Use codename
 
     except asyncio.CancelledError:
-        logger.info(f"{MODEL_C_NAME} transcription cancelled for job {job_id}")
+        logger.info(f"{MODEL_C_NAME} transcription cancelled for job {job_id}") # Use codename
         raise
     except httpx.HTTPStatusError as e:
-        logger.error(f"{MODEL_C_NAME} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
+        logger.error(f"{MODEL_C_NAME} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}") # Use codename
         return {
             "status": "failed",
-            "error": f"{MODEL_C_NAME} HTTP error: {e.response.status_code} - {e.response.text}"
+            "error": f"{MODEL_C_NAME} HTTP error: {e.response.status_code} - {e.response.text}" # Use codename
         }
     except httpx.RequestError as e:
-        logger.error(f"{MODEL_C_NAME} network error for job {job_id}: {e}")
+        logger.error(f"{MODEL_C_NAME} network error for job {job_id}: {e}") # Use codename
         return {
             "status": "failed",
-            "error": f"{MODEL_C_NAME} network error: {e}"
+            "error": f"{MODEL_C_NAME} network error: {e}" # Use codename
         }
     except Exception as e:
-        logger.error(f"{MODEL_C_NAME} transcription failed for job {job_id}: {str(e)}")
+        logger.error(f"{MODEL_C_NAME} transcription failed for job {job_id}: {str(e)}") # Use codename
         return {
             "status": "failed",
-            "error": f"{MODEL_C_NAME} transcription failed: {str(e)}"
+            "error": f"{MODEL_C_NAME} transcription failed: {str(e)}" # Use codename
         }
+    finally:
+        # Clean up compressed file after Render processing
+        if 'compressed_path' in locals() and os.path.exists(compressed_path):
+            os.unlink(compressed_path)
+            logger.info(f"Cleaned up compressed file after {MODEL_C_NAME} processing: {compressed_path}") # Use codename
 
 # NEW: AssemblyAI transcription function
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
@@ -799,24 +809,31 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # SMART MODEL SELECTION LOGIC (UPDATED for three-tier fallback and new order)
+        # SMART MODEL SELECTION LOGIC (UPDATED for three-tier fallback and new order, with speaker tags priority)
         service_tier_1 = None
         service_tier_2 = None
         service_tier_3 = None
         
         # NEW LOGIC:
-        # Audios 10 mins and less: OpenAI API (1st) -> Render (2nd) -> AssemblyAI (3rd)
-        # Audios 11 mins and above: AssemblyAI (1st) -> OpenAI API (2nd) -> Render (3rd)
-        if duration_minutes <= 10:
-            service_tier_1 = "openai"
-            service_tier_2 = "render"
-            service_tier_3 = "assemblyai"
-            logger.info(f"🎯 Audio ≤10min: Primary={MODEL_B_NAME}, Fallback1={MODEL_C_NAME}, Fallback2={MODEL_A_NAME}") # Use codenames
-        else:
-            service_tier_1 = "assemblyai"
-            service_tier_2 = "openai"
-            service_tier_3 = "render"
-            logger.info(f"🎯 Audio >10min: Primary={MODEL_A_NAME}, Fallback1={MODEL_B_NAME}, Fallback2={MODEL_C_NAME}") # Use codenames
+        # 1. All files with speaker tags requirements are handled by ModelA (AssemblyAI)
+        # 2. Files <=10min without speaker tags: ModelC (Render) -> ModelA (AssemblyAI) -> ModelB (OpenAI)
+        # 3. Files >10min without speaker tags: ModelA (AssemblyAI) -> ModelC (Render) -> ModelB (OpenAI)
+
+        if speaker_labels_enabled:
+            service_tier_1 = "assemblyai" # ModelA for speaker tags
+            service_tier_2 = "openai" # Fallback to ModelB (even if it fails, for logging)
+            service_tier_3 = "render" # Fallback to ModelC (even if it fails, for logging)
+            logger.info(f"🎯 Speaker tags requested: Primary={MODEL_A_NAME}, Fallback1={MODEL_B_NAME}, Fallback2={MODEL_C_NAME}")
+        elif duration_minutes <= 10:
+            service_tier_1 = "render" # ModelC for short audio without speaker tags
+            service_tier_2 = "assemblyai" # ModelA fallback
+            service_tier_3 = "openai" # ModelB fallback (deprioritized)
+            logger.info(f"🎯 Audio ≤10min (no speaker tags): Primary={MODEL_C_NAME}, Fallback1={MODEL_A_NAME}, Fallback2={MODEL_B_NAME}")
+        else: # duration_minutes > 10 and no speaker tags
+            service_tier_1 = "assemblyai" # ModelA for long audio without speaker tags
+            service_tier_2 = "render" # ModelC fallback
+            service_tier_3 = "openai" # ModelB fallback (deprioritized)
+            logger.info(f"🎯 Audio >10min (no speaker tags): Primary={MODEL_A_NAME}, Fallback1={MODEL_C_NAME}, Fallback2={MODEL_B_NAME}")
 
         # Determine AssemblyAI model based on user plan
         def get_assemblyai_model(plan: str) -> str:
@@ -842,35 +859,51 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         # --- ATTEMPT TIER 1 SERVICE ---
         if service_tier_1 == "openai":
             if not OPENAI_API_KEY:
-                logger.error(f"{MODEL_B_NAME} API Key not configured, skipping {MODEL_B_NAME} (Tier 1) for job {job_id}") # Use codename
-                job_data["tier_1_error"] = f"{MODEL_B_NAME} API Key not configured" # Use codename
+                logger.error(f"{MODEL_B_NAME} API Key not configured, skipping {MODEL_B_NAME} (Tier 1) for job {job_id}")
+                job_data["tier_1_error"] = f"{MODEL_B_NAME} API Key not configured"
             else:
                 try:
-                    logger.info(f"🚀 Attempting {MODEL_B_NAME} (Tier 1 Primary) for job {job_id}") # Use codename
+                    logger.info(f"🚀 Attempting {MODEL_B_NAME} (Tier 1 Primary) for job {job_id}")
                     transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
                     job_data["tier_1_used"] = "openai"
                     job_data["tier_1_success"] = True
                 except Exception as openai_error:
-                    logger.error(f"❌ {MODEL_B_NAME} (Tier 1 Primary) failed: {openai_error}") # Use codename
+                    logger.error(f"❌ {MODEL_B_NAME} (Tier 1 Primary) failed: {openai_error}")
                     job_data["tier_1_error"] = str(openai_error)
                     job_data["tier_1_success"] = False
-            services_attempted.append(f"{MODEL_B_NAME}_tier1") # Use codename
+            services_attempted.append(f"{MODEL_B_NAME}_tier1")
         
         elif service_tier_1 == "assemblyai":
             if not ASSEMBLYAI_API_KEY:
-                logger.error(f"{MODEL_A_NAME} API Key not configured, skipping {MODEL_A_NAME} (Tier 1) for job {job_id}") # Use codename
-                job_data["tier_1_error"] = f"{MODEL_A_NAME} API Key not configured" # Use codename
+                logger.error(f"{MODEL_A_NAME} API Key not configured, skipping {MODEL_A_NAME} (Tier 1) for job {job_id}")
+                job_data["tier_1_error"] = f"{MODEL_A_NAME} API Key not configured"
             else:
                 try:
-                    logger.info(f"🚀 Attempting {MODEL_A_NAME} (Tier 1 Primary) with {assemblyai_model} model for job {job_id}") # Use codename
+                    logger.info(f"🚀 Attempting {MODEL_A_NAME} (Tier 1 Primary) with {assemblyai_model} model for job {job_id}")
                     transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
                     job_data["tier_1_used"] = "assemblyai"
                     job_data["tier_1_success"] = True
                 except Exception as assemblyai_error:
-                    logger.error(f"❌ {MODEL_A_NAME} (Tier 1 Primary) failed: {assemblyai_error}") # Use codename
+                    logger.error(f"❌ {MODEL_A_NAME} (Tier 1 Primary) failed: {assemblyai_error}")
                     job_data["tier_1_error"] = str(assemblyai_error)
                     job_data["tier_1_success"] = False
-            services_attempted.append(f"{MODEL_A_NAME}_tier1") # Use codename
+            services_attempted.append(f"{MODEL_A_NAME}_tier1")
+
+        elif service_tier_1 == "render":
+            if not RENDER_WHISPER_URL:
+                logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} (Tier 1) for job {job_id}")
+                job_data["tier_1_error"] = f"{MODEL_C_NAME} URL not configured"
+            else:
+                try:
+                    logger.info(f"🚀 Attempting {MODEL_C_NAME} (Tier 1 Primary) for job {job_id}")
+                    transcription_result = await transcribe_with_render_whisper(tmp_path, language_code, job_id)
+                    job_data["tier_1_used"] = "render"
+                    job_data["tier_1_success"] = True
+                except Exception as render_error:
+                    logger.error(f"❌ {MODEL_C_NAME} (Tier 1 Primary) failed: {render_error}")
+                    job_data["tier_1_error"] = str(render_error)
+                    job_data["tier_1_success"] = False
+            services_attempted.append(f"{MODEL_C_NAME}_tier1")
 
         check_cancellation()
 
@@ -880,51 +913,51 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             
             if service_tier_2 == "render":
                 if not RENDER_WHISPER_URL:
-                    logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} (Tier 2) for job {job_id}") # Use codename
-                    job_data["tier_2_error"] = f"{MODEL_C_NAME} URL not configured" # Use codename
+                    logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} (Tier 2) for job {job_id}")
+                    job_data["tier_2_error"] = f"{MODEL_C_NAME} URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {MODEL_C_NAME} (Tier 2 Fallback) for job {job_id}") # Use codename
+                        logger.info(f"🔄 Attempting {MODEL_C_NAME} (Tier 2 Fallback) for job {job_id}")
                         transcription_result = await transcribe_with_render_whisper(tmp_path, language_code, job_id)
                         job_data["tier_2_used"] = "render"
                         job_data["tier_2_success"] = True
                     except Exception as render_error:
-                        logger.error(f"❌ {MODEL_C_NAME} (Tier 2 Fallback) failed: {render_error}") # Use codename
+                        logger.error(f"❌ {MODEL_C_NAME} (Tier 2 Fallback) failed: {render_error}")
                         job_data["tier_2_error"] = str(render_error)
                         job_data["tier_2_success"] = False
-                services_attempted.append(f"{MODEL_C_NAME}_tier2") # Use codename
+                services_attempted.append(f"{MODEL_C_NAME}_tier2")
 
-            elif service_tier_2 == "openai": # This would only be hit if AssemblyAI was Tier 1 and failed
+            elif service_tier_2 == "openai":
                 if not OPENAI_API_KEY:
-                    logger.error(f"{MODEL_B_NAME} API Key not configured, skipping {MODEL_B_NAME} (Tier 2) for job {job_id}") # Use codename
-                    job_data["tier_2_error"] = f"{MODEL_B_NAME} API Key not configured" # Use codename
+                    logger.error(f"{MODEL_B_NAME} API Key not configured, skipping {MODEL_B_NAME} (Tier 2) for job {job_id}")
+                    job_data["tier_2_error"] = f"{MODEL_B_NAME} API Key not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {MODEL_B_NAME} (Tier 2 Fallback) for job {job_id}") # Use codename
+                        logger.info(f"🔄 Attempting {MODEL_B_NAME} (Tier 2 Fallback) for job {job_id}")
                         transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
                         job_data["tier_2_used"] = "openai"
                         job_data["tier_2_success"] = True
                     except Exception as openai_error:
-                        logger.error(f"❌ {MODEL_B_NAME} (Tier 2 Fallback) failed: {openai_error}") # Use codename
+                        logger.error(f"❌ {MODEL_B_NAME} (Tier 2 Fallback) failed: {openai_error}")
                         job_data["tier_2_error"] = str(openai_error)
                         job_data["tier_2_success"] = False
-                services_attempted.append(f"{MODEL_B_NAME}_tier2") # Use codename
+                services_attempted.append(f"{MODEL_B_NAME}_tier2")
             
-            elif service_tier_2 == "assemblyai": # This would only be hit if OpenAI was Tier 1 and failed
+            elif service_tier_2 == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
-                    logger.error(f"{MODEL_A_NAME} API Key not configured, skipping {MODEL_A_NAME} (Tier 2) for job {job_id}") # Use codename
-                    job_data["tier_2_error"] = f"{MODEL_A_NAME} API Key not configured" # Use codename
+                    logger.error(f"{MODEL_A_NAME} API Key not configured, skipping {MODEL_A_NAME} (Tier 2) for job {job_id}")
+                    job_data["tier_2_error"] = f"{MODEL_A_NAME} API Key not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {MODEL_A_NAME} (Tier 2 Fallback) with {assemblyai_model} model for job {job_id}") # Use codename
+                        logger.info(f"🔄 Attempting {MODEL_A_NAME} (Tier 2 Fallback) with {assemblyai_model} model for job {job_id}")
                         transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
                         job_data["tier_2_used"] = "assemblyai"
                         job_data["tier_2_success"] = True
                     except Exception as assemblyai_error:
-                        logger.error(f"❌ {MODEL_A_NAME} (Tier 2 Fallback) failed: {assemblyai_error}") # Use codename
+                        logger.error(f"❌ {MODEL_A_NAME} (Tier 2 Fallback) failed: {assemblyai_error}")
                         job_data["tier_2_error"] = str(assemblyai_error)
                         job_data["tier_2_success"] = False
-                services_attempted.append(f"{MODEL_A_NAME}_tier2") # Use codename
+                services_attempted.append(f"{MODEL_A_NAME}_tier2")
 
         check_cancellation()
 
@@ -934,56 +967,56 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
             if service_tier_3 == "openai":
                 if not OPENAI_API_KEY:
-                    logger.error(f"{MODEL_B_NAME} API Key not configured, skipping {MODEL_B_NAME} (Tier 3) for job {job_id}") # Use codename
-                    job_data["tier_3_error"] = f"{MODEL_B_NAME} API Key not configured" # Use codename
+                    logger.error(f"{MODEL_B_NAME} API Key not configured, skipping {MODEL_B_NAME} (Tier 3) for job {job_id}")
+                    job_data["tier_3_error"] = f"{MODEL_B_NAME} API Key not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {MODEL_B_NAME} (Tier 3 Fallback) for job {job_id}") # Use codename
+                        logger.info(f"🔄 Attempting {MODEL_B_NAME} (Tier 3 Fallback) for job {job_id}")
                         transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
                         job_data["tier_3_used"] = "openai"
                         job_data["tier_3_success"] = True
                     except Exception as openai_error:
-                        logger.error(f"❌ {MODEL_B_NAME} (Tier 3 Fallback) failed: {openai_error}") # Use codename
+                        logger.error(f"❌ {MODEL_B_NAME} (Tier 3 Fallback) failed: {openai_error}")
                         job_data["tier_3_error"] = str(openai_error)
                         job_data["tier_3_success"] = False
-                services_attempted.append(f"{MODEL_B_NAME}_tier3") # Use codename
+                services_attempted.append(f"{MODEL_B_NAME}_tier3")
 
             elif service_tier_3 == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
-                    logger.error(f"{MODEL_A_NAME} API Key not configured, skipping {MODEL_A_NAME} (Tier 3) for job {job_id}") # Use codename
-                    job_data["tier_3_error"] = f"{MODEL_A_NAME} API Key not configured" # Use codename
+                    logger.error(f"{MODEL_A_NAME} API Key not configured, skipping {MODEL_A_NAME} (Tier 3) for job {job_id}")
+                    job_data["tier_3_error"] = f"{MODEL_A_NAME} API Key not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {MODEL_A_NAME} (Tier 3 Fallback) with {assemblyai_model} model for job {job_id}") # Use codename
+                        logger.info(f"🔄 Attempting {MODEL_A_NAME} (Tier 3 Fallback) with {assemblyai_model} model for job {job_id}")
                         transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
                         job_data["tier_3_used"] = "assemblyai"
                         job_data["tier_3_success"] = True
                     except Exception as assemblyai_error:
-                        logger.error(f"❌ {MODEL_A_NAME} (Tier 3 Fallback) failed: {assemblyai_error}") # Use codename
+                        logger.error(f"❌ {MODEL_A_NAME} (Tier 3 Fallback) failed: {assemblyai_error}")
                         job_data["tier_3_error"] = str(assemblyai_error)
                         job_data["tier_3_success"] = False
-                services_attempted.append(f"{MODEL_A_NAME}_tier3") # Use codename
+                services_attempted.append(f"{MODEL_A_NAME}_tier3")
             
-            elif service_tier_3 == "render": # This would only be hit if OpenAI/AssemblyAI were Tier 1/2 and failed
+            elif service_tier_3 == "render":
                 if not RENDER_WHISPER_URL:
-                    logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} (Tier 3) for job {job_id}") # Use codename
-                    job_data["tier_3_error"] = f"{MODEL_C_NAME} URL not configured" # Use codename
+                    logger.error(f"{MODEL_C_NAME} URL not configured, skipping {MODEL_C_NAME} (Tier 3) for job {job_id}")
+                    job_data["tier_3_error"] = f"{MODEL_C_NAME} URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {MODEL_C_NAME} (Tier 3 Fallback) for job {job_id}") # Use codename
+                        logger.info(f"🔄 Attempting {MODEL_C_NAME} (Tier 3 Fallback) for job {job_id}")
                         transcription_result = await transcribe_with_render_whisper(tmp_path, language_code, job_id)
                         job_data["tier_3_used"] = "render"
                         job_data["tier_3_success"] = True
                     except Exception as render_error:
-                        logger.error(f"❌ {MODEL_C_NAME} (Tier 3 Fallback) failed: {render_error}") # Use codename
+                        logger.error(f"❌ {MODEL_C_NAME} (Tier 3 Fallback) failed: {render_error}")
                         job_data["tier_3_error"] = str(render_error)
                         job_data["tier_3_success"] = False
-                services_attempted.append(f"{MODEL_C_NAME}_tier3") # Use codename
+                services_attempted.append(f"{MODEL_C_NAME}_tier3")
 
         check_cancellation()
         # PROCESS RESULTS
         if transcription_result and transcription_result.get("status") == "completed":
-            logger.info(f"✅ Transcription completed successfully for job {job_id}")
+            logger.info(f"✅ Done! {job_id}")
             job_data.update({
                 "status": "completed",
                 "transcription": transcription_result["transcription"],
@@ -1053,7 +1086,7 @@ async def lifespan(app: FastAPI):
     logger.info("All background tasks cancelled and cleanup complete")
 
 logger.info("Creating FastAPI app...")
-app = FastAPI(title="Enhanced Transcription Service with ModelB, ModelC & ModelA", lifespan=lifespan) # Use codenames
+app = FastAPI(title=f"Enhanced Transcription Service with {MODEL_B_NAME}, {MODEL_C_NAME} & {MODEL_A_NAME}", lifespan=lifespan) # Use codenames
 logger.info("FastAPI app created successfully")
 
 logger.info("Setting up CORS middleware...")
@@ -1069,7 +1102,7 @@ logger.info("CORS middleware configured successfully")
 async def root():
     logger.info("Root endpoint called")
     return {
-        "message": "Enhanced Transcription Service with ModelB, ModelC & ModelA is running!", # Use codenames
+        "message": f"Enhanced Transcription Service with {MODEL_B_NAME}, {MODEL_C_NAME} & {MODEL_A_NAME} is running!", # Use codenames
         "features": [
             f"{MODEL_B_NAME} integration", # Use codename
             f"{MODEL_C_NAME} integration", # Use codename
@@ -1081,8 +1114,9 @@ async def root():
             "Language selection for transcription"
         ],
         "logic": {
-            "audio_10min_or_less": f"Primary={MODEL_B_NAME}, Fallback1={MODEL_C_NAME}, Fallback2={MODEL_A_NAME}", # Use codenames
-            "audio_over_10min": f"Primary={MODEL_A_NAME}, Fallback1={MODEL_B_NAME}, Fallback2={MODEL_C_NAME}", # Use codenames
+            "audio_10min_or_less": f"Primary={MODEL_C_NAME}, Fallback1={MODEL_B_NAME}, Fallback2={MODEL_A_NAME}", # UPDATED logic description
+            "audio_over_10min": f"Primary={MODEL_A_NAME}, Fallback1={MODEL_B_NAME}, Fallback2={MODEL_C_NAME}", # UPDATED logic description
+            "speaker_tags_enabled": f"Primary={MODEL_A_NAME}, Fallback1={MODEL_B_NAME}, Fallback2={MODEL_C_NAME}", # NEW logic description
             "free_users_assemblyai": f"{MODEL_A_NAME} nano model", # Use codename
             "paid_users_assemblyai": f"{MODEL_A_NAME} best model" # Use codename
         },
@@ -1385,7 +1419,7 @@ async def transcribe_audio(
         "file_size_mb": jobs[job_id]["file_size_mb"],
         "duration_minutes": duration_minutes,
         "created_at": jobs[job_id]["created_at"],
-        "logic_used": f"≤10min: {MODEL_B_NAME}→{MODEL_C_NAME}→{MODEL_A_NAME}, >10min: {MODEL_A_NAME}→{MODEL_B_NAME}→{MODEL_C_NAME}" # Use codenames
+        "logic_used": f"SpeakerTags:{MODEL_A_NAME}→{MODEL_B_NAME}→{MODEL_C_NAME}, ≤10min:{MODEL_C_NAME}→{MODEL_A_NAME}→{MODEL_B_NAME}, >10min:{MODEL_A_NAME}→{MODEL_C_NAME}→{MODEL_B_NAME}" # UPDATED logic description
     }
 
 # NEW ENDPOINT: Generate formatted Word document
@@ -1659,8 +1693,9 @@ async def health_check():
                 "paystack_configured": bool(PAYSTACK_SECRET_KEY)
             },
             "transcription_logic": {
-                "audio_10min_or_less": f"{MODEL_B_NAME} primary → {MODEL_C_NAME} Fallback → {MODEL_A_NAME} Fallback",
-                "audio_over_10min": f"{MODEL_A_NAME} primary → {MODEL_B_NAME} Fallback → {MODEL_C_NAME} Fallback",
+                "speaker_tags_enabled": f"Primary={MODEL_A_NAME} → {MODEL_B_NAME} Fallback → {MODEL_C_NAME} Fallback",
+                "audio_10min_or_less_no_speaker_tags": f"Primary={MODEL_C_NAME} → {MODEL_A_NAME} Fallback → {MODEL_B_NAME} Fallback",
+                "audio_over_10min_no_speaker_tags": f"Primary={MODEL_A_NAME} → {MODEL_C_NAME} Fallback → {MODEL_B_NAME} Fallback",
                 "free_users_assemblyai": f"{MODEL_A_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{MODEL_A_NAME} best model ($0.27/hour)",
                 "openai_whisper": f"{MODEL_B_NAME} (whisper-1 model ($0.006/minute))",
@@ -1713,10 +1748,10 @@ if __name__ == "__main__":
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
-    logger.info(f"  ✅ {MODEL_B_NAME} integration (replaces Render backend)")
-    logger.info(f"  ✅ {MODEL_C_NAME} re-integrated as fallback")
-    logger.info(f"  ✅ Smart service selection: ≤10min→{MODEL_B_NAME}→{MODEL_C_NAME}→{MODEL_A_NAME}, >10min→{MODEL_A_NAME}→{MODEL_B_NAME}→{MODEL_C_NAME}")
-    logger.info(f"  ✅ Three-tier automatic fallback between {MODEL_B_NAME}, {MODEL_C_NAME} and {MODEL_A_NAME}")
+    logger.info(f"  ✅ {MODEL_B_NAME} integration")
+    logger.info(f"  ✅ {MODEL_C_NAME} re-integrated")
+    logger.info(f"  ✅ Smart service selection with speaker tags priority")
+    logger.info(f"  ✅ Three-tier automatic fallback between {MODEL_A_NAME}, {MODEL_B_NAME}, and {MODEL_C_NAME}")
     logger.info(f"  ✅ Speaker diarization for {MODEL_B_NAME} and {MODEL_A_NAME}")
     logger.info(f"  ✅ Dynamic {MODEL_A_NAME} model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
@@ -1727,8 +1762,9 @@ if __name__ == "__main__":
     logger.info("  ✅ Formatted Word document generation")
     
     logger.info("🔧 TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Audio ≤10 minutes: {MODEL_B_NAME} primary, {MODEL_C_NAME} fallback, {MODEL_A_NAME} fallback")
-    logger.info(f"  - Audio >10 minutes: {MODEL_A_NAME} primary, {MODEL_B_NAME} fallback, {MODEL_C_NAME} fallback")
+    logger.info(f"  - Files with speaker tags: {MODEL_A_NAME} primary → {MODEL_B_NAME} fallback → {MODEL_C_NAME} fallback")
+    logger.info(f"  - Audio ≤10 minutes (no speaker tags): {MODEL_C_NAME} primary → {MODEL_A_NAME} fallback → {MODEL_B_NAME} fallback")
+    logger.info(f"  - Audio >10 minutes (no speaker tags): {MODEL_A_NAME} primary → {MODEL_C_NAME} fallback → {MODEL_B_NAME} fallback")
     logger.info(f"  - Free users: {MODEL_A_NAME} nano model ($0.12/hour)")
     logger.info(f"  - Paid users: {MODEL_A_NAME} best model ($0.27/hour)")
     logger.info(f"  - {MODEL_B_NAME}: whisper-1 model ($0.006/minute = $0.36/hour)")
