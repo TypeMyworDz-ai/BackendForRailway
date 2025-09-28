@@ -15,8 +15,7 @@ import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
-# NEW: Import httpx for explicit client creation
-import httpx
+import httpx # Keep httpx for potential future explicit async client use, though not directly for this fix
 # NEW IMPORTS for python-docx and regex
 from docx import Document
 from docx.shared import Inches
@@ -476,7 +475,21 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
-# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and `proxies` fix)
+# NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and `httpx.Client` for synchronous calls)
+def _transcribe_openai_sync(audio_path: str, language_code: str, openai_api_key: str) -> dict:
+    """Synchronous helper for OpenAI Whisper to be used with asyncio.to_thread."""
+    client = OpenAI(api_key=openai_api_key) # Instantiate synchronous client
+    
+    with open(audio_path, "rb") as audio_file:
+        transcript = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language=language_code if language_code != "en" else None,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"]
+        )
+    return transcript.model_dump() # Use model_dump to convert to dict
+
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "en", job_id: str = None) -> dict:
     """Transcribe audio using OpenAI Whisper API with speaker diarization"""
     try:
@@ -489,37 +502,22 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
         
         check_cancellation()
         
-        # Get file size for logging
         file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
         logger.info(f"OpenAI Whisper: Processing {file_size_mb:.2f} MB audio file")
         
-        # NEW: Instantiate OpenAI client for version >= 1.0.0, explicitly handling HTTPX client
-        # This resolves the 'unexpected keyword argument proxies' error.
-        # httpx will automatically pick up proxy settings from environment variables.
-        async_client = httpx.AsyncClient() 
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=async_client)
-        
-        # Open and transcribe the audio file
-        with open(audio_path, "rb") as audio_file:
-            check_cancellation()
-            
-            # Use new OpenAI API syntax (client.audio.transcriptions.create)
-            transcript = await asyncio.to_thread(
-                client.audio.transcriptions.create, # Updated API call
-                model="whisper-1",
-                file=audio_file,
-                language=language_code if language_code != "en" else None,  # Let Whisper auto-detect for English
-                response_format="verbose_json",
-                timestamp_granularities=["segment"]
-            )
+        # Call the synchronous helper function in a thread pool
+        transcript_data = await asyncio.to_thread(
+            _transcribe_openai_sync,
+            audio_path,
+            language_code,
+            OPENAI_API_KEY
+        )
         
         check_cancellation()
         
-        # Process the transcript for speaker diarization simulation
-        transcription_text = transcript.text
-        segments = getattr(transcript, 'segments', []) # Use getattr for safe access
+        transcription_text = transcript_data['text']
+        segments = transcript_data.get('segments', [])
         
-        # Simple speaker diarization simulation based on pauses
         if segments and len(segments) > 1:
             formatted_transcript = ""
             current_speaker = 1
@@ -529,7 +527,6 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
                 start_time = segment.get('start', 0)
                 text = segment.get('text', '').strip()
                 
-                # If there's a significant pause (>3 seconds), switch speaker
                 if start_time - last_end_time > 3.0:
                     current_speaker = 2 if current_speaker == 1 else 1
                 
@@ -538,7 +535,6 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
                 
                 last_end_time = segment.get('end', start_time)
             
-            # Use formatted transcript if we have segments, otherwise use plain text
             final_transcript = formatted_transcript.strip() if formatted_transcript.strip() else transcription_text
         else:
             final_transcript = transcription_text
@@ -548,11 +544,11 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
         return {
             "status": "completed",
             "transcription": final_transcript,
-            "language": getattr(transcript, 'language', language_code), # Use getattr for safe access
-            "duration": getattr(transcript, 'duration', 0), # Use getattr for safe access
+            "language": transcript_data.get('language', language_code),
+            "duration": transcript_data.get('duration', 0),
             "word_count": len(transcription_text.split()) if transcription_text else 0,
             "segments_count": len(segments),
-            "has_speaker_labels": len(segments) > 1  # Indicate if we added speaker labels
+            "has_speaker_labels": len(segments) > 1
         }
         
     except asyncio.CancelledError:
