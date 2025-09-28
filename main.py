@@ -15,7 +15,7 @@ import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
-import httpx # Keep httpx for potential future explicit async client use, though not directly for this fix
+import httpx # Keep httpx import in case it's used elsewhere, but not directly for OpenAI client instantiation in this fix
 # NEW IMPORTS for python-docx and regex
 from docx import Document
 from docx.shared import Inches
@@ -475,9 +475,12 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
+
 # NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and `httpx.Client` for synchronous calls)
 def _transcribe_openai_sync(audio_path: str, language_code: str, openai_api_key: str) -> dict:
     """Synchronous helper for OpenAI Whisper to be used with asyncio.to_thread."""
+    # Ensure no 'proxies' argument is unexpectedly passed by the environment
+    # The OpenAI client will automatically pick up HTTP_PROXY/HTTPS_PROXY env vars.
     client = OpenAI(api_key=openai_api_key) # Instantiate synchronous client
     
     with open(audio_path, "rb") as audio_file:
@@ -860,6 +863,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             del cancellation_flags[job_id]
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
@@ -891,7 +895,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS middleware configured successfully")
-
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
