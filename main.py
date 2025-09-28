@@ -15,7 +15,7 @@ import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional
-import httpx # Keep httpx import
+import httpx # Keep httpx import for Render backend calls
 # NEW IMPORTS for python-docx and regex
 from docx import Document
 from docx.shared import Inches
@@ -58,7 +58,7 @@ logger.info("Loading environment variables...")
 load_dotenv()
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL") # NEW: Render Whisper URL
+RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL") # RE-ADDED: Render Whisper URL
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
@@ -66,7 +66,7 @@ PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
 
 logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"Attempted to load OPENAI_API_KEY. Value found: {bool(OPENAI_API_KEY)}")
-logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}") # NEW
+logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}") # RE-ADDED
 logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
 
@@ -78,7 +78,7 @@ if not OPENAI_API_KEY:
 else:
     logger.info("OpenAI API key found and will be configured with client instantiation.")
 
-if not RENDER_WHISPER_URL: # NEW
+if not RENDER_WHISPER_URL: # RE-ADDED
     logger.warning("RENDER_WHISPER_URL environment variable not set! Render Whisper will not be available as a fallback.")
 
 if not PAYSTACK_SECRET_KEY:
@@ -124,7 +124,6 @@ active_background_tasks = {}
 cancellation_flags = {}
 
 logger.info("Enhanced job tracking initialized")
-
 async def analyze_audio_characteristics(audio_path: str) -> dict:
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -259,7 +258,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_path) * 100 if input_size > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
@@ -480,25 +479,41 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
-
 # NEW: OpenAI Whisper transcription function (UPDATED for openai>=1.0.0 and `httpx.Client` for synchronous calls)
 def _transcribe_openai_sync(audio_path: str, language_code: str, openai_api_key: str) -> dict:
     """Synchronous helper for OpenAI Whisper to be used with asyncio.to_thread."""
-    # Ensure no 'proxies' argument is unexpectedly passed by the environment
-    # The OpenAI client will automatically pick up HTTP_PROXY/HTTPS_PROXY env vars.
-    # Instantiate synchronous client directly without http_client if not explicitly needed,
-    # to avoid the 'unexpected keyword argument proxies' error.
-    client = OpenAI(api_key=openai_api_key) 
+    # Temporarily remove proxy environment variables to prevent injection into OpenAI client
+    # Store original values to restore them later.
+    original_http_proxy = os.environ.pop('HTTP_PROXY', None)
+    original_https_proxy = os.environ.pop('HTTPS_PROXY', None)
+    original_no_proxy = os.environ.pop('NO_PROXY', None)
     
-    with open(audio_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            language=language_code if language_code != "en" else None,
-            response_format="verbose_json",
-            timestamp_granularities=["segment"]
-        )
-    return transcript.model_dump() # Use model_dump to convert to dict
+    # Also explicitly remove 'proxies' if it somehow got into os.environ
+    original_proxies = os.environ.pop('proxies', None)
+
+    try:
+        client = OpenAI(api_key=openai_api_key) # Instantiate synchronous client
+        
+        with open(audio_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language=language_code if language_code != "en" else None,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"]
+            )
+        return transcript.model_dump() # Use model_dump to convert to dict
+    finally:
+        # Restore original proxy environment variables
+        if original_http_proxy is not None:
+            os.environ['HTTP_PROXY'] = original_http_proxy
+        if original_https_proxy is not None:
+            os.environ['HTTPS_PROXY'] = original_https_proxy
+        if original_no_proxy is not None:
+            os.environ['NO_PROXY'] = original_no_proxy
+        if original_proxies is not None:
+            os.environ['proxies'] = original_proxies
+
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "en", job_id: str = None) -> dict:
     """Transcribe audio using OpenAI Whisper API with speaker diarization"""
     try:
@@ -570,7 +585,7 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str = "
             "error": f"OpenAI Whisper transcription failed: {str(e)}"
         }
 
-# NEW: Render Whisper transcription function
+# NEW: Render Whisper transcription function (UPDATED for httpx.FormData fix)
 async def transcribe_with_render_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Transcribe audio using the self-hosted Render Whisper backend."""
     if not RENDER_WHISPER_URL:
@@ -587,16 +602,15 @@ async def transcribe_with_render_whisper(audio_path: str, language_code: str, jo
         
         check_cancellation()
 
-        # Prepare form data for Render Whisper
-        form_data = httpx.FormData()
+        # UPDATED: Directly pass file content using 'files' parameter
         with open(audio_path, "rb") as f:
-            form_data.add_field("file", f.read(), filename=os.path.basename(audio_path), content_type="audio/mpeg")
-        form_data.add_field("language_code", language_code)
+            files = {'file': (os.path.basename(audio_path), f.read(), 'audio/mpeg')}
+            data = {'language_code': language_code}
 
-        # Send request to Render Whisper backend
-        async with httpx.AsyncClient() as client:
-            response = await client.post(f"{RENDER_WHISPER_URL}/transcribe", files=form_data.files, timeout=300.0) # 5 min timeout
-            response.raise_for_status() # Raise an exception for HTTP errors
+            # Send request to Render Whisper backend
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"{RENDER_WHISPER_URL}/transcribe", files=files, data=data, timeout=300.0) # 5 min timeout
+                response.raise_for_status() # Raise an exception for HTTP errors
 
         result = response.json()
         
@@ -742,7 +756,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                     "transcription": transcription_text,
                     "language": status_result["language_code"],
                     "duration": status_result.get("audio_duration", 0),
-                    "word_count": len(status_result["text"].split()) if status_result["text"] else 0,
+                    "word_count": len(transcription_text.split()) if transcription_text else 0,
                     "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances"))
                 }
             elif status_result["status"] == "error":
