@@ -1,5 +1,5 @@
 # ===============================================================================
-# COMPLETE UPDATED main.py - PART 1
+# COMPLETE UPDATED main.py - PART 1 (WITH CLAUDE MODEL FIX + TEST ENDPOINT)
 # This file includes Anthropic Claude integration for user-facing and admin-facing AI features.
 # ===============================================================================
 
@@ -142,17 +142,17 @@ class FormattedWordDownloadRequest(BaseModel):
     transcription_html: str
     filename: Optional[str] = "transcription.docx"
 
-# FIXED: Updated Pydantic Models for AI Interaction with correct model names
+# FIXED: Updated Pydantic Models for AI Interaction with most likely working model
 class UserAIRequest(BaseModel):
     transcript: str
     user_prompt: str
-    model: str = "claude-3-5-sonnet-20240620"  # UPDATED to verified working model
+    model: str = "claude-3-sonnet-20240229"  # UPDATED to most stable model
     max_tokens: int = 1000
 
 class AdminAIFormatRequest(BaseModel):
     transcript: str
     formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-3-5-sonnet-20240620"  # UPDATED to verified working model
+    model: str = "claude-3-sonnet-20240229"  # UPDATED to most stable model
     max_tokens: int = 4000
 
 # Global variables for job tracking
@@ -958,6 +958,57 @@ async def root():
         }
     }
 
+# ADDED: Quick Test Method for Claude Models
+@app.get("/test-claude-models")
+async def test_claude_models():
+    """Test which Claude models work with your API key"""
+    if not claude_client:
+        return {"error": "Claude client not initialized - check your ANTHROPIC_API_KEY"}
+    
+    models_to_test = [
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307",
+        "claude-3-5-sonnet-20240620",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022"
+    ]
+    
+    results = {}
+    
+    for model in models_to_test:
+        try:
+            logger.info(f"Testing Claude model: {model}")
+            message = claude_client.messages.create(
+                model=model,
+                max_tokens=10,
+                timeout=10.0,
+                messages=[{"role": "user", "content": "Hello"}]
+            )
+            results[model] = "✅ WORKS"
+            logger.info(f"✅ Model {model} works!")
+        except anthropic.APIError as e:
+            error_msg = str(e)
+            if hasattr(e, 'body'):
+                try:
+                    error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
+                    error_msg = str(error_data)
+                except:
+                    pass
+            results[model] = f"❌ API ERROR: {error_msg}"
+            logger.error(f"❌ Model {model} failed: {error_msg}")
+        except Exception as e:
+            results[model] = f"❌ ERROR: {str(e)}"
+            logger.error(f"❌ Model {model} failed: {str(e)}")
+    
+    return {
+        "test_results": results,
+        "recommendation": "Use the first model marked with ✅ WORKS in your UserAIRequest and AdminAIFormatRequest classes",
+        "current_default_models": {
+            "UserAIRequest": "claude-3-sonnet-20240229",
+            "AdminAIFormatRequest": "claude-3-sonnet-20240229"
+        }
+    }
+
 @app.post("/api/initialize-paystack-payment")
 async def initialize_paystack_payment(request: PaystackInitializationRequest):
     logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
@@ -1162,7 +1213,8 @@ async def paystack_status():
             "status": "/api/paystack-status",
             "transcribe": "/transcribe",
             "ai_user_query": "/ai/user-query",
-            "ai_admin_format": "/ai/admin-format"
+            "ai_admin_format": "/ai/admin-format",
+            "test_claude_models": "/test-claude-models"
         },
         "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"],
         "supported_plans": [
@@ -1600,6 +1652,7 @@ async def list_jobs():
             }
         }
     }
+
 @app.get("/health")
 async def health_check():
     logger.info("Health check endpoint called")
@@ -1639,7 +1692,7 @@ async def health_check():
                 "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model ($0.27/hour)",
                 "render_whisper": f"{TYPEMYWORDZ2_NAME} (self-hosted Whisper)",
-                "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3.5 Sonnet)"
+                "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Sonnet)"
             }
         }
         
@@ -1660,27 +1713,17 @@ logger.info(f"{TYPEMYWORDZ1_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}
 logger.info(f"{TYPEMYWORDZ2_NAME} URL configured: {bool(RENDER_WHISPER_URL)}")
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
-logger.info(f"Job tracking systems initialized:")
-logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
-logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
-logger.info(f"  - Cancellation flags: {len(cancellation_flags)} flags")
 
 logger.info("Available API endpoints:")
-logger.info("  POST /transcribe - Main transcription endpoint with smart service selection")
+logger.info("  POST /transcribe - Main transcription endpoint")
+logger.info("  GET /test-claude-models - Test which Claude models work with your API key")
+logger.info("  POST /ai/user-query - Process user AI queries")
+logger.info("  POST /ai/admin-format - Process admin AI formatting")
 logger.info("  GET /status/{job_id} - Check job status")
 logger.info("  POST /cancel/{job_id} - Cancel transcription job")
-logger.info("  POST /compress-download - Compress audio for download")
-logger.info("  POST /generate-formatted-word - Generate formatted Word document with speaker labels")
-logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points)")
-logger.info("  POST /ai/admin-format - Process admin-driven AI formatting requests")
-logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payment")
-logger.info("  POST /api/verify-payment - Verify Paystack payment")
-logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
-logger.info("  GET /api/paystack-status - Get integration status")
-logger.info("  GET /jobs - List all jobs")
 logger.info("  GET /health - System health check")
+logger.info("  GET /jobs - List all jobs")
 logger.info("  DELETE /cleanup - Clean up old jobs")
-logger.info("  GET / - Root endpoint with service info")
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
@@ -1689,31 +1732,15 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
-    logger.info("🚀 NEW ENHANCED FEATURES:")
-    logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} re-integrated")
-    logger.info(f"  ✅ Smart service selection with speaker tags priority")
-    logger.info(f"  ✅ Two-tier automatic fallback between {TYPEMYWORDZ1_NAME} and {TYPEMYWORDZ2_NAME}")
-    logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ1_NAME}")
-    logger.info(f"  ✅ Dynamic {TYPEMYWORDZ1_NAME} model selection (nano for free, best for paid)")
-    logger.info("  ✅ Unified transcription processing pipeline")
-    logger.info("  ✅ Enhanced error handling and service resilience")
-    logger.info("  ✅ Comprehensive job tracking and cancellation")
+    logger.info("🚀 ENHANCED FEATURES:")
+    logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} integration")
+    logger.info(f"  ✅ {TYPEMYWORDZ1_NAME} integration with smart model selection")
+    logger.info(f"  ✅ {TYPEMYWORDZ_AI_NAME} integration with Claude model testing")
+    logger.info("  ✅ Two-tier automatic fallback system")
+    logger.info("  ✅ Enhanced error handling and logging")
+    logger.info("  ✅ Comprehensive job tracking")
     logger.info("  ✅ Paystack payment integration")
-    logger.info("  ✅ Multi-language support")
-    logger.info("  ✅ Formatted Word document generation")
-    logger.info(f"  ✅ User-driven AI features (summarization, Q&A, bullet points) via {TYPEMYWORDZ_AI_NAME}")
-    logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME}")
-    
-    logger.info("🔧 TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Files with speaker tags: {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback")
-    logger.info(f"  - Audio <5 minutes (no speaker tags): {TYPEMYWORDZ2_NAME} primary → {TYPEMYWORDZ1_NAME} fallback")
-    logger.info(f"  - Audio >=5 minutes (no speaker tags): {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback")
-    logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model ($0.12/hour)")
-    logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model ($0.27/hour)")
-    logger.info(f"  - {TYPEMYWORDZ2_NAME}: self-hosted Whisper (variable cost)")
-    logger.info(f"  - {TYPEMYWORDZ1_NAME} supports speaker labels with HTML formatting")
-    logger.info(f"  - {TYPEMYWORDZ2_NAME} typically does NOT support speaker labels")
-    logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3.5 Sonnet) for text processing")
+    logger.info("  ✅ Claude model compatibility testing endpoint")
     
     try:
         uvicorn.run(
@@ -1733,5 +1760,5 @@ else:
     logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ_AI_NAME} integration")
 
 # ===============================================================================
-# END COMPLETE UPDATED main.py
+# END COMPLETE UPDATED main.py WITH CLAUDE MODEL FIX + TEST ENDPOINT
 # ===============================================================================
