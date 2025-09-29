@@ -116,7 +116,8 @@ else:
 
 # NEW: Helper function to determine if a user has access to AI features
 def is_paid_ai_user(user_plan: str) -> bool:
-    paid_plans_for_ai = ['Three-Day Plan', 'One-Week Plan', 'Pro']
+    # UPDATED: Only 'Three-Day Plan' and 'Pro' plans are eligible for AI features
+    paid_plans_for_ai = ['Three-Day Plan', 'Pro']
     return user_plan in paid_plans_for_ai
 
 
@@ -306,7 +307,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_path) * 100 if input_path > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
@@ -762,18 +763,19 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         
         # Determine AssemblyAI model based on user plan
         def get_assemblyai_model(plan: str) -> str:
-            if plan == 'free':
-                return "nano"  # $0.12/hour for free users
+            if plan == 'free' or plan == 'One-Day Plan': # Free and One-Day users get nano for TypeMyworDz1 if it were used
+                return "nano"  # $0.12/hour
             else:
-                return "best"  # $0.27/hour for paid users
+                return "best"  # $0.27/hour
 
         assemblyai_model = get_assemblyai_model(user_plan)
 
+        # NEW LOGIC:
         if user_plan == 'free' or user_plan == 'One-Day Plan': # Free and One-Day users only get TypeMyworDz2
             service_tier_1 = "render"
             service_tier_2 = None # No fallback for free/one-day users as per request
             logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ2_NAME}, No fallback (as per request)")
-        else: # All other paid users (3-Day, 1-Week, Pro)
+        else: # All other paid users (Three-Day, One-Week, Pro)
             service_tier_1 = "assemblyai"
             service_tier_2 = "render" # TypeMyworDz2 as fallback for paid users
             logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ1_NAME} ({assemblyai_model}), Fallback={TYPEMYWORDZ2_NAME}")
@@ -966,11 +968,11 @@ async def root():
             f"{TYPEMYWORDZ_AI_NAME} for admin-driven transcript formatting"
         ],
         "logic": {
-            "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}", # UPDATED
-            "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED
+            "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}",
+            "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
             "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for 3-Day, 1-Week, and Pro plans" # NEW
+            "ai_features_access": "Only for Three-Day and Pro plans" # UPDATED
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1025,8 +1027,8 @@ async def test_claude_models():
         "test_results": results,
         "recommendation": "Use the first model marked with ✅ WORKS in your UserAIRequest and AdminAIFormatRequest classes",
         "current_default_models": {
-            "UserAIRequest": "claude-3-haiku-20240307", # UPDATED
-            "AdminAIFormatRequest": "claude-3-5-haiku-20241022" # UPDATED
+            "UserAIRequest": "claude-3-haiku-20240307",
+            "AdminAIFormatRequest": "claude-3-5-haiku-20241022"
         }
     }
 
@@ -1381,7 +1383,7 @@ async def ai_user_query(request: UserAIRequest, user_plan: str = Form("free")): 
 
     # NEW: AI Access Control
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (3-Day, 1-Week, Pro plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, Pro plans). Please upgrade your plan.")
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1441,7 +1443,7 @@ async def ai_admin_format(request: AdminAIFormatRequest, user_plan: str = Form("
 
     # NEW: AI Access Control
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (3-Day, 1-Week, Pro plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, Pro plans). Please upgrade your plan.")
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1720,13 +1722,13 @@ async def health_check():
                 "paystack_configured": bool(PAYSTACK_SECRET_KEY)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}", # UPDATED
-                "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED
+                "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}",
+                "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
                 "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model ($0.27/hour)",
-                "ai_features_access": "Only for 3-Day, 1-Week, and Pro plans", # NEW
+                "ai_features_access": "Only for Three-Day and Pro plans", # UPDATED
                 "render_whisper": f"{TYPEMYWORDZ2_NAME} (self-hosted Whisper)",
-                "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku)" # UPDATED to reflect selected models
+                "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku)"
             }
         }
         
@@ -1775,8 +1777,8 @@ if __name__ == "__main__":
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
     logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} re-integrated")
-    logger.info(f"  ✅ Smart service selection with updated logic") # UPDATED
-    logger.info(f"  ✅ Two-tier automatic fallback for paid users") # UPDATED
+    logger.info(f"  ✅ Smart service selection with updated logic")
+    logger.info(f"  ✅ Two-tier automatic fallback for paid users")
     logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ1_NAME}")
     logger.info(f"  ✅ Dynamic {TYPEMYWORDZ1_NAME} model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
@@ -1787,17 +1789,17 @@ if __name__ == "__main__":
     logger.info("  ✅ Formatted Word document generation")
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, bullet points) via {TYPEMYWORDZ_AI_NAME}")
     logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME}")
-    logger.info(f"  ✅ AI Assistant features restricted to paid users (3-Day, 1-Week, Pro plans)") # NEW
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, Pro plans)") # UPDATED
     
     logger.info("🔧 TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free/One-Day users: Only {TYPEMYWORDZ2_NAME}") # UPDATED
-    logger.info(f"  - Paid users (3-Day, 1-Week, Pro): {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback") # UPDATED
+    logger.info(f"  - Free/One-Day users: Only {TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Paid users (3-Day, 1-Week, Pro): {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model ($0.12/hour)")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model ($0.27/hour)")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: self-hosted Whisper (variable cost)")
     logger.info(f"  - {TYPEMYWORDZ1_NAME} supports speaker labels with HTML formatting")
     logger.info(f"  - {TYPEMYWORDZ2_NAME} typically does NOT support speaker labels")
-    logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing") # UPDATED
+    logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing")
     
     try:
         uvicorn.run(
