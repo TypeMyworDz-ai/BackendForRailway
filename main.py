@@ -1443,7 +1443,11 @@ async def ai_user_query(
         logger.error(f"Unexpected error processing AI user query: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# UPDATED: AI Endpoint for Admin Formatting with Form fields
+# ===============================================================================
+# main.py - Admin AI Format Endpoint (UPDATED to remove character limit)
+# ===============================================================================
+
+# UPDATED: AI Endpoint for Admin Formatting (removed character limit validation)
 @app.post("/ai/admin-format")
 async def ai_admin_format(
     transcript: str = Form(...),
@@ -1462,12 +1466,13 @@ async def ai_admin_format(
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
 
     try:
-        # Validate input lengths
+        # Validate input lengths (transcript limit remains)
         if len(transcript) > 200000:  # ~200k chars limit for admin (higher than user)
             raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
         
-        if len(formatting_instructions) > 2000:  # 2k chars limit for admin instructions
-            raise HTTPException(status_code=400, detail="Formatting instructions are too long. Please use shorter instructions.")
+        # REMOVED: Frontend character limit check for instructions
+        # if len(formatting_instructions) > 2000:
+        #     raise HTTPException(status_code=400, detail="Formatting instructions are too long. Please use shorter instructions.")
 
         # Construct the full prompt for Claude, emphasizing the formatting instructions
         full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
@@ -1508,6 +1513,7 @@ async def ai_admin_format(
     except Exception as e:
         logger.error(f"Unexpected error processing AI admin format request: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during admin formatting: {str(e)}")
+
 # ===============================================================================
 # main.py - Part 7 of 7: Final Endpoints and Application Startup (UPDATED)
 # ===============================================================================
