@@ -1,5 +1,5 @@
 # ===============================================================================
-# COMPLETE UPDATED main.py - PART 1 (WITH CLAUDE MODEL FIX + TEST ENDPOINT)
+# COMPLETE UPDATED main.py - PART 1 (WITH NEW AI ACCESS LOGIC)
 # This file includes Anthropic Claude integration for user-facing and admin-facing AI features.
 # ===============================================================================
 
@@ -114,6 +114,12 @@ if ANTHROPIC_API_KEY:
 else:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} API key is missing, Claude client will not be initialized.")
 
+# NEW: Helper function to determine if a user has access to AI features
+def is_paid_ai_user(user_plan: str) -> bool:
+    paid_plans_for_ai = ['Three-Day Plan', 'One-Week Plan', 'Pro']
+    return user_plan in paid_plans_for_ai
+
+
 # Pydantic Models
 class PaystackVerificationRequest(BaseModel):
     reference: str
@@ -146,13 +152,13 @@ class FormattedWordDownloadRequest(BaseModel):
 class UserAIRequest(BaseModel):
     transcript: str
     user_prompt: str
-    model: str = "claude-3-haiku-20240307"  # UPDATED to most stable model
+    model: str = "claude-3-haiku-20240307"  # UPDATED to working model
     max_tokens: int = 1000
 
 class AdminAIFormatRequest(BaseModel):
     transcript: str
     formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-3-5-haiku-20241022"  # UPDATED to most stable model
+    model: str = "claude-3-5-haiku-20241022"  # UPDATED to latest working model
     max_tokens: int = 4000
 
 # Global variables for job tracking
@@ -161,6 +167,10 @@ active_background_tasks = {}
 cancellation_flags = {}
 
 logger.info("Enhanced job tracking initialized")
+# ===============================================================================
+# main.py - Part 2 of 7: Audio Processing and Helper Functions (UNCHANGED)
+# ===============================================================================
+
 # Audio analysis and compression functions
 async def analyze_audio_characteristics(audio_path: str) -> dict:
     try:
@@ -300,7 +310,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -417,6 +427,10 @@ async def health_monitor():
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
             await asyncio.sleep(30)
+# ===============================================================================
+# main.py - Part 3 of 7: Paystack Functions (UNCHANGED)
+# ===============================================================================
+
 # Paystack helper functions
 async def verify_paystack_payment(reference: str) -> dict:
     """Verify Paystack payment using reference"""
@@ -517,6 +531,9 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'success': False,
             'error': str(e)
         }
+# ===============================================================================
+# main.py - Part 4 of 7: Transcription Service Functions (UNCHANGED)
+# ===============================================================================
 
 # Transcription service functions
 async def transcribe_with_render_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
@@ -717,6 +734,10 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "status": "failed",
             "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
         }
+# ===============================================================================
+# main.py - Part 5 of 7: Main Transcription Processing (UPDATED)
+# ===============================================================================
+
 # Main transcription processing function
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float):
     """Unified transcription processing with smart model selection and two-tier fallback."""
@@ -735,23 +756,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # Smart model selection logic
+        # UPDATED: Transcription service selection logic
         service_tier_1 = None
         service_tier_2 = None
         
-        if speaker_labels_enabled:
-            service_tier_1 = "assemblyai"
-            service_tier_2 = "render"
-            logger.info(f"🎯 Speaker tags requested: Primary={TYPEMYWORDZ1_NAME}, Fallback={TYPEMYWORDZ2_NAME}")
-        elif duration_minutes < 5:
-            service_tier_1 = "render"
-            service_tier_2 = "assemblyai"
-            logger.info(f"🎯 Audio <5min (no speaker tags): Primary={TYPEMYWORDZ2_NAME}, Fallback={TYPEMYWORDZ1_NAME}")
-        else:
-            service_tier_1 = "assemblyai"
-            service_tier_2 = "render"
-            logger.info(f"🎯 Audio >=5min (no speaker tags): Primary={TYPEMYWORDZ1_NAME}, Fallback={TYPEMYWORDZ2_NAME}")
-
         # Determine AssemblyAI model based on user plan
         def get_assemblyai_model(plan: str) -> str:
             if plan == 'free':
@@ -760,7 +768,16 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 return "best"  # $0.27/hour for paid users
 
         assemblyai_model = get_assemblyai_model(user_plan)
-        
+
+        if user_plan == 'free' or user_plan == 'One-Day Plan': # Free and One-Day users only get TypeMyworDz2
+            service_tier_1 = "render"
+            service_tier_2 = None # No fallback for free/one-day users as per request
+            logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ2_NAME}, No fallback (as per request)")
+        else: # All other paid users (3-Day, 1-Week, Pro)
+            service_tier_1 = "assemblyai"
+            service_tier_2 = "render" # TypeMyworDz2 as fallback for paid users
+            logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ1_NAME} ({assemblyai_model}), Fallback={TYPEMYWORDZ2_NAME}")
+
         job_data.update({
             "service_tier_1": service_tier_1,
             "service_tier_2": service_tier_2,
@@ -806,8 +823,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # --- ATTEMPT TIER 2 SERVICE (FALLBACK 1) if Tier 1 failed ---
-        if not transcription_result or transcription_result.get("status") == "failed":
+        # --- ATTEMPT TIER 2 SERVICE (FALLBACK 1) if Tier 1 failed AND service_tier_2 is defined ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and service_tier_2:
             logger.warning(f"⚠️ Tier 1 service failed, trying Tier 2 fallback ({service_tier_2}) for job {job_id}")
             
             if service_tier_2 == "render":
@@ -896,6 +913,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             del cancellation_flags[job_id]
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
+# ===============================================================================
+# main.py - Part 6 of 7: App Setup and AI Endpoints (UPDATED)
+# ===============================================================================
 
 # Application lifespan management
 @asynccontextmanager
@@ -929,6 +949,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS middleware configured successfully")
+
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
@@ -945,11 +966,11 @@ async def root():
             f"{TYPEMYWORDZ_AI_NAME} for admin-driven transcript formatting"
         ],
         "logic": {
-            "speaker_tags_enabled": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
-            "audio_less_than_5min_no_speaker_tags": f"Primary={TYPEMYWORDZ2_NAME} → {TYPEMYWORDZ1_NAME} Fallback",
-            "audio_5min_and_above_no_speaker_tags": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
+            "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}", # UPDATED
+            "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED
             "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model",
-            "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model"
+            "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model",
+            "ai_features_access": "Only for 3-Day, 1-Week, and Pro plans" # NEW
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1004,8 +1025,8 @@ async def test_claude_models():
         "test_results": results,
         "recommendation": "Use the first model marked with ✅ WORKS in your UserAIRequest and AdminAIFormatRequest classes",
         "current_default_models": {
-            "UserAIRequest": "claude-3-sonnet-20240229",
-            "AdminAIFormatRequest": "claude-3-sonnet-20240229"
+            "UserAIRequest": "claude-3-haiku-20240307", # UPDATED
+            "AdminAIFormatRequest": "claude-3-5-haiku-20241022" # UPDATED
         }
     }
 
@@ -1225,12 +1246,13 @@ async def paystack_status():
         ],
         "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES
     }
+
 @app.post("/transcribe")
 async def transcribe_audio(
     file: UploadFile = File(...),
     language_code: Optional[str] = Form("en"),
     speaker_labels_enabled: bool = Form(False),
-    user_plan: str = Form("free"),
+    user_plan: str = Form("free"), # Get user_plan from frontend
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     logger.info(f"Main transcription endpoint called with file: {file.filename}, language: {language_code}, speaker_labels: {speaker_labels_enabled}, user_plan: {user_plan}")
@@ -1301,7 +1323,7 @@ async def transcribe_audio(
         "file_size_mb": jobs[job_id]["file_size_mb"],
         "duration_minutes": duration_minutes,
         "created_at": jobs[job_id]["created_at"],
-        "logic_used": f"SpeakerTags:{TYPEMYWORDZ1_NAME}→{TYPEMYWORDZ2_NAME}, <5min:{TYPEMYWORDZ2_NAME}→{TYPEMYWORDZ1_NAME}, >=5min:{TYPEMYWORDZ1_NAME}→{TYPEMYWORDZ2_NAME}"
+        "logic_used": f"UserPlan:{user_plan}" # UPDATED: Logic description
     }
 
 @app.post("/generate-formatted-word")
@@ -1352,10 +1374,14 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
         logger.error(f"Error generating formatted Word document: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate formatted Word document: {str(e)}")
 
-# IMPROVED: AI Endpoint for User Queries with better error handling
+# UPDATED: AI Endpoint for User Queries with plan check
 @app.post("/ai/user-query")
-async def ai_user_query(request: UserAIRequest):
-    logger.info(f"AI user query endpoint called. Model: {request.model}, Prompt: '{request.user_prompt}'")
+async def ai_user_query(request: UserAIRequest, user_plan: str = Form("free")): # Get user_plan from frontend
+    logger.info(f"AI user query endpoint called. Model: {request.model}, Prompt: '{request.user_prompt}', User Plan: {user_plan}")
+
+    # NEW: AI Access Control
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (3-Day, 1-Week, Pro plans). Please upgrade your plan.")
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1408,10 +1434,14 @@ async def ai_user_query(request: UserAIRequest):
         logger.error(f"Unexpected error processing AI user query: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# IMPROVED: AI Endpoint for Admin Formatting with better error handling
+# UPDATED: AI Endpoint for Admin Formatting with plan check
 @app.post("/ai/admin-format")
-async def ai_admin_format(request: AdminAIFormatRequest):
-    logger.info(f"AI admin format endpoint called. Model: {request.model}, Instructions: '{request.formatting_instructions}'")
+async def ai_admin_format(request: AdminAIFormatRequest, user_plan: str = Form("free")): # Get user_plan from frontend
+    logger.info(f"AI admin format endpoint called. Model: {request.model}, Instructions: '{request.formatting_instructions}', User Plan: {user_plan}")
+
+    # NEW: AI Access Control
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (3-Day, 1-Week, Pro plans). Please upgrade your plan.")
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1463,6 +1493,10 @@ async def ai_admin_format(request: AdminAIFormatRequest):
     except Exception as e:
         logger.error(f"Unexpected error processing AI admin format request: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during admin formatting: {str(e)}")
+# ===============================================================================
+# main.py - Part 7 of 7: Final Endpoints and Application Startup (UPDATED)
+# ===============================================================================
+
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     logger.info(f"Status check for job ID: {job_id}")
@@ -1686,13 +1720,13 @@ async def health_check():
                 "paystack_configured": bool(PAYSTACK_SECRET_KEY)
             },
             "transcription_logic": {
-                "speaker_tags_enabled": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
-                "audio_less_than_5min_no_speaker_tags": f"Primary={TYPEMYWORDZ2_NAME} → {TYPEMYWORDZ1_NAME} Fallback",
-                "audio_5min_and_above_no_speaker_tags": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
+                "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}", # UPDATED
+                "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback", # UPDATED
                 "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model ($0.27/hour)",
+                "ai_features_access": "Only for 3-Day, 1-Week, and Pro plans", # NEW
                 "render_whisper": f"{TYPEMYWORDZ2_NAME} (self-hosted Whisper)",
-                "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Sonnet)"
+                "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku)" # UPDATED to reflect selected models
             }
         }
         
@@ -1715,15 +1749,22 @@ logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 
 logger.info("Available API endpoints:")
-logger.info("  POST /transcribe - Main transcription endpoint")
+logger.info("  POST /transcribe - Main transcription endpoint with smart service selection")
 logger.info("  GET /test-claude-models - Test which Claude models work with your API key")
-logger.info("  POST /ai/user-query - Process user AI queries")
-logger.info("  POST /ai/admin-format - Process admin AI formatting")
+logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points)")
+logger.info("  POST /ai/admin-format - Process admin-driven AI formatting requests")
+logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payment")
+logger.info("  POST /api/verify-payment - Verify Paystack payment")
+logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
+logger.info("  GET /api/paystack-status - Get integration status")
 logger.info("  GET /status/{job_id} - Check job status")
 logger.info("  POST /cancel/{job_id} - Cancel transcription job")
-logger.info("  GET /health - System health check")
+logger.info("  POST /compress-download - Compress audio for download")
+logger.info("  POST /generate-formatted-word - Generate formatted Word document with speaker labels")
 logger.info("  GET /jobs - List all jobs")
+logger.info("  GET /health - System health check")
 logger.info("  DELETE /cleanup - Clean up old jobs")
+logger.info("  GET / - Root endpoint with service info")
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
@@ -1732,15 +1773,31 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
-    logger.info("🚀 ENHANCED FEATURES:")
-    logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} integration")
-    logger.info(f"  ✅ {TYPEMYWORDZ1_NAME} integration with smart model selection")
-    logger.info(f"  ✅ {TYPEMYWORDZ_AI_NAME} integration with Claude model testing")
-    logger.info("  ✅ Two-tier automatic fallback system")
-    logger.info("  ✅ Enhanced error handling and logging")
-    logger.info("  ✅ Comprehensive job tracking")
+    logger.info("🚀 NEW ENHANCED FEATURES:")
+    logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} re-integrated")
+    logger.info(f"  ✅ Smart service selection with updated logic") # UPDATED
+    logger.info(f"  ✅ Two-tier automatic fallback for paid users") # UPDATED
+    logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ1_NAME}")
+    logger.info(f"  ✅ Dynamic {TYPEMYWORDZ1_NAME} model selection (nano for free, best for paid)")
+    logger.info("  ✅ Unified transcription processing pipeline")
+    logger.info("  ✅ Enhanced error handling and service resilience")
+    logger.info("  ✅ Comprehensive job tracking and cancellation")
     logger.info("  ✅ Paystack payment integration")
-    logger.info("  ✅ Claude model compatibility testing endpoint")
+    logger.info("  ✅ Multi-language support")
+    logger.info("  ✅ Formatted Word document generation")
+    logger.info(f"  ✅ User-driven AI features (summarization, Q&A, bullet points) via {TYPEMYWORDZ_AI_NAME}")
+    logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME}")
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (3-Day, 1-Week, Pro plans)") # NEW
+    
+    logger.info("🔧 TRANSCRIPTION LOGIC:")
+    logger.info(f"  - Free/One-Day users: Only {TYPEMYWORDZ2_NAME}") # UPDATED
+    logger.info(f"  - Paid users (3-Day, 1-Week, Pro): {TYPEMYWORDZ1_NAME} primary → {TYPEMYWORDZ2_NAME} fallback") # UPDATED
+    logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model ($0.12/hour)")
+    logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model ($0.27/hour)")
+    logger.info(f"  - {TYPEMYWORDZ2_NAME}: self-hosted Whisper (variable cost)")
+    logger.info(f"  - {TYPEMYWORDZ1_NAME} supports speaker labels with HTML formatting")
+    logger.info(f"  - {TYPEMYWORDZ2_NAME} typically does NOT support speaker labels")
+    logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing") # UPDATED
     
     try:
         uvicorn.run(
@@ -1760,5 +1817,5 @@ else:
     logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ_AI_NAME} integration")
 
 # ===============================================================================
-# END COMPLETE UPDATED main.py WITH CLAUDE MODEL FIX + TEST ENDPOINT
+# END COMPLETE UPDATED main.py
 # ===============================================================================
