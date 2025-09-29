@@ -146,13 +146,13 @@ class FormattedWordDownloadRequest(BaseModel):
 class UserAIRequest(BaseModel):
     transcript: str
     user_prompt: str
-    model: str = "claude-3-sonnet-20240229"  # UPDATED to most stable model
+    model: str = "claude-3-haiku-20240307"  # UPDATED to most stable model
     max_tokens: int = 1000
 
 class AdminAIFormatRequest(BaseModel):
     transcript: str
     formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-3-sonnet-20240229"  # UPDATED to most stable model
+    model: str = "claude-3-5-haiku-20241022"  # UPDATED to most stable model
     max_tokens: int = 4000
 
 # Global variables for job tracking
