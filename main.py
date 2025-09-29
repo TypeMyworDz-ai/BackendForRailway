@@ -1,5 +1,5 @@
 # ===============================================================================
-# COMPLETE UPDATED main.py - PART 1 (WITH NEW AI ACCESS LOGIC)
+# COMPLETE UPDATED main.py - PART 1 (FIXING 422 ERROR)
 # This file includes Anthropic Claude integration for user-facing and admin-facing AI features.
 # ===============================================================================
 
@@ -10,7 +10,7 @@ import subprocess
 import os
 import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form # ADDED Form
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
@@ -121,7 +121,7 @@ def is_paid_ai_user(user_plan: str) -> bool:
     return user_plan in paid_plans_for_ai
 
 
-# Pydantic Models
+# Pydantic Models (UserAIRequest and AdminAIFormatRequest will be replaced by Form fields)
 class PaystackVerificationRequest(BaseModel):
     reference: str
 
@@ -149,17 +149,18 @@ class FormattedWordDownloadRequest(BaseModel):
     transcription_html: str
     filename: Optional[str] = "transcription.docx"
 
-# FIXED: Updated Pydantic Models for AI Interaction with most likely working model
-class UserAIRequest(BaseModel):
+# UserAIRequest and AdminAIFormatRequest Pydantic models are no longer used for FastAPI arguments
+# They are kept here as a reference for the expected parameters if needed elsewhere.
+class UserAIRequest_Pydantic(BaseModel): # Renamed to avoid conflict with Form fields
     transcript: str
     user_prompt: str
-    model: str = "claude-3-haiku-20240307"  # UPDATED to working model
+    model: str = "claude-3-haiku-20240307"
     max_tokens: int = 1000
 
-class AdminAIFormatRequest(BaseModel):
+class AdminAIFormatRequest_Pydantic(BaseModel): # Renamed to avoid conflict with Form fields
     transcript: str
     formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-3-5-haiku-20241022"  # UPDATED to latest working model
+    model: str = "claude-3-5-haiku-20241022"
     max_tokens: int = 4000
 
 # Global variables for job tracking
@@ -307,7 +308,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_path) * 100 if input_path > 0 else 0
+            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
@@ -873,7 +874,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 "completed_at": datetime.now().isoformat(),
                 "word_count": transcription_result.get("word_count", 0),
                 "duration_seconds": transcription_result.get("duration", 0),
-                "speaker_labels": transcription_result.get("has_speaker_labels", False),
+                "speaker_labels": speaker_labels_enabled, # Use the requested speaker_labels_enabled from input
                 "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used"))
             })
         else:
@@ -916,7 +917,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
 # ===============================================================================
-# main.py - Part 6 of 7: App Setup and AI Endpoints (UPDATED)
+# main.py - Part 6 of 7: App Setup and AI Endpoints (UPDATED TO FIX 422 ERROR)
 # ===============================================================================
 
 # Application lifespan management
@@ -972,7 +973,7 @@ async def root():
             "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
             "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for Three-Day and Pro plans" # UPDATED
+            "ai_features_access": "Only for Three-Day and Pro plans"
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1376,10 +1377,16 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
         logger.error(f"Error generating formatted Word document: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate formatted Word document: {str(e)}")
 
-# UPDATED: AI Endpoint for User Queries with plan check
+# UPDATED: AI Endpoint for User Queries with Form fields
 @app.post("/ai/user-query")
-async def ai_user_query(request: UserAIRequest, user_plan: str = Form("free")): # Get user_plan from frontend
-    logger.info(f"AI user query endpoint called. Model: {request.model}, Prompt: '{request.user_prompt}', User Plan: {user_plan}")
+async def ai_user_query(
+    transcript: str = Form(...),
+    user_prompt: str = Form(...),
+    model: str = Form("claude-3-haiku-20240307"),
+    max_tokens: int = Form(1000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
 
     # NEW: AI Access Control
     if not is_paid_ai_user(user_plan):
@@ -1390,25 +1397,25 @@ async def ai_user_query(request: UserAIRequest, user_plan: str = Form("free")): 
 
     try:
         # Validate input lengths
-        if len(request.transcript) > 100000:  # ~100k chars limit
+        if len(transcript) > 100000:  # ~100k chars limit
             raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
         
-        if len(request.user_prompt) > 1000:  # 1k chars limit for prompts
+        if len(user_prompt) > 1000:  # 1k chars limit for prompts
             raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
 
         # Construct the full prompt for Claude
-        full_prompt = f"{request.user_prompt}\n\nHere is the transcript:\n{request.transcript}"
+        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
 
         message = claude_client.messages.create(
-            model=request.model,
-            max_tokens=request.max_tokens,
+            model=model,
+            max_tokens=max_tokens,
             timeout=30.0,  # Add timeout
             messages=[
                 {"role": "user", "content": full_prompt}
             ]
         )
         ai_response = message.content[0].text
-        logger.info(f"Successfully processed AI user query with {request.model}.")
+        logger.info(f"Successfully processed AI user query with {model}.")
         return {"ai_response": ai_response}
 
     except anthropic.APIError as e:
@@ -1436,10 +1443,16 @@ async def ai_user_query(request: UserAIRequest, user_plan: str = Form("free")): 
         logger.error(f"Unexpected error processing AI user query: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
-# UPDATED: AI Endpoint for Admin Formatting with plan check
+# UPDATED: AI Endpoint for Admin Formatting with Form fields
 @app.post("/ai/admin-format")
-async def ai_admin_format(request: AdminAIFormatRequest, user_plan: str = Form("free")): # Get user_plan from frontend
-    logger.info(f"AI admin format endpoint called. Model: {request.model}, Instructions: '{request.formatting_instructions}', User Plan: {user_plan}")
+async def ai_admin_format(
+    transcript: str = Form(...),
+    formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
+    model: str = Form("claude-3-5-haiku-20241022"),
+    max_tokens: int = Form(4000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI admin format endpoint called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
     # NEW: AI Access Control
     if not is_paid_ai_user(user_plan):
@@ -1450,25 +1463,25 @@ async def ai_admin_format(request: AdminAIFormatRequest, user_plan: str = Form("
 
     try:
         # Validate input lengths
-        if len(request.transcript) > 200000:  # ~200k chars limit for admin (higher than user)
+        if len(transcript) > 200000:  # ~200k chars limit for admin (higher than user)
             raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
         
-        if len(request.formatting_instructions) > 2000:  # 2k chars limit for admin instructions
+        if len(formatting_instructions) > 2000:  # 2k chars limit for admin instructions
             raise HTTPException(status_code=400, detail="Formatting instructions are too long. Please use shorter instructions.")
 
         # Construct the full prompt for Claude, emphasizing the formatting instructions
-        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {request.formatting_instructions}\n\nTranscript to format:\n{request.transcript}"
+        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
 
         message = claude_client.messages.create(
-            model=request.model,
-            max_tokens=request.max_tokens,
+            model=model,
+            max_tokens=max_tokens,
             timeout=60.0,  # Longer timeout for admin tasks
             messages=[
                 {"role": "user", "content": full_prompt}
             ]
         )
         ai_response = message.content[0].text
-        logger.info(f"Successfully processed AI admin format request with {request.model}.")
+        logger.info(f"Successfully processed AI admin format request with {model}.")
         return {"formatted_transcript": ai_response}
 
     except anthropic.APIError as e:
@@ -1726,7 +1739,7 @@ async def health_check():
                 "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → {TYPEMYWORDZ2_NAME} Fallback",
                 "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model ($0.27/hour)",
-                "ai_features_access": "Only for Three-Day and Pro plans", # UPDATED
+                "ai_features_access": "Only for Three-Day and Pro plans",
                 "render_whisper": f"{TYPEMYWORDZ2_NAME} (self-hosted Whisper)",
                 "ai_features": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku)"
             }
@@ -1789,7 +1802,7 @@ if __name__ == "__main__":
     logger.info("  ✅ Formatted Word document generation")
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, bullet points) via {TYPEMYWORDZ_AI_NAME}")
     logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME}")
-    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, Pro plans)") # UPDATED
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, Pro plans)")
     
     logger.info("🔧 TRANSCRIPTION LOGIC:")
     logger.info(f"  - Free/One-Day users: Only {TYPEMYWORDZ2_NAME}")
