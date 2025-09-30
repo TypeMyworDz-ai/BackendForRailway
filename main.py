@@ -38,6 +38,9 @@ TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper (previously TypeMyworDz3)
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
+# Admin email addresses
+ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
+
 def install_ffmpeg():
     try:
         subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
@@ -70,6 +73,7 @@ logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY
 logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}") # NEW DEBUG
+logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -109,12 +113,13 @@ def is_paid_ai_user(user_plan: str) -> bool:
     paid_plans_for_ai = ['Three-Day Plan', 'Pro', 'One-Week Plan']
     return user_plan in paid_plans_for_ai
 
-def is_admin_user(user_plan: str) -> bool:
-    """Check if user is an admin"""
-    admin_plans = ['admin', 'Admin', 'ADMIN']
-    return user_plan in admin_plans
+def is_admin_user(user_email: str) -> bool:
+    """Check if user is an admin based on email address"""
+    if not user_email:
+        return False
+    return user_email.lower().strip() in [email.lower() for email in ADMIN_EMAILS]
 
-def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, is_admin: bool = False):
+def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
     New logic for service selection:
     - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback
@@ -122,6 +127,9 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, is_
     - Admins: OpenAI (TypeMyworDz2) primary, AssemblyAI (TypeMyworDz1) fallback
     - Speaker labels requested: Always use AssemblyAI (TypeMyworDz1) first
     """
+    
+    # Check if user is admin based on email
+    is_admin = is_admin_user(user_email) if user_email else False
     
     if speaker_labels_enabled:
         # All users use AssemblyAI for speaker labels
@@ -724,9 +732,9 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "status": "failed",
             "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
         }
-async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float):
-    """Updated transcription processing with new two-service logic"""
-    logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}")
+async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float, user_email: str = ""):
+    """Updated transcription processing with new two-service logic and admin email checking"""
+    logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}, email: {user_email}")
     job_data = jobs[job_id]
     
     active_background_tasks[job_id] = asyncio.current_task()
@@ -741,11 +749,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # Determine if user is admin
-        is_admin = is_admin_user(user_plan)
-
-        # Get service configuration based on new logic
-        service_config = get_transcription_services(user_plan, speaker_labels_enabled, is_admin)
+        # Get service configuration based on new logic - NOW PASS EMAIL
+        service_config = get_transcription_services(user_plan, speaker_labels_enabled, user_email)
         primary_service = service_config["primary"]
         fallback_service = service_config["fallback"]
         
@@ -765,7 +770,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             "assemblyai_model": assemblyai_model,
             "duration_minutes": duration_minutes,
             "selection_reason": service_config["reason"],
-            "is_admin": is_admin
+            "user_email": user_email,
+            "is_admin": is_admin_user(user_email)
         })
 
         transcription_result = None
@@ -952,7 +958,8 @@ async def root():
             "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
             "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
             "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
-            "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)"
+            "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
+            "admin_emails": ADMIN_EMAILS
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1158,6 +1165,7 @@ async def paystack_status():
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
+        "admin_emails": ADMIN_EMAILS,
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -1183,10 +1191,11 @@ async def transcribe_audio(
     file: UploadFile = File(...),
     language_code: Optional[str] = Form("en"),
     speaker_labels_enabled: bool = Form(False),
-    user_plan: str = Form("free"), 
+    user_plan: str = Form("free"),
+    user_email: str = Form(""), # ADDED: User email parameter
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    logger.info(f"Main transcription endpoint called with file: {file.filename}, language: {language_code}, speaker_labels: {speaker_labels_enabled}, user_plan: {user_plan}")
+    logger.info(f"Main transcription endpoint called with file: {file.filename}, language: {language_code}, speaker_labels: {speaker_labels_enabled}, user_plan: {user_plan}, user_email: {user_email}")
     
     if not file.content_type.startswith(('audio/', 'video/')):
         logger.warning(f"Invalid file type: {file.content_type}")
@@ -1220,6 +1229,7 @@ async def transcribe_audio(
             "requested_language": language_code,
             "speaker_labels_enabled": speaker_labels_enabled,
             "user_plan": user_plan,
+            "user_email": user_email,  # ADDED: Store user email
             "duration_minutes": duration_minutes,
             "duration_seconds": duration_seconds
         }
@@ -1243,7 +1253,8 @@ async def transcribe_audio(
         language_code, 
         speaker_labels_enabled, 
         user_plan, 
-        duration_minutes
+        duration_minutes,
+        user_email  # ADDED: Pass user email to processing function
     )
     
     logger.info(f"Returning immediate response for job ID: {job_id}")
@@ -1254,9 +1265,8 @@ async def transcribe_audio(
         "file_size_mb": jobs[job_id]["file_size_mb"],
         "duration_minutes": duration_minutes,
         "created_at": jobs[job_id]["created_at"],
-        "logic_used": f"UserPlan:{user_plan}"
+        "logic_used": f"UserPlan:{user_plan}, Email:{user_email}, Admin:{is_admin_user(user_email)}"
     }
-
 @app.post("/generate-formatted-word")
 async def generate_formatted_word(request: FormattedWordDownloadRequest):
     logger.info(f"Generating formatted Word document for {request.filename}")
@@ -1298,6 +1308,7 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
     except Exception as e:
         logger.error(f"Error generating formatted Word document: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate formatted Word document: {str(e)}")
+
 @app.post("/ai/user-query")
 async def ai_user_query(
     transcript: str = Form(...),
@@ -1640,6 +1651,8 @@ async def list_jobs():
             "file_size_mb": job_data.get("file_size_mb", 0),
             "duration_minutes": job_data.get("duration_minutes", 0),
             "user_plan": job_data.get("user_plan", "unknown"),
+            "user_email": job_data.get("user_email", "unknown"),
+            "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("primary_service"),
             "service_used": job_data.get("service_used"),
             "has_background_task": job_id in active_background_tasks,
@@ -1647,7 +1660,8 @@ async def list_jobs():
             "word_count": job_data.get("word_count"),
             "duration_seconds": job_data.get("duration_seconds"),
             "requested_language": job_data.get("requested_language", "en"),
-            "speaker_labels_enabled": job_data.get("speaker_labels_enabled", False)
+            "speaker_labels_enabled": job_data.get("speaker_labels_enabled", False),
+            "selection_reason": job_data.get("selection_reason", "unknown")
         }
     
     return {
@@ -1655,6 +1669,7 @@ async def list_jobs():
         "active_background_tasks": len(active_background_tasks),
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
+        "admin_emails": ADMIN_EMAILS,
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -1706,7 +1721,8 @@ async def health_check():
                 "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
                 "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
-                "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)"
+                "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
+                "admin_emails": ADMIN_EMAILS
             }
         }
         
@@ -1728,11 +1744,11 @@ logger.info(f"{TYPEMYWORDZ2_NAME} Service URL configured: {bool(OPENAI_WHISPER_S
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
+logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
 logger.info(f"  - Cancellation flags: {len(cancellation_flags)} flags")
-
 logger.info("Available API endpoints:")
 logger.info("  POST /transcribe - Main transcription endpoint with smart service selection")
 logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points)")
@@ -1762,6 +1778,7 @@ if __name__ == "__main__":
     logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} (OpenAI Whisper) integrated for transcription")
     logger.info(f"  ✅ Smart service selection with updated logic")
     logger.info(f"  ✅ Two-tier automatic fallback system")
+    logger.info(f"  ✅ Admin email-based service prioritization")
     logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ1_NAME}")
     logger.info(f"  ✅ Dynamic {TYPEMYWORDZ1_NAME} model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
@@ -1777,7 +1794,7 @@ if __name__ == "__main__":
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
     logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - Paid users: Primary={TYPEMYWORDZ1_NAME} → Fallback={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Admin users: Primary={TYPEMYWORDZ2_NAME} → Fallback={TYPEMYWORDZ1_NAME}")
+    logger.info(f"  - Admin users ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback={TYPEMYWORDZ1_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
