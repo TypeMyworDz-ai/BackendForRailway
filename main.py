@@ -10,19 +10,18 @@ from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
 from datetime import datetime
-# REMOVED: from dotenv import load_dotenv # REMOVED: Not needed if relying purely on Railway env vars
 import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional, List
-import httpx
+import httpx # Used for making HTTP requests to other services
 from docx import Document
 from docx.shared import Inches
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re
 import anthropic
-import openai
+import openai # Keep openai import for GPT-based AI formatting
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,11 +32,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info("=== STARTING FASTAPI APPLICATION ===")
+logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # Render Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # OpenAI Whisper (NEW)
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # OpenAI Whisper (NEW - now a separate service)
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
 def install_ffmpeg():
@@ -55,27 +54,26 @@ def install_ffmpeg():
 
 install_ffmpeg()
 logger.info("Loading environment variables...")
-# REMOVED: load_dotenv() # REMOVED
 
-# --- VERBOSE DEBUGGING FOR ENVIRONMENT VARIABLES ---
-# Access environment variables directly from os.environ
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 RENDER_WHISPER_URL = os.environ.get("RENDER_WHISPER_URL")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # NEW ENV VAR for the separate Whisper service
 
-logger.info(f"DEBUG: --- Environment Variable Check ---")
+logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"DEBUG: RENDER_WHISPER_URL loaded value: {bool(RENDER_WHISPER_URL)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
-logger.info(f"DEBUG: OPENAI_API_KEY loaded value: {bool(OPENAI_API_KEY)}")
+logger.info(f"DEBUG: OPENAI_API_KEY (for GPT) loaded value: {bool(OPENAI_API_KEY)}") # Clarified
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
-logger.info(f"DEBUG: --- End Environment Variable Check ---")
+logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}") # NEW DEBUG
+logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 
 if not ASSEMBLYAI_API_KEY:
@@ -88,8 +86,11 @@ if not ANTHROPIC_API_KEY:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
 
 if not OPENAI_API_KEY:
-    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI) API Key environment variable not set! OpenAI transcription and AI features will be disabled.")
-    
+    logger.warning(f"OPENAI_API_KEY (for GPT) environment variable not set! OpenAI GPT AI features (admin formatting) will be disabled.")
+
+if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # NEW CHECK
+    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper) Service URL not configured! OpenAI Whisper transcription will be disabled.")
+
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
 
@@ -100,15 +101,18 @@ else:
 
 logger.info("Environment variables loaded successfully")
 
-openai_client = None
+# REMOVED: Direct OpenAI client initialization for transcription (now in separate service)
+# OpenAI client for GPT-based AI features (Admin formatting)
+openai_gpt_client = None 
 if OPENAI_API_KEY:
     try:
-        openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("OpenAI client initialized successfully.")
+        openai_gpt_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI GPT client initialized successfully for AI features.")
     except Exception as e:
-        logger.error(f"Error initializing OpenAI client: {e}")
+        logger.error(f"Error initializing OpenAI GPT client for AI features: {e}")
 else:
-    logger.warning("OpenAI API key is missing, OpenAI client will not be initialized.")
+    logger.warning("OpenAI API key is missing, OpenAI GPT client will not be initialized for AI features.")
+
 
 claude_client = None
 if ANTHROPIC_API_KEY:
@@ -524,6 +528,68 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'error': str(e)
         }
 
+# MODIFIED: Call the new dedicated Whisper service
+async def call_openai_whisper_service(audio_path: str, language_code: str, job_id: str) -> dict:
+    """Calls the dedicated OpenAI Whisper service deployed on Railway."""
+    if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+        logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} Service URL not configured")
+
+    try:
+        logger.info(f"Calling {TYPEMYWORDZ3_NAME} service for job {job_id} at {OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe")
+        
+        # Read the audio file content
+        with open(audio_path, "rb") as f:
+            audio_content = f.read()
+
+        # Prepare form data
+        files = {'file': (os.path.basename(audio_path), audio_content, 'audio/mpeg')}
+        data = {'language_code': language_code}
+
+        # Make HTTP POST request to the dedicated Whisper service
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe",
+                files=files,
+                data=data,
+                timeout=300.0 # 5 min timeout for transcription
+            )
+            response.raise_for_status() # Raise an exception for HTTP errors
+
+        result = response.json()
+        
+        if result.get("status") == "completed" and result.get("transcription"):
+            logger.info(f"{TYPEMYWORDZ3_NAME} service transcription completed for job {job_id}")
+            return result # The dedicated service returns a dict similar to what we expect
+        else:
+            raise Exception(f"{TYPEMYWORDZ3_NAME} service returned an incomplete or failed status: {result}")
+
+    except asyncio.CancelledError:
+        logger.info(f"{TYPEMYWORDZ3_NAME} service call cancelled for job {job_id}")
+        raise
+    except httpx.HTTPStatusError as e:
+        logger.error(f"{TYPEMYWORDZ3_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ3_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
+        }
+    except httpx.RequestError as e:
+        logger.error(f"{TYPEMYWORDZ3_NAME} service network error for job {job_id}: {e}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ3_NAME} service network error: {e}"
+        }
+    except Exception as e:
+        logger.error(f"{TYPEMYWORDZ3_NAME} service transcription failed for job {job_id}: {str(e)}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ3_NAME} service transcription failed: {str(e)}"
+        }
+    finally:
+        # The temporary file cleanup (tmp_path) is handled in process_transcription_job's finally block
+        # The compressed_path cleanup for the dedicated service is handled within whisper_service.py
+        pass
+
 async def transcribe_with_render_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Transcribe audio using the self-hosted Render Whisper backend."""
     if not RENDER_WHISPER_URL:
@@ -597,6 +663,10 @@ async def transcribe_with_render_whisper(audio_path: str, language_code: str, jo
 
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
     """Transcribe audio using AssemblyAI API"""
+    if not ASSEMBLYAI_API_KEY:
+        logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping {TYPEMYWORDZ1_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ1_NAME} API Key not configured")
+
     try:
         logger.info(f"Starting {TYPEMYWORDZ1_NAME} transcription with {model} model for job {job_id}")
         
@@ -711,65 +781,6 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
         }
 
-async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
-    """Transcribe audio using OpenAI Whisper API."""
-    if not openai_client:
-        logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} API Key not configured")
-
-    try:
-        logger.info(f"Starting {TYPEMYWORDZ3_NAME} transcription for job {job_id}")
-        
-        def check_cancellation():
-            if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ3_NAME} processing")
-                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        check_cancellation()
-
-        compressed_path, compression_stats = compress_audio_for_transcription(audio_path, job_id=job_id)
-        logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME}: {compression_stats}")
-
-        with open(compressed_path, "rb") as audio_file:
-            transcript = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language=language_code,
-                response_format="json"
-            )
-        
-        transcription_text = transcript.text
-        logger.info(f"{TYPEMYWORDZ3_NAME} transcription completed for job {job_id}")
-        return {
-            "status": "completed",
-            "transcription": transcription_text,
-            "language": language_code,
-            "duration": compression_stats.get("duration_seconds", 0),
-            "word_count": len(transcription_text.split()) if transcription_text else 0,
-            "has_speaker_labels": False
-        }
-
-    except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ3_NAME} transcription cancelled for job {job_id}")
-        raise
-    except openai.APIError as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} API Error for job {job_id}: {e.response}")
-        return {
-            "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} API error: {e.response}"
-        }
-    except Exception as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} transcription failed for job {job_id}: {str(e)}")
-        return {
-            "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} transcription failed: {str(e)}"
-        }
-    finally:
-        if 'compressed_path' in locals() and os.path.exists(compressed_path):
-            os.unlink(compressed_path)
-            logger.info(f"Cleaned up compressed file after {TYPEMYWORDZ3_NAME} processing: {compressed_path}")
-
-
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float):
     """Unified transcription processing with smart model selection and three-tier fallback."""
     logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}")
@@ -804,7 +815,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             service_tier_2 = None 
             service_tier_3 = None
             logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ2_NAME}, No fallback (as per request)")
-        else:
+        else: # All other paid users (Three-Day, One-Week, Pro)
             service_tier_1 = "openai_whisper"
             service_tier_2 = "assemblyai"     
             service_tier_3 = "render"         
@@ -823,13 +834,13 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         # --- ATTEMPT TIER 1 SERVICE ---
         if service_tier_1 == "openai_whisper":
-            if not OPENAI_API_KEY:
-                logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 1) for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} API Key not configured"
+            if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check NEW ENV VAR
+                logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 1) for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
             else:
                 try:
                     logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Tier 1 Primary) for job {job_id}")
-                    transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                    transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
                     job_data["tier_1_used"] = "openai_whisper"
                     job_data["tier_1_success"] = True
                 except Exception as openai_error:
@@ -876,13 +887,13 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.warning(f"⚠️ Tier 1 service failed, trying Tier 2 fallback ({service_tier_2}) for job {job_id}")
             
             if service_tier_2 == "openai_whisper":
-                if not OPENAI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 2) for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} API Key not configured"
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check NEW ENV VAR
+                    logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 2) for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
                 else:
                     try:
                         logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                        transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
                         job_data["tier_2_used"] = "openai_whisper"
                         job_data["tier_2_success"] = True
                     except Exception as openai_error:
@@ -928,13 +939,13 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.warning(f"⚠️ Tier 2 service failed, trying Tier 3 fallback ({service_tier_3}) for job {job_id}")
 
             if service_tier_3 == "openai_whisper":
-                if not OPENAI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 3) for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} API Key not configured"
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check NEW ENV VAR
+                    logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 3) for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_3_NAME} (Tier 3 Fallback) for job {job_id}") # Corrected typo
+                        transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
                         job_data["tier_3_used"] = "openai_whisper"
                         job_data["tier_3_success"] = True
                     except Exception as openai_error:
@@ -1049,7 +1060,6 @@ logger.info("Creating FastAPI app...")
 app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ3_NAME} & {TYPEMYWORDZ_AI_NAME}", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
-logger.info("Setting up CORS middleware...")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1080,7 +1090,11 @@ async def root():
             "paid_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for Three-Day, One-Week and Pro plans"
+            "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
+            "render_whisper": f"{TYPEMYWORDZ2_NAME} (self-hosted Whisper)",
+            "openai_whisper": f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper-1)",
+            "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
+            "ai_features_openai": "OpenAI (GPT models) for text processing"
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1561,7 +1575,7 @@ async def ai_admin_format_openai(
     if not is_paid_ai_user(user_plan):
         raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
 
-    if not openai_client:
+    if not openai_gpt_client:
         raise HTTPException(status_code=503, detail="OpenAI service is not initialized (API key missing or invalid).")
 
     try:
@@ -1570,7 +1584,7 @@ async def ai_admin_format_openai(
         
         full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
 
-        completion = openai_client.chat.completions.create(
+        completion = openai_gpt_client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "user", "content": full_prompt}
@@ -1827,7 +1841,8 @@ async def health_check():
                 "render_whisper_configured": bool(RENDER_WHISPER_URL),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
-                "paystack_configured": bool(PAYSTACK_SECRET_KEY)
+                "paystack_configured": bool(PAYSTACK_SECRET_KEY),
+                "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL) # NEW
             },
             "transcription_logic": {
                 "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}",
@@ -1857,8 +1872,9 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"{TYPEMYWORDZ1_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"{TYPEMYWORDZ2_NAME} URL configured: {bool(RENDER_WHISPER_URL)}")
-logger.info(f"{TYPEMYWORDZ3_NAME} API Key configured: {bool(OPENAI_API_KEY)}")
+logger.info(f"{TYPEMYWORDZ3_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
+logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
