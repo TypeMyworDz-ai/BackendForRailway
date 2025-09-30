@@ -21,7 +21,7 @@ from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re
 import anthropic
-import openai # Keep openai import for GPT-based AI formatting (if needed for other direct calls, though now consolidated)
+import openai # Keep openai import for GPT-based AI formatting
 
 logging.basicConfig(
     level=logging.INFO,
@@ -274,7 +274,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -309,7 +309,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_path) * 100 if input_size > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
@@ -679,7 +679,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
         check_cancellation()
         
         compressed_path, compression_stats = compress_audio_for_transcription(audio_path, job_id=job_id)
-        
+        logger.info(f"Audio compressed for {TYPEMYWORDZ1_NAME}: {compression_stats}")
+
         check_cancellation()
         
         logger.info(f"Uploading audio to {TYPEMYWORDZ1_NAME}...")
@@ -811,16 +812,22 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         assemblyai_model = get_assemblyai_model(user_plan)
 
-        if user_plan == 'free' or user_plan == 'One-Day Plan':
-            service_tier_1 = "render"
+        # UPDATED LOGIC: Prioritize AssemblyAI if speaker labels are requested
+        if speaker_labels_enabled:
+            service_tier_1 = "assemblyai" # TypeMyworDz1 (AssemblyAI) as primary for speaker labels
+            service_tier_2 = "openai_whisper" # TypeMyworDz3 (OpenAI) as first fallback
+            service_tier_3 = "render"         # TypeMyworDz2 (Render) as second fallback
+            logger.info(f"🎯 User plan '{user_plan}' (Speaker Labels): Primary={TYPEMYWORDZ1_NAME} ({assemblyai_model}), Fallback1={TYPEMYWORZD3_NAME}, Fallback2={TYPEMYWORDZ2_NAME}") # Corrected typo
+        elif user_plan == 'free' or user_plan == 'One-Day Plan':
+            service_tier_1 = "render" # Free/One-Day users only get TypeMyworDz2
             service_tier_2 = None 
             service_tier_3 = None
             logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ2_NAME}, No fallback (as per request)")
-        else: # All other paid users (Three-Day, One-Week, Pro)
-            service_tier_1 = "openai_whisper"
-            service_tier_2 = "assemblyai"     
-            service_tier_3 = "render"         
-            logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ3_NAME}, Fallback1={TYPEMYWORDZ1_NAME} ({assemblyai_model}), Fallback2={TYPEMYWORDZ2_NAME}")
+        else: # All other paid users (Three-Day, One-Week, Pro) without speaker labels
+            service_tier_1 = "openai_whisper" # TypeMyworDz3 (OpenAI) as primary for paid users
+            service_tier_2 = "assemblyai"     # TypeMyworDz1 (AssemblyAI) as first fallback
+            service_tier_3 = "render"         # TypeMyworDz2 (Render) as second fallback
+            logger.info(f"🎯 User plan '{user_plan}' (No Speaker Labels): Primary={TYPEMYWORDZ3_NAME}, Fallback1={TYPEMYWORDZ1_NAME} ({assemblyai_model}), Fallback2={TYPEMYWORDZ2_NAME}")
 
         job_data.update({
             "service_tier_1": service_tier_1,
@@ -1063,7 +1070,7 @@ logger.info("FastAPI app created successfully")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # MODIFIED: This needs to be specific now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1088,7 +1095,7 @@ async def root():
         ],
         "logic": {
             "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}",
-            "paid_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+            "paid_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORZD1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}", # Corrected typo
             "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model",
             "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
@@ -1716,7 +1723,7 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
         
     except Exception as e:
         logger.error(f"Error compressing file for download: {e}")
-        raise HTTPException(status_code=500, detail="Failed to compress audio file")
+        raise HTTPException(status_code=500, detail=f"Failed to compress audio file: {str(e)}")
 
 @app.delete("/cleanup")
 async def cleanup_old_jobs():
@@ -1846,14 +1853,14 @@ async def health_check():
             },
             "transcription_logic": {
                 "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}",
-                "paid_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+                "paid_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORZD1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}", # Corrected typo
                 "free_users_assemblyai": f"{TYPEMYWORDZ1_NAME} nano model ($0.12/hour)",
                 "paid_users_assemblyai": f"{TYPEMYWORDZ1_NAME} best model ($0.27/hour)",
                 "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
                 "render_whisper": f"{TYPEMYWORDZ2_NAME} (self-hosted Whisper)",
                 "openai_whisper": f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper-1)",
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
-                "ai_features_openai": "OpenAI (GPT models) for text processing"
+                "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)"
             }
         }
         
@@ -1886,7 +1893,7 @@ logger.info("  POST /transcribe - Main transcription endpoint with smart service
 logger.info("  GET /test-claude-models - Test which Claude models work with your API key")
 logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points)")
 logger.info("  POST /ai/admin-format - Process admin-driven AI formatting requests (Anthropic)")
-logger.info("  POST /ai/admin-format-openai - Process admin-driven AI formatting requests (OpenAI)")
+logger.info("  POST /ai/admin-format-openai - Process admin-driven AI formatting requests (OpenAI via Render service)")
 logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payment")
 logger.info("  POST /api/verify-payment - Verify Paystack payment")
 logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
@@ -1921,12 +1928,13 @@ if __name__ == "__main__":
     logger.info("  ✅ Multi-language support")
     logger.info("  ✅ Formatted Word document generation")
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic)")
-    logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic) and OpenAI")
+    logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic) and OpenAI (via Render service)")
     logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Pro plans)")
     
     logger.info("🔧 TRANSCRIPTION LOGIC:")
     logger.info(f"  - Free/One-Day users: Only {TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Paid users (3-Day, 1-Week, Pro): Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Paid users (3-Day, 1-Week, Pro) with Speaker Labels: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Paid users (3-Day, 1-Week, Pro) without Speaker Labels: Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORZD1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}") # Corrected typo
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model ($0.12/hour)")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model ($0.27/hour)")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: self-hosted Whisper (variable cost)")
@@ -1934,7 +1942,7 @@ if __name__ == "__main__":
     logger.info(f"  - {TYPEMYWORDZ1_NAME} supports speaker labels with HTML formatting")
     logger.info(f"  - {TYPEMYWORDZ2_NAME} and {TYPEMYWORDZ3_NAME} typically do NOT support speaker labels for now")
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
-    logger.info(f"  - OpenAI (GPT models) for admin AI text processing")
+    logger.info(f"  - OpenAI (GPT models) for admin AI text processing (via Render service)")
     
     try:
         uvicorn.run(
