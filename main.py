@@ -21,7 +21,7 @@ from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re
 import anthropic
-import openai # Keep openai import for GPT-based AI formatting
+import openai # Keep openai import for GPT-based AI formatting (if needed for other direct calls, though now consolidated)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,9 +35,9 @@ logger = logging.getLogger(__name__)
 logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
-TYPEMYWORDZ2_NAME = "TypeMyworDz2" # Render Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # OpenAI Whisper (NEW - now a separate service)
-TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
+TYPEMYWORDZ2_NAME = "TypeMyworDz2" # Render Whisper (self-hosted)
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # OpenAI Whisper (now via Render service)
+TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT (now via Render service)
 
 def install_ffmpeg():
     try:
@@ -58,17 +58,17 @@ logger.info("Loading environment variables...")
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 RENDER_WHISPER_URL = os.environ.get("RENDER_WHISPER_URL")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
-OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # NEW ENV VAR for the separate Whisper service
+OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # URL for the Render-deployed OpenAI service
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"DEBUG: RENDER_WHISPER_URL loaded value: {bool(RENDER_WHISPER_URL)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
-logger.info(f"DEBUG: OPENAI_API_KEY (for GPT) loaded value: {bool(OPENAI_API_KEY)}") # Clarified
+logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}") # Clarified
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
@@ -85,11 +85,12 @@ if not RENDER_WHISPER_URL:
 if not ANTHROPIC_API_KEY:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
 
+# OPENAI_API_KEY is no longer used directly for GPT client in main.py, but log it anyway
 if not OPENAI_API_KEY:
-    logger.warning(f"OPENAI_API_KEY (for GPT) environment variable not set! OpenAI GPT AI features (admin formatting) will be disabled.")
+    logger.warning(f"OPENAI_API_KEY (for GPT if direct) environment variable not set! Direct OpenAI GPT calls disabled.")
 
 if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # NEW CHECK
-    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper) Service URL not configured! OpenAI Whisper transcription will be disabled.")
+    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper & GPT) Service URL not configured! OpenAI transcription and GPT formatting will be disabled.")
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -101,17 +102,17 @@ else:
 
 logger.info("Environment variables loaded successfully")
 
-# REMOVED: Direct OpenAI client initialization for transcription (now in separate service)
-# OpenAI client for GPT-based AI features (Admin formatting)
-openai_gpt_client = None 
-if OPENAI_API_KEY:
-    try:
-        openai_gpt_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("OpenAI GPT client initialized successfully for AI features.")
-    except Exception as e:
-        logger.error(f"Error initializing OpenAI GPT client for AI features: {e}")
-else:
-    logger.warning("OpenAI API key is missing, OpenAI GPT client will not be initialized for AI features.")
+# REMOVED: Direct OpenAI client initialization for Whisper transcription
+# REMOVED: Direct OpenAI GPT client initialization (now handled by Render service)
+# openai_gpt_client = None 
+# if OPENAI_API_KEY:
+#     try:
+#         openai_gpt_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+#         logger.info("OpenAI GPT client initialized successfully for AI features.")
+#     except Exception as e:
+#         logger.error(f"Error initializing OpenAI GPT client for AI features: {e}")
+# else:
+#     logger.warning("OpenAI API key is missing, OpenAI GPT client will not be initialized for AI features.")
 
 
 claude_client = None
@@ -530,7 +531,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
 
 # MODIFIED: Call the new dedicated Whisper service
 async def call_openai_whisper_service(audio_path: str, language_code: str, job_id: str) -> dict:
-    """Calls the dedicated OpenAI Whisper service deployed on Railway."""
+    """Calls the dedicated OpenAI Whisper service deployed on Render."""
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
         logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
         raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} Service URL not configured")
@@ -834,7 +835,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         # --- ATTEMPT TIER 1 SERVICE ---
         if service_tier_1 == "openai_whisper":
-            if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check NEW ENV VAR
+            if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
                 logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 1) for job {job_id}")
                 job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
             else:
@@ -887,7 +888,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.warning(f"⚠️ Tier 1 service failed, trying Tier 2 fallback ({service_tier_2}) for job {job_id}")
             
             if service_tier_2 == "openai_whisper":
-                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check NEW ENV VAR
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
                     logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 2) for job {job_id}")
                     job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
                 else:
@@ -939,12 +940,12 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.warning(f"⚠️ Tier 2 service failed, trying Tier 3 fallback ({service_tier_3}) for job {job_id}")
 
             if service_tier_3 == "openai_whisper":
-                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check NEW ENV VAR
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
                     logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} (Tier 3) for job {job_id}")
                     job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_3_NAME} (Tier 3 Fallback) for job {job_id}") # Corrected typo
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Tier 3 Fallback) for job {job_id}")
                         transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
                         job_data["tier_3_used"] = "openai_whisper"
                         job_data["tier_3_success"] = True
@@ -1575,46 +1576,45 @@ async def ai_admin_format_openai(
     if not is_paid_ai_user(user_plan):
         raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
 
-    if not openai_gpt_client:
-        raise HTTPException(status_code=503, detail="OpenAI service is not initialized (API key missing or invalid).")
+    if not OPENAI_WHISPER_SERVICE_RAILWAY_URL: # Check if the Render service URL is configured
+        raise HTTPException(status_code=503, detail=f"OpenAI GPT formatting service is not initialized (URL for Render service missing).")
 
     try:
         if len(transcript) > 200000:
             raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
         
-        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
+        # Prepare form data to send to the Render openai_service
+        form_data = httpx.FormData({
+            'transcript': transcript,
+            'formatting_instructions': formatting_instructions,
+            'model': model,
+            'max_tokens': str(max_tokens) # Convert int to string for FormData
+        })
 
-        completion = openai_gpt_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "user", "content": full_prompt}
-            ],
-            max_tokens=max_tokens,
-            timeout=60.0,
-        )
-        ai_response = completion.choices[0].message.content
-        logger.info(f"Successfully processed AI admin format request with OpenAI model: {model}.")
-        return {"formatted_transcript": ai_response}
+        # Make HTTP POST request to the dedicated GPT formatting endpoint on the Render service
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{OPENAI_WHISPER_SERVICE_RAILWAY_URL}/ai/admin-format-gpt", # NEW ENDPOINT
+                data=form_data, # Send as form data
+                timeout=120.0 # Longer timeout for GPT formatting
+            )
+            response.raise_for_status() # Raise an exception for HTTP errors
 
-    except openai.APIError as e:
-        error_message = "OpenAI service error for admin formatting"
-        error_details = str(e)
+        result = response.json()
         
-        if hasattr(e, 'response'):
-            try:
-                error_data = e.response.json() if hasattr(e.response, 'json') else {"error": str(e.response)}
-                error_details = error_data
-                logger.error(f"OpenAI API Error for admin format: {error_data}")
-            except:
-                logger.error(f"OpenAI API Error for admin format: {str(e)}")
+        if result.get("formatted_transcript"):
+            logger.info(f"Successfully processed AI admin format request via Render service with OpenAI model: {model}.")
+            return {"formatted_transcript": result["formatted_transcript"]}
         else:
-            logger.error(f"OpenAI API Error for admin format: {str(e)}")
-            
-        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
+            raise Exception(f"OpenAI GPT formatting service returned an incomplete or failed status: {result}")
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"OpenAI GPT formatting service HTTP error: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(status_code=500, detail=f"OpenAI GPT formatting service HTTP error: {e.response.status_code} - {e.response.text}")
     
-    except openai.APITimeoutError as e:
-        logger.error(f"OpenAI API Timeout for admin format: {e}")
-        raise HTTPException(status_code=504, detail="OpenAI service timeout. Please try again with a shorter transcript.")
+    except httpx.RequestError as e:
+        logger.error(f"OpenAI GPT formatting service network error: {e}")
+        raise HTTPException(status_code=500, detail=f"OpenAI GPT formatting service network error: {e}")
 
     except Exception as e:
         logger.error(f"Unexpected error processing OpenAI admin format request: {e}")
@@ -1842,7 +1842,7 @@ async def health_check():
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
                 "paystack_configured": bool(PAYSTACK_SECRET_KEY),
-                "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL) # NEW
+                "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)
             },
             "transcription_logic": {
                 "free_user_transcription": f"Only {TYPEMYWORDZ2_NAME}",
