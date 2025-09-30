@@ -53,28 +53,30 @@ def install_ffmpeg():
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to install ffmpeg: {e}")
 
+# ... (previous imports and initial logger setup) ...
+
 install_ffmpeg()
 logger.info("Loading environment variables...")
-load_dotenv()
+load_dotenv() # This loads from a .env file if present locally, but not on Railway
 
-# CORRECTED ORDER: Assign variables before using them in logs
+# CORRECTED ORDER AND ADDED VERBOSE DEBUGGING
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-logger.info(f"DEBUG: OPENAI_API_KEY loaded value: {OPENAI_API_KEY}") # ADD THIS LINE
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
 
-logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"Attempted to load RENDER_WHISPER_URL. Value found: {bool(RENDER_WHISPER_URL)}")
-logger.info(f"Attempted to load ANTHROPIC_API_KEY. Value found: {bool(ANTHROPIC_API_KEY)}")
-logger.info(f"Attempted to load OPENAI_API_KEY. Value found: {bool(OPENAI_API_KEY)}")
-logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK_SECRET_KEY)}")
-logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
-logger.info(f"Attempted to load PAYSTACK_WEBHOOK_SECRET. Value found: {bool(PAYSTACK_WEBHOOK_SECRET)}")
-
+# --- VERBOSE DEBUGGING FOR ENVIRONMENT VARIABLES ---
+logger.info(f"DEBUG: Environment variable 'ASSEMBLYAI_API_KEY' found: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"DEBUG: Environment variable 'RENDER_WHISPER_URL' found: {bool(RENDER_WHISPER_URL)}")
+logger.info(f"DEBUG: Environment variable 'ANTHROPIC_API_KEY' found: {bool(ANTHROPIC_API_KEY)}")
+logger.info(f"DEBUG: Environment variable 'OPENAI_API_KEY' found: {bool(OPENAI_API_KEY)}")
+logger.info(f"DEBUG: Environment variable 'PAYSTACK_SECRET_KEY' found: {bool(PAYSTACK_SECRET_KEY)}")
+logger.info(f"DEBUG: Environment variable 'PAYSTACK_PUBLIC_KEY' found: {bool(PAYSTACK_PUBLIC_KEY)}")
+logger.info(f"DEBUG: Environment variable 'PAYSTACK_WEBHOOK_SECRET' found: {bool(PAYSTACK_WEBHOOK_SECRET)}")
+# --- END VERBOSE DEBUGGING ---
 
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
@@ -86,7 +88,7 @@ if not ANTHROPIC_API_KEY:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
 
 if not OPENAI_API_KEY:
-    logger.warning(f"{TYPEMYWORDZ3_NAME} (OpenAI) API Key environment variable not set! OpenAI transcription and AI features will be disabled.")
+    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI) API Key environment variable not set! OpenAI transcription and AI features will be disabled.") # Changed to ERROR
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -97,6 +99,8 @@ else:
     logger.warning("Paystack configuration missing - payment verification disabled")
 
 logger.info("Environment variables loaded successfully")
+
+# ... (rest of your main.py code, including client initializations) ...
 
 openai_client = None
 if OPENAI_API_KEY:
