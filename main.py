@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
 from datetime import datetime
-from dotenv import load_dotenv
+# REMOVED: from dotenv import load_dotenv # REMOVED: Not needed if relying purely on Railway env vars
 import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
@@ -53,30 +53,30 @@ def install_ffmpeg():
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to install ffmpeg: {e}")
 
-# ... (previous imports and initial logger setup) ...
-
 install_ffmpeg()
 logger.info("Loading environment variables...")
-load_dotenv() # This loads from a .env file if present locally, but not on Railway
-
-# CORRECTED ORDER AND ADDED VERBOSE DEBUGGING
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-RENDER_WHISPER_URL = os.getenv("RENDER_WHISPER_URL")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
-PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
-PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
+# REMOVED: load_dotenv() # REMOVED
 
 # --- VERBOSE DEBUGGING FOR ENVIRONMENT VARIABLES ---
-logger.info(f"DEBUG: Environment variable 'ASSEMBLYAI_API_KEY' found: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"DEBUG: Environment variable 'RENDER_WHISPER_URL' found: {bool(RENDER_WHISPER_URL)}")
-logger.info(f"DEBUG: Environment variable 'ANTHROPIC_API_KEY' found: {bool(ANTHROPIC_API_KEY)}")
-logger.info(f"DEBUG: Environment variable 'OPENAI_API_KEY' found: {bool(OPENAI_API_KEY)}")
-logger.info(f"DEBUG: Environment variable 'PAYSTACK_SECRET_KEY' found: {bool(PAYSTACK_SECRET_KEY)}")
-logger.info(f"DEBUG: Environment variable 'PAYSTACK_PUBLIC_KEY' found: {bool(PAYSTACK_PUBLIC_KEY)}")
-logger.info(f"DEBUG: Environment variable 'PAYSTACK_WEBHOOK_SECRET' found: {bool(PAYSTACK_WEBHOOK_SECRET)}")
-# --- END VERBOSE DEBUGGING ---
+# Access environment variables directly from os.environ
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
+RENDER_WHISPER_URL = os.environ.get("RENDER_WHISPER_URL")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
+PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
+PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+
+logger.info(f"DEBUG: --- Environment Variable Check ---")
+logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"DEBUG: RENDER_WHISPER_URL loaded value: {bool(RENDER_WHISPER_URL)}")
+logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
+logger.info(f"DEBUG: OPENAI_API_KEY loaded value: {bool(OPENAI_API_KEY)}")
+logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
+logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
+logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
+logger.info(f"DEBUG: --- End Environment Variable Check ---")
+
 
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
@@ -88,8 +88,8 @@ if not ANTHROPIC_API_KEY:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
 
 if not OPENAI_API_KEY:
-    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI) API Key environment variable not set! OpenAI transcription and AI features will be disabled.") # Changed to ERROR
-
+    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI) API Key environment variable not set! OpenAI transcription and AI features will be disabled.")
+    
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
 
@@ -99,8 +99,6 @@ else:
     logger.warning("Paystack configuration missing - payment verification disabled")
 
 logger.info("Environment variables loaded successfully")
-
-# ... (rest of your main.py code, including client initializations) ...
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -801,16 +799,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         assemblyai_model = get_assemblyai_model(user_plan)
 
-        # NEW LOGIC:
         if user_plan == 'free' or user_plan == 'One-Day Plan':
-            service_tier_1 = "render" # Free/One-Day users only get TypeMyworDz2
+            service_tier_1 = "render"
             service_tier_2 = None 
             service_tier_3 = None
             logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ2_NAME}, No fallback (as per request)")
-        else: # All other paid users (Three-Day, One-Week, Pro)
-            service_tier_1 = "openai_whisper" # NEW: TypeMyworDz3 (OpenAI) as primary for paid users
-            service_tier_2 = "assemblyai"     # TypeMyworDz1 (AssemblyAI) as first fallback
-            service_tier_3 = "render"         # TypeMyworDz2 (Render) as second fallback
+        else:
+            service_tier_1 = "openai_whisper"
+            service_tier_2 = "assemblyai"     
+            service_tier_3 = "render"         
             logger.info(f"🎯 User plan '{user_plan}': Primary={TYPEMYWORDZ3_NAME}, Fallback1={TYPEMYWORDZ1_NAME} ({assemblyai_model}), Fallback2={TYPEMYWORDZ2_NAME}")
 
         job_data.update({
