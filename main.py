@@ -1551,6 +1551,33 @@ async def paystack_status():
         ],
         "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES
     }
+@app.get("/api/list-gemini-models")
+async def list_gemini_models():
+    logger.info("Listing available Gemini models...")
+    if not gemini_client:
+        raise HTTPException(status_code=503, detail="Google Gemini service is not initialized (API key missing or invalid).")
+    
+    try:
+        # List all models available through the API key
+        models = genai.list_models()
+        
+        # Filter for Gemini models and extract relevant info
+        gemini_models_info = []
+        for m in models:
+            if 'gemini' in m.name and 'generateContent' in m.supported_generation_methods:
+                gemini_models_info.append({
+                    "name": m.name,
+                    "display_name": m.display_name,
+                    "version": m.version,
+                    "supported_generation_methods": m.supported_generation_methods,
+                    "input_token_limit": m.input_token_limit,
+                    "output_token_limit": m.output_token_limit
+                })
+        logger.info(f"Found {len(gemini_models_info)} Gemini models.")
+        return {"available_gemini_models": gemini_models_info}
+    except Exception as e:
+        logger.error(f"Error listing Gemini models: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list Gemini models: {str(e)}")
 
 @app.post("/transcribe")
 async def transcribe_audio(
