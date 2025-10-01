@@ -4,7 +4,7 @@ import asyncio
 import subprocess
 import os
 import json
-import base64 # NEW: For decoding Base64 GCP key
+import base64 # For decoding Base64 GCP key
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,9 +28,7 @@ import openai # Keep openai import for GPT-based AI formatting
 from google.cloud import speech_v1p1beta1 as speech
 from google.oauth2 import service_account
 
-# Speechmatics BatchClient for its part of the logic
-from speechmatics.batch_client import BatchClient
-from speechmatics.models import ConnectionSettings
+# REMOVED: Speechmatics BatchClient and ConnectionSettings imports
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +44,7 @@ logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 # Service Names
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text - NEW!
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
 # Admin email addresses
@@ -69,8 +67,8 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
-SPEECHMATICS_API_KEY = os.environ.get("SPEECHMATICS_API_KEY")
-GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # NEW: Google Cloud Speech Key
+# REMOVED: SPEECHMATICS_API_KEY = os.environ.get("SPEECHMATICS_API_KEY")
+GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # Google Cloud Speech Key
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -80,8 +78,8 @@ OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAIL
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"DEBUG: SPEECHMATICS_API_KEY loaded value: {bool(SPEECHMATICS_API_KEY)}")
-logger.info(f"DEBUG: GCP_SPEECH_KEY_BASE64 loaded value: {bool(GCP_SPEECH_KEY_BASE64)}") # NEW DEBUG
+# logger.info(f"DEBUG: SPEECHMATICS_API_KEY loaded value: {bool(SPEECHMATICS_API_KEY)}") # REMOVED
+logger.info(f"DEBUG: GCP_SPEECH_KEY_BASE64 loaded value: {bool(GCP_SPEECH_KEY_BASE64)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
@@ -94,10 +92,11 @@ logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
 
-if not SPEECHMATICS_API_KEY:
-    logger.warning(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key environment variable not set! Speechmatics will not be available as a fallback.")
+# REMOVED: Speechmatics API Key check
+# if not SPEECHMATICS_API_KEY:
+#     logger.warning(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key environment variable not set! Speechmatics will not be available as a fallback.")
 
-if not GCP_SPEECH_KEY_BASE64: # NEW CHECK
+if not GCP_SPEECH_KEY_BASE64:
     logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud) API Key environment variable not set! Google Cloud Speech-to-Text will not be available as a fallback.")
 
 if not ANTHROPIC_API_KEY:
@@ -129,7 +128,7 @@ if ANTHROPIC_API_KEY:
 else:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API key is missing, Claude client will not be initialized.")
 
-# NEW: Google Cloud Speech Client initialization
+# Google Cloud Speech Client initialization
 google_speech_client = None
 if GCP_SPEECH_KEY_BASE64:
     try:
@@ -155,7 +154,7 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    Logic for service selection with three tiers, adjusted for Google Cloud integration:
+    Logic for service selection with three tiers, now exclusively Google Cloud as TYPEMYWORDZ3_NAME:
     - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Google Cloud (TypeMyworDz3) fallback2
     - Paid users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Google Cloud (TypeMyworDz3) fallback2
     - Admins: Google Cloud (TypeMyworDz3) primary, OpenAI (TypeMyworDz2) fallback1, AssemblyAI (TypeMyworDz1) fallback2
@@ -656,137 +655,7 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
     finally:
         pass
 
-async def transcribe_with_speechmatics(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
-    """Transcribe audio using Speechmatics API"""
-    if not SPEECHMATICS_API_KEY:
-        logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured")
-
-    if not SPEECHMATICS_API_KEY: # Double check
-        logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key environment variable not set! Speechmatics will not be available.")
-        return {"status": "failed", "error": f"{TYPEMYWORDZ3_NAME} API Key not configured"}
-
-    try:
-        logger.info(f"Starting {TYPEMYWORDZ3_NAME} (Speechmatics) transcription for job {job_id}")
-        
-        def check_cancellation():
-            if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ3_NAME} (Speechmatics) processing")
-                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        check_cancellation()
-        
-        compressed_path, compression_stats = compress_audio_for_transcription(audio_path, job_id=job_id)
-        logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Speechmatics): {compression_stats}")
-
-        check_cancellation()
-        
-        logger.info(f"Submitting audio to {TYPEMYWORDZ3_NAME} (Speechmatics) using SDK...")
-        
-        # Use the Speechmatics BatchClient SDK
-        connection_settings = ConnectionSettings(
-            url="https://asr.api.speechmatics.com/v2", # Correct base URL from your docs
-            auth_token=SPEECHMATICS_API_KEY,
-        )
-
-        with BatchClient(connection_settings) as client:
-            # Configuration for Speechmatics
-            config_data = {
-                "type": "transcription",
-                "transcription_config": {
-                    "language": language_code,
-                    "operating_point": "enhanced", # Or "standard"
-                    "enable_partials": False,
-                }
-            }
-            if speaker_labels_enabled:
-                config_data["transcription_config"]["enable_speaker_diarization"] = True
-                logger.info(f"{TYPEMYWORDZ3_NAME} (Speechmatics): Speaker diarization ENABLED for job {job_id}")
-
-            speechmatics_job_id = client.submit_job(
-                audio=compressed_path, # Path to the local audio file
-                config=config_data,
-            )
-            logger.info(f"{TYPEMYWORDZ3_NAME} (Speechmatics) job created and audio submitted with ID: {speechmatics_job_id}")
-        
-            # Polling for job completion (SDK handles polling internally)
-            while True:
-                check_cancellation()
-                await asyncio.sleep(5) # Poll every 5 seconds
-
-                job_details = client.get_job_details(speechmatics_job_id)
-                job_status = job_details['job']['status']
-
-                if job_status == 'completed':
-                    logger.info(f"{TYPEMYWORDZ3_NAME} (Speechmatics) job {speechmatics_job_id} completed. Fetching results.")
-                    transcript_result = client.get_transcript(speechmatics_job_id, "json-v2") # Request json-v2 format
-
-                    transcription_text = ""
-                    has_speaker_labels = False
-
-                    if speaker_labels_enabled and transcript_result.get("results"):
-                        formatted_transcript_parts = []
-                        current_speaker = None
-                        for item in transcript_result["results"]:
-                            if item.get("type") == "speaker_change":
-                                new_speaker = item.get("speaker")
-                                if new_speaker is not None and new_speaker != current_speaker:
-                                    if formatted_transcript_parts and formatted_transcript_parts[-1].strip().endswith("\n"):
-                                        formatted_transcript_parts.append("\n")
-                                    formatted_transcript_parts.append(f"<strong>Speaker {new_speaker + 1}:</strong> ")
-                                    current_speaker = new_speaker
-                            elif item.get("type") == "word":
-                                formatted_transcript_parts.append(item["content"])
-                                if item.get("punctuated_word_end"):
-                                    formatted_transcript_parts.append(item["punctuated_word_end"])
-                            elif item.get("type") == "punctuation":
-                                formatted_transcript_parts.append(item["content"])
-                        transcription_text = "".join(formatted_transcript_parts).strip()
-                        has_speaker_labels = speaker_labels_enabled and bool(current_speaker is not None)
-                    elif transcript_result.get("transcript"):
-                        transcription_text = transcript_result["transcript"]
-
-                    duration = transcript_result.get("duration", 0)
-                    word_count = len(transcription_text.split()) if transcription_text else 0
-
-                    return {
-                        "status": "completed",
-                        "transcription": transcription_text,
-                        "language": language_code, # Speechmatics might return language, but using requested for now
-                        "duration": duration,
-                        "word_count": word_count,
-                        "has_speaker_labels": has_speaker_labels
-                    }
-                elif job_status == 'error':
-                    raise HTTPException(status_code=500, detail=job_details['job'].get('reason', f"Transcription failed on {TYPEMYWORDZ3_NAME} (Speechmatics)"))
-                else:
-                    logger.info(f"{TYPEMYWORDZ3_NAME} (Speechmatics) status: {job_status}")
-                    continue
-        
-    except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ3_NAME} (Speechmatics) transcription cancelled for job {job_id}")
-        if 'speechmatics_job_id' in locals():
-            try:
-                # Need to use the client object from the context manager
-                with BatchClient(connection_settings) as client: # Re-enter context to delete
-                    client.delete_job(speechmatics_job_id)
-                logger.info(f"{TYPEMYWORDZ3_NAME} (Speechmatics) job {speechmatics_job_id} deleted due to cancellation.")
-            except Exception as e:
-                logger.warning(f"Failed to delete {TYPEMYWORDZ3_NAME} (Speechmatics) job {speechmatics_job_id} after cancellation: {e}")
-        raise
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) transcription failed for job {job_id}: {str(e)}")
-        return {
-            "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} (Speechmatics) transcription failed: {str(e)}"
-        }
-    finally:
-        if 'compressed_path' in locals() and os.path.exists(compressed_path):
-            os.unlink(compressed_path)
-            logger.info(f"Cleaned up compressed file after {TYPEMYWORDZ3_NAME} (Speechmatics) processing: {compressed_path}")
-
+# REMOVED: transcribe_with_speechmatics function
 
 async def transcribe_with_google_cloud(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Transcribe audio using Google Cloud Speech-to-Text API."""
@@ -1085,21 +954,22 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
 
-        elif tier_1_service == "speechmatics": # TYPEMYWORDZ3_NAME
-            if not SPEECHMATICS_API_KEY:
-                logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
-            else:
-                try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 1 Primary) for job {job_id}")
-                    transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
-                    job_data["tier_1_used"] = "speechmatics"
-                    job_data["tier_1_success"] = True
-                except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 1 Primary) failed: {error}")
-                    job_data["tier_1_error"] = str(error)
-                    job_data["tier_1_success"] = False
-            services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier1")
+        # REMOVED: Speechmatics tier 1 block
+        # elif tier_1_service == "speechmatics": 
+        #     if not SPEECHMATICS_API_KEY:
+        #         logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 1 for job {job_id}")
+        #         job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
+        #     else:
+        #         try:
+        #             logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 1 Primary) for job {job_id}")
+        #             transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
+        #             job_data["tier_1_used"] = "speechmatics"
+        #             job_data["tier_1_success"] = True
+        #         except Exception as error:
+        #             logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 1 Primary) failed: {error}")
+        #             job_data["tier_1_error"] = str(error)
+        #             job_data["tier_1_success"] = False
+        #     services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier1")
         
         elif tier_1_service == "google_cloud": # TYPEMYWORDZ3_NAME
             if not google_speech_client:
@@ -1155,21 +1025,22 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
 
-            elif tier_2_service == "speechmatics": # TYPEMYWORDZ3_NAME
-                if not SPEECHMATICS_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_2_used"] = "speechmatics"
-                        job_data["tier_2_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 2 Fallback) failed: {error}")
-                        job_data["tier_2_error"] = str(error)
-                        job_data["tier_2_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
+            # REMOVED: Speechmatics tier 2 block
+            # elif tier_2_service == "speechmatics": 
+            #     if not SPEECHMATICS_API_KEY:
+            #         logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 2 for job {job_id}")
+            #         job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
+            #     else:
+            #         try:
+            #             logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 2 Fallback) for job {job_id}")
+            #             transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
+            #             job_data["tier_2_used"] = "speechmatics"
+            #             job_data["tier_2_success"] = True
+            #         except Exception as error:
+            #             logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 2 Fallback) failed: {error}")
+            #             job_data["tier_2_error"] = str(error)
+            #             job_data["tier_2_success"] = False
+            #     services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
             
             elif tier_2_service == "google_cloud": # TYPEMYWORDZ3_NAME
                 if not google_speech_client:
@@ -1225,21 +1096,22 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
 
-            elif tier_3_service == "speechmatics": # TYPEMYWORDZ3_NAME
-                if not SPEECHMATICS_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_3_used"] = "speechmatics"
-                        job_data["tier_3_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 3 Fallback) failed: {error}")
-                        job_data["tier_3_error"] = str(error)
-                        job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
+            # REMOVED: Speechmatics tier 3 block
+            # elif tier_3_service == "speechmatics": 
+            #     if not SPEECHMATICS_API_KEY:
+            #         logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 3 for job {job_id}")
+            #         job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
+            #     else:
+            #         try:
+            #             logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 3 Fallback) for job {job_id}")
+            #             transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
+            #             job_data["tier_3_used"] = "speechmatics"
+            #             job_data["tier_3_success"] = True
+            #         except Exception as error:
+            #             logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 3 Fallback) failed: {error}")
+            #             job_data["tier_3_error"] = str(error)
+            #             job_data["tier_3_success"] = False
+            #     services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
             
             elif tier_3_service == "google_cloud": # TYPEMYWORDZ3_NAME
                 if not google_speech_client:
@@ -1369,8 +1241,6 @@ async def root():
             "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
             "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
             "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
-            "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
-            "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
             "admin_emails": ADMIN_EMAILS
         },
         "stats": {
@@ -1569,16 +1439,18 @@ async def paystack_webhook(request: Request):
 
 @app.get("/api/paystack-status")
 async def paystack_status():
+    # FIX: Corrected syntax error in the return dictionary
     return {
         "paystack_configured": bool(PAYSTACK_SECRET_KEY),
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-        "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
+        # REMOVED: "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
+        "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64), # NEW
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
-        "admin_emails": ADMIN_EMAILS,
+        "admin_emails": ADMIN_EMAILS, # Moved outside the inner dict
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -2120,8 +1992,8 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
-                "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64), # NEW
+                # REMOVED: "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
+                "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)
@@ -2136,8 +2008,8 @@ async def health_check():
                 "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
                 "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
                 "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
-                "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)", # NEW
-                "speechmatics": f"Speechmatics (currently configured as {TYPEMYWORDZ3_NAME} for testing)", # Clarification
+                "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
+                # REMOVED: "speechmatics": f"Speechmatics (currently not active as a primary, but available as a fallback option via {TYPEMYWORDZ3_NAME} if Google Cloud fails)",
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
                 "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
                 "admin_emails": ADMIN_EMAILS
@@ -2159,7 +2031,8 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"{TYPEMYWORDZ1_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"{TYPEMYWORDZ2_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
-logger.info(f"{TYPEMYWORDZ3_NAME} API Key configured: {bool(GCP_SPEECH_KEY_BASE64) or bool(SPEECHMATICS_API_KEY)}") # Check for either GCP or Speechmatics key
+logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) API Key configured: {bool(GCP_SPEECH_KEY_BASE64)}")
+# logger.info(f"Speechmatics API Key configured (but not actively used in primary logic): {bool(SPEECHMATICS_API_KEY)}") # REMOVED
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
@@ -2220,8 +2093,8 @@ if __name__ == "__main__":
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
-    logger.info(f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)") # NEW
-    logger.info(f"  - Speechmatics: Currently integrated as {TYPEMYWORDZ3_NAME} for testing, but replaced by Google Cloud in default logic.") # Clarification
+    logger.info(f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)")
+    # logger.info(f"  - Speechmatics: Currently integrated as {TYPEMYWORDZ3_NAME} for testing, but replaced by Google Cloud in default logic.") # REMOVED
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
     logger.info(f"  - OpenAI (GPT models) for admin AI text processing (via Render service)")
     logger.info("  - REMOVED: Self-hosted Whisper service (old TypeMyworDz2)")
