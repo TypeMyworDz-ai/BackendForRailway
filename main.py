@@ -158,8 +158,8 @@ gemini_client = None
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # You can choose different Gemini models, e.g., 'gemini-pro', 'gemini-1.5-pro-latest'
-        gemini_client = genai.GenerativeModel('gemini-pro')
+        # You can choose different Gemini models, e.g., 'gemini-1.0-pro', 'gemini-pro', 'gemini-1.5-pro-latest'
+        gemini_client = genai.GenerativeModel('gemini-1.0-pro')
         logger.info(f"Google Gemini client initialized successfully.")
     except Exception as e:
         logger.error(f"Error initializing Google Gemini client: {e}")
@@ -275,7 +275,7 @@ class AdminAIFormatRequest_Pydantic(BaseModel):
 class AdminAIFormatGeminiRequest_Pydantic(BaseModel):
     transcript: str
     formatting_instructions: str = "Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."
-    model: str = "gemini-pro" # Default Gemini model
+    model: str = "gemini-1.0-pro" # Default Gemini model
     max_tokens: int = 4000
 
 jobs = {}
@@ -1800,7 +1800,7 @@ async def ai_admin_format(
 async def ai_admin_format_gemini(
     transcript: str = Form(...),
     formatting_instructions: str = Form("Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."),
-    model: str = Form("gemini-pro"), # Default to Gemini Pro
+    model: str = Form("gemini-1.0-pro"), # Default to Gemini Pro
     max_tokens: int = Form(4000),
     user_plan: str = Form("free")
 ):
