@@ -1208,7 +1208,7 @@ async def lifespan(app: FastAPI):
     logger.info("All background tasks cancelled and cleanup complete")
 
 logger.info("Creating FastAPI app...")
-app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYTPEYWORDZ3_NAME} & {TYPEMYWORDZ_AI_NAME}", lifespan=lifespan) # Corrected typo in title
+app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ3_NAME} & {TYPEMYWORDZ_AI_NAME}", lifespan=lifespan) # Corrected typo in title
 logger.info("FastAPI app created successfully")
 
 app.add_middleware(
