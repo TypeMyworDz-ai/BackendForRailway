@@ -699,6 +699,7 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
         
         # Wait for the operation to complete
         result = await asyncio.to_thread(operation.result) # This will block until complete or error
+        logger.info(f"DEBUG: Full Google Cloud Speech result for job {job_id}: {result}")
 
         transcription_text = ""
         has_speaker_labels = False
