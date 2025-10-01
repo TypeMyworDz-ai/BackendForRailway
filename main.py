@@ -44,7 +44,7 @@ logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 # Service Names
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text - NEW!
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
 # Admin email addresses
@@ -724,7 +724,14 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
                     transcription_text += res.alternatives[0].transcript
             
             # Estimate duration and word count (Google Cloud doesn't always provide duration directly in results)
-            duration = sum(res.result_end_time.seconds + res.result_end_time.nanos / 1e9 for res in result.results) if result.results else 0
+            # FIX: Correctly access seconds and microseconds from timedelta
+            duration = 0
+            if result.results:
+                # Sum the duration of all recognized segments
+                for res in result.results:
+                    if res.result_end_time:
+                        duration += res.result_end_time.seconds + res.result_end_time.microseconds / 1e6
+            
             word_count = len(transcription_text.split()) if transcription_text else 0
 
             logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription completed for job {job_id}")
@@ -955,22 +962,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
 
         # REMOVED: Speechmatics tier 1 block
-        # elif tier_1_service == "speechmatics": 
-        #     if not SPEECHMATICS_API_KEY:
-        #         logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 1 for job {job_id}")
-        #         job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
-        #     else:
-        #         try:
-        #             logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 1 Primary) for job {job_id}")
-        #             transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
-        #             job_data["tier_1_used"] = "speechmatics"
-        #             job_data["tier_1_success"] = True
-        #         except Exception as error:
-        #             logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 1 Primary) failed: {error}")
-        #             job_data["tier_1_error"] = str(error)
-        #             job_data["tier_1_success"] = False
-        #     services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier1")
-        
+
         elif tier_1_service == "google_cloud": # TYPEMYWORDZ3_NAME
             if not google_speech_client:
                 logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 1 for job {job_id}")
@@ -1026,21 +1018,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
 
             # REMOVED: Speechmatics tier 2 block
-            # elif tier_2_service == "speechmatics": 
-            #     if not SPEECHMATICS_API_KEY:
-            #         logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 2 for job {job_id}")
-            #         job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
-            #     else:
-            #         try:
-            #             logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 2 Fallback) for job {job_id}")
-            #             transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
-            #             job_data["tier_2_used"] = "speechmatics"
-            #             job_data["tier_2_success"] = True
-            #         except Exception as error:
-            #             logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 2 Fallback) failed: {error}")
-            #             job_data["tier_2_error"] = str(error)
-            #             job_data["tier_2_success"] = False
-            #     services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
             
             elif tier_2_service == "google_cloud": # TYPEMYWORDZ3_NAME
                 if not google_speech_client:
@@ -1097,21 +1074,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
 
             # REMOVED: Speechmatics tier 3 block
-            # elif tier_3_service == "speechmatics": 
-            #     if not SPEECHMATICS_API_KEY:
-            #         logger.error(f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured, skipping Tier 3 for job {job_id}")
-            #         job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} (Speechmatics) API Key not configured"
-            #     else:
-            #         try:
-            #             logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 3 Fallback) for job {job_id}")
-            #             transcription_result = await transcribe_with_speechmatics(tmp_path, language_code, speaker_labels_enabled, job_id)
-            #             job_data["tier_3_used"] = "speechmatics"
-            #             job_data["tier_3_success"] = True
-            #         except Exception as error:
-            #             logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Speechmatics) (Tier 3 Fallback) failed: {error}")
-            #             job_data["tier_3_error"] = str(error)
-            #             job_data["tier_3_success"] = False
-            #     services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
             
             elif tier_3_service == "google_cloud": # TYPEMYWORDZ3_NAME
                 if not google_speech_client:
@@ -2094,7 +2056,6 @@ if __name__ == "__main__":
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
     logger.info(f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)")
-    # logger.info(f"  - Speechmatics: Currently integrated as {TYPEMYWORDZ3_NAME} for testing, but replaced by Google Cloud in default logic.") # REMOVED
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
     logger.info(f"  - OpenAI (GPT models) for admin AI text processing (via Render service)")
     logger.info("  - REMOVED: Self-hosted Whisper service (old TypeMyworDz2)")
