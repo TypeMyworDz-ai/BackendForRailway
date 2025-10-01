@@ -304,7 +304,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
         logger.info("Audio compression complete")
         
         if os.path.exists(output_path):
-            output_size = os.path.getsize(output_path) / (1024 * 1024)
+            output_size = os.path.getsize(output_path) / (1024 * 1024) # FIX: Changed output_path to output_size
             
             size_difference = input_size - output_size
             if input_size > 0:
@@ -314,7 +314,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_path, 2),
+                "compressed_size_mb": round(output_size, 2), # FIX: Changed output_path to output_size
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -349,11 +349,11 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_path) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0 # FIX: Changed input_path to input_size
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_path, 2),
+                "compressed_size_mb": round(output_size, 2), # FIX: Changed output_path to output_size
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
