@@ -1308,7 +1308,7 @@ async def root():
             "Google Gemini integration for AI queries"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYT_NAME}",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
             "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
             "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}", # UPDATED
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
