@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 
 logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
-# NEW Service Names
+# NEW Service Names and their mapping based on accuracy feedback
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
-TYPEMYWORDZ2_NAME = "TypeMyworDz2" # Deepgram - NEW primary for many
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # OpenAI Whisper
+TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper (previously TypeMyworDz3, now moved to 2nd slot)
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Deepgram (previously TypeMyworDz2, now moved to 3rd slot)
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
 # Admin email addresses
@@ -60,7 +60,7 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
-DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY") # NEW: Deepgram API Key
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -70,31 +70,30 @@ OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAIL
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}") # NEW DEBUG
+logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
-logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}") # Clarified
+logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
-logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}") # NEW DEBUG
+logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
 
-if not DEEPGRAM_API_KEY: # NEW CHECK
-    logger.warning(f"{TYPEMYWORDZ2_NAME} API Key environment variable not set! {TYPEMYWORDZ2_NAME} will not be available as a fallback.")
+if not DEEPGRAM_API_KEY:
+    logger.warning(f"{TYPEMYWORDZ3_NAME} API Key environment variable not set! {TYPEMYWORDZ3_NAME} will not be available as a fallback.")
 
 if not ANTHROPIC_API_KEY:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
 
-# OPENAI_API_KEY is no longer used directly for GPT client in main.py, but log it anyway
 if not OPENAI_API_KEY:
     logger.warning(f"OPENAI_API_KEY (for GPT if direct) environment variable not set! Direct OpenAI GPT calls disabled.")
 
 if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-    logger.error(f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper & GPT) Service URL not configured! OpenAI transcription and GPT formatting will be disabled.")
+    logger.error(f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper & GPT) Service URL not configured! OpenAI transcription and GPT formatting will be disabled.")
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -128,11 +127,11 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    New logic for service selection with three tiers:
-    - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz3) fallback1, Deepgram (TypeMyworDz2) fallback2
-    - Paid users: Deepgram (TypeMyworDz2) primary, AssemblyAI (TypeMyworDz1) fallback1, OpenAI (TypeMyworDz3) fallback2
-    - Admins: Deepgram (TypeMyworDz2) primary, OpenAI (TypeMyworDz3) fallback1, AssemblyAI (TypeMyworDz1) fallback2
-    - Speaker labels requested: Always use AssemblyAI (TypeMyworDz1) first, Deepgram (TypeMyworDz2) fallback1, OpenAI (TypeMyworDz3) fallback2
+    New logic for service selection with three tiers, adjusted for Deepgram accuracy feedback:
+    - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Deepgram (TypeMyworDz3) fallback2
+    - Paid users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Deepgram (TypeMyworDz3) fallback2
+    - Admins: OpenAI (TypeMyworDz2) primary, AssemblyAI (TypeMyworDz1) fallback1, Deepgram (TypeMyworDz3) fallback2
+    - Speaker labels requested: Always use AssemblyAI (TypeMyworDz1) first, Deepgram (TypeMyworDz3) fallback1, OpenAI (TypeMyworDz2) fallback2
     """
     
     # Check if user is admin based on email
@@ -143,32 +142,32 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         # Fallback to Deepgram (which also supports speaker labels), then OpenAI (without speaker labels).
         return {
             "tier_1": "assemblyai",      # TypeMyworDz1
-            "tier_2": "deepgram",        # TypeMyworDz2
-            "tier_3": "openai_whisper",  # TypeMyworDz3
+            "tier_2": "deepgram",        # TypeMyworDz3 (Deepgram still good for speaker labels)
+            "tier_3": "openai_whisper",  # TypeMyworDz2
             "reason": "speaker_labels_requested"
         }
     elif is_admin:
-        # Admins get Deepgram first, then OpenAI, then AssemblyAI
+        # Admins get OpenAI first, then AssemblyAI, then Deepgram
         return {
-            "tier_1": "deepgram",        # TypeMyworDz2
-            "tier_2": "openai_whisper",  # TypeMyworDz3
-            "tier_3": "assemblyai",      # TypeMyworDz1
+            "tier_1": "openai_whisper",  # TypeMyworDz2
+            "tier_2": "assemblyai",      # TypeMyworDz1
+            "tier_3": "deepgram",        # TypeMyworDz3
             "reason": "admin_user"
         }
     elif is_paid_ai_user(user_plan): # All other paid users
-        # Paid users get Deepgram first, then AssemblyAI, then OpenAI
+        # Paid users get AssemblyAI first, then OpenAI, then Deepgram
         return {
-            "tier_1": "deepgram",        # TypeMyworDz2
-            "tier_2": "assemblyai",      # TypeMyworDz1
-            "tier_3": "openai_whisper",  # TypeMyworDz3
+            "tier_1": "assemblyai",      # TypeMyworDz1
+            "tier_2": "openai_whisper",  # TypeMyworDz2
+            "tier_3": "deepgram",        # TypeMyworDz3
             "reason": f"paid_user_{user_plan}"
         }
     else: # Free users
         # Free users get AssemblyAI first, then OpenAI, then Deepgram
         return {
             "tier_1": "assemblyai",      # TypeMyworDz1
-            "tier_2": "openai_whisper",  # TypeMyworDz3
-            "tier_3": "deepgram",        # TypeMyworDz2
+            "tier_2": "openai_whisper",  # TypeMyworDz2
+            "tier_3": "deepgram",        # TypeMyworDz3
             "reason": f"free_user_{user_plan}"
         }
 class PaystackVerificationRequest(BaseModel):
@@ -315,7 +314,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -350,11 +349,11 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_path) * 100 if input_size > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -569,15 +568,15 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'error': str(e)
         }
 
-# MODIFIED: Call the new dedicated Whisper service
-async def call_openai_whisper_service(audio_path: str, language_code: str, job_id: str) -> dict:
+# Renamed from call_openai_whisper_service to transcribe_with_openai_whisper for consistency
+async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-        logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} Service URL not configured")
+        logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping {TYPEMYWORDZ2_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ2_NAME} Service URL not configured")
 
     try:
-        logger.info(f"Calling {TYPEMYWORDZ3_NAME} service for job {job_id} at {OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe")
+        logger.info(f"Calling {TYPEMYWORDZ2_NAME} service for job {job_id} at {OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe")
         
         # Read the audio file content
         with open(audio_path, "rb") as f:
@@ -600,31 +599,31 @@ async def call_openai_whisper_service(audio_path: str, language_code: str, job_i
         result = response.json()
         
         if result.get("status") == "completed" and result.get("transcription"):
-            logger.info(f"{TYPEMYWORDZ3_NAME} service transcription completed for job {job_id}")
+            logger.info(f"{TYPEMYWORDZ2_NAME} service transcription completed for job {job_id}")
             return result # The dedicated service returns a dict similar to what we expect
         else:
-            raise Exception(f"{TYPEMYWORDZ3_NAME} service returned an incomplete or failed status: {result}")
+            raise Exception(f"{TYPEMYWORDZ2_NAME} service returned an incomplete or failed status: {result}")
 
     except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ3_NAME} service call cancelled for job {job_id}")
+        logger.info(f"{TYPEMYWORDZ2_NAME} service call cancelled for job {job_id}")
         raise
     except httpx.HTTPStatusError as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
+        logger.error(f"{TYPEMYWORDZ2_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
+            "error": f"{TYPEMYWORDZ2_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
         }
     except httpx.RequestError as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} service network error for job {job_id}: {e}")
+        logger.error(f"{TYPEMYWORDZ2_NAME} service network error for job {job_id}: {e}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} service network error: {e}"
+            "error": f"{TYPEMYWORDZ2_NAME} service network error: {e}"
         }
     except Exception as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} service transcription failed for job {job_id}: {str(e)}")
+        logger.error(f"{TYPEMYWORDZ2_NAME} service transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} service transcription failed: {str(e)}"
+            "error": f"{TYPEMYWORDZ2_NAME} service transcription failed: {str(e)}"
         }
     finally:
         # The temporary file cleanup (tmp_path) is handled in process_transcription_job's finally block
@@ -634,25 +633,25 @@ async def call_openai_whisper_service(audio_path: str, language_code: str, job_i
 async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Transcribe audio using Deepgram API"""
     if not DEEPGRAM_API_KEY:
-        logger.error(f"{TYPEMYWORDZ2_NAME} API Key not configured, skipping {TYPEMYWORDZ2_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ2_NAME} API Key not configured")
+        logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} API Key not configured")
 
     try:
-        logger.info(f"Starting {TYPEMYWORDZ2_NAME} transcription for job {job_id}")
+        logger.info(f"Starting {TYPEMYWORDZ3_NAME} transcription for job {job_id}")
         
         def check_cancellation():
             if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ2_NAME} processing")
+                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ3_NAME} processing")
                 raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
         check_cancellation()
         
         compressed_path, compression_stats = compress_audio_for_transcription(audio_path, job_id=job_id)
-        logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
+        logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME}: {compression_stats}")
 
         check_cancellation()
         
-        logger.info(f"Uploading audio to {TYPEMYWORDZ2_NAME}...")
+        logger.info(f"Uploading audio to {TYPEMYWORDZ3_NAME}...")
         
         headers = {
             "Authorization": f"Token {DEEPGRAM_API_KEY}",
@@ -668,7 +667,7 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         if speaker_labels_enabled:
             params["diarize"] = "true"
             params["utterances"] = "true" # Deepgram can provide utterance-level speaker info
-            logger.info(f"{TYPEMYWORDZ2_NAME}: Speaker diarization ENABLED for job {job_id}")
+            logger.info(f"{TYPEMYWORDZ3_NAME}: Speaker diarization ENABLED for job {job_id}")
         
         url = "https://api.deepgram.com/v1/listen"
         
@@ -698,7 +697,7 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
             duration = result["results"]["channels"][0].get("alternatives", [{}])[0].get("duration", 0)
             word_count = len(transcription_text.split()) if transcription_text else 0
 
-            logger.info(f"{TYPEMYWORDZ2_NAME} transcription completed for job {job_id}")
+            logger.info(f"{TYPEMYWORDZ3_NAME} transcription completed for job {job_id}")
             return {
                 "status": "completed",
                 "transcription": transcription_text,
@@ -708,33 +707,33 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
                 "has_speaker_labels": has_speaker_labels
             }
         else:
-            raise Exception(f"{TYPEMYWORDZ2_NAME} returned an incomplete or failed status: {result}")
+            raise Exception(f"{TYPEMYWORDZ3_NAME} returned an incomplete or failed status: {result}")
 
     except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ2_NAME} transcription cancelled for job {job_id}")
+        logger.info(f"{TYPEMYWORDZ3_NAME} transcription cancelled for job {job_id}")
         raise
     except httpx.HTTPStatusError as e:
-        logger.error(f"{TYPEMYWORDZ2_NAME} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
+        logger.error(f"{TYPEMYWORDZ3_NAME} HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} HTTP error: {e.response.status_code} - {e.response.text}"
+            "error": f"{TYPEMYWORDZ3_NAME} HTTP error: {e.response.status_code} - {e.response.text}"
         }
     except httpx.RequestError as e:
-        logger.error(f"{TYPEMYWORDZ2_NAME} network error for job {job_id}: {e}")
+        logger.error(f"{TYPEMYWORDZ3_NAME} network error for job {job_id}: {e}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} network error: {e}"
+            "error": f"{TYPEMYWORDZ3_NAME} network error: {e}"
         }
     except Exception as e:
-        logger.error(f"{TYPEMYWORDZ2_NAME} transcription failed for job {job_id}: {str(e)}")
+        logger.error(f"{TYPEMYWORDZ3_NAME} transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} transcription failed: {str(e)}"
+            "error": f"{TYPEMYWORDZ3_NAME} transcription failed: {str(e)}"
         }
     finally:
         if 'compressed_path' in locals() and os.path.exists(compressed_path):
             os.unlink(compressed_path)
-            logger.info(f"Cleaned up compressed file after {TYPEMYWORDZ2_NAME} processing: {compressed_path}")
+            logger.info(f"Cleaned up compressed file after {TYPEMYWORDZ3_NAME} processing: {compressed_path}")
 
 
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
@@ -921,15 +920,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier1")
             
-        elif tier_1_service == "deepgram":
-            if not DEEPGRAM_API_KEY:
-                logger.error(f"{TYPEMYWORDZ2_NAME} API Key not configured, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ2_NAME} API Key not configured"
+        elif tier_1_service == "openai_whisper": # Changed to TypeMyworDz2
+            if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
             else:
                 try:
                     logger.info(f"🚀 Attempting {TYPEMYWORDZ2_NAME} (Tier 1 Primary) for job {job_id}")
-                    transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id)
-                    job_data["tier_1_used"] = "deepgram"
+                    transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id) # Renamed function
+                    job_data["tier_1_used"] = "openai_whisper"
                     job_data["tier_1_success"] = True
                 except Exception as error:
                     logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 1 Primary) failed: {error}")
@@ -937,15 +936,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
 
-        elif tier_1_service == "openai_whisper":
-            if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
+        elif tier_1_service == "deepgram": # Changed to TypeMyworDz3
+            if not DEEPGRAM_API_KEY:
+                logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} API Key not configured"
             else:
                 try:
                     logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Tier 1 Primary) for job {job_id}")
-                    transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
-                    job_data["tier_1_used"] = "openai_whisper"
+                    transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id)
+                    job_data["tier_1_used"] = "deepgram"
                     job_data["tier_1_success"] = True
                 except Exception as error:
                     logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Tier 1 Primary) failed: {error}")
@@ -975,15 +974,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier2")
                 
-            elif tier_2_service == "deepgram":
-                if not DEEPGRAM_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ2_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ2_NAME} API Key not configured"
+            elif tier_2_service == "openai_whisper": # Changed to TypeMyworDz2
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
                 else:
                     try:
                         logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_2_used"] = "deepgram"
+                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id) # Renamed function
+                        job_data["tier_2_used"] = "openai_whisper"
                         job_data["tier_2_success"] = True
                     except Exception as error:
                         logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 2 Fallback) failed: {error}")
@@ -991,15 +990,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
 
-            elif tier_2_service == "openai_whisper":
-                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
+            elif tier_2_service == "deepgram": # Changed to TypeMyworDz3
+                if not DEEPGRAM_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} API Key not configured"
                 else:
                     try:
                         logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
-                        job_data["tier_2_used"] = "openai_whisper"
+                        transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_2_used"] = "deepgram"
                         job_data["tier_2_success"] = True
                     except Exception as error:
                         logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Tier 2 Fallback) failed: {error}")
@@ -1029,15 +1028,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier3")
                 
-            elif tier_3_service == "deepgram":
-                if not DEEPGRAM_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ2_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ2_NAME} API Key not configured"
+            elif tier_3_service == "openai_whisper": # Changed to TypeMyworDz2
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
                 else:
                     try:
                         logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_3_used"] = "deepgram"
+                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id) # Renamed function
+                        job_data["tier_3_used"] = "openai_whisper"
                         job_data["tier_3_success"] = True
                     except Exception as error:
                         logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) failed: {error}")
@@ -1045,15 +1044,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
 
-            elif tier_3_service == "openai_whisper":
-                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} Service URL not configured"
+            elif tier_3_service == "deepgram": # Changed to TypeMyworDz3
+                if not DEEPGRAM_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ3_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} API Key not configured"
                 else:
                     try:
                         logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await call_openai_whisper_service(tmp_path, language_code, job_id)
-                        job_data["tier_3_used"] = "openai_whisper"
+                        transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_3_used"] = "deepgram"
                         job_data["tier_3_success"] = True
                     except Exception as error:
                         logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Tier 3 Fallback) failed: {error}")
@@ -1157,22 +1156,22 @@ async def root():
             f"{TYPEMYWORDZ3_NAME} integration for transcription",
             "Three-tier automatic fallback between services",
             "Paystack payment integration",
-            f"Speaker diarization for {TYPEMYWORDZ1_NAME} and {TYPEMYWORDZ2_NAME}",
+            f"Speaker diarization for {TYPEMYWORDZ1_NAME} and {TYPEMYWORDZ3_NAME}", # Updated Deepgram name
             "Language selection for transcription",
             f"{TYPEMYWORDZ_AI_NAME} (Anthropic) for user-driven summarization, Q&A, and bullet points",
             f"OpenAI for admin-driven transcript formatting"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "paid_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
-            "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
-            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+            "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+            "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
             "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
             "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
-            "deepgram": f"{TYPEMYWORDZ2_NAME} (Deepgram)",
-            "openai_whisper": f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper-1)",
+            "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)", # Updated Deepgram name
+            "deepgram": f"{TYPEMYWORDZ3_NAME} (Deepgram)", # Updated Deepgram name
             "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
             "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
             "admin_emails": ADMIN_EMAILS
@@ -1378,7 +1377,7 @@ async def paystack_status():
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-        "deepgram_configured": bool(DEEPGRAM_API_KEY), # NEW
+        "deepgram_configured": bool(DEEPGRAM_API_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
@@ -1871,7 +1870,7 @@ async def list_jobs():
             "user_plan": job_data.get("user_plan", "unknown"),
             "user_email": job_data.get("user_email", "unknown"),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
-            "primary_service": job_data.get("tier_1_service"), # Changed to reflect tiers
+            "primary_service": job_data.get("tier_1_service"),
             "service_used": job_data.get("service_used"),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
@@ -1924,22 +1923,22 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "deepgram_configured": bool(DEEPGRAM_API_KEY), # NEW
+                "deepgram_configured": bool(DEEPGRAM_API_KEY),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "paid_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
-                "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}", # Corrected typo
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+                "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+                "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
                 "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
-                "deepgram": f"{TYPEMYWORDZ2_NAME} (Deepgram)", # Corrected typo
-                "openai_whisper": f"{TYPEMYWORDZ3_NAME} (OpenAI Whisper-1)",
+                "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
+                "deepgram": f"{TYPEMYWORDZ3_NAME} (Deepgram)",
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
                 "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
                 "admin_emails": ADMIN_EMAILS
@@ -1960,8 +1959,8 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
 logger.info("Performing final system validation...")
 logger.info(f"{TYPEMYWORDZ1_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"{TYPEMYWORDZ2_NAME} API Key configured: {bool(DEEPGRAM_API_KEY)}") # NEW
-logger.info(f"{TYPEMYWORDZ3_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
+logger.info(f"{TYPEMYWORDZ2_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}") # Updated name
+logger.info(f"{TYPEMYWORDZ3_NAME} API Key configured: {bool(DEEPGRAM_API_KEY)}") # Updated name
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
@@ -1997,11 +1996,12 @@ if __name__ == "__main__":
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
-    logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} (Deepgram) integrated for transcription") # NEW
+    logger.info(f"  ✅ {TYPEMYWORDZ2_NAME} (OpenAI Whisper) integrated for transcription") # Updated name
+    logger.info(f"  ✅ {TYPEMYWORDZ3_NAME} (Deepgram) integrated for transcription") # Updated name
     logger.info(f"  ✅ Smart service selection with updated logic")
     logger.info(f"  ✅ Three-tier automatic fallback system")
     logger.info(f"  ✅ Admin email-based service prioritization")
-    logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ1_NAME} and {TYPEMYWORDZ2_NAME}") # NEW
+    logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ1_NAME} and {TYPEMYWORDZ3_NAME}") # Updated Deepgram name
     logger.info(f"  ✅ Dynamic {TYPEMYWORDZ1_NAME} model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
     logger.info("  ✅ Enhanced error handling and service resilience")
@@ -2009,20 +2009,20 @@ if __name__ == "__main__":
     logger.info("  ✅ Paystack payment integration")
     logger.info("  ✅ Multi-language support")
     logger.info("  ✅ Formatted Word document generation")
-    logger.info(f"  ✅ User-driven AI features (summarization, Q&A, bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic)")
+    logger.info(f"  ✅ User-driven AI features (summarization, Q&A, and bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic)")
     logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic) and OpenAI (via Render service)")
     logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Pro plans)")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Paid users: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
-    logger.info(f"  - Admin users ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
-    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Paid users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Admin users ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
-    logger.info(f"  - {TYPEMYWORDZ2_NAME}: Deepgram (supports speaker labels)") # NEW
-    logger.info(f"  - {TYPEMYWORDZ3_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
+    logger.info(f"  - {TYPEMYWORDZ2_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)") # Updated Deepgram name
+    logger.info(f"  - {TYPEMYWORDZ3_NAME}: Deepgram (supports speaker labels)") # Updated Deepgram name
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
     logger.info(f"  - OpenAI (GPT models) for admin AI text processing (via Render service)")
     logger.info("  - REMOVED: Self-hosted Whisper service (old TypeMyworDz2)")
@@ -2042,4 +2042,4 @@ if __name__ == "__main__":
         sys.exit(1)
 else:
     logger.info("Application loaded as module")
-    logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ3_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + OpenAI integration") # Corrected typo
+    logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ3_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + OpenAI integration")
