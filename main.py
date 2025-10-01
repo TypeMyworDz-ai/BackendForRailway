@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 
 logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
-# NEW Service Names and their mapping
+# Service Names
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Speechmatics - NEW!
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Speechmatics
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
 # Admin email addresses
@@ -60,7 +60,7 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
-SPEECHMATICS_API_KEY = os.environ.get("SPEECHMATICS_API_KEY") # NEW: Speechmatics API Key
+SPEECHMATICS_API_KEY = os.environ.get("SPEECHMATICS_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -70,7 +70,7 @@ OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAIL
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"DEBUG: SPEECHMATICS_API_KEY loaded value: {bool(SPEECHMATICS_API_KEY)}") # NEW DEBUG
+logger.info(f"DEBUG: SPEECHMATICS_API_KEY loaded value: {bool(SPEECHMATICS_API_KEY)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
@@ -83,7 +83,7 @@ logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
 
-if not SPEECHMATICS_API_KEY: # NEW CHECK
+if not SPEECHMATICS_API_KEY:
     logger.warning(f"{TYPEMYWORDZ3_NAME} API Key environment variable not set! {TYPEMYWORDZ3_NAME} will not be available as a fallback.")
 
 if not ANTHROPIC_API_KEY:
@@ -127,7 +127,7 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    New logic for service selection with three tiers, adjusted for Speechmatics testing:
+    Logic for service selection with three tiers for Speechmatics testing:
     - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Speechmatics (TypeMyworDz3) fallback2
     - Paid users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Speechmatics (TypeMyworDz3) fallback2
     - Admins: Speechmatics (TypeMyworDz3) primary, OpenAI (TypeMyworDz2) fallback1, AssemblyAI (TypeMyworDz1) fallback2
@@ -314,7 +314,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             stats = {
                 "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
+                "compressed_size_mb": round(output_path, 2),
                 "compression_ratio_percent": round(compression_ratio, 1),
                 "size_reduction_mb": round(size_difference, 2),
                 "duration_seconds": len(audio) / 1000.0
@@ -349,7 +349,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
+            compression_ratio = (size_difference / input_path) * 100 if input_size > 0 else 0
             
             stats = {
                 "original_size_mb": round(input_size, 2),
@@ -627,7 +627,6 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
     finally:
         pass
 
-# Renamed from transcribe_with_deepgram to transcribe_with_speechmatics
 async def transcribe_with_speechmatics(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Transcribe audio using Speechmatics API"""
     if not SPEECHMATICS_API_KEY:
@@ -649,19 +648,12 @@ async def transcribe_with_speechmatics(audio_path: str, language_code: str, spea
 
         check_cancellation()
         
-        logger.info(f"Uploading audio to {TYPEMYWORDZ3_NAME}...")
-        
-        headers = {
-            "Authorization": f"Bearer {SPEECHMATICS_API_KEY}",
-            "Content-Type": "application/octet-stream" # Binary audio stream
-        }
+        logger.info(f"Submitting audio to {TYPEMYWORDZ3_NAME}...")
         
         # Speechmatics API endpoint
         url = "https://asr.speechmatics.com/v2/jobs"
         
         # Configuration for Speechmatics
-        # For full flexibility, you might want to adjust model, language, diarization options
-        # based on user input or specific requirements.
         config_data = {
             "type": "transcription",
             "transcription_config": {
@@ -674,29 +666,24 @@ async def transcribe_with_speechmatics(audio_path: str, language_code: str, spea
             config_data["transcription_config"]["enable_speaker_diarization"] = True
             logger.info(f"{TYPEMYWORDZ3_NAME}: Speaker diarization ENABLED for job {job_id}")
 
-        # Use httpx for async request
+        # Use httpx for async request with multipart/form-data
         async with httpx.AsyncClient(timeout=300.0) as client:
             with open(compressed_path, "rb") as f:
-                # First, create the job
-                create_job_response = await client.post(
-                    url,
-                    json=config_data,
-                    headers={"Authorization": f"Bearer {SPEECHMATICS_API_KEY}", "Content-Type": "application/json"}
-                )
-                create_job_response.raise_for_status()
-                job_creation_result = create_job_response.json()
-                speechmatics_job_id = job_creation_result['id']
-                logger.info(f"{TYPEMYWORDZ3_NAME} job created with ID: {speechmatics_job_id}")
+                files = {
+                    'config': (None, json.dumps(config_data), 'application/json'),
+                    'data_file': (os.path.basename(compressed_path), f.read(), 'application/octet-stream')
+                }
+                headers = {
+                    "Authorization": f"Bearer {SPEECHMATICS_API_KEY}"
+                }
+                
+                # Send the multipart/form-data request
+                response = await client.post(url, files=files, headers=headers)
+                response.raise_for_status() # Raise an exception for HTTP errors
 
-                # Then, upload the audio
-                upload_url = f"{url}/{speechmatics_job_id}/audio"
-                upload_audio_response = await client.post(
-                    upload_url,
-                    headers={"Authorization": f"Bearer {SPEECHMATICS_API_KEY}", "Content-Type": "application/octet-stream"},
-                    content=f.read()
-                )
-                upload_audio_response.raise_for_status()
-                logger.info(f"{TYPEMYWORDZ3_NAME} audio uploaded for job {speechmatics_job_id}")
+        job_creation_result = response.json()
+        speechmatics_job_id = job_creation_result['id']
+        logger.info(f"{TYPEMYWORDZ3_NAME} job created and audio submitted with ID: {speechmatics_job_id}")
         
         # Polling for job completion
         while True:
@@ -726,36 +713,25 @@ async def transcribe_with_speechmatics(audio_path: str, language_code: str, spea
 
                 if speaker_labels_enabled and transcript_result.get("results"):
                     formatted_transcript_parts = []
-                    for result_item in transcript_result["results"]:
-                        if result_item.get("type") == "speaker_change":
-                            # Speechmatics provides speaker change events
-                            speaker_id = result_item.get("speaker", "Unknown")
-                            formatted_transcript_parts.append(f"<strong>Speaker {speaker_id}:</strong> ")
-                            has_speaker_labels = True
-                        elif result_item.get("type") == "word":
-                            formatted_transcript_parts.append(result_item["content"])
-                            if result_item.get("punctuated_word_end"):
-                                formatted_transcript_parts.append(result_item["punctuated_word_end"])
-                        elif result_item.get("type") == "punctuation":
-                            formatted_transcript_parts.append(result_item["content"])
-                    
+                    current_speaker = None
+                    for item in transcript_result["results"]:
+                        if item.get("type") == "speaker_change":
+                            new_speaker = item.get("speaker")
+                            if new_speaker != current_speaker:
+                                if formatted_transcript_parts and formatted_transcript_parts[-1].endswith("\n"):
+                                    formatted_transcript_parts.append("\n") # Add extra newline if previous ended with one
+                                formatted_transcript_parts.append(f"<strong>Speaker {new_speaker + 1}:</strong> ")
+                                current_speaker = new_speaker
+                        elif item.get("type") == "word":
+                            formatted_transcript_parts.append(item["content"])
+                            if item.get("punctuated_word_end"):
+                                formatted_transcript_parts.append(item["punctuated_word_end"])
+                        elif item.get("type") == "punctuation":
+                             # Punctuation might be handled by punctuated_word_end,
+                             # but if it appears as a separate item, append it.
+                             formatted_transcript_parts.append(item["content"])
                     transcription_text = "".join(formatted_transcript_parts).strip()
-                    # A more robust way to handle Speechmatics diarization output might be needed
-                    # depending on the exact format of 'results' when diarization is enabled.
-                    # For simplicity, this is a basic attempt to reconstruct.
-                    # A typical output would be more structured like:
-                    # if speaker_labels_enabled and transcript_result.get("results"):
-                    #     for result_item in transcript_result["results"]:
-                    #         if result_item.get("type") == "utterance":
-                    #             speaker_id = result_item.get("speaker", "Unknown")
-                    #             transcription_text += f"<strong>Speaker {speaker_id}:</strong> {result_item['content'].strip()}\n"
-                    #     has_speaker_labels = True
-                    # else:
-                    #     transcription_text = transcript_result["results"][0]["alternatives"][0]["transcript"] # Example for non-diarized
-                    # For now, let's assume the previous word-by-word processing is a starting point,
-                    # but real Speechmatics diarization might need specific handling of 'utterance' types.
-                    if not has_speaker_labels and transcript_result.get("transcript"):
-                        transcription_text = transcript_result["transcript"]
+                    has_speaker_labels = speaker_labels_enabled and bool(current_speaker is not None) # Check if any speaker tags were found
                 elif transcript_result.get("transcript"):
                     transcription_text = transcript_result["transcript"]
 
@@ -1208,7 +1184,7 @@ async def lifespan(app: FastAPI):
     logger.info("All background tasks cancelled and cleanup complete")
 
 logger.info("Creating FastAPI app...")
-app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ3_NAME} & {TYPEMYWORDZ_AI_NAME}", lifespan=lifespan) # Corrected typo in title
+app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ3_NAME} & {TYPEMYWORDZ_AI_NAME}", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
 app.add_middleware(
@@ -1452,7 +1428,7 @@ async def paystack_status():
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-        "speechmatics_configured": bool(SPEECHMATICS_API_KEY), # NEW
+        "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
@@ -1998,7 +1974,7 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "speechmatics_configured": bool(SPEECHMATICS_API_KEY), # NEW
+                "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)
@@ -2035,7 +2011,7 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"{TYPEMYWORDZ1_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"{TYPEMYWORDZ2_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
-logger.info(f"{TYPEMYWORDZ3_NAME} API Key configured: {bool(SPEECHMATICS_API_KEY)}") # NEW
+logger.info(f"{TYPEMYWORDZ3_NAME} API Key configured: {bool(SPEECHMATICS_API_KEY)}")
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
@@ -2071,7 +2047,7 @@ if __name__ == "__main__":
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
-    logger.info(f"  ✅ {TYPEMYWORDZ3_NAME} (Speechmatics) integrated for transcription") # NEW
+    logger.info(f"  ✅ {TYPEMYWORDZ3_NAME} (Speechmatics) integrated for transcription")
     logger.info(f"  ✅ Smart service selection with updated logic")
     logger.info(f"  ✅ Three-tier automatic fallback system")
     logger.info(f"  ✅ Admin email-based service prioritization")
@@ -2096,7 +2072,7 @@ if __name__ == "__main__":
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
-    logger.info(f"  - {TYPEMYWORDZ3_NAME}: Speechmatics (supports speaker labels)") # NEW
+    logger.info(f"  - {TYPEMYWORDZ3_NAME}: Speechmatics (supports speaker labels)")
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
     logger.info(f"  - OpenAI (GPT models) for admin AI text processing (via Render service)")
     logger.info("  - REMOVED: Self-hosted Whisper service (old TypeMyworDz2)")
