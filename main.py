@@ -1,3 +1,4 @@
+# Part 1: Imports and Logger Setup
 import logging
 import sys
 import asyncio
@@ -27,6 +28,7 @@ import openai # Keep openai import for GPT-based AI formatting
 # NEW: Import Google Cloud Speech-to-Text libraries
 from google.cloud import speech_v1p1beta1 as speech
 from google.oauth2 import service_account
+from google.cloud import storage # NEW: For Google Cloud Storage operations
 
 # REMOVED: Speechmatics BatchClient and ConnectionSettings imports
 
@@ -38,13 +40,13 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
+# Part 2: Service Names, Admin Emails, ffmpeg, Environment Variables Loading and Checks
 logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
 # Service Names
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text - NEW!
+TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT
 
 # Admin email addresses
@@ -69,6 +71,7 @@ logger.info("Loading environment variables...")
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 # REMOVED: SPEECHMATICS_API_KEY = os.environ.get("SPEECHMATICS_API_KEY")
 GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # Google Cloud Speech Key
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # NEW: Google Cloud Storage Bucket Name
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -80,6 +83,7 @@ logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
 # logger.info(f"DEBUG: SPEECHMATICS_API_KEY loaded value: {bool(SPEECHMATICS_API_KEY)}") # REMOVED
 logger.info(f"DEBUG: GCP_SPEECH_KEY_BASE64 loaded value: {bool(GCP_SPEECH_KEY_BASE64)}")
+logger.info(f"DEBUG: GCS_BUCKET_NAME loaded value: {bool(GCS_BUCKET_NAME)}") # NEW DEBUG
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
@@ -117,336 +121,7 @@ else:
     logger.warning("Paystack configuration missing - payment verification disabled")
 
 logger.info("Environment variables loaded successfully")
-
-claude_client = None
-if ANTHROPIC_API_KEY:
-    try:
-        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        logger.info(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) client initialized successfully.")
-    except Exception as e:
-        logger.error(f"Error initializing {TYPEMYWORDZ_AI_NAME} (Anthropic) client: {e}")
-else:
-    logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API key is missing, Claude client will not be initialized.")
-
-# Google Cloud Speech Client initialization
-google_speech_client = None
-if GCP_SPEECH_KEY_BASE64:
-    try:
-        # Decode the Base64 key
-        service_account_info = json.loads(base64.b64decode(GCP_SPEECH_KEY_BASE64).decode('utf-8'))
-        credentials = service_account.Credentials.from_service_account_info(service_account_info)
-        google_speech_client = speech.SpeechClient(credentials=credentials)
-        logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client initialized successfully.")
-    except Exception as e:
-        logger.error(f"Error initializing {TYPEMYWORDZ3_NAME} (Google Cloud Speech) client: {e}")
-else:
-    logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) API key is missing, client will not be initialized.")
-
-def is_paid_ai_user(user_plan: str) -> bool:
-    paid_plans_for_ai = ['Three-Day Plan', 'Pro', 'One-Week Plan']
-    return user_plan in paid_plans_for_ai
-
-def is_admin_user(user_email: str) -> bool:
-    """Check if user is an admin based on email address"""
-    if not user_email:
-        return False
-    return user_email.lower().strip() in [email.lower() for email in ADMIN_EMAILS]
-
-def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
-    """
-    Logic for service selection with three tiers, now exclusively Google Cloud as TYPEMYWORDZ3_NAME:
-    - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Google Cloud (TypeMyworDz3) fallback2
-    - Paid users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Google Cloud (TypeMyworDz3) fallback2
-    - Admins: Google Cloud (TypeMyworDz3) primary, OpenAI (TypeMyworDz2) fallback1, AssemblyAI (TypeMyworDz1) fallback2
-    - Speaker labels requested: Always use AssemblyAI (TypeMyworDz1) first, Google Cloud (TypeMyworDz3) fallback1, OpenAI (TypeMyworDz2) fallback2
-    """
-    
-    # Check if user is admin based on email
-    is_admin = is_admin_user(user_email) if user_email else False
-    
-    if speaker_labels_enabled:
-        # All users use AssemblyAI for speaker labels first.
-        # Fallback to Google Cloud (which also supports speaker labels), then OpenAI (without speaker labels).
-        return {
-            "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": "google_cloud",     # TypeMyworDz3
-            "tier_3": "openai_whisper",   # TypeMyworDz2
-            "reason": "speaker_labels_requested"
-        }
-    elif is_admin:
-        # Admins get Google Cloud first, then OpenAI, then AssemblyAI
-        return {
-            "tier_1": "google_cloud",     # TypeMyworDz3
-            "tier_2": "openai_whisper",   # TypeMyworDz2
-            "tier_3": "assemblyai",       # TypeMyworDz1
-            "reason": "admin_user_testing_google_cloud"
-        }
-    elif is_paid_ai_user(user_plan): # All other paid users
-        # Paid users get AssemblyAI first, then OpenAI, then Google Cloud
-        return {
-            "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": "openai_whisper",   # TypeMyworDz2
-            "tier_3": "google_cloud",     # TypeMyworDz3
-            "reason": f"paid_user_{user_plan}"
-        }
-    else: # Free users
-        # Free users get AssemblyAI first, then OpenAI, then Google Cloud
-        return {
-            "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": "openai_whisper",   # TypeMyworDz2
-            "tier_3": "google_cloud",     # TypeMyworDz3
-            "reason": f"free_user_{user_plan}"
-        }
-class PaystackVerificationRequest(BaseModel):
-    reference: str
-
-class PaystackInitializationRequest(BaseModel):
-    email: str
-    amount: float
-    plan_name: str
-    user_id: str
-    country_code: str
-    callback_url: str
-
-class PaystackWebhookRequest(BaseModel):
-    event: str
-    data: dict
-
-class CreditUpdateRequest(BaseModel):
-    email: str
-    plan_name: str
-    amount: float
-    currency: str
-    duration_hours: Optional[int] = None
-    duration_days: Optional[int] = None
-
-class FormattedWordDownloadRequest(BaseModel):
-    transcription_html: str
-    filename: Optional[str] = "transcription.docx"
-
-class UserAIRequest_Pydantic(BaseModel):
-    transcript: str
-    user_prompt: str
-    model: str = "claude-3-haiku-20240307"
-    max_tokens: int = 1000
-
-class AdminAIFormatRequest_Pydantic(BaseModel):
-    transcript: str
-    formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-3-5-haiku-20241022"
-    max_tokens: int = 4000
-
-jobs = {}
-active_background_tasks = {}
-cancellation_flags = {}
-
-logger.info("Enhanced job tracking initialized")
-
-async def analyze_audio_characteristics(audio_path: str) -> dict:
-    try:
-        audio = AudioSegment.from_file(audio_path)
-        duration_seconds = len(audio) / 1000.0
-        
-        if audio.dBFS < -50:
-            quality_score = 0.1
-        elif audio.dBFS < -30:
-            quality_score = 0.4
-        else:
-            quality_score = 0.8
-            
-        language = "unknown"
-        return {
-            "duration_seconds": duration_seconds,
-            "quality_score": quality_score,
-            "language": language,
-            "channels": audio.channels,
-            "sample_rate": audio.frame_rate,
-            "size_mb": os.path.getsize(audio_path) / (1024 * 1024)
-        }
-    except Exception as e:
-        logger.error(f"Error analyzing audio characteristics: {e}")
-        return {
-            "duration_seconds": 0,
-            "quality_score": 0,
-            "language": "unknown",
-            "channels": 0,
-            "sample_rate": 0,
-            "size_mb": 0,
-            "error": str(e)
-        }
-
-def compress_audio_for_transcription(input_path: str, output_path: str = None, job_id: str = None) -> tuple[str, dict]:
-    """Compress audio file optimally for transcription with cancellation support"""
-    if output_path is None:
-        base_name = os.path.splitext(input_path)[0]
-        output_path = f"{base_name}_compressed.mp3"
-    
-    try:
-        if job_id and cancellation_flags.get(job_id, False):
-            logger.info(f"Job {job_id} cancelled during compression setup")
-            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-            
-        logger.info(f"Compressing {input_path} for transcription...")
-        
-        input_size = os.path.getsize(input_path) / (1024 * 1024)
-        logger.info(f"Original file size: {input_size:.2f} MB")
-        
-        audio = AudioSegment.from_file(input_path)
-        # FIX: Ensure these log lines use actual audio properties instead of hardcoded values
-        logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
-        
-        if job_id and cancellation_flags.get(job_id, False):
-            logger.info(f"Job {job_id} cancelled during audio loading")
-            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        if audio.channels > 1:
-            audio = audio.set_channels(1)
-            logger.info("Converted to mono audio")
-        
-        target_sample_rate = 16000
-        audio = audio.set_frame_rate(target_sample_rate)
-        logger.info(f"Reduced sample rate to {target_sample_rate} Hz")
-        
-        if job_id and cancellation_flags.get(job_id, False):
-            logger.info(f"Job {job_id} cancelled during sample rate conversion")
-            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        audio = audio - 3
-        audio = audio.normalize()
-        logger.info("Applied audio normalization")
-        
-        if job_id and cancellation_flags.get(job_id, False):
-            logger.info(f"Job {job_id} cancelled before export")
-            raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        audio.export(
-            output_path, 
-            format="mp3",
-            bitrate="64k",
-            parameters=[
-                "-q:a", "9",
-                "-ac", "1",
-                "-ar", str(target_sample_rate)
-            ]
-        )
-        logger.info("Audio compression complete")
-        
-        if os.path.exists(output_path):
-            output_size = os.path.getsize(output_path) / (1024 * 1024)
-            
-            size_difference = input_size - output_size
-            if input_size > 0:
-                compression_ratio = (size_difference / input_size) * 100
-            else:
-                compression_ratio = 0
-            
-            stats = {
-                "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
-                "compression_ratio_percent": round(compression_ratio, 1),
-                "size_reduction_mb": round(size_difference, 2),
-                "duration_seconds": len(audio) / 1000.0
-            }
-            
-            logger.info(f"Compression result:")
-            logger.info(f"  Original: {stats['original_size_mb']} MB")
-            logger.info(f"  Processed: {stats['compressed_size_mb']} MB")
-            if size_difference > 0:
-                logger.info(f"  Size reduction: {stats['compression_ratio_percent']}% ({stats['size_reduction_mb']} MB saved)")
-            else:
-                logger.info(f"  Size increase: {abs(stats['compression_ratio_percent'])}% ({abs(stats['size_reduction_mb'])} MB added)")
-        
-        return output_path, stats
-        
-    except asyncio.CancelledError:
-        logger.info(f"Compression cancelled for job {job_id}")
-        if os.path.exists(output_path):
-            os.unlink(output_path)
-        raise
-        
-    except Exception as e:
-        logger.error(f"Error compressing audio: {e}")
-        try:
-            if job_id and cancellation_flags.get(job_id, False):
-                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-                
-            audio = AudioSegment.from_file(input_path)
-            audio = audio.set_channels(1)
-            audio = audio.set_frame_rate(16000)
-            audio.export(output_path, format="mp3", bitrate="64k")
-            
-            output_size = os.path.getsize(output_path) / (1024 * 1024)
-            size_difference = input_size - output_size
-            compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
-            
-            stats = {
-                "original_size_mb": round(input_size, 2),
-                "compressed_size_mb": round(output_size, 2),
-                "compression_ratio_percent": round(compression_ratio, 1),
-                "size_reduction_mb": round(size_difference, 2),
-                "duration_seconds": len(audio) / 1000.0
-            }
-            
-            logger.info("Used fallback compression")
-            return output_path, stats
-            
-        except asyncio.CancelledError:
-            logger.info(f"Fallback compression cancelled for job {job_id}")
-            if os.path.exists(output_path):
-                os.unlink(output_path)
-            raise
-            
-        except Exception as fallback_error:
-            logger.error(f"Fallback compression also failed: {fallback_error}")
-            raise
-
-def compress_audio_for_download(input_path: str, output_path: str = None, quality: str = "high") -> str:
-    """Compress audio file for download with different quality options"""
-    if output_path is None:
-        base_name = os.path.splitext(input_path)[0]
-        output_path = f"{base_name}_download.mp3"
-    
-    try:
-        logger.info(f"Compressing {input_path} for download (quality: {quality})...")
-        
-        audio = AudioSegment.from_file(input_path)
-        
-        if quality == "high":
-            bitrate = "128k"
-            sample_rate = 44100
-            channels = 2 if audio.channels > 1 else 1
-        elif quality == "medium":
-            bitrate = "96k"
-            sample_rate = 22050
-            channels = 1
-        else:
-            bitrate = "64k"
-            sample_rate = 16000
-            channels = 1
-        
-        if audio.channels != channels:
-            audio = audio.set_channels(channels)
-        if audio.frame_rate != sample_rate:
-            audio = audio.set_frame_rate(sample_rate)
-        
-        audio.export(
-            output_path,
-            format="mp3",
-            bitrate=bitrate,
-            parameters=[
-                "-q:a", "2" if quality == "high" else "5",
-                "-ac", str(channels),
-                "-ar", str(sample_rate)
-            ]
-        )
-        
-        logger.info(f"Download compression complete: {quality} quality")
-        return output_path
-        
-    except Exception as e:
-        logger.error(f"Error compressing audio for download: {e}")
-        raise
-
+# Part 3: Currency/Payment Logic, Health Monitor, Paystack Verification/Update, and Transcription Functions (OpenAI, Google Cloud)
 # Currency Conversion and Channel Mapping Logic
 USD_TO_LOCAL_RATES = {
     'KE': 145.0,
@@ -663,6 +338,10 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
         logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping for job {job_id}")
         raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized")
 
+    gcs_uri = None # Initialize GCS URI
+    gcs_object_name = None
+    compressed_audio_duration_seconds = 0 # To store actual duration of compressed audio
+
     try:
         logger.info(f"Starting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription for job {job_id}")
 
@@ -673,11 +352,34 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
         
         check_cancellation()
 
-        # Read the audio file content
-        with open(audio_path, "rb") as f:
-            audio_content = f.read()
+        # Analyze the compressed audio to get its actual duration
+        audio_characteristics = await analyze_audio_characteristics(audio_path)
+        compressed_audio_duration_seconds = audio_characteristics.get("duration_seconds", 0)
+        logger.info(f"Compressed audio duration for Google Cloud: {compressed_audio_duration_seconds:.1f} seconds")
 
-        audio = speech.RecognitionAudio(content=audio_content)
+        audio_source = None
+        if compressed_audio_duration_seconds > 120: # Google's 2-minute limit for inline content
+            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Audio longer than 2 minutes. Uploading to GCS.")
+            if not GCS_BUCKET_NAME: # Check if env var is set
+                raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME environment variable not set for long audio transcription.")
+
+            bucket_name = GCS_BUCKET_NAME
+            storage_client = storage.Client(credentials=google_speech_client._credentials) # Use existing credentials
+            bucket = storage_client.bucket(bucket_name)
+
+            gcs_object_name = f"audio/{job_id}_{os.path.basename(audio_path)}"
+            blob = bucket.blob(gcs_object_name)
+
+            await asyncio.to_thread(blob.upload_from_filename, audio_path)
+            gcs_uri = f"gs://{bucket_name}/{gcs_object_name}"
+            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Uploaded audio to GCS: {gcs_uri}")
+
+            audio_source = speech.RecognitionAudio(uri=gcs_uri)
+        else:
+            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Audio 2 minutes or less. Sending inline content.")
+            with open(audio_path, "rb") as f:
+                audio_content = f.read()
+            audio_source = speech.RecognitionAudio(content=audio_content)
         
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.MP3, # Assuming compressed to MP3
@@ -693,13 +395,12 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
             logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Speaker diarization ENABLED for job {job_id}")
         
         # Perform the transcription
-        operation = await asyncio.to_thread(google_speech_client.long_running_recognize, config=config, audio=audio)
+        operation = await asyncio.to_thread(google_speech_client.long_running_recognize, config=config, audio=audio_source) # Use audio_source here
         
         logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) long_running_recognize operation started for job {job_id}. Waiting for result...")
         
         # Wait for the operation to complete
         result = await asyncio.to_thread(operation.result) # This will block until complete or error
-        logger.info(f"DEBUG: Full Google Cloud Speech result for job {job_id}: {result}")
 
         transcription_text = ""
         has_speaker_labels = False
@@ -757,11 +458,24 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
             "error": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription failed: {str(e)}"
         }
     finally:
-        if 'compressed_path' in locals() and os.path.exists(compressed_path):
-            os.unlink(compressed_path)
-            logger.info(f"Cleaned up compressed file after {TYPEMYWORDZ3_NAME} (Google Cloud Speech) processing: {compressed_path}")
-
-
+        # Clean up GCS object if it was uploaded
+        if gcs_object_name and 'bucket' in locals():
+            try:
+                # Ensure the bucket object is available in this scope
+                bucket_name = GCS_BUCKET_NAME
+                storage_client = storage.Client(credentials=google_speech_client._credentials)
+                bucket = storage_client.bucket(bucket_name)
+                
+                await asyncio.to_thread(bucket.blob(gcs_object_name).delete)
+                logger.info(f"Cleaned up GCS object {gcs_object_name} after {TYPEMYWORDZ3_NAME} (Google Cloud Speech) processing: {gcs_uri}")
+            except Exception as e:
+                logger.warning(f"Failed to delete GCS object {gcs_object_name}: {e}")
+            
+        # Clean up compressed file (handled by process_transcription_job's finally)
+        # if 'compressed_path' in locals() and os.path.exists(compressed_path):
+        #     os.unlink(compressed_path)
+        #     logger.info(f"Cleaned up compressed file after {TYPEMYWORDZ3_NAME} (Google Cloud Speech) processing: {compressed_path}")
+# Part 4: AssemblyAI Transcription Function and `process_transcription_job`
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
     """Transcribe audio using AssemblyAI API"""
     if not ASSEMBLYAI_API_KEY:
@@ -841,7 +555,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                 
                 if speaker_labels_enabled and status_result.get("utterances"):
                     formatted_transcript = ""
-                    for utterance in status_result["utterances"]:
+                    for utterance in status_result.get("utterances"):
                         speaker_letter = utterance['speaker']
                         if speaker_letter == 'A':
                             speaker_num = '1'
@@ -890,6 +604,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
     active_background_tasks[job_id] = asyncio.current_task()
     cancellation_flags[job_id] = False
 
+    compressed_path = None # Initialize compressed_path here
+
     try:
         def check_cancellation():
             if cancellation_flags.get(job_id, False) or job_data.get("status") == "cancelled":
@@ -932,53 +648,57 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         # --- ATTEMPT TIER 1 SERVICE ---
         if tier_1_service == "assemblyai":
             if not ASSEMBLYAI_API_KEY:
-                logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
+                logger.error(f"TypeMyworDz1 API Key not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"TypeMyworDz1 API Key not configured"
             else:
                 try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ1_NAME} (Tier 1 Primary) with {assemblyai_model} model for job {job_id}")
-                    transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                    logger.info(f"🚀 Attempting TypeMyworDz1 (Tier 1 Primary) for job {job_id}")
+                    compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id) # Ensure compression is done here
+                    logger.info(f"Audio compressed for TypeMyworDz1: {compression_stats}")
+                    transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
                     job_data["tier_1_used"] = "assemblyai"
                     job_data["tier_1_success"] = True
                 except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 1 Primary) failed: {error}")
+                    logger.error(f"❌ TypeMyworDz1 (Tier 1 Primary) failed: {error}")
                     job_data["tier_1_error"] = str(error)
                     job_data["tier_1_success"] = False
-            services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier1")
+            services_attempted.append(f"TypeMyworDz1_tier1")
             
         elif tier_1_service == "openai_whisper": # TYPEMYWORDZ2_NAME
             if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
+                logger.error(f"TypeMyworDz2 Service URL not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"TypeMyworDz2 Service URL not configured"
             else:
                 try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ2_NAME} (Tier 1 Primary) for job {job_id}")
-                    transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                    logger.info(f"🚀 Attempting TypeMyworDz2 (Tier 1 Primary) for job {job_id}")
+                    compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id) # Ensure compression is done here
+                    logger.info(f"Audio compressed for TypeMyworDz2: {compression_stats}")
+                    transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
                     job_data["tier_1_used"] = "openai_whisper"
                     job_data["tier_1_success"] = True
                 except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 1 Primary) failed: {error}")
+                    logger.error(f"❌ TypeMyworDz2 (Tier 1 Primary) failed: {error}")
                     job_data["tier_1_error"] = str(error)
                     job_data["tier_1_success"] = False
-            services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
-
-        # REMOVED: Speechmatics tier 1 block
-
+            services_attempted.append(f"TypeMyworDz2_tier1")
+        
         elif tier_1_service == "google_cloud": # TYPEMYWORDZ3_NAME
             if not google_speech_client:
-                logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
+                logger.error(f"TypeMyworDz3 (Google Cloud Speech) client not initialized, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"TypeMyworDz3 (Google Cloud Speech) client not initialized"
             else:
                 try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 1 Primary) for job {job_id}")
-                    transcription_result = await transcribe_with_google_cloud(tmp_path, language_code, speaker_labels_enabled, job_id)
+                    logger.info(f"🚀 Attempting TypeMyworDz3 (Google Cloud Speech) (Tier 1 Primary) for job {job_id}")
+                    compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id) # Ensure compression is done here
+                    logger.info(f"Audio compressed for TypeMyworDz3 (Google Cloud Speech): {compression_stats}")
+                    transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
                     job_data["tier_1_used"] = "google_cloud"
                     job_data["tier_1_success"] = True
                 except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 1 Primary) failed: {error}")
+                    logger.error(f"❌ TypeMyworDz3 (Google Cloud Speech) (Tier 1 Primary) failed: {error}")
                     job_data["tier_1_error"] = str(error)
                     job_data["tier_1_success"] = False
-            services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier1")
+            services_attempted.append(f"TypeMyworDz3_tier1")
 
         check_cancellation()
 
@@ -988,53 +708,63 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             
             if tier_2_service == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
+                    logger.error(f"TypeMyworDz1 API Key not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"TypeMyworDz1 API Key not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 2 Fallback) with {assemblyai_model} model for job {job_id}")
-                        transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        logger.info(f"🔄 Attempting TypeMyworDz1 (Tier 2 Fallback) for job {job_id}")
+                        # If compressed_path is None, compress now, otherwise use existing
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for TypeMyworDz1: {compression_stats}")
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
                         job_data["tier_2_used"] = "assemblyai"
                         job_data["tier_2_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 2 Fallback) failed: {error}")
+                        logger.error(f"❌ TypeMyworDz1 (Tier 2 Fallback) failed: {error}")
                         job_data["tier_2_error"] = str(error)
                         job_data["tier_2_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier2")
+                services_attempted.append(f"TypeMyworDz1_tier2")
                 
             elif tier_2_service == "openai_whisper": # TYPEMYWORDZ2_NAME
                 if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
+                    logger.error(f"TypeMyworDz2 Service URL not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"TypeMyworDz2 Service URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                        logger.info(f"🔄 Attempting TypeMyworDz2 (Tier 2 Fallback) for job {job_id}")
+                        # If compressed_path is None, compress now, otherwise use existing
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for TypeMyworDz2: {compression_stats}")
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
                         job_data["tier_2_used"] = "openai_whisper"
                         job_data["tier_2_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 2 Fallback) failed: {error}")
+                        logger.error(f"❌ TypeMyworDz2 (Tier 2 Fallback) failed: {error}")
                         job_data["tier_2_error"] = str(error)
                         job_data["tier_2_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
-
-            # REMOVED: Speechmatics tier 2 block
+                services_attempted.append(f"TypeMyworDz2_tier2")
             
             elif tier_2_service == "google_cloud": # TYPEMYWORDZ3_NAME
                 if not google_speech_client:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
+                    logger.error(f"TypeMyworDz3 (Google Cloud Speech) client not initialized, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"TypeMyworDz3 (Google Cloud Speech) client not initialized"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_google_cloud(tmp_path, language_code, speaker_labels_enabled, job_id)
+                        logger.info(f"🔄 Attempting TypeMyworDz3 (Google Cloud Speech) (Tier 2 Fallback) for job {job_id}")
+                        # If compressed_path is None, compress now, otherwise use existing
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for TypeMyworDz3 (Google Cloud Speech): {compression_stats}")
+                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
                         job_data["tier_2_used"] = "google_cloud"
                         job_data["tier_2_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 2 Fallback) failed: {error}")
+                        logger.error(f"❌ TypeMyworDz3 (Google Cloud Speech) (Tier 2 Fallback) failed: {error}")
                         job_data["tier_2_error"] = str(error)
                         job_data["tier_2_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
+                services_attempted.append(f"TypeMyworDz3_tier2")
 
         check_cancellation()
 
@@ -1044,53 +774,63 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
             if tier_3_service == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
+                    logger.error(f"TypeMyworDz1 API Key not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"TypeMyworDz1 API Key not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 3 Fallback) with {assemblyai_model} model for job {job_id}")
-                        transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        logger.info(f"🔄 Attempting TypeMyworDz1 (Tier 3 Fallback) for job {job_id}")
+                        # If compressed_path is None, compress now, otherwise use existing
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for TypeMyworDz1: {compression_stats}")
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
                         job_data["tier_3_used"] = "assemblyai"
                         job_data["tier_3_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 3 Fallback) failed: {error}")
+                        logger.error(f"❌ TypeMyworDz1 (Tier 3 Fallback) failed: {error}")
                         job_data["tier_3_error"] = str(error)
                         job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier3")
+                services_attempted.append(f"TypeMyworDz1_tier3")
                 
             elif tier_3_service == "openai_whisper": # TYPEMYWORDZ2_NAME
                 if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
+                    logger.error(f"TypeMyworDz2 Service URL not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"TypeMyworDz2 Service URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_openai_whisper(tmp_path, language_code, job_id)
+                        logger.info(f"🔄 Attempting TypeMyworDz2 (Tier 3 Fallback) for job {job_id}")
+                        # If compressed_path is None, compress now, otherwise use existing
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for TypeMyworDz2: {compression_stats}")
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
                         job_data["tier_3_used"] = "openai_whisper"
                         job_data["tier_3_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) failed: {error}")
+                        logger.error(f"❌ TypeMyworDz2 (Tier 3 Fallback) failed: {error}")
                         job_data["tier_3_error"] = str(error)
                         job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
-
-            # REMOVED: Speechmatics tier 3 block
+                services_attempted.append(f"TypeMyworDz2_tier3")
             
             elif tier_3_service == "google_cloud": # TYPEMYWORDZ3_NAME
                 if not google_speech_client:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
+                    logger.error(f"TypeMyworDz3 (Google Cloud Speech) client not initialized, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"TypeMyworDz3 (Google Cloud Speech) client not initialized"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_google_cloud(tmp_path, language_code, speaker_labels_enabled, job_id)
+                        logger.info(f"🔄 Attempting TypeMyworDz3 (Google Cloud Speech) (Tier 3 Fallback) for job {job_id}")
+                        # If compressed_path is None, compress now, otherwise use existing
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for TypeMyworDz3 (Google Cloud Speech): {compression_stats}")
+                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
                         job_data["tier_3_used"] = "google_cloud"
                         job_data["tier_3_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 3 Fallback) failed: {error}")
+                        logger.error(f"❌ TypeMyworDz3 (Google Cloud Speech) (Tier 3 Fallback) failed: {error}")
                         job_data["tier_3_error"] = str(error)
                         job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
+                services_attempted.append(f"TypeMyworDz3_tier3")
 
         check_cancellation()
 
@@ -1135,9 +875,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             "completed_at": datetime.now().isoformat()
         })
     finally:
+        # Clean up original temporary file
         if os.path.exists(tmp_path):
-            logger.info(f"Transcription job: Cleaning up temporary file: {tmp_path}")
             os.unlink(tmp_path)
+            logger.info(f"Cleaned up original temporary file: {tmp_path}")
+        
+        # Clean up compressed file if it was created and not already handled by service-specific finally blocks
+        # (For Google Cloud, GCS cleanup is handled within transcribe_with_google_cloud's finally)
+        # (For AssemblyAI, compressed_path is cleaned up within transcribe_with_assemblyai)
+        # So, no general compressed_path cleanup here unless a service failed very early.
         
         if job_id in active_background_tasks:
             del active_background_tasks[job_id]
@@ -1145,7 +891,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             del cancellation_flags[job_id]
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
-
+# Part 5: FastAPI App Setup, Root Endpoint, Paystack Endpoints, Transcription Endpoint
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
@@ -1196,7 +942,8 @@ async def root():
         "logic": {
             "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
             "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
-            "admin_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+            "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+            "google_api_test_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} (no fallback)",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
@@ -1409,11 +1156,11 @@ async def paystack_status():
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
         # REMOVED: "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
-        "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64), # NEW
+        "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
-        "admin_emails": ADMIN_EMAILS, # Moved outside the inner dict
+        "admin_emails": ADMIN_EMAILS, # Corrected placement
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -1515,7 +1262,7 @@ async def transcribe_audio(
         "created_at": jobs[job_id]["created_at"],
         "logic_used": f"UserPlan:{user_plan}, Email:{user_email}, Admin:{is_admin_user(user_email)}"
     }
-
+# Part 6: Remaining Endpoints, Main Execution Block, and Final Logging
 @app.post("/generate-formatted-word")
 async def generate_formatted_word(request: FormattedWordDownloadRequest):
     logger.info(f"Generating formatted Word document for {request.filename}")
@@ -1955,7 +1702,6 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                # REMOVED: "speechmatics_configured": bool(SPEECHMATICS_API_KEY),
                 "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
@@ -1964,7 +1710,8 @@ async def health_check():
             "transcription_logic": {
                 "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
                 "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
-                "admin_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+                "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}",
+                "google_api_test_user_transcription": f"Primary={TYPEMYWORDZ3_NAME} (no fallback)",
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
@@ -1972,9 +1719,8 @@ async def health_check():
                 "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
                 "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
                 "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
-                # REMOVED: "speechmatics": f"Speechmatics (currently not active as a primary, but available as a fallback option via {TYPEMYWORDZ3_NAME} if Google Cloud fails)",
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
-                "ai_features_openai": "OpenAI (GPT models) for text processing (via Render service)",
+                "ai_features_openai": "OpenAI (GPT models) for admin AI text processing (via Render service)",
                 "admin_emails": ADMIN_EMAILS
             }
         }
@@ -1995,7 +1741,6 @@ logger.info("Performing final system validation...")
 logger.info(f"{TYPEMYWORDZ1_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"{TYPEMYWORDZ2_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) API Key configured: {bool(GCP_SPEECH_KEY_BASE64)}")
-# logger.info(f"Speechmatics API Key configured (but not actively used in primary logic): {bool(SPEECHMATICS_API_KEY)}") # REMOVED
 logger.info(f"{TYPEMYWORDZ_AI_NAME} API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
@@ -2050,7 +1795,8 @@ if __name__ == "__main__":
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
     logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Paid users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
-    logger.info(f"  - Admin users ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ3_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
+    logger.info(f"  - Admin users ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Google API Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ3_NAME} (no fallback)")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
@@ -2077,3 +1823,4 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ3_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + OpenAI integration")
+
