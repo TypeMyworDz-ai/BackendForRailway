@@ -761,7 +761,7 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
 
         # Configure options
         options = PrerecordedOptions(
-            model="flux-general-en",  # Updated to flux-general-en for testing
+            model="nova-3",  # Updated to nova-3 for testing
             language=language_code,
             smart_format=True,
             punctuate=True,
