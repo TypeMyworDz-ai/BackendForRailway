@@ -928,9 +928,19 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         else:
             transcription_text = transcript
 
-        # Get duration and word count
-        duration = response["results"]["channels"][0]["alternatives"][0].get("duration", 0)
+                # Get duration and word count - safer approach
+        duration = 0
+        try:
+            # Try different ways to get duration from Deepgram response
+            if hasattr(response["results"]["channels"][0]["alternatives"][0], 'duration'):
+                duration = response["results"]["channels"][0]["alternatives"][0].duration
+            elif "metadata" in response and "duration" in response["metadata"]:
+                duration = response["metadata"]["duration"]
+        except (AttributeError, KeyError, TypeError):
+            logger.warning(f"Could not extract duration from Deepgram response for job {job_id}")
+            
         word_count = len(transcription_text.split()) if transcription_text else 0
+
 
         logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription completed for job {job_id}")
         return {
