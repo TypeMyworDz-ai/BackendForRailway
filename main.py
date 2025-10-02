@@ -569,7 +569,7 @@ async def health_monitor():
             import psutil
             memory_info = psutil.virtual_memory()
             cpu_percent = psutil.cpu_percent(interval=1)
-            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
+            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: 14.9%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
             logger.info(f"Active jobs: {len(jobs)}, Active background tasks: {len(active_background_tasks)}, Cancellation flags: {len(cancellation_flags)}")
             await asyncio.sleep(30)
         except Exception as e:
@@ -781,59 +781,71 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         check_cancellation()
 
         # Process the response
-        transcript = response["results"]["channels"][0]["alternatives"][0]["transcript"]
+        # Deepgram's SDK returns a complex object, convert to dict for easier access
+        response_dict = response.to_dict() 
         
-        transcription_text = ""
+        # Extract the main transcript
+        transcript_text = ""
+        if "results" in response_dict and "channels" in response_dict["results"] and len(response_dict["results"]["channels"]) > 0:
+            if "alternatives" in response_dict["results"]["channels"][0] and len(response_dict["results"]["channels"][0]["alternatives"]) > 0:
+                transcript_text = response_dict["results"]["channels"][0]["alternatives"][0].get("transcript", "")
+        
         has_speaker_labels = False
         
-        if speaker_labels_enabled and "utterances" in response["results"]:
-            # Process diarized output - FIXED
+        if speaker_labels_enabled and "utterances" in response_dict["results"]:
+            # Process diarized output - MORE ROBUST FIX
             try:
-                utterances = response["results"]["utterances"]
-                logger.info(f"Processing {len(utterances)} utterances with speaker labels")
-                for utterance in utterances:
-                    # Access speaker and transcript properly as attributes
-                    speaker_num = utterance.speaker + 1  # Deepgram uses 0-based indexing
-                    utterance_text = utterance.transcript
-                    transcription_text += f"<strong>Speaker {speaker_num}:</strong> {utterance_text}\n"
-                has_speaker_labels = True
-                logger.info(f"Successfully processed speaker diarization for job {job_id}")
+                utterances = response_dict["results"]["utterances"]
+                if utterances: # Ensure utterances list is not empty
+                    logger.info(f"Processing {len(utterances)} utterances with speaker labels")
+                    formatted_diarized_text = []
+                    for utterance in utterances:
+                        # Ensure utterance is a dictionary and has 'speaker' and 'transcript'
+                        if isinstance(utterance, dict) and 'speaker' in utterance and 'transcript' in utterance:
+                            speaker_num = utterance['speaker'] + 1  # Deepgram uses 0-based indexing
+                            utterance_text = utterance['transcript']
+                            formatted_diarized_text.append(f"<strong>Speaker {speaker_num}:</strong> {utterance_text}")
+                        else:
+                            logger.warning(f"Unexpected utterance format in Deepgram response: {utterance}")
+                    
+                    if formatted_diarized_text:
+                        transcript_text = "\n".join(formatted_diarized_text)
+                        has_speaker_labels = True
+                        logger.info(f"Successfully processed speaker diarization for job {job_id}")
+                    else:
+                        logger.warning(f"No valid utterances found in Deepgram diarization for job {job_id}. Falling back to single transcript.")
+                        # Fallback to single transcript if no valid utterances were processed
+                        has_speaker_labels = False
+                else:
+                    logger.warning(f"Deepgram response indicated speaker labels enabled but 'utterances' list was empty for job {job_id}. Falling back to single transcript.")
+                    has_speaker_labels = False
             except Exception as e:
-                logger.error(f"Error processing speaker diarization: {e}")
-                # Fallback to regular transcript
-                transcription_text = transcript
+                logger.error(f"Error processing speaker diarization for job {job_id}: {e}")
+                # Fallback to regular transcript if any error during diarization processing
                 has_speaker_labels = False
-        else:
-            transcription_text = transcript
-
+        
         # Get duration and word count - FIXED
         duration = 0
         try:
-            # Try different ways to get duration from Deepgram response
-            metadata = response.get("metadata", {})
-            if "duration" in metadata:
-                duration = metadata["duration"]
-            else:
-                # Try to get from channels
-                channels = response.get("results", {}).get("channels", [])
-                if channels and len(channels) > 0:
-                    alternatives = channels[0].get("alternatives", [])
-                    if alternatives and len(alternatives) > 0:
-                        # Some responses might have duration in alternatives
-                        alt = alternatives[0]
-                        if hasattr(alt, 'duration'):
-                            duration = alt.duration
-                        elif isinstance(alt, dict) and 'duration' in alt:
-                            duration = alt['duration']
+            # Try to get duration from the metadata first
+            if "metadata" in response_dict and "duration" in response_dict["metadata"]:
+                duration = response_dict["metadata"]["duration"]
+            elif "results" in response_dict and "channels" in response_dict["results"] and len(response_dict["results"]["channels"]) > 0:
+                channel = response_dict["results"]["channels"][0]
+                if "alternatives" in channel and len(channel["alternatives"]) > 0:
+                    # Some responses might have duration in alternatives
+                    alt = channel["alternatives"][0]
+                    if isinstance(alt, dict) and 'duration' in alt:
+                        duration = alt['duration']
         except (AttributeError, KeyError, TypeError) as e:
             logger.warning(f"Could not extract duration from Deepgram response for job {job_id}: {e}")
             
-        word_count = len(transcription_text.split()) if transcription_text else 0
+        word_count = len(transcript_text.split()) if transcript_text else 0
 
         logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription completed for job {job_id}")
         return {
             "status": "completed",
-            "transcription": transcription_text,
+            "transcription": transcript_text,
             "language": language_code,
             "duration": duration,
             "word_count": word_count,
@@ -1234,6 +1246,251 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier1")
 
         check_cancellation()
+        # --- ATTEMPT TIER 2 SERVICE (FALLBACK 1) if Tier 1 failed AND tier_2_service is defined ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_2_service:
+            logger.warning(f"⚠️ Tier 1 service failed, trying Tier 2 fallback ({tier_2_service}) for job {job_id}")
+            
+            if tier_2_service == "assemblyai":
+                if not ASSEMBLYAI_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 2 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ1_NAME}: {compression_stats}")
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        job_data["tier_2_used"] = "assemblyai"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier2")
+                
+            elif tier_2_service == "openai_whisper":
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 2 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
+                        job_data["tier_2_used"] = "openai_whisper"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
+            
+            elif tier_2_service == "google_cloud":
+                if not google_speech_client:
+                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 2 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
+                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_2_used"] = "google_cloud"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
+
+            elif tier_2_service == "deepgram":
+                if not deepgram_client:
+                    logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 2 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                        transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_2_used"] = "deepgram"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier2")
+
+        check_cancellation()
+
+        # --- ATTEMPT TIER 3 SERVICE (FALLBACK 2) if Tier 2 failed AND tier_3_service is defined ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_3_service:
+            logger.warning(f"⚠️ Tier 2 service failed, trying Tier 3 fallback ({tier_3_service}) for job {job_id}")
+
+            if tier_3_service == "assemblyai":
+                if not ASSEMBLYAI_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 3 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ1_NAME}: {compression_stats}")
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        job_data["tier_3_used"] = "assemblyai"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier3")
+                
+            elif tier_3_service == "openai_whisper":
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
+                        job_data["tier_3_used"] = "openai_whisper"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
+            
+            elif tier_3_service == "google_cloud":
+                if not google_speech_client:
+                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 3 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
+                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_3_used"] = "google_cloud"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
+
+            elif tier_3_service == "deepgram":
+                if not deepgram_client:
+                    logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 3 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                        transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_3_used"] = "deepgram"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier3")
+
+        check_cancellation()
+        # --- ATTEMPT TIER 4 SERVICE (FINAL FALLBACK) if Tier 3 failed AND tier_4_service is defined ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_4_service:
+            logger.warning(f"⚠️ Tier 3 service failed, trying Tier 4 fallback ({tier_4_service}) for job {job_id}")
+
+            if tier_4_service == "assemblyai":
+                if not ASSEMBLYAI_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 4 for job {job_id}")
+                    job_data["tier_4_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 4 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ1_NAME}: {compression_stats}")
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        job_data["tier_4_used"] = "assemblyai"
+                        job_data["tier_4_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 4 Fallback) failed: {error}")
+                        job_data["tier_4_error"] = str(error)
+                        job_data["tier_4_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier4")
+                
+            elif tier_4_service == "openai_whisper":
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 4 for job {job_id}")
+                    job_data["tier_4_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 4 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_4_used"] = "openai_whisper"
+                        job_data["tier_4_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 4 Fallback) failed: {error}")
+                        job_data["tier_4_error"] = str(error)
+                        job_data["tier_4_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier4")
+            
+            elif tier_4_service == "google_cloud":
+                if not google_speech_client:
+                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 4 for job {job_id}")
+                    job_data["tier_4_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 4 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
+                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_4_used"] = "google_cloud"
+                        job_data["tier_4_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 4 Fallback) failed: {error}")
+                        job_data["tier_4_error"] = str(error)
+                        job_data["tier_4_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier4")
+
+            elif tier_4_service == "deepgram":
+                if not deepgram_client:
+                    logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 4 for job {job_id}")
+                    job_data["tier_4_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 4 Fallback) for job {job_id}")
+                        if compressed_path is None:
+                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                        transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        job_data["tier_4_used"] = "deepgram"
+                        job_data["tier_4_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 4 Fallback) failed: {error}")
+                        job_data["tier_4_error"] = str(error)
+                        job_data["tier_4_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier4")
+
+        check_cancellation()
+
         # Final result processing
         if not transcription_result or transcription_result.get("status") == "failed":
             logger.error(f"❌ All transcription services failed for job {job_id}. Services attempted: {services_attempted}")
@@ -1363,7 +1620,6 @@ async def root():
             "cancellation_flags": len(cancellation_flags)
         }
     }
-
 @app.post("/api/initialize-paystack-payment")
 async def initialize_paystack_payment(request: PaystackInitializationRequest):
     logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
@@ -1434,6 +1690,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         import traceback
         logger.error(f"❌ Error initializing Paystack payment: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
+
 @app.post("/api/verify-payment")
 async def verify_payment(request: PaystackVerificationRequest):
     logger.info(f"Payment verification request for reference: {request.reference}")
@@ -1610,6 +1867,7 @@ async def list_gemini_models():
     except Exception as e:
         logger.error(f"Error listing Gemini models: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list Gemini models: {str(e)}")
+
 @app.post("/transcribe")
 async def transcribe_audio(
     file: UploadFile = File(...),
@@ -1892,6 +2150,7 @@ async def ai_admin_format_gemini(
     except Exception as e:
         logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini admin formatting: {str(e)}")
+
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     logger.info(f"Status check for job ID: {job_id}")
@@ -2086,6 +2345,7 @@ async def list_jobs():
             }
         }
     }
+
 @app.get("/health")
 async def health_check():
     logger.info("Health check endpoint called")
