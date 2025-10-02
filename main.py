@@ -60,7 +60,8 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 
 # Admin email addresses
 ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
-DEEPGRAM_TEST_EMAIL = 'kariukigrace52@gmail.com'  # Special test user for Deepgram
+# REMOVED: DEEPGRAM_TEST_EMAIL is no longer used for dedicated testing
+# DEEPGRAM_TEST_EMAIL = 'kariukigrace52@gmail.com'  # Special test user for Deepgram
 
 def install_ffmpeg():
     try:
@@ -103,7 +104,7 @@ logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPEN
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"DEBUG: Deepgram test email configured: {DEEPGRAM_TEST_EMAIL}")
+# REMOVED: Deepgram test email check
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -196,30 +197,17 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    Logic for service selection with four tiers:
-    - Free users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Google Cloud (TypeMyworDz3) fallback2, Deepgram (TypeMyworDz4) fallback3
-    - Paid users: AssemblyAI (TypeMyworDz1) primary, OpenAI (TypeMyworDz2) fallback1, Google Cloud (TypeMyworDz3) fallback2, Deepgram (TypeMyworDz4) fallback3
-    - Admins: OpenAI (TypeMyworDz2) primary, AssemblyAI (TypeMyworDz1) fallback1, Google Cloud (TypeMyworDz3) fallback2, Deepgram (TypeMyworDz4) fallback3
-    - Speaker labels requested: Always use AssemblyAI (TypeMyworDz1) first, Google Cloud (TypeMyworDz3) fallback1, Deepgram (TypeMyworDz4) fallback2, OpenAI (TypeMyworDz2) fallback3
+    Logic for service selection based on new rules:
+    - Free users & One-Day Plan: Primary=AssemblyAI, Fallback=Deepgram, then OpenAI
+    - Three-Day & One-Week Plan: Primary=Deepgram, Fallback=AssemblyAI, then OpenAI
+    - Monthly Subscribers & Admins: Primary=OpenAI, Fallback=Deepgram, then AssemblyAI
+    - All speaker tags requests: Primary=AssemblyAI, Fallback=Deepgram, then OpenAI
     - Dedicated Google Cloud Test User (njokigituku@gmail.com): Google Cloud (TypeMyworDz3) primary, no fallback.
-    - Dedicated Deepgram Test User (kariukigrace52@gmail.com): Deepgram (TypeMyworDz4) primary, no fallback.
     """
     
-    # Check if user is admin based on email
     is_admin = is_admin_user(user_email) if user_email else False
     
-    # NEW LOGIC: Dedicated user for Deepgram API testing
-    if user_email and user_email.lower() == DEEPGRAM_TEST_EMAIL.lower():
-        logger.info(f"🎯 Job for {user_email}: Dedicated Deepgram user.")
-        return {
-            "tier_1": "deepgram",          # TypeMyworDz4
-            "tier_2": None,                # No fallback
-            "tier_3": None,                # No fallback
-            "tier_4": None,                # No fallback
-            "reason": "dedicated_deepgram_test_user"
-        }
-
-    # EXISTING LOGIC: Dedicated user for Google Cloud API testing
+    # Dedicated Google Cloud Test User (njokigituku@gmail.com) remains as is
     TEST_GOOGLE_USER_EMAIL = 'njokigituku@gmail.com'
     if user_email and user_email.lower() == TEST_GOOGLE_USER_EMAIL.lower():
         logger.info(f"🎯 Job for {user_email}: Dedicated Google Cloud Speech-to-Text user.")
@@ -231,43 +219,46 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "reason": "dedicated_google_test_user"
         }
 
+    # All instances of speaker tags requests: Primary=AssemblyAI, fallback Deepgram.
     if speaker_labels_enabled:
-        # All users use AssemblyAI for speaker labels first.
-        # Fallback to Google Cloud, then Deepgram, then OpenAI
         return {
             "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": "google_cloud",     # TypeMyworDz3
-            "tier_3": "deepgram",         # TypeMyworDz4
-            "tier_4": "openai_whisper",   # TypeMyworDz2
+            "tier_2": "deepgram",         # TypeMyworDz4
+            "tier_3": "openai_whisper",   # TypeMyworDz2
+            "tier_4": None,               # No further fallback
             "reason": "speaker_labels_requested"
         }
-    elif is_admin:
-        # NEW ADMIN LOGIC: Admins get OpenAI first, then AssemblyAI, then Google Cloud, then Deepgram
+    
+    # Monthly subscribers and Admins (Admins gets this logic no matter what plans they have subscribed to)
+    # Assuming 'Pro' plan is the monthly subscription.
+    if is_admin or user_plan == 'Pro':
         return {
             "tier_1": "openai_whisper",   # TypeMyworDz2
+            "tier_2": "deepgram",         # TypeMyworDz4
+            "tier_3": "assemblyai",       # TypeMyworDz1
+            "tier_4": None,               # No further fallback
+            "reason": "admin_or_monthly_subscriber_prioritizing_openai"
+        }
+    
+    # Deepgram: first option for paid users of three-day and weekly plans. Fallback Assembly > OpenAI
+    if user_plan in ['Three-Day Plan', 'One-Week Plan']:
+        return {
+            "tier_1": "deepgram",         # TypeMyworDz4
             "tier_2": "assemblyai",       # TypeMyworDz1
-            "tier_3": "google_cloud",     # TypeMyworDz3
-            "tier_4": "deepgram",         # TypeMyworDz4
-            "reason": "admin_user_prioritizing_openai"
+            "tier_3": "openai_whisper",   # TypeMyworDz2
+            "tier_4": None,               # No further fallback
+            "reason": f"paid_user_{user_plan}_prioritizing_deepgram"
         }
-    elif is_paid_ai_user(user_plan): # All other paid users
-        # Paid users get AssemblyAI first, then OpenAI, then Google Cloud, then Deepgram
-        return {
-            "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": "openai_whisper",   # TypeMyworDz2
-            "tier_3": "google_cloud",     # TypeMyworDz3
-            "tier_4": "deepgram",         # TypeMyworDz4
-            "reason": f"paid_user_{user_plan}"
-        }
-    else: # Free users
-        # Free users get AssemblyAI first, then OpenAI, then Google Cloud, then Deepgram
-        return {
-            "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": "openai_whisper",   # TypeMyworDz2
-            "tier_3": "google_cloud",     # TypeMyworDz3
-            "tier_4": "deepgram",         # TypeMyworDz4
-            "reason": f"free_user_{user_plan}"
-        }
+
+    # Assembly first option for free users, first option for one-day subscribers. fallback is Deepgram > OpenAI
+    # This covers 'free' and 'One-Day Plan'
+    return {
+        "tier_1": "assemblyai",       # TypeMyworDz1
+        "tier_2": "deepgram",         # TypeMyworDz4
+        "tier_3": "openai_whisper",   # TypeMyworDz2
+        "tier_4": None,               # No further fallback
+        "reason": f"free_or_oneday_user_{user_plan}_prioritizing_assemblyai"
+    }
 
 class PaystackVerificationRequest(BaseModel):
     reference: str
@@ -761,7 +752,7 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
 
         # Configure options
         options = PrerecordedOptions(
-            model="nova-3",  # Updated to nova-3 for testing
+            model="nova-3",  # Using nova-3 as per your request
             language=language_code,
             smart_format=True,
             punctuate=True,
@@ -1361,7 +1352,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         if compressed_path is None:
                             compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
                             logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, speaker_labels_enabled, job_id)
                         job_data["tier_3_used"] = "openai_whisper"
                         job_data["tier_3_success"] = True
                     except Exception as error:
@@ -1596,12 +1587,13 @@ async def root():
             "Google Gemini integration for AI queries"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}",
-            "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}",
-            "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}",
-            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ2_NAME}",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+            "monthly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYT_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "dedicated_google_test_user": "njokigituku@gmail.com (Google Cloud only, no fallback)",
-            "dedicated_deepgram_test_user": f"{DEEPGRAM_TEST_EMAIL} (Deepgram only, no fallback)",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
             "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
@@ -1612,7 +1604,7 @@ async def root():
             "anthropic_ai": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini",
             "admin_emails": ADMIN_EMAILS,
-            "deepgram_test_email": DEEPGRAM_TEST_EMAIL
+            "deepgram_test_email_removed": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram."
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1822,7 +1814,7 @@ async def paystack_status():
         "google_gemini_configured": bool(GEMINI_API_KEY),
         "deepgram_configured": bool(DEEPGRAM_API_KEY),
         "admin_emails": ADMIN_EMAILS,
-        "deepgram_test_email": DEEPGRAM_TEST_EMAIL,
+        "deepgram_test_email": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram.", # Updated description
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -2337,7 +2329,7 @@ async def list_jobs():
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
-        "deepgram_test_email": DEEPGRAM_TEST_EMAIL,
+        "deepgram_test_email_removed": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram.", # Updated description
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -2382,12 +2374,13 @@ async def health_check():
                 "deepgram_configured": bool(DEEPGRAM_API_KEY)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}",
-                "paid_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}",
-                "admin_user_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}",
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ2_NAME}",
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+                "monthly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
                 "dedicated_google_test_user": "njokigituku@gmail.com (Google Cloud only, no fallback)",
-                "dedicated_deepgram_test_user": f"{DEEPGRAM_TEST_EMAIL} (Deepgram only, no fallback)",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
@@ -2398,7 +2391,7 @@ async def health_check():
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
                 "ai_features_gemini": "Google Gemini for text processing",
                 "admin_emails": ADMIN_EMAILS,
-                "deepgram_test_email": DEEPGRAM_TEST_EMAIL
+                "deepgram_test_email_removed": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram."
             }
         }
         
@@ -2424,7 +2417,7 @@ logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"Deepgram test email configured: {DEEPGRAM_TEST_EMAIL}")
+logger.info(f"Deepgram test email removed: kariukigrace52@gmail.com no longer a dedicated tester for Deepgram.")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
@@ -2476,12 +2469,13 @@ if __name__ == "__main__":
     logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Pro plans)")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}")
-    logger.info(f"  - Paid users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}")
-    logger.info(f"  - Admin users ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ3_NAME} → Fallback3={TYPEMYWORDZ4_NAME}")
-    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ3_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Monthly Subscribers & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - Dedicated Google Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ3_NAME} (no fallback)")
-    logger.info(f"  - Dedicated Deepgram Test User ({DEEPGRAM_TEST_EMAIL}): Primary={TYPEMYWORDZ4_NAME} (no fallback)")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
