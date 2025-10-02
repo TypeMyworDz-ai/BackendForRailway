@@ -60,9 +60,6 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 
 # Admin email addresses
 ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
-# REMOVED: DEEPGRAM_TEST_EMAIL is no longer used for dedicated testing
-# DEEPGRAM_TEST_EMAIL = 'kariukigrace52@gmail.com'  # Special test user for Deepgram
-
 def install_ffmpeg():
     try:
         subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
@@ -104,7 +101,6 @@ logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPEN
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-# REMOVED: Deepgram test email check
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -299,6 +295,13 @@ class AdminAIFormatRequest_Pydantic(BaseModel):
     model: str = "claude-3-5-haiku-20241022"
     max_tokens: int = 4000
 
+# UPDATED: Pydantic model for Gemini User queries (now available for all paid users)
+class UserAIGeminiRequest_Pydantic(BaseModel):
+    transcript: str
+    user_prompt: str
+    model: str = "models/gemini-pro-latest" # Default Gemini model
+    max_tokens: int = 1000
+
 # NEW: Pydantic model for Gemini Admin formatting
 class AdminAIFormatGeminiRequest_Pydantic(BaseModel):
     transcript: str
@@ -311,7 +314,6 @@ active_background_tasks = {}
 cancellation_flags = {}
 
 logger.info("Enhanced job tracking initialized")
-
 async def analyze_audio_characteristics(audio_path: str) -> dict:
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -469,6 +471,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
         except Exception as fallback_error:
             logger.error(f"Fallback compression also failed: {fallback_error}")
             raise
+
 def compress_audio_for_download(input_path: str, output_path: str = None, quality: str = "high") -> str:
     """Compress audio file for download with different quality options"""
     if output_path is None:
@@ -515,7 +518,6 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
     except Exception as e:
         logger.error(f"Error compressing audio for download: {e}")
         raise
-
 # Currency Conversion and Channel Mapping Logic
 USD_TO_LOCAL_RATES = {
     'KE': 145.0,
@@ -665,7 +667,6 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'success': False,
             'error': str(e)
         }
-
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
@@ -852,7 +853,6 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
             "status": "failed",
             "error": f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription failed: {str(e)}"
         }
-
 async def transcribe_with_google_cloud(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Transcribe audio using Google Cloud Speech-to-Text API."""
     if not google_speech_client:
@@ -961,7 +961,7 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
             return {
                 "status": "completed",
                 "transcription": transcription_text,
-                "language": language_code, # Google Cloud returns language, but using requested for now
+                "language": transcription_result.get("language", language_code), # Google Cloud returns language, but using requested for now
                 "duration": duration,
                 "word_count": word_count,
                 "has_speaker_labels": has_speaker_labels
@@ -1352,7 +1352,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         if compressed_path is None:
                             compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
                             logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
                         job_data["tier_3_used"] = "openai_whisper"
                         job_data["tier_3_success"] = True
                     except Exception as error:
@@ -1433,7 +1433,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         if compressed_path is None:
                             compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
                             logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, speaker_labels_enabled, job_id)
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
                         job_data["tier_4_used"] = "openai_whisper"
                         job_data["tier_4_success"] = True
                     except Exception as error:
@@ -1567,7 +1567,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS middleware configured successfully")
-
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
@@ -1584,27 +1583,27 @@ async def root():
             "Language selection for transcription",
             f"User-driven AI features (summarization, Q&A, and bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic)",
             f"Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic) and Google Gemini",
-            "Google Gemini integration for AI queries"
+            "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
             "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "monthly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYT_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+            "monthly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
             "dedicated_google_test_user": "njokigituku@gmail.com (Google Cloud only, no fallback)",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
             "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
+            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
             "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
             "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
             "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
             "deepgram": f"{TYPEMYWORDZ4_NAME} (Deepgram)",
             "anthropic_ai": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude)",
-            "google_gemini_ai": "Google Gemini",
-            "admin_emails": ADMIN_EMAILS,
-            "deepgram_test_email_removed": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram."
+            "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
+            "admin_emails": ADMIN_EMAILS
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1612,6 +1611,7 @@ async def root():
             "cancellation_flags": len(cancellation_flags)
         }
     }
+
 @app.post("/api/initialize-paystack-payment")
 async def initialize_paystack_payment(request: PaystackInitializationRequest):
     logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
@@ -1799,7 +1799,6 @@ async def paystack_webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Error processing Paystack webhook: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Webhook processing failed: {str(e)}")
-
 @app.get("/api/paystack-status")
 async def paystack_status():
     return {
@@ -1814,7 +1813,7 @@ async def paystack_status():
         "google_gemini_configured": bool(GEMINI_API_KEY),
         "deepgram_configured": bool(DEEPGRAM_API_KEY),
         "admin_emails": ADMIN_EMAILS,
-        "deepgram_test_email": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram.", # Updated description
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -1822,6 +1821,7 @@ async def paystack_status():
             "status": "/api/paystack-status",
             "transcribe": "/transcribe",
             "ai_user_query": "/ai/user-query",
+            "ai_user_query_gemini": "/ai/user-query-gemini",
             "ai_admin_format": "/ai/admin-format",
             "ai_admin_format_gemini": "/ai/admin-format-gemini"
         },
@@ -1860,6 +1860,209 @@ async def list_gemini_models():
         logger.error(f"Error listing Gemini models: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list Gemini models: {str(e)}")
 
+@app.post("/ai/user-query")
+async def ai_user_query(
+    transcript: str = Form(...),
+    user_prompt: str = Form(...),
+    model: str = Form("claude-3-haiku-20240307"),
+    max_tokens: int = Form(1000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+
+    if not claude_client:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 100000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        if len(user_prompt) > 1000:
+            raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
+
+        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
+
+        message = claude_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            timeout=30.0,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ]
+        )
+        ai_response = message.content[0].text
+        logger.info(f"Successfully processed AI user query with {model}.")
+        return {"ai_response": ai_response}
+
+    except anthropic.APIError as e:
+        error_message = "AI service error"
+        error_details = str(e)
+        
+        if hasattr(e, 'body'):
+            try:
+                error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
+                error_details = error_data
+                logger.error(f"Anthropic API Error for user query: {error_data}")
+            except:
+                logger.error(f"Anthropic API Error for user query: {str(e)}")
+        else:
+            logger.error(f"Anthropic API Error for user query: {str(e)}")
+            
+        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
+    
+    except anthropic.APITimeoutError as e:
+        logger.error(f"Anthropic API Timeout for user query: {e}")
+        raise HTTPException(status_code=504, detail="AI service timeout. Please try again.")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI user query: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.post("/ai/user-query-gemini")
+async def ai_user_query_gemini(
+    transcript: str = Form(...),
+    user_prompt: str = Form(...),
+    model: str = Form("models/gemini-pro-latest"),
+    max_tokens: int = Form(1000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI user query endpoint (Gemini) called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
+
+    # UPDATED: Allow all paid AI users to access Gemini, not just admins
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+
+    if not gemini_client:
+        raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 100000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        if len(user_prompt) > 1000:
+            raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
+
+        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
+
+        response = gemini_client.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=40
+            )
+        )
+        
+        gemini_response = response.text
+        logger.info(f"Successfully processed AI user query with Gemini model: {model}.")
+        return {"ai_response": gemini_response}
+
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI user query with Gemini: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini user query: {str(e)}")
+
+@app.post("/ai/admin-format")
+async def ai_admin_format(
+    transcript: str = Form(...),
+    formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
+    model: str = Form("claude-3-5-haiku-20241022"),
+    max_tokens: int = Form(4000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+
+    if not claude_client:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 200000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
+
+        message = claude_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            timeout=60.0,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ]
+        )
+        ai_response = message.content[0].text
+        logger.info(f"Successfully processed AI admin format request with {model}.")
+        return {"formatted_transcript": ai_response}
+
+    except anthropic.APIError as e:
+        error_message = "AI service error for admin formatting"
+        error_details = str(e)
+        
+        if hasattr(e, 'body'):
+            try:
+                error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
+                error_details = error_data
+                logger.error(f"Anthropic API Error for admin format: {error_data}")
+            except:
+                logger.error(f"Anthropic API Error for admin format: {str(e)}")
+        else:
+            logger.error(f"Anthropic API Error for admin format: {str(e)}")
+            
+        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
+    
+    except anthropic.APITimeoutError as e:
+        logger.error(f"Anthropic API Timeout for admin format: {e}")
+        raise HTTPException(status_code=504, detail="AI service timeout. Please try again with a shorter transcript.")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI admin format request: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during admin formatting: {str(e)}")
+
+@app.post("/ai/admin-format-gemini")
+async def ai_admin_format_gemini(
+    transcript: str = Form(...),
+    formatting_instructions: str = Form("Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."),
+    model: str = Form("models/gemini-pro-latest"),
+    max_tokens: int = Form(4000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
+
+    # UPDATED: Allow all paid AI users to access Gemini admin formatting, not just admins
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+
+    if not gemini_client:
+        raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 200000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
+
+        response = gemini_client.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=40
+            )
+        )
+        
+        gemini_response = response.text
+        logger.info(f"Successfully processed AI admin format request with Gemini model: {model}.")
+        return {"formatted_transcript": gemini_response}
+
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini admin formatting: {str(e)}")
 @app.post("/transcribe")
 async def transcribe_audio(
     file: UploadFile = File(...),
@@ -1983,165 +2186,6 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
     except Exception as e:
         logger.error(f"Error generating formatted Word document: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate formatted Word document: {str(e)}")
-
-@app.post("/ai/user-query")
-async def ai_user_query(
-    transcript: str = Form(...),
-    user_prompt: str = Form(...),
-    model: str = Form("claude-3-haiku-20240307"),
-    max_tokens: int = Form(1000),
-    user_plan: str = Form("free")
-):
-    logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
-
-    if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
-
-    if not claude_client:
-        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
-
-    try:
-        if len(transcript) > 100000:
-            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
-        
-        if len(user_prompt) > 1000:
-            raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
-
-        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
-
-        message = claude_client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            timeout=30.0,
-            messages=[
-                {"role": "user", "content": full_prompt}
-            ]
-        )
-        ai_response = message.content[0].text
-        logger.info(f"Successfully processed AI user query with {model}.")
-        return {"ai_response": ai_response}
-
-    except anthropic.APIError as e:
-        error_message = "AI service error"
-        error_details = str(e)
-        
-        if hasattr(e, 'body'):
-            try:
-                error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
-                error_details = error_data
-                logger.error(f"Anthropic API Error for user query: {error_data}")
-            except:
-                logger.error(f"Anthropic API Error for user query: {str(e)}")
-        else:
-            logger.error(f"Anthropic API Error for user query: {str(e)}")
-            
-        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
-    
-    except anthropic.APITimeoutError as e:
-        logger.error(f"Anthropic API Timeout for user query: {e}")
-        raise HTTPException(status_code=504, detail="AI service timeout. Please try again.")
-    
-    except Exception as e:
-        logger.error(f"Unexpected error processing AI user query: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-
-@app.post("/ai/admin-format")
-async def ai_admin_format(
-    transcript: str = Form(...),
-    formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
-    model: str = Form("claude-3-5-haiku-20241022"),
-    max_tokens: int = Form(4000),
-    user_plan: str = Form("free")
-):
-    logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
-
-    if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
-
-    if not claude_client:
-        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
-
-    try:
-        if len(transcript) > 200000:
-            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
-        
-        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
-
-        message = claude_client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            timeout=60.0,
-            messages=[
-                {"role": "user", "content": full_prompt}
-            ]
-        )
-        ai_response = message.content[0].text
-        logger.info(f"Successfully processed AI admin format request with {model}.")
-        return {"formatted_transcript": ai_response}
-
-    except anthropic.APIError as e:
-        error_message = "AI service error for admin formatting"
-        error_details = str(e)
-        
-        if hasattr(e, 'body'):
-            try:
-                error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
-                error_details = error_data
-                logger.error(f"Anthropic API Error for admin format: {error_data}")
-            except:
-                logger.error(f"Anthropic API Error for admin format: {str(e)}")
-        else:
-            logger.error(f"Anthropic API Error for admin format: {str(e)}")
-            
-        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
-    
-    except anthropic.APITimeoutError as e:
-        logger.error(f"Anthropic API Timeout for admin format: {e}")
-        raise HTTPException(status_code=504, detail="AI service timeout. Please try again with a shorter transcript.")
-    
-    except Exception as e:
-        logger.error(f"Unexpected error processing AI admin format request: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during admin formatting: {str(e)}")
-
-@app.post("/ai/admin-format-gemini")
-async def ai_admin_format_gemini(
-    transcript: str = Form(...),
-    formatting_instructions: str = Form("Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."),
-    model: str = Form("models/gemini-pro-latest"),
-    max_tokens: int = Form(4000),
-    user_plan: str = Form("free")
-):
-    logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
-
-    if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
-
-    if not gemini_client:
-        raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
-
-    try:
-        if len(transcript) > 200000:
-            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
-        
-        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
-
-        response = gemini_client.generate_content(
-            full_prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=max_tokens,
-                temperature=0.7,
-                top_p=0.95,
-                top_k=40
-            )
-        )
-        
-        gemini_response = response.text
-        logger.info(f"Successfully processed AI admin format request with Gemini model: {model}.")
-        return {"formatted_transcript": gemini_response}
-
-    except Exception as e:
-        logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini admin formatting: {str(e)}")
 
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
@@ -2296,7 +2340,6 @@ async def cleanup_old_jobs():
         "message": f"Cleaned up {len(jobs_to_remove)} old jobs",
         "stats": cleanup_stats
     }
-
 @app.get("/jobs")
 async def list_jobs():
     logger.info("Jobs list endpoint called")
@@ -2329,7 +2372,7 @@ async def list_jobs():
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
-        "deepgram_test_email_removed": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram.", # Updated description
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -2384,14 +2427,14 @@ async def health_check():
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
+                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
                 "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
                 "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
                 "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
                 "deepgram": f"{TYPEMYWORDZ4_NAME} (Deepgram)",
                 "ai_features_anthropic": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for text processing",
-                "ai_features_gemini": "Google Gemini for text processing",
-                "admin_emails": ADMIN_EMAILS,
-                "deepgram_test_email_removed": "kariukigrace52@gmail.com no longer a dedicated tester for Deepgram."
+                "ai_features_gemini": "Google Gemini for text processing - Available for ALL paid AI users",
+                "admin_emails": ADMIN_EMAILS
             }
         }
         
@@ -2417,17 +2460,17 @@ logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"Deepgram test email removed: kariukigrace52@gmail.com no longer a dedicated tester for Deepgram.")
+logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Pro plans)")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
 logger.info(f"  - Cancellation flags: {len(cancellation_flags)} flags")
-
 logger.info("Available API endpoints:")
 logger.info("  POST /transcribe - Main transcription endpoint with smart service selection")
-logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points)")
+logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points) with Claude")
+logger.info("  POST /ai/user-query-gemini - Process user-driven AI queries with Gemini (NOW FOR ALL PAID USERS)")
 logger.info("  POST /ai/admin-format - Process admin-driven AI formatting requests (Anthropic)")
-logger.info("  POST /ai/admin-format-gemini - Process admin-driven AI formatting requests (Google Gemini)")
+logger.info("  POST /ai/admin-format-gemini - Process admin-driven AI formatting requests (Google Gemini - NOW FOR ALL PAID USERS)")
 logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payment")
 logger.info("  POST /api/verify-payment - Verify Paystack payment")
 logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
@@ -2465,8 +2508,9 @@ if __name__ == "__main__":
     logger.info("  ✅ Formatted Word document generation")
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, and bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic)")
     logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic) and Google Gemini")
-    logger.info(f"  ✅ Google Gemini integration for AI queries")
+    logger.info(f"  ✅ Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS")
     logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Pro plans)")
+    logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
     logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
@@ -2483,7 +2527,7 @@ if __name__ == "__main__":
     logger.info(f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)")
     logger.info(f"  - {TYPEMYWORDZ4_NAME}: Deepgram (supports speaker labels)")
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
-    logger.info(f"  - Google Gemini for admin AI text processing")
+    logger.info(f"  - Google Gemini for AI text processing - NOW AVAILABLE FOR ALL PAID AI USERS")
     
     try:
         uvicorn.run(
