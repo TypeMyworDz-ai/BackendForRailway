@@ -33,15 +33,21 @@ from google.cloud import storage # NEW: For Google Cloud Storage operations
 import google.generativeai as genai
 
 # NEW: Import Deepgram libraries
-# NEW: Import Deepgram libraries
 try:
-    # Updated import path for DeepgramClient and PrerecordedOptions
-    from deepgram.client import DeepgramClient
-    from deepgram.options import PrerecordedOptions # PrerecordedOptions might also be in a submodule
+    # Attempt import for Deepgram SDK v2.12.0, which might have moved things
+    # Based on docs and errors, trying a combined approach
+    from deepgram import DeepgramClient # Try direct import first for DeepgramClient
+    try:
+        from deepgram.options import PrerecordedOptions # PrerecordedOptions is often in .options
+    except ImportError:
+        # Fallback if PrerecordedOptions is also directly in deepgram or elsewhere
+        from deepgram import PrerecordedOptions
 except ImportError as e:
     DeepgramClient = None
     PrerecordedOptions = None
     logging.warning(f"Deepgram SDK not installed or import error: {e}. Deepgram features will be disabled.")
+
+
 
 
 logging.basicConfig(
