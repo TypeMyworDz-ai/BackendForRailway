@@ -79,7 +79,10 @@ except ImportError as e:
     print(f'Deepgram module itself could not be imported: {e}')
     sys.exit(1)
 EOF
-    # Run the inspection script
+# The line above (EOF) MUST NOT have a backslash for cat <<EOF to work.
+# The backslash should be on the line *before* the cat command if you were chaining.
+# However, to chain commands *after* cat <<EOF, we simply add '&& \' after the EOF.
+ && \
     python inspect_deepgram.py && \
     rm inspect_deepgram.py || \
     (echo "!!! ERROR: Deepgram SDK inspection script execution failed. Check above logs for details. !!!" && exit 1)
