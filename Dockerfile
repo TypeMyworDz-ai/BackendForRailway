@@ -1,9 +1,3 @@
-Here's the updated Dockerfile to fix the Deepgram SDK issue:
-# ======================================================================================
-# backend/Dockerfile (UPDATED to ensure correct httpx version and Deepgram installation)
-# Dockerfile for your main backend service
-# ======================================================================================
-
 # Use an official Python runtime as a parent image
 FROM python:3.10-slim-bullseye
 
@@ -49,13 +43,3 @@ ENV PYTHONUNBUFFERED=1
 # Define the command to run your application
 # Railway expects 'main:app' if your main file is main.py
 CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-
-Key changes I've made:
-
-Added build-essential and python3-dev to ensure all compilation tools are available for any packages that need them
-Added explicit upgrade of pip, setuptools, and wheel to ensure the latest versions
-Explicitly installed deepgram-sdk with a specific version (2.12.0) before other requirements
-Added a verification step to check if Deepgram can be imported correctly
-Set PYTHONUNBUFFERED=1 to ensure logs are output immediately (helps with debugging)
-
-Let me know when you're ready to provide the main.py file, and I'll make the changes you request for the Gemini AI formatter issue.
