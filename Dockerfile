@@ -24,10 +24,17 @@ RUN echo "--- Attempting to install deepgram-sdk in isolation ---" && \
     python -c "import deepgram; print('Deepgram SDK (base module) imported successfully.')" || \
     (echo "!!! ERROR: Deepgram SDK (base module) failed to import after isolated install. Check above logs for details. !!!" && exit 1)
 
+# --- NEW STEP: Explicitly install Uvicorn and verify ---
+RUN echo "--- Attempting to install uvicorn in isolation ---" && \
+    pip install --no-cache-dir uvicorn==0.30.1 && \
+    echo "--- Uvicorn installation command finished. Verifying import... ---" && \
+    python -c "import uvicorn; print('Uvicorn module imported successfully.')" || \
+    (echo "!!! ERROR: Uvicorn module failed to import after isolated install. Check above logs for details. !!!" && exit 1)
+
 # Install the rest of the Python dependencies from requirements.txt
-# We'll filter out deepgram-sdk from requirements.txt to avoid re-installing
+# We'll filter out deepgram-sdk AND uvicorn from requirements.txt to avoid re-installing
 RUN echo "--- Installing remaining requirements from requirements.txt ---" && \
-    grep -v deepgram-sdk requirements.txt > /tmp/filtered_requirements.txt && \
+    grep -vE 'deepgram-sdk|uvicorn' requirements.txt > /tmp/filtered_requirements.txt && \
     pip install --no-cache-dir -r /tmp/filtered_requirements.txt && \
     rm /tmp/filtered_requirements.txt
 
@@ -36,10 +43,11 @@ RUN echo "--- Verifying Deepgram SDK (base module) again after all requirements.
     python -c "import deepgram; print('Deepgram SDK (base module) imported successfully (post-all-install).')" || \
     (echo "!!! ERROR: Deepgram SDK (base module) failed to import after all other installs. A dependency conflict might exist. !!!" && exit 1)
 
-# --- NEW DIAGNOSTIC STEP 3: Verify Uvicorn import ---
-RUN echo "--- Verifying Uvicorn import ---" && \
-    python -c "import uvicorn; print('Uvicorn module imported successfully.')" || \
-    (echo "!!! ERROR: Uvicorn module failed to import. Check above logs for details. !!!" && exit 1)
+# --- DIAGNOSTIC STEP 3: Verify Uvicorn import (again, after all installs) ---
+RUN echo "--- Verifying Uvicorn import again after all requirements.txt installs ---" && \
+    python -c "import uvicorn; print('Uvicorn module imported successfully (post-all-install).')" || \
+    (echo "!!! ERROR: Uvicorn module failed to import after all other installs. A dependency conflict might exist. !!!" && exit 1)
+
 
 # Check for any broken dependencies (this can sometimes reveal conflicts)
 RUN echo "--- Running pip check for broken dependencies ---" && \
