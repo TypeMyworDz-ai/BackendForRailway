@@ -182,7 +182,7 @@ if DEEPGRAM_API_KEY and DeepgramClient:
 else:
     logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) API key is missing or SDK not installed, client will not be initialized.")
 def is_paid_ai_user(user_plan: str) -> bool:
-    paid_plans_for_ai = ['Three-Day Plan', 'Pro', 'One-Week Plan']
+    paid_plans_for_ai = ['Three-Day Plan', 'Pro Monthly', 'Pro Yearly', 'One-Week Plan'] # UPDATED: Added Pro Monthly and Pro Yearly
     return user_plan in paid_plans_for_ai
 def is_admin_user(user_email: str) -> bool:
     """Check if user is an admin based on email address"""
@@ -225,7 +225,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         }
     
     # OpenAI: First option for Monthly subscribers and Admins
-    if is_admin or user_plan == 'Pro':
+    if is_admin or user_plan in ['Pro Monthly', 'Pro Yearly']: # UPDATED: Check for 'Pro Monthly' and 'Pro Yearly'
         return {
             "tier_1": "openai_whisper",   # TypeMyworDz2
             "tier_2": "assemblyai",       # TypeMyworDz1
@@ -647,6 +647,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             duration_info = {'days': 3}
         elif plan_name == 'One-Week Plan':
             duration_info = {'days': 7}
+        # NEW: No explicit duration for recurring plans, as they are subscription-based
         
         logger.info(f"✅ Credits updated successfully for {email}")
         return {
@@ -1592,8 +1593,8 @@ async def root():
             "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
-            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
+            "ai_features_access": "Only for Three-Day, One-Week, Pro Monthly, and Pro Yearly plans", # UPDATED
+            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro Monthly, Pro Yearly plans)", # UPDATED
             "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
             "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
             "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
@@ -1810,7 +1811,7 @@ async def paystack_status():
         "google_gemini_configured": bool(GEMINI_API_KEY),
         "deepgram_configured": bool(DEEPGRAM_API_KEY),
         "admin_emails": ADMIN_EMAILS,
-        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro Monthly, Pro Yearly plans)", # UPDATED
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -1827,7 +1828,8 @@ async def paystack_status():
             "One-Day Plan",
             "Three-Day Plan",
             "One-Week Plan",
-            "Pro"
+            "Pro Monthly", # NEW
+            "Pro Yearly"   # NEW
         ],
         "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES
     }
@@ -1868,7 +1870,7 @@ async def ai_user_query(
     logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro Monthly, Pro Yearly plans). Please upgrade your plan.") # UPDATED
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1930,9 +1932,10 @@ async def ai_user_query_gemini(
 
     # UPDATED: Allow all paid AI users to access Gemini, not just admins
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Pro Monthly, Pro Yearly plans). Please upgrade your plan.") # UPDATED
 
     if not gemini_client:
+        logger.error("Gemini client is not initialized in /ai/user-query-gemini. Check GEMINI_API_KEY.") # NEW: More specific error log
         raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
 
     try:
@@ -1973,7 +1976,7 @@ async def ai_admin_format(
     logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro Monthly, Pro Yearly plans). Please upgrade your plan.") # UPDATED
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -2032,9 +2035,10 @@ async def ai_admin_format_gemini(
 
     # UPDATED: Allow all paid AI users to access Gemini admin formatting, not just admins
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Pro Monthly, Pro Yearly plans). Please upgrade your plan.") # UPDATED
 
     if not gemini_client:
+        logger.error("Gemini client is not initialized in /ai/admin-format-gemini. Check GEMINI_API_KEY.") # NEW: More specific error log
         raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
 
     try:
@@ -2369,7 +2373,7 @@ async def list_jobs():
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
-        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro Monthly, Pro Yearly plans)", # UPDATED
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -2423,8 +2427,8 @@ async def health_check():
                 "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-                "ai_features_access": "Only for Three-Day, One-Week and Pro plans",
-                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro plans)",
+                "ai_features_access": "Only for Three-Day, One-Week, Pro Monthly, and Pro Yearly plans", # UPDATED
+                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Pro Monthly, Pro Yearly plans)", # UPDATED
                 "assemblyai": f"{TYPEMYWORDZ1_NAME} (AssemblyAI)",
                 "openai_whisper": f"{TYPEMYWORDZ2_NAME} (OpenAI Whisper-1)",
                 "google_cloud_speech": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech-to-Text)",
@@ -2457,7 +2461,7 @@ logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Pro plans)")
+logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Pro Monthly, Pro Yearly plans)") # UPDATED
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
@@ -2506,13 +2510,13 @@ if __name__ == "__main__":
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, and bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic)")
     logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic) and Google Gemini")
     logger.info(f"  ✅ Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS")
-    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Pro plans)")
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Pro Monthly, Pro Yearly plans)") # UPDATED
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
     logger.info(f"  - Free users: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Three-Day Plan: Primary={TYTWORZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
     logger.info(f"  - Monthly Subscribers & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
