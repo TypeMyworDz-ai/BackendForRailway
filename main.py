@@ -32,22 +32,14 @@ from google.cloud import storage # NEW: For Google Cloud Storage operations
 # NEW: Import Google Generative AI libraries
 import google.generativeai as genai
 
-# NEW: Import Deepgram libraries
+# NEW: Import Deepgram libraries (Re-enabled)
 try:
-    # Attempt import for Deepgram SDK v2.12.0, which might have moved things
-    # Based on docs and errors, trying a combined approach
-    from deepgram import DeepgramClient # Try direct import first for DeepgramClient
-    try:
-        from deepgram.options import PrerecordedOptions # PrerecordedOptions is often in .options
-    except ImportError:
-        # Fallback if PrerecordedOptions is also directly in deepgram or elsewhere
-        from deepgram import PrerecordedOptions
+    # Based on successful Docker build, DeepgramClient and PrerecordedOptions should be directly available
+    from deepgram import DeepgramClient, PrerecordedOptions
 except ImportError as e:
     DeepgramClient = None
     PrerecordedOptions = None
     logging.warning(f"Deepgram SDK not installed or import error: {e}. Deepgram features will be disabled.")
-
-
 
 
 logging.basicConfig(
@@ -97,6 +89,9 @@ PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
 OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # URL for the Render-deployed OpenAI service
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # NEW: Google Gemini API Key
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY") # NEW: Deepgram API Key
+# NEW: URL for the Render-deployed Deepgram service (same as OpenAI Whisper service)
+DEEPGRAM_SERVICE_RENDER_URL = os.environ.get("DEEPGRAM_SERVICE_RENDER_URL")
+
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
@@ -110,6 +105,7 @@ logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOO
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}")
+logger.info(f"DEBUG: DEEPGRAM_SERVICE_RENDER_URL loaded value: {bool(DEEPGRAM_SERVICE_RENDER_URL)}") # NEW: Deepgram Render URL debug
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
@@ -131,8 +127,13 @@ if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
 if not GEMINI_API_KEY:
     logger.warning("Google Gemini API Key environment variable not set! Google Gemini AI features will be disabled.")
 
+# Re-enabled Deepgram API Key check
 if not DEEPGRAM_API_KEY:
     logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) API Key environment variable not set! Deepgram transcription will be disabled.")
+
+if not DEEPGRAM_SERVICE_RENDER_URL: # NEW: Check for Render service URL
+    logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) Render Service URL not configured! Deepgram transcription will be disabled.")
+
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -181,16 +182,14 @@ if GEMINI_API_KEY:
 else:
     logger.warning(f"Google Gemini API key is missing, client will not be initialized.")
 
-# NEW: Deepgram Client initialization
+# Re-enabled Deepgram Client initialization
 deepgram_client = None
-if DEEPGRAM_API_KEY and DeepgramClient:
-    try:
-        deepgram_client = DeepgramClient(DEEPGRAM_API_KEY)
-        logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) client initialized successfully.")
-    except Exception as e:
-        logger.error(f"Error initializing {TYPEMYWORDZ4_NAME} (Deepgram) client: {e}")
+if DEEPGRAM_API_KEY and DeepgramClient and DEEPGRAM_SERVICE_RENDER_URL: # Check all conditions for Deepgram
+    # We don't initialize a local DeepgramClient here, as we'll call the Render service
+    logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) client is configured for Render service at {DEEPGRAM_SERVICE_RENDER_URL}.")
 else:
-    logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) API key is missing or SDK not installed, client will not be initialized.")
+    logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) client initialization skipped (API key, SDK, or Render URL missing).")
+
 
 def is_paid_ai_user(user_plan: str) -> bool:
     # UPDATED: AI features for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan
@@ -205,11 +204,11 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    Logic for service selection based on new rules:
-    - All instances of speaker tags requests: First option Assembly, fallback Deepgram. (OpenAI does not typically support speaker labels)
-    - Free users & One-Day Plan: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI (No AI Assistant)
-    - Three-Day Plan & One-Week Plan: Primary=Deepgram, Fallback1=Assembly, Fallback2=OpenAI
-    - Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly, Fallback2=Deepgram
+    Logic for service selection based on new rules, with Deepgram working:
+    - All instances of speaker tags requests: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI, Fallback3=Google Cloud
+    - Free users & One-Day Plan: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI, Fallback3=Google Cloud
+    - Three-Day Plan & One-Week Plan: Primary=Deepgram, Fallback1=Assembly, Fallback2=OpenAI, Fallback3=Google Cloud
+    - Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly, Fallback2=Deepgram, Fallback3=Google Cloud
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
@@ -226,13 +225,13 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "reason": "dedicated_deepgram_test_user"
         }
 
-    # All instances of speaker tags requests: Primary=AssemblyAI, fallback Deepgram.
+    # All instances of speaker tags requests: Primary=AssemblyAI, fallback Deepgram, then OpenAI, then Google Cloud.
     if speaker_labels_enabled:
         return {
             "tier_1": "assemblyai",       # TypeMyworDz1
             "tier_2": "deepgram",         # TypeMyworDz4
-            "tier_3": "openai_whisper",   # TypeMyworDz2 (as a last resort if others fail)
-            "tier_4": None,               # No further fallback
+            "tier_3": "openai_whisper",   # TypeMyworDz2
+            "tier_4": "google_cloud",     # TypeMyworDz3
             "reason": "speaker_labels_requested_prioritizing_assemblyai"
         }
     
@@ -242,7 +241,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "tier_1": "openai_whisper",   # TypeMyworDz2
             "tier_2": "assemblyai",       # TypeMyworDz1
             "tier_3": "deepgram",         # TypeMyworDz4
-            "tier_4": None,               # No further fallback
+            "tier_4": "google_cloud",     # TypeMyworDz3
             "reason": "admin_or_monthly_yearly_prioritizing_openai"
         }
     
@@ -252,17 +251,16 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "tier_1": "deepgram",         # TypeMyworDz4
             "tier_2": "assemblyai",       # TypeMyworDz1
             "tier_3": "openai_whisper",   # TypeMyworDz2
-            "tier_4": None,               # No further fallback
+            "tier_4": "google_cloud",     # TypeMyworDz3
             "reason": f"paid_user_{user_plan}_prioritizing_deepgram"
         }
 
     # Assembly: First option for free users & One-Day Plan
-    # This covers 'free' plan and 'One-Day Plan'
     return {
         "tier_1": "assemblyai",       # TypeMyworDz1
         "tier_2": "deepgram",         # TypeMyworDz4
         "tier_3": "openai_whisper",   # TypeMyworDz2
-        "tier_4": None,               # No further fallback
+        "tier_4": "google_cloud",     # TypeMyworDz3
         "reason": "free_or_oneday_user_prioritizing_assemblyai"
     }
 
@@ -746,133 +744,77 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
     finally:
         pass
 
-# NEW: FIXED Deepgram transcription function
+# NEW: Deepgram transcription function (Re-enabled and modified to call Render service)
 async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
-    """Transcribe audio using Deepgram API."""
-    if not deepgram_client:
-        logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized")
+    """Transcribe audio using Deepgram API via the Render service."""
+    if not DEEPGRAM_SERVICE_RENDER_URL:
+        logger.error(f"{TYPEMYWORDZ4_NAME} Render Service URL not configured, skipping {TYPEMYWORDZ4_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ4_NAME} Render Service URL not configured")
+    if not DEEPGRAM_API_KEY:
+        logger.error(f"{TYPEMYWORDZ4_NAME} API Key not configured, skipping {TYPEMYWORDZ4_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ4_NAME} API Key not configured")
 
     try:
-        logger.info(f"Starting {TYPEMYWORDZ4_NAME} (Deepgram) transcription for job {job_id}")
+        logger.info(f"Calling {TYPEMYWORDZ4_NAME} service for job {job_id} at {DEEPGRAM_SERVICE_RENDER_URL}/deepgram_transcribe")
         
-        def check_cancellation():
-            if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ4_NAME} (Deepgram) processing")
-                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        check_cancellation()
-        
-        # Read audio file
-        with open(audio_path, "rb") as audio:
-            buffer_data = audio.read()
+        # Read the audio file content
+        with open(audio_path, "rb") as f:
+            audio_content = f.read()
 
-        payload = {
-            "buffer": buffer_data,
+        # Prepare form data
+        files = {'file': (os.path.basename(audio_path), audio_content, 'audio/mpeg')}
+        data = {
+            'language_code': language_code,
+            'speaker_labels_enabled': speaker_labels_enabled
         }
+        # Deepgram API Key is passed as an environment variable to the Render service, not in the request body.
+        # It's assumed the Render service handles its own Deepgram API key.
+        # However, if the Render service expects it in a header, you'd add:
+        # headers = {'X-Deepgram-Api-Key': DEEPGRAM_API_KEY}
 
-        # Configure options
-        options = PrerecordedOptions(
-            model="nova-3",  # Using nova-3 as per your request
-            language=language_code,
-            smart_format=True,
-            punctuate=True,
-            diarize=speaker_labels_enabled,
-            utterances=speaker_labels_enabled
-        )
+        # Make HTTP POST request to the dedicated Deepgram service on Render
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{DEEPGRAM_SERVICE_RENDER_URL}/deepgram_transcribe",
+                files=files,
+                data=data,
+                timeout=300.0 # 5 min timeout for transcription
+            )
+            response.raise_for_status() # Raise an exception for HTTP errors
 
-        check_cancellation()
-
-        # Make the transcription request
-        response = await asyncio.to_thread(
-            deepgram_client.listen.rest.v("1").transcribe_file,
-            payload,
-            options
-        )
-
-        check_cancellation()
-
-        # Process the response
-        # Deepgram's SDK returns a complex object, convert to dict for easier access
-        response_dict = response.to_dict() 
+        result = response.json()
         
-        # Extract the main transcript
-        transcript_text = ""
-        if "results" in response_dict and "channels" in response_dict["results"] and len(response_dict["results"]["channels"]) > 0:
-            if "alternatives" in response_dict["results"]["channels"][0] and len(response_dict["results"]["channels"][0]["alternatives"]) > 0:
-                transcript_text = response_dict["results"]["channels"][0]["alternatives"][0].get("transcript", "")
-        
-        has_speaker_labels = False
-        
-        if speaker_labels_enabled and "utterances" in response_dict["results"]:
-            # Process diarized output - MORE ROBUST FIX
-            try:
-                utterances = response_dict["results"]["utterances"]
-                if utterances: # Ensure utterances list is not empty
-                    logger.info(f"Processing {len(utterances)} utterances with speaker labels")
-                    formatted_diarized_text = []
-                    for utterance in utterances:
-                        # Ensure utterance is a dictionary and has 'speaker' and 'transcript'
-                        if isinstance(utterance, dict) and 'speaker' in utterance and 'transcript' in utterance:
-                            speaker_num = utterance['speaker'] + 1  # Deepgram uses 0-based indexing
-                            utterance_text = utterance['transcript']
-                            formatted_diarized_text.append(f"<strong>Speaker {speaker_num}:</strong> {utterance_text}")
-                        else:
-                            logger.warning(f"Unexpected utterance format in Deepgram response: {utterance}")
-                    
-                    if formatted_diarized_text:
-                        transcript_text = "\n".join(formatted_diarized_text)
-                        has_speaker_labels = True
-                        logger.info(f"Successfully processed speaker diarization for job {job_id}")
-                    else:
-                        logger.warning(f"No valid utterances found in Deepgram diarization for job {job_id}. Falling back to single transcript.")
-                        # Fallback to single transcript if no valid utterances were processed
-                        has_speaker_labels = False
-                else:
-                    logger.warning(f"Deepgram response indicated speaker labels enabled but 'utterances' list was empty for job {job_id}. Falling back to single transcript.")
-                    has_speaker_labels = False
-            except Exception as e:
-                logger.error(f"Error processing speaker diarization for job {job_id}: {e}")
-                # Fallback to regular transcript if any error during diarization processing
-                has_speaker_labels = False
-        
-        # Get duration and word count - FIXED
-        duration = 0
-        try:
-            # Try to get duration from the metadata first
-            if "metadata" in response_dict and "duration" in response_dict["metadata"]:
-                duration = response_dict["metadata"]["duration"]
-            elif "results" in response_dict and "channels" in response_dict["results"] and len(response_dict["results"]["channels"]) > 0:
-                channel = response_dict["results"]["channels"][0]
-                if "alternatives" in channel and len(channel["alternatives"]) > 0:
-                    # Some responses might have duration in alternatives
-                    alt = channel["alternatives"][0]
-                    if isinstance(alt, dict) and 'duration' in alt:
-                        duration = alt['duration']
-        except (AttributeError, KeyError, TypeError) as e:
-            logger.warning(f"Could not extract duration from Deepgram response for job {job_id}: {e}")
-            
-        word_count = len(transcript_text.split()) if transcript_text else 0
-
-        logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription completed for job {job_id}")
-        return {
-            "status": "completed",
-            "transcription": transcript_text,
-            "language": language_code,
-            "duration": duration,
-            "word_count": word_count,
-            "has_speaker_labels": has_speaker_labels
-        }
+        if result.get("status") == "completed" and result.get("transcription"):
+            logger.info(f"{TYPEMYWORDZ4_NAME} service transcription completed for job {job_id}")
+            return result # The dedicated service returns a dict similar to what we expect
+        else:
+            raise Exception(f"{TYPEMYWORDZ4_NAME} service returned an incomplete or failed status: {result}")
 
     except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription cancelled for job {job_id}")
+        logger.info(f"{TYPEMYWORDZ4_NAME} service call cancelled for job {job_id}")
         raise
-    except Exception as e:
-        logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription failed for job {job_id}: {str(e)}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"{TYPEMYWORDZ4_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ4_NAME} (Deepgram) transcription failed: {str(e)}"
+            "error": f"{TYPEMYWORDZ4_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
         }
+    except httpx.RequestError as e:
+        logger.error(f"{TYPEMYWORDZ4_NAME} service network error for job {job_id}: {e}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ4_NAME} service network error: {e}"
+        }
+    except Exception as e:
+        logger.error(f"{TYPEMYWORDZ4_NAME} service transcription failed for job {job_id}: {str(e)}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ4_NAME} service transcription failed: {str(e)}"
+        }
+    finally:
+        pass
+
+
 async def transcribe_with_google_cloud(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Transcribe audio using Google Cloud Speech-to-Text API."""
     if not google_speech_client:
@@ -938,7 +880,7 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
         # Perform the transcription
         operation = await asyncio.to_thread(google_speech_client.long_running_recognize, config=config, audio=audio_source) # Use audio_source here
         
-        logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) long_running_recognize operation started for job {job_id}. Waiting for result...")
+        logger.info(f"K{TYPEMYWORDZ3_NAME} (Google Cloud Speech) long_running_recognize operation started for job {job_id}. Waiting for result...")
         
         # Wait for the operation to complete
         result = await asyncio.to_thread(operation.result) # This will block until complete or error
@@ -1238,19 +1180,19 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier1")
 
         elif tier_1_service == "deepgram":
-            if not deepgram_client:
-                logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+            if not DEEPGRAM_API_KEY or not DeepgramClient or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                logger.error(f"{TYPEMYWORDZ4_NAME} client or Render URL not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ4_NAME} client or Render URL not configured"
             else:
                 try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 1 Primary) for job {job_id}")
+                    logger.info(f"🚀 Attempting {TYPEMYWORDZ4_NAME} (Tier 1 Primary) for job {job_id}")
                     compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                    logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                    logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME}: {compression_stats}")
                     transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
                     job_data["tier_1_used"] = "deepgram"
                     job_data["tier_1_success"] = True
                 except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 1 Primary) failed: {error}")
+                    logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Tier 1 Primary) failed: {error}")
                     job_data["tier_1_error"] = str(error)
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier1")
@@ -1318,20 +1260,20 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
 
             elif tier_2_service == "deepgram":
-                if not deepgram_client:
-                    logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+                if not DEEPGRAM_API_KEY or not DeepgramClient or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                    logger.error(f"{TYPEMYWORDZ4_NAME} client or Render URL not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ4_NAME} client or Render URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 2 Fallback) for job {job_id}")
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Tier 2 Fallback) for job {job_id}")
                         if compressed_path is None:
                             compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME}: {compression_stats}")
                         transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
                         job_data["tier_2_used"] = "deepgram"
                         job_data["tier_2_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 2 Fallback) failed: {error}")
+                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Tier 2 Fallback) failed: {error}")
                         job_data["tier_2_error"] = str(error)
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier2")
@@ -1400,20 +1342,20 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
 
             elif tier_3_service == "deepgram":
-                if not deepgram_client:
-                    logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+                if not DEEPGRAM_API_KEY or not DeepgramClient or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                    logger.error(f"{TYPEMYWORDZ4_NAME} client or Render URL not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ4_NAME} client or Render URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 3 Fallback) for job {job_id}")
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Tier 3 Fallback) for job {job_id}")
                         if compressed_path is None:
                             compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME}: {compression_stats}")
                         transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
                         job_data["tier_3_used"] = "deepgram"
                         job_data["tier_3_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 3 Fallback) failed: {error}")
+                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Tier 3 Fallback) failed: {error}")
                         job_data["tier_3_error"] = str(error)
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier3")
@@ -1482,20 +1424,20 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier4")
 
             elif tier_4_service == "deepgram":
-                if not deepgram_client:
-                    logger.error(f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized, skipping Tier 4 for job {job_id}")
-                    job_data["tier_4_error"] = f"{TYPEMYWORDZ4_NAME} (Deepgram) client not initialized"
+                if not DEEPGRAM_API_KEY or not DeepgramClient or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                    logger.error(f"{TYPEMYWORDZ4_NAME} client or Render URL not configured, skipping Tier 4 for job {job_id}")
+                    job_data["tier_4_error"] = f"{TYPEMYWORDZ4_NAME} client or Render URL not configured"
                 else:
                     try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 4 Fallback) for job {job_id}")
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Tier 4 Fallback) for job {job_id}")
                         if compressed_path is None:
                             compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME} (Deepgram): {compression_stats}")
+                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME}: {compression_stats}")
                         transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
                         job_data["tier_4_used"] = "deepgram"
                         job_data["tier_4_success"] = True
                     except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Deepgram) (Tier 4 Fallback) failed: {error}")
+                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Tier 4 Fallback) failed: {error}")
                         job_data["tier_4_error"] = str(error)
                         job_data["tier_4_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier4")
@@ -1596,22 +1538,22 @@ async def root():
             f"AssemblyAI integration with smart model selection",
             f"OpenAI Whisper integration for transcription",
             f"Google Cloud Speech-to-Text integration for transcription",
-            f"Deepgram integration for transcription",
+            f"Deepgram integration for transcription", # Deepgram re-added
             "Four-tier automatic fallback between services",
             "Paystack payment integration",
-            f"Speaker diarization for AssemblyAI, Google Cloud Speech-to-Text, and Deepgram",
+            f"Speaker diarization for AssemblyAI, Google Cloud Speech-to-Text, and Deepgram", # Deepgram re-added
             "Language selection for transcription",
             f"User-driven AI features (summarization, Q&A, and bullet points) via TypeMyworDz AI (Anthropic)",
             f"Admin-driven AI formatting via TypeMyworDz AI (Anthropic) and Google Gemini",
             "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME}",
-            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
             "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
@@ -1620,7 +1562,7 @@ async def root():
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
             "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
             "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
-            "deepgram": f"TypeMyworDz4 (Deepgram)",
+            "deepgram": f"TypeMyworDz4 (Deepgram)", # Deepgram re-added
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
             "admin_emails": ADMIN_EMAILS
@@ -1832,7 +1774,7 @@ async def paystack_status():
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
         "google_gemini_configured": bool(GEMINI_API_KEY),
-        "deepgram_configured": bool(DEEPGRAM_API_KEY),
+        "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(DeepgramClient) and bool(DEEPGRAM_SERVICE_RENDER_URL), # Re-added and updated
         "admin_emails": ADMIN_EMAILS,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
         "endpoints": {
@@ -2450,15 +2392,15 @@ async def health_check():
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
                 "google_gemini_configured": bool(GEMINI_API_KEY),
-                "deepgram_configured": bool(DEEPGRAM_API_KEY)
+                "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(DeepgramClient) and bool(DEEPGRAM_SERVICE_RENDER_URL)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME}",
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
                 "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
@@ -2467,7 +2409,7 @@ async def health_check():
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
                 "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
                 "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
-                "deepgram": f"TypeMyworDz4 (Deepgram)",
+                "deepgram": f"TypeMyworDz4 (Deepgram)", # Deepgram re-added
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
                 "admin_emails": ADMIN_EMAILS
@@ -2549,12 +2491,12 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME}")
-    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Dedicated Deepgram Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ4_NAME} (no fallback)")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
