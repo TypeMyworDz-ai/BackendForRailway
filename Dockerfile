@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     python3-dev \
     # Add any other system dependencies deepgram-sdk might need, though usually Python-only
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/apt/lists/*
 
 # Copy requirements.txt
 COPY requirements.txt .
@@ -23,8 +23,8 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN echo "--- Attempting to install deepgram-sdk in isolation ---" && \
     pip install --no-cache-dir deepgram-sdk==2.12.0 && \
     echo "--- deepgram-sdk installation command finished. Verifying import... ---" && \
-    python -c "from deepgram import DeepgramClient; print('Deepgram SDK (DeepgramClient) imported successfully.')" || \
-    (echo "!!! ERROR: Deepgram SDK failed to import DeepgramClient after isolated install. Check above logs for details. !!!" && exit 1)
+    python -c "from deepgram.client import DeepgramClient; print('Deepgram SDK (DeepgramClient) imported successfully.')" || \
+    (echo "!!! ERROR: Deepgram SDK failed to import DeepgramClient from deepgram.client after isolated install. Check above logs for details. !!!" && exit 1)
 
 # Install the rest of the Python dependencies from requirements.txt
 # We'll filter out deepgram-sdk from requirements.txt to avoid re-installing
@@ -33,8 +33,8 @@ RUN echo "--- Installing remaining requirements from requirements.txt ---" && \
 
 # --- DIAGNOSTIC STEP 2: Verify Deepgram again after all installs ---
 RUN echo "--- Verifying Deepgram SDK again after all requirements.txt installs ---" && \
-    python -c "from deepgram import DeepgramClient; print('Deepgram SDK (DeepgramClient) imported successfully (post-all-install).')" || \
-    (echo "!!! ERROR: Deepgram SDK failed to import DeepgramClient after all other installs. A dependency conflict might exist. !!!" && exit 1)
+    python -c "from deepgram.client import DeepgramClient; print('Deepgram SDK (DeepgramClient) imported successfully (post-all-install).')" || \
+    (echo "!!! ERROR: Deepgram SDK failed to import DeepgramClient from deepgram.client after all other installs. A dependency conflict might exist. !!!" && exit 1)
 
 # Check for any broken dependencies (this can sometimes reveal conflicts)
 RUN echo "--- Running pip check for broken dependencies ---" && \
