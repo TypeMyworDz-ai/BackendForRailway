@@ -18,54 +18,65 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # --- DIAGNOSTIC STEP 1: Install Deepgram SDK in isolation and inspect ---
+# Create a temporary Python script to inspect the deepgram module
 RUN echo "--- Attempting to install deepgram-sdk in isolation ---" && \
     pip install --no-cache-dir deepgram-sdk==2.12.0 && \
-    echo "--- deepgram-sdk installation command finished. Inspecting deepgram module... ---" && \
-    python -c "import pkgutil; import sys; \
-               found_deepgram = False; \
-               for importer, modname, ispkg in pkgutil.iter_modules(sys.path): \
-                   if modname == 'deepgram': \
-                       print(f'Found deepgram module at: {importer.find_spec(modname).origin}'); \
-                       found_deepgram = True; \
-                       break; \
-               if not found_deepgram: \
-                   print('Deepgram module not found after installation!'); exit(1); \
-               \
-               import deepgram; \
-               print('\n--- Contents of deepgram module: ---'); \
-               for name in dir(deepgram): \
-                   if not name.startswith('__'): \
-                       obj = getattr(deepgram, name); \
-                       if hasattr(obj, '__module__') and obj.__module__.startswith('deepgram'): \
-                           print(f'{name}: {obj.__module__}.{obj.__name__}'); \
-                       else: \
-                           print(f'{name}: {type(obj).__name__}'); \
-               print('\n--- Attempting to import DeepgramClient and PrerecordedOptions directly ---'); \
-               try: \
-                   from deepgram import DeepgramClient; \
-                   print('DeepgramClient found directly in deepgram package.'); \
-               except ImportError: \
-                   print('DeepgramClient NOT found directly in deepgram package.'); \
-               try: \
-                   from deepgram import PrerecordedOptions; \
-                   print('PrerecordedOptions found directly in deepgram package.'); \
-               except ImportError: \
-                   print('PrerecordedOptions NOT found directly in deepgram package.'); \
-               \
-               print('\n--- Attempting to import from deepgram.client ---'); \
-               try: \
-                   from deepgram.client import DeepgramClient; \
-                   print('DeepgramClient found in deepgram.client.'); \
-               except ImportError: \
-                   print('DeepgramClient NOT found in deepgram.client.'); \
-               try: \
-                   from deepgram.options import PrerecordedOptions; \
-                   print('PrerecordedOptions found in deepgram.options.'); \
-               except ImportError: \
-                   print('PrerecordedOptions NOT found in deepgram.options.'); \
-               \
-               print('\n--- Deepgram module inspection complete ---'); \
-               " || (echo "!!! ERROR: Deepgram SDK inspection failed. Check above logs for details. !!!" && exit 1)
+    echo "--- deepgram-sdk installation command finished. Creating inspection script... ---" && \
+    echo "import pkgutil, sys, inspect" > inspect_deepgram.py && \
+    echo "found_deepgram = False" >> inspect_deepgram.py && \
+    echo "for importer, modname, ispkg in pkgutil.iter_modules(sys.path):" >> inspect_deepgram.py && \
+    echo "    if modname == 'deepgram':" >> inspect_deepgram.py && \
+    echo "        print(f'Found deepgram module at: {importer.find_spec(modname).origin}')" >> inspect_deepgram.py && \
+    echo "        found_deepgram = True" >> inspect_deepgram.py && \
+    echo "        break" >> inspect_deepgram.py && \
+    echo "if not found_deepgram:" >> inspect_deepgram.py && \
+    echo "    print('Deepgram module not found after installation!'); sys.exit(1)" >> inspect_deepgram.py && \
+    echo "" >> inspect_deepgram.py && \
+    echo "import deepgram" >> inspect_deepgram.py && \
+    echo "print('\\n--- Contents of deepgram module: ---')" >> inspect_deepgram.py && \
+    echo "for name in dir(deepgram):" >> inspect_deepgram.py && \
+    echo "    if not name.startswith('__'):" >> inspect_deepgram.py && \
+    echo "        obj = getattr(deepgram, name)" >> inspect_deepgram.py && \
+    echo "        if inspect.isclass(obj) and obj.__module__.startswith('deepgram'):" >> inspect_deepgram.py && \
+    echo "            print(f'{name}: CLASS in {obj.__module__}.{obj.__name__}')" >> inspect_deepgram.py && \
+    echo "        elif inspect.ismodule(obj) and obj.__name__.startswith('deepgram'):" >> inspect_deepgram.py && \
+    echo "            print(f'{name}: SUBMODULE {obj.__name__}')" >> inspect_deepgram.py && \
+    echo "        else:" >> inspect_deepgram.py && \
+    echo "            print(f'{name}: {type(obj).__name__}')" >> inspect_deepgram.py && \
+    echo "" >> inspect_deepgram.py && \
+    echo "print('\\n--- Attempting to import DeepgramClient and PrerecordedOptions directly ---')" >> inspect_deepgram.py && \
+    echo "try:" >> inspect_deepgram.py && \
+    echo "    from deepgram import DeepgramClient" >> inspect_deepgram.py && \
+    echo "    print('DeepgramClient found directly in deepgram package.')" >> inspect_deepgram.py && \
+    echo "except ImportError:" >> inspect_deepgram.py && \
+    echo "    print('DeepgramClient NOT found directly in deepgram package.')" >> inspect_deepgram.py && \
+    echo "try:" >> inspect_deepgram.py && \
+    echo "    from deepgram import PrerecordedOptions" >> inspect_deepgram.py && \
+    echo "    print('PrerecordedOptions found directly in deepgram package.')" >> inspect_deepgram.py && \
+    echo "except ImportError:" >> inspect_deepgram.py && \
+    echo "    print('PrerecordedOptions NOT found directly in deepgram package.')" >> inspect_deepgram.py && \
+    echo "" >> inspect_deepgram.py && \
+    echo "print('\\n--- Attempting to import from deepgram.client / deepgram.options ---')" >> inspect_deepgram.py && \
+    echo "try:" >> inspect_deepgram.py && \
+    echo "    from deepgram.client import DeepgramClient" >> inspect_deepgram.py && \
+    echo "    print('DeepgramClient found in deepgram.client.')" >> inspect_deepgram.py && \
+    echo "except ImportError:" >> inspect_deepgram.py && \
+    echo "    print('DeepgramClient NOT found in deepgram.client.')" >> inspect_deepgram.py && \
+    echo "try:" >> inspect_deepgram.py && \
+    echo "    from deepgram.options import PrerecordedOptions" >> inspect_deepgram.py && \
+    echo "    print('PrerecordedOptions found in deepgram.options.')" >> inspect_deepgram.py && \
+    echo "except ImportError:" >> inspect_deepgram.py && \
+    echo "    print('PrerecordedOptions NOT found in deepgram.options.')" >> inspect_deepgram.py && \
+    echo "" >> inspect_deepgram.py && \
+    echo "print('\\n--- Deepgram module inspection complete ---')" >> inspect_deepgram.py && \
+    echo "" >> inspect_deepgram.py && \
+    echo "if 'DeepgramClient found directly in deepgram package.' in sys.stdout.getvalue() or \
+          'DeepgramClient found in deepgram.client.' in sys.stdout.getvalue(): \
+        sys.exit(0)" >> inspect_deepgram.py && \
+    echo "else: sys.exit(1)" >> inspect_deepgram.py && \
+    python inspect_deepgram.py && \
+    rm inspect_deepgram.py || \
+    (echo "!!! ERROR: Deepgram SDK inspection failed. Check above logs for details. !!!" && exit 1)
 
 # Install the rest of the Python dependencies from requirements.txt
 # We'll filter out deepgram-sdk from requirements.txt to avoid re-installing
