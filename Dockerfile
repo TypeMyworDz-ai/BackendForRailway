@@ -36,6 +36,11 @@ RUN echo "--- Verifying Deepgram SDK (base module) again after all requirements.
     python -c "import deepgram; print('Deepgram SDK (base module) imported successfully (post-all-install).')" || \
     (echo "!!! ERROR: Deepgram SDK (base module) failed to import after all other installs. A dependency conflict might exist. !!!" && exit 1)
 
+# --- NEW DIAGNOSTIC STEP 3: Verify Uvicorn import ---
+RUN echo "--- Verifying Uvicorn import ---" && \
+    python -c "import uvicorn; print('Uvicorn module imported successfully.')" || \
+    (echo "!!! ERROR: Uvicorn module failed to import. Check above logs for details. !!!" && exit 1)
+
 # Check for any broken dependencies (this can sometimes reveal conflicts)
 RUN echo "--- Running pip check for broken dependencies ---" && \
     pip check || \
