@@ -4,28 +4,21 @@ FROM python:3.10-slim-bullseye
 # Set the working directory in the container
 WORKDIR /app
 
-# Install system dependencies (ffmpeg for pydub)
+# Install system dependencies (ffmpeg for pydub and build tools)
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     build-essential \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements.txt and install Python dependencies
+# Copy requirements.txt
 COPY requirements.txt .
 
-# First install specific packages that might cause issues
+# Upgrade pip, setuptools, and wheel first to ensure a robust installation environment
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Force reinstall httpx and its dependencies to ensure FormData is available
-# --no-cache-dir: Prevents pip from using cached versions
-# --upgrade --force-reinstall: Ensures it's a fresh install
-RUN pip install --no-cache-dir --upgrade --force-reinstall httpx==0.28.1
-
-# Explicitly install deepgram-sdk with specific version before other requirements
-RUN pip install --no-cache-dir deepgram-sdk==2.12.0
-
-# Install the rest of the requirements
+# Install all Python dependencies from requirements.txt
+# This will now correctly install httpx and deepgram-sdk as specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Verify Deepgram is installed correctly
