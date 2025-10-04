@@ -27,7 +27,9 @@ RUN echo "--- Attempting to install deepgram-sdk in isolation ---" && \
 # Install the rest of the Python dependencies from requirements.txt
 # We'll filter out deepgram-sdk from requirements.txt to avoid re-installing
 RUN echo "--- Installing remaining requirements from requirements.txt ---" && \
-    pip install --no-cache-dir -r <(grep -v deepgram-sdk requirements.txt)
+    grep -v deepgram-sdk requirements.txt > /tmp/filtered_requirements.txt && \
+    pip install --no-cache-dir -r /tmp/filtered_requirements.txt && \
+    rm /tmp/filtered_requirements.txt
 
 # --- DIAGNOSTIC STEP 2: Verify Deepgram again after all installs (base import) ---
 RUN echo "--- Verifying Deepgram SDK (base module) again after all requirements.txt installs ---" && \
