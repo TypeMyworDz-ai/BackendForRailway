@@ -386,6 +386,7 @@ class UserAIGeminiRequest_Pydantic(BaseModel):
 # NEW: Pydantic model for Gemini Admin formatting
 class AdminAIFormatGeminiRequest_Pydantic(BaseModel):
     transcript: str
+
     formatting_instructions: str = "Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."
     model: str = "models/gemini-pro-latest" # Default Gemini model
     max_tokens: int = 4000
@@ -845,9 +846,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
                 # This is a simplification. Real conversion would need live rates.
                 # For now, if local currency, we need to know the USD value of the plan.
                 # Since frontend sends base_usd_amount, we should use that from metadata if available.
-                # For now, let's assume `amount` passed here is already in USD for revenue tracking,
-                # or we need to pass the original `base_usd_amount` from initialization.
-                # For safety, let's ensure the frontend sends the USD amount for revenue update.
+                # For safety, let's ensure the frontend sends the USD amount for revenue.
                 logger.warning(f"Revenue update: Received {amount} {currency}. Assuming this is the USD equivalent for simplicity. For accurate revenue, pass original USD amount from frontend.")
                 # Ideally, `amount` here should be the USD equivalent of the plan price.
                 
@@ -1846,7 +1845,9 @@ async def verify_payment(request: PaystackVerificationRequest):
             base_usd_amount = verification_result['raw_data'].get('metadata', {}).get('base_usd_amount')
             update_admin_revenue_flag = verification_result['raw_data'].get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
 
-            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag) # Pass base_usd_amount for revenue if available
+            # Pass base_usd_amount for revenue if available, otherwise `amount` (which is transaction currency)
+            # Ensure update_admin_revenue_flag is passed
+            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag) 
             
             if credit_result['success']:
                 logger.info(f"✅ Payment verified and credits updated for {email}")
@@ -2328,7 +2329,7 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
         document = Document()
         lines = request.transcription_html.split('\n')
         
-        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)< /strong>(.*)')
+        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)</strong>(.*)') # Corrected regex
         
         for line in lines:
             if line.strip():
@@ -2601,7 +2602,7 @@ async def health_check():
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
                 "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
-                "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
+                "paid_users_assemblyai_model": f"{TYTEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
@@ -2690,10 +2691,10 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYTEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYTEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Dedicated Deepgram Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ4_NAME} (no fallback)")
