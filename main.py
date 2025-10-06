@@ -41,6 +41,11 @@ except ImportError as e:
     PrerecordedOptions = None
     logging.warning(f"Deepgram SDK not installed or import error: {e}. Deepgram features will be disabled.")
 
+# NEW: Import Firebase Admin SDK
+import firebase_admin
+from firebase_admin import credentials, firestore, initialize_app
+from google.cloud.firestore_v1.base_query import FieldFilter # For explicit FieldFilter import
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,7 +96,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # NEW: Google Gemini API Key
 DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY") # NEW: Deepgram API Key
 # NEW: URL for the Render-deployed Deepgram service (same as OpenAI Whisper service)
 DEEPGRAM_SERVICE_RENDER_URL = os.environ.get("DEEPGRAM_SERVICE_RENDER_URL")
-
+FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64") # NEW: Firebase Admin SDK config
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
@@ -106,6 +111,7 @@ logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPEN
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}")
 logger.info(f"DEBUG: DEEPGRAM_SERVICE_RENDER_URL loaded value: {bool(DEEPGRAM_SERVICE_RENDER_URL)}") # NEW: Deepgram Render URL debug
+logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}") # NEW
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
@@ -134,6 +140,8 @@ if not DEEPGRAM_API_KEY:
 if not DEEPGRAM_SERVICE_RENDER_URL: # NEW: Check for Render service URL
     logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) Render Service URL not configured! Deepgram transcription will be disabled.")
 
+if not FIREBASE_ADMIN_SDK_CONFIG_BASE64: # NEW
+    logger.error("FIREBASE_ADMIN_SDK_CONFIG_BASE64 environment variable not set! Firebase Admin SDK features (user/revenue updates) will be disabled.")
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -144,6 +152,20 @@ else:
     logger.warning("Paystack configuration missing - payment verification disabled")
 
 logger.info("Environment variables loaded successfully")
+
+# NEW: Initialize Firebase Admin SDK
+db = None
+if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
+    try:
+        service_account_info = json.loads(base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8'))
+        cred = credentials.Certificate(service_account_info)
+        initialize_app(cred)
+        db = firestore.client()
+        logger.info("Firebase Admin SDK initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing Firebase Admin SDK: {e}")
+else:
+    logger.warning("Firebase Admin SDK config is missing, Firestore operations will not be available.")
 
 claude_client = None
 if ANTHROPIC_API_KEY:
@@ -324,6 +346,7 @@ class PaystackInitializationRequest(BaseModel):
     user_id: str
     country_code: str
     callback_url: str
+    update_admin_revenue: Optional[bool] = False # NEW: Added for explicit revenue update flag
 
 class PaystackWebhookRequest(BaseModel):
     event: str
@@ -372,6 +395,96 @@ active_background_tasks = {}
 cancellation_flags = {}
 
 logger.info("Enhanced job tracking initialized")
+
+# NEW: Firebase Firestore interaction functions
+async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: Optional[str] = None, payment_amount_usd: Optional[float] = None):
+    """Updates a user's plan and related fields in Firestore using Firebase Admin SDK."""
+    if not db:
+        logger.error("Firestore client not initialized. Cannot update user plan.")
+        return {'success': False, 'error': 'Firestore not initialized'}
+
+    user_ref = db.collection('users').document(user_id)
+    updates = {
+        'plan': new_plan,
+        'lastAccessed': firestore.SERVER_TIMESTAMP, # Use server timestamp for consistency
+        'paystackReferenceId': reference_id,
+        'hasReceivedInitialFreeMinutes': True, # Any paid plan means initial free minutes are considered used
+        'totalMinutesUsed': 0 # Reset for paid plans as they get unlimited
+    }
+
+    plan_duration_days = 0
+    if new_plan == 'One-Day Plan':
+        plan_duration_days = 1
+    elif new_plan == 'Three-Day Plan':
+        plan_duration_days = 3
+    elif new_plan == 'One-Week Plan':
+        plan_duration_days = 7
+    elif new_plan == 'Monthly Plan':
+        plan_duration_days = 30
+    elif new_plan == 'Yearly Plan':
+        plan_duration_days = 365
+
+    if plan_duration_days > 0:
+        expires_at = datetime.now() + timedelta(days=plan_duration_days)
+        updates['expiresAt'] = expires_at
+        updates['subscriptionStartDate'] = firestore.SERVER_TIMESTAMP
+        logger.info(f"User {user_id} {new_plan} plan will expire on: {expires_at}")
+    else:
+        updates['expiresAt'] = None
+        updates['subscriptionStartDate'] = None
+
+    try:
+        await user_ref.update(updates) # Use update for existing document
+        logger.info(f"User {user_id} plan updated to {new_plan} in Firestore.")
+        return {'success': True}
+    except Exception as e:
+        logger.error(f"Error updating user {user_id} plan in Firestore: {e}")
+        return {'success': False, 'error': str(e)}
+
+async def update_monthly_revenue_firebase(amount_usd: float):
+    """Updates the monthly revenue in Firestore using Firebase Admin SDK."""
+    if not db:
+        logger.error("Firestore client not initialized. Cannot update monthly revenue.")
+        return {'success': False, 'error': 'Firestore not initialized'}
+
+    admin_stats_ref = db.collection('admin_stats').document('current')
+
+    try:
+        # Use a transaction to safely increment the revenue
+        @firestore.transactional
+        async def update_in_transaction(transaction, doc_ref):
+            snapshot = await transaction.get(doc_ref)
+            current_monthly_revenue = 0
+            if snapshot.exists:
+                current_monthly_revenue = snapshot.get('monthlyRevenue') or 0
+            
+            new_monthly_revenue = current_monthly_revenue + amount_usd
+            transaction.set(doc_ref, {'monthlyRevenue': new_monthly_revenue, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
+            logger.info(f"📊 Monthly Revenue updated by ${amount_usd:.2f} to ${new_monthly_revenue:.2f} in Firestore.")
+            return new_monthly_revenue
+
+        await db.run_transaction(update_in_transaction, admin_stats_ref)
+        return {'success': True}
+    except Exception as e:
+        logger.error(f"Error updating monthly revenue in Firestore: {e}")
+        return {'success': False, 'error': str(e)}
+
+async def get_user_profile_by_email_firestore(email: str):
+    """Fetches user profile by email to get UID (for webhook processing)."""
+    if not db:
+        logger.error("Firestore client not initialized. Cannot fetch user by email.")
+        return None
+    try:
+        users_ref = db.collection('users')
+        query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1) # Use FieldFilter
+        docs = await query_ref.get()
+        for doc in docs:
+            return doc.id # Return UID
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching user by email {email}: {e}")
+        return None
+
 async def analyze_audio_characteristics(audio_path: str) -> dict:
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -702,39 +815,53 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
 
-async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str):
-    """Update user credits based on Paystack payment"""
+# UPDATED: update_user_credits_paystack to interact with Firestore
+async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False):
+    """Update user credits/plan in Firestore and optionally admin revenue based on Paystack payment."""
+    if not db:
+        logger.error(f"Firestore client not initialized. Cannot update credits for {email}.")
+        return {'success': False, 'error': 'Firestore not initialized'}
+
     try:
-        logger.info(f"📝 Updating credits for {email} - {plan_name} ({amount} {currency})")
+        logger.info(f"📝 Updating credits for {email} - {plan_name} ({amount} {currency}) in Firestore.")
         
-        duration_info = {}
-        if plan_name == 'One-Day Plan':
-            duration_info = {'days': 1}
-        elif plan_name == 'Three-Day Plan':
-            duration_info = {'days': 3}
-        elif plan_name == 'One-Week Plan':
-            duration_info = {'days': 7}
-        elif plan_name == 'Monthly Plan': # NEW: Monthly Plan
-            duration_info = {'days': 30}
-        elif plan_name == 'Yearly Plan': # NEW: Yearly Plan
-            duration_info = {'days': 365}
+        # 1. Get user UID from email
+        user_id = await get_user_profile_by_email_firestore(email)
+        if not user_id:
+            logger.error(f"User with email {email} not found in Firestore. Cannot update plan.")
+            return {'success': False, 'error': f"User {email} not found in Firestore."}
+
+        # 2. Update user's plan in Firestore
+        user_plan_update_result = await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None) # Pass amount if USD
+        if not user_plan_update_result['success']:
+            logger.error(f"Failed to update user plan in Firestore for {email}: {user_plan_update_result['error']}")
+            return {'success': False, 'error': user_plan_update_result['error']}
+
+        # 3. Optionally update monthly revenue if requested and currency is USD
+        if update_admin_revenue:
+            # Convert amount to USD if it's in a local currency
+            amount_usd = amount
+            if currency != 'USD':
+                # This is a simplification. Real conversion would need live rates.
+                # For now, if local currency, we need to know the USD value of the plan.
+                # Since frontend sends base_usd_amount, we should use that from metadata if available.
+                # For now, let's assume `amount` passed here is already in USD for revenue tracking,
+                # or we need to pass the original `base_usd_amount` from initialization.
+                # For safety, let's ensure the frontend sends the USD amount for revenue update.
+                logger.warning(f"Revenue update: Received {amount} {currency}. Assuming this is the USD equivalent for simplicity. For accurate revenue, pass original USD amount from frontend.")
+                # Ideally, `amount` here should be the USD equivalent of the plan price.
+                
+            revenue_update_result = await update_monthly_revenue_firebase(amount_usd)
+            if not revenue_update_result['success']:
+                logger.error(f"Failed to update monthly revenue in Firestore: {revenue_update_result['error']}")
+                # This is a non-critical failure for the user, but important for admin.
         
-        logger.info(f"✅ Credits updated successfully for {email}")
-        return {
-            'success': True,
-            'email': email,
-            'plan': plan_name,
-            'amount': amount,
-            'currency': currency,
-            'duration': duration_info
-        }
+        logger.info(f"✅ Credits and plan updated successfully for {email} in Firestore.")
+        return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount, 'currency': currency}
         
     except Exception as e:
-        logger.error(f"❌ Error updating user credits: {str(e)}")
-        return {
-            'success': False,
-            'error': str(e)
-        }
+        logger.error(f"❌ Error updating user credits in Firestore: {str(e)}")
+        return {'success': False, 'error': str(e)}
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
@@ -1652,7 +1779,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
             'channels': payment_channels,
             'metadata': {
                 'plan': request.plan_name,
-                'base_usd_amount': request.amount,
+                'base_usd_amount': request.amount, # NEW: Store base USD amount for revenue tracking
                 'custom_fields': [
                     {
                         'display_name': "Plan Type",
@@ -1663,6 +1790,11 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
                         'display_name': "Country",
                         'variable_name': "country",
                         'value': request.country_code
+                    },
+                    { # NEW: Pass update_admin_revenue flag through metadata
+                        'display_name': "Update Admin Revenue",
+                        'variable_name': "update_admin_revenue",
+                        'value': str(request.update_admin_revenue)
                     }
                 ]
             }
@@ -1706,10 +1838,15 @@ async def verify_payment(request: PaystackVerificationRequest):
         if verification_result['status'] == 'success':
             email = verification_result['email']
             plan_name = verification_result['plan']
-            amount = verification_result['amount']
+            amount = verification_result['amount'] # This is in transaction currency
             currency = verification_result['currency']
+            reference = verification_result['reference']
             
-            credit_result = await update_user_credits_paystack(email, plan_name, amount, currency)
+            # Extract base_usd_amount from raw_data if available for accurate revenue tracking
+            base_usd_amount = verification_result['raw_data'].get('metadata', {}).get('base_usd_amount')
+            update_admin_revenue_flag = verification_result['raw_data'].get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
+
+            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag) # Pass base_usd_amount for revenue if available
             
             if credit_result['success']:
                 logger.info(f"✅ Payment verified and credits updated for {email}")
@@ -1726,7 +1863,7 @@ async def verify_payment(request: PaystackVerificationRequest):
                     }
                 }
             else:
-                logger.warning(f"⚠️ Payment verified but credit update failed for {email}")
+                logger.warning(f"⚠️ Payment verified but credit update failed for {email}: {credit_result.get('error')}")
                 return {
                     "status": "partial_success",
                     "message": "Payment verified but credit update failed",
@@ -1775,25 +1912,37 @@ async def paystack_webhook(request: Request):
             logger.error(f"Invalid JSON in webhook: {e}")
             raise HTTPException(status_code=400, detail="Invalid JSON payload")
         
+        # Optional: Verify webhook signature for production.
+        # if PAYSTACK_WEBHOOK_SECRET:
+        #     import hmac
+        #     import hashlib
+        #     expected_signature = hmac.new(PAYSTACK_WEBHOOK_SECRET.encode('utf-8'), body, hashlib.sha512).hexdigest()
+        #     if not hmac.compare_digest(expected_signature, signature):
+        #         logger.warning("❌ Webhook signature mismatch!")
+        #         raise HTTPException(status_code=400, detail="Invalid webhook signature")
+        
         event_type = webhook_data.get('event')
         logger.info(f"Processing Paystack webhook event: {event_type}")
         
         if event_type == 'charge.success':
             data = webhook_data.get('data', {})
             customer_email = data.get('customer', {}).get('email')
-            amount = data.get('amount', 0) / 100
+            amount = data.get('amount', 0) / 100 # This is in transaction currency
             currency = data.get('currency')
             reference = data.get('reference')
             plan_name = data.get('metadata', {}).get('plan', 'Unknown')
-            
-            logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}")
+            base_usd_amount = data.get('metadata', {}).get('base_usd_amount') # NEW: Get base USD amount from metadata
+            update_admin_revenue_flag = data.get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true' # NEW: Get flag
+
+            logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}. Base USD: {base_usd_amount}, Update Revenue: {update_admin_revenue_flag}")
             
             if customer_email:
-                credit_result = await update_user_credits_paystack(customer_email, plan_name, amount, currency)
+                # Use base_usd_amount for revenue tracking if available, otherwise `amount`
+                credit_result = await update_user_credits_paystack(customer_email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag)
                 if credit_result['success']:
-                    logger.info(f"✅ Webhook: Credits updated automatically for {customer_email}")
+                    logger.info(f"✅ Webhook: Credits updated automatically for {customer_email} in Firestore.")
                 else:
-                    logger.warning(f"⚠️ Webhook: Failed to update credits for {customer_email}")
+                    logger.warning(f"⚠️ Webhook: Failed to update credits for {customer_email} in Firestore: {credit_result.get('error')}")
             
         elif event_type == 'charge.failed':
             data = webhook_data.get('data', {})
@@ -2179,7 +2328,7 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
         document = Document()
         lines = request.transcription_html.split('\n')
         
-        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)</strong>(.*)')
+        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)< /strong>(.*)')
         
         for line in lines:
             if line.strip():
@@ -2383,7 +2532,7 @@ async def list_jobs():
             "user_email": job_data.get("user_email", "unknown"),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("tier_1_service"),
-            "service_used": job_data.get("service_used"),
+            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used")),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
             "word_count": job_data.get("word_count"),
@@ -2486,6 +2635,7 @@ logger.info(f"TypeMyworDz AI API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
+logger.info(f"Firebase Admin SDK configured: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64) and bool(db)}") # NEW
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)") # UPDATED
 logger.info(f"Job tracking systems initialized:")
@@ -2540,10 +2690,10 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYTEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYTEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Dedicated Deepgram Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ4_NAME} (no fallback)")
