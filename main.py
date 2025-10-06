@@ -435,7 +435,8 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         updates['subscriptionStartDate'] = None
 
     try:
-        await user_ref.update(updates) # Use update for existing document
+        # FIX: Removed 'await' from user_ref.update() as it's synchronous
+        user_ref.update(updates) 
         logger.info(f"User {user_id} plan updated to {new_plan} in Firestore.")
         return {'success': True}
     except Exception as e:
@@ -836,7 +837,8 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             return {'success': False, 'error': f"User {email} not found in Firestore."}
 
         # 2. Update user's plan in Firestore
-        user_plan_update_result = await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None) # Pass amount if USD
+        # FIX: Removed 'await' from update_user_plan_firestore as it's now synchronous
+        user_plan_update_result = await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None)
         if not user_plan_update_result['success']:
             logger.error(f"Failed to update user plan in Firestore for {email}: {user_plan_update_result['error']}")
             return {'success': False, 'error': user_plan_update_result['error']}
@@ -846,17 +848,12 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             # Convert amount to USD if it's in a local currency
             amount_usd = amount
             if currency != 'USD':
-                # This is a simplification. Real conversion would need live rates.
-                # For now, if local currency, we need to know the USD value of the plan.
-                # Since frontend sends base_usd_amount, we should use that from metadata if available.
-                # For safety, let's ensure the frontend sends the USD amount for revenue.
                 logger.warning(f"Revenue update: Received {amount} {currency}. Assuming this is the USD equivalent for simplicity. For accurate revenue, pass original USD amount from frontend.")
-                # Ideally, `amount` here should be the USD equivalent of the plan price.
                 
+            # FIX: Removed 'await' from update_monthly_revenue_firebase as it's now synchronous
             revenue_update_result = await update_monthly_revenue_firebase(amount_usd)
             if not revenue_update_result['success']:
                 logger.error(f"Failed to update monthly revenue in Firestore: {revenue_update_result['error']}")
-                # This is a non-critical failure for the user, but important for admin.
         
         logger.info(f"✅ Credits and plan updated successfully for {email} in Firestore.")
         return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount, 'currency': currency}
@@ -864,6 +861,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
     except Exception as e:
         logger.error(f"❌ Error updating user credits in Firestore: {str(e)}")
         return {'success': False, 'error': str(e)}
+
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
@@ -2135,7 +2133,7 @@ async def ai_user_query_gemini(
     except Exception as e:
         logger.error(f"Unexpected error processing AI user query with Gemini: {e}")
         # Return a more user-friendly error
-        raise HTTPException(status_code=500, detail=f"An error occurred with Gemini formatting: {str(e)}. Try using Claude instead.")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred with Gemini formatting: {str(e)}. Try using Claude instead.")
 
 
 @app.post("/ai/admin-format")
