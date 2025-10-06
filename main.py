@@ -454,7 +454,8 @@ async def update_monthly_revenue_firebase(amount_usd: float):
         # Use a transaction to safely increment the revenue
         @firestore.transactional
         async def update_in_transaction(transaction, doc_ref):
-            snapshot = await transaction.get(doc_ref)
+            # FIX: Removed 'await' from transaction.get() as it's synchronous
+            snapshot = transaction.get(doc_ref) 
             current_monthly_revenue = 0
             if snapshot.exists:
                 current_monthly_revenue = snapshot.get('monthlyRevenue') or 0
@@ -478,8 +479,10 @@ async def get_user_profile_by_email_firestore(email: str):
     try:
         users_ref = db.collection('users')
         query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1) # Use FieldFilter
-        docs = await query_ref.get()
-        for doc in docs:
+        # FIX: Removed 'await' from query_ref.get() as it's synchronous
+        snapshot = query_ref.get() 
+
+        for doc in snapshot: # Iterate directly over the snapshot
             return doc.id # Return UID
         return None
     except Exception as e:
@@ -2602,7 +2605,7 @@ async def health_check():
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}", # UPDATED
                 "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
-                "paid_users_assemblyai_model": f"{TYTEMYWORDZ1_NAME} best model",
+                "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
