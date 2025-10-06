@@ -266,7 +266,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         if not is_deepgram_available:
             tier_2 = "openai_whisper"
             tier_3 = "google_cloud"
-            tier_4 = None # Only 3 tiers now
+            tier4 = None # Only 3 tiers now
 
         return {
             "tier_1": "assemblyai",       # TypeMyworDz1
@@ -436,7 +436,7 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
 
     try:
         # FIX: Removed 'await' from user_ref.update() as it's synchronous
-        user_ref.update(updates) 
+        await asyncio.to_thread(user_ref.update, updates) 
         logger.info(f"User {user_id} plan updated to {new_plan} in Firestore.")
         return {'success': True}
     except Exception as e:
@@ -463,10 +463,10 @@ async def update_monthly_revenue_firebase(amount_usd: float):
             
             new_monthly_revenue = current_monthly_revenue + amount_usd
             transaction.set(doc_ref, {'monthlyRevenue': new_monthly_revenue, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
-            logger.info(f"📊 Monthly Revenue updated by ${amount_usd:.2f} to ${new_monthly_revenue:.2f} in Firestore.")
+            logger.info(f"📊 Monthly Revenue updated by USD {amount_usd:.2f} to USD {new_monthly_revenue:.2f} in Firestore.")
             return new_monthly_revenue
 
-        await db.run_transaction(update_in_transaction, admin_stats_ref)
+        await asyncio.to_thread(db.run_transaction, update_in_transaction, admin_stats_ref)
         return {'success': True}
     except Exception as e:
         logger.error(f"Error updating monthly revenue in Firestore: {e}")
@@ -481,7 +481,7 @@ async def get_user_profile_by_email_firestore(email: str):
         users_ref = db.collection('users')
         query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1) # Use FieldFilter
         # FIX: Removed 'await' from query_ref.get() as it's synchronous
-        snapshot = query_ref.get() 
+        snapshot = await asyncio.to_thread(query_ref.get) 
 
         for doc in snapshot: # Iterate directly over the snapshot
             return doc.id # Return UID
@@ -1987,7 +1987,8 @@ async def paystack_status():
             "ai_user_query": "/ai/user-query",
             "ai_user_query_gemini": "/ai/user-query-gemini",
             "ai_admin_format": "/ai/admin-format",
-            "ai_admin_format_gemini": "/ai/admin-format-gemini"
+            "ai_admin_format_gemini": "/ai/admin-format-gemini",
+            "admin_monthly_revenue": "/api/admin/monthly-revenue" # NEW: Added revenue endpoint
         },
         "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"], # USD is always supported, other local currencies if applicable
         "supported_plans": [
@@ -2518,6 +2519,29 @@ async def cleanup_old_jobs():
         "message": f"Cleaned up {len(jobs_to_remove)} old jobs",
         "stats": cleanup_stats
     }
+
+# NEW: Endpoint to fetch monthly revenue for Admin Dashboard
+@app.get("/api/admin/monthly-revenue")
+async def get_admin_monthly_revenue():
+    """Fetches the current monthly revenue from Firestore."""
+    if not db:
+        logger.error("Firestore client not initialized. Cannot fetch monthly revenue.")
+        raise HTTPException(status_code=500, detail="Firestore not initialized")
+
+    admin_stats_ref = db.collection('admin_stats').document('current')
+    try:
+        # Use asyncio.to_thread for potentially blocking Firestore get() call
+        doc_snap = await asyncio.to_thread(admin_stats_ref.get)
+        if doc_snap.exists:
+            monthly_revenue = doc_snap.get('monthlyRevenue') or 0.0
+            logger.info(f"Fetched current monthly revenue: USD {monthly_revenue:.2f}")
+            return {"monthlyRevenue": monthly_revenue}
+        logger.info("Admin stats document not found, returning 0 monthly revenue.")
+        return {"monthlyRevenue": 0.0}
+    except Exception as e:
+        logger.error(f"Error fetching monthly revenue from Firestore: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch monthly revenue: {str(e)}")
+
 @app.get("/jobs")
 async def list_jobs():
     logger.info("Jobs list endpoint called")
@@ -2654,6 +2678,7 @@ logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payme
 logger.info("  POST /api/verify-payment - Verify Paystack payment")
 logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
 logger.info("  GET /api/paystack-status - Get integration status")
+logger.info("  GET /api/admin/monthly-revenue - Get admin monthly revenue (NEW)") # NEW: Log new endpoint
 logger.info("  GET /api/list-gemini-models - List available Gemini models")
 logger.info("  GET /status/{job_id} - Check job status")
 logger.info("  POST /cancel/{job_id} - Cancel transcription job")
