@@ -22,6 +22,29 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN echo "--- Installing ALL Python dependencies from requirements.txt with force-reinstall ---" && \
     pip install --no-cache-dir --force-reinstall -r requirements.txt
 
+# --- NEW DIAGNOSTIC STEP: Inspect Firebase Admin SDK config ---
+# This will try to decode and print the Firebase Admin SDK config.
+# WARNING: This will expose part of your Firebase key in the build logs.
+# REMOVE THIS STEP AFTER DEBUGGING!
+RUN echo "--- DIAGNOSTIC: Inspecting FIREBASE_ADMIN_SDK_CONFIG_BASE64 ---" && \
+    apt-get update && apt-get install -y jq && \
+    python -c "import os, base64, json; \
+               config_base64 = os.environ.get('FIREBASE_ADMIN_SDK_CONFIG_BASE64'); \
+               if config_base64: \
+                   try: \
+                       decoded_json = base64.b64decode(config_base64).decode('utf-8'); \
+                       parsed_json = json.loads(decoded_json); \
+                       print(f'Firebase config decoded and parsed successfully. Project ID: {parsed_json.get('project_id', 'N/A')}, Client Email: {parsed_json.get('client_email', 'N/A')}'); \
+                       # Optionally print more, but keep it brief for security \
+                       # print(f'Full decoded JSON (WARNING - sensitive!): {decoded_json}') \
+                   except Exception as e: \
+                       print(f'ERROR: Failed to decode/parse Firebase config: {e}'); \
+                       exit(1); \
+               else: \
+                   print('FIREBASE_ADMIN_SDK_CONFIG_BASE64 environment variable is NOT set in Dockerfile context.'); \
+                   exit(1);" || \
+    (echo "!!! DIAGNOSTIC ERROR: Firebase config inspection failed. !!!" && exit 1)
+
 # --- DIAGNOSTIC STEP: Verify essential modules ---
 # This will now correctly verify modules that are still present
 RUN echo "--- Verifying essential modules ---" && \
