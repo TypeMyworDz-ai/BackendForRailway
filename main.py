@@ -24,10 +24,10 @@ import re
 import anthropic
 import openai # Keep openai import for GPT-based AI formatting
 
-# NEW: Import Google Cloud Speech-to-Text libraries
-from google.cloud import speech_v1p1beta1 as speech
-from google.oauth2 import service_account
-from google.cloud import storage # NEW: For Google Cloud Storage operations
+# REMOVED: Google Cloud Speech-to-Text libraries
+# REMOVED: from google.cloud import speech_v1p1beta1 as speech
+# REMOVED: from google.oauth2 import service_account
+# REMOVED: from google.cloud import storage # NEW: For Google Cloud Storage operations
 
 # NEW: Import Google Generative AI libraries
 import google.generativeai as genai
@@ -61,7 +61,7 @@ logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 # Service Names
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
-TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
+# REMOVED: TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
 TYPEMYWORDZ4_NAME = "TypeMyworDz4" # Deepgram
 TYPEMYWORDZ5_NAME = "TypeMyworDz5" # Temi (NEW)
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google Gemini
@@ -85,8 +85,8 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
-GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # Google Cloud Speech Key
-GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # NEW: Google Cloud Storage Bucket Name
+# REMOVED: GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # Google Cloud Speech Key
+# REMOVED: GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # NEW: Google Cloud Storage Bucket Name
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -102,8 +102,8 @@ TEMI_API_KEY = os.environ.get("TEMI_API_KEY") # NEW: Temi API Key
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"DEBUG: GCP_SPEECH_KEY_BASE64 loaded value: {bool(GCP_SPEECH_KEY_BASE64)}")
-logger.info(f"DEBUG: GCS_BUCKET_NAME loaded value: {bool(GCS_BUCKET_NAME)}")
+# REMOVED: logger.info(f"DEBUG: GCP_SPEECH_KEY_BASE64 loaded value: {bool(GCP_SPEECH_KEY_BASE64)}")
+# REMOVED: logger.info(f"DEBUG: GCS_BUCKET_NAME loaded value: {bool(GCS_BUCKET_NAME)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
@@ -121,8 +121,8 @@ logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 if not ASSEMBLYAI_API_KEY:
     logger.error(f"{TYPEMYWORDZ1_NAME} API Key environment variable not set! {TYPEMYWORDZ1_NAME} will not work as primary or fallback.")
 
-if not GCP_SPEECH_KEY_BASE64:
-    logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud) API Key environment variable not set! Google Cloud Speech-to-Text will not be available as a fallback.")
+# REMOVED: if not GCP_SPEECH_KEY_BASE64:
+# REMOVED:     logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud) API Key environment variable not set! Google Cloud Speech-to-Text will not be available as a fallback.")
 
 if not ANTHROPIC_API_KEY:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
@@ -161,8 +161,7 @@ logger.info("Environment variables loaded successfully")
 
 # NEW: Initialize Firebase Admin SDK
 db = None
-# Store credentials object globally for reuse
-global_gcp_credentials = None 
+# REMOVED: global_gcp_credentials = None # Global credentials no longer needed for STT
 if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
     try:
         service_account_info = json.loads(base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8'))
@@ -185,20 +184,18 @@ if ANTHROPIC_API_KEY:
 else:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API key is missing, Claude client will not be initialized.")
 
-# Google Cloud Speech Client initialization
-google_speech_client = None
-if GCP_SPEECH_KEY_BASE64:
-    try:
-        # Decode the Base64 key
-        service_account_info = json.loads(base64.b64decode(GCP_SPEECH_KEY_BASE64).decode('utf-8'))
-        # Store credentials globally for reuse by Storage client
-        global_gcp_credentials = service_account.Credentials.from_service_account_info(service_account_info)
-        google_speech_client = speech.SpeechClient(credentials=global_gcp_credentials)
-        logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client initialized successfully.")
-    except Exception as e:
-        logger.error(f"Error initializing {TYPEMYWORDZ3_NAME} (Google Cloud Speech) client: {e}")
-else:
-    logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) API key is missing, client will not be initialized.")
+# REMOVED: Google Cloud Speech Client initialization
+# REMOVED: google_speech_client = None
+# REMOVED: if GCP_SPEECH_KEY_BASE64:
+# REMOVED:     try:
+# REMOVED:         service_account_info = json.loads(base64.b64decode(GCP_SPEECH_KEY_BASE64).decode('utf-8'))
+# REMOVED:         global_gcp_credentials = service_account.Credentials.from_service_account_info(service_account_info)
+# REMOVED:         google_speech_client = speech.SpeechClient(credentials=global_gcp_credentials)
+# REMOVED:         logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client initialized successfully.")
+# REMOVED:     except Exception as e:
+# REMOVED:         logger.error(f"Error initializing {TYPEMYWORDZ3_NAME} (Google Cloud Speech) client: {e}")
+# REMOVED: else:
+# REMOVED:     logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) API key is missing, client will not be initialized.")
 
 # NEW: Google Gemini Client initialization
 gemini_client = None
@@ -236,12 +233,13 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    Logic for service selection based on new rules, with Deepgram working:
-    - Dedicated Tester (njokigituku@gmail.com): Primary=Google Cloud STT, no fallback
-    - All instances of speaker tags requests: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI, Fallback3=Google Cloud
-    - Free users & One-Day Plan: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI, Fallback3=Google Cloud
-    - Three-Day Plan & One-Week Plan: Primary=Deepgram, Fallback1=Assembly, Fallback2=OpenAI, Fallback3=Google Cloud
-    - Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly, Fallback2=Deepgram, Fallback3=Google Cloud
+    Logic for service selection based on new rules, with Temi as Tier 3 and Deepgram as Tier 4.
+    Google Cloud STT is removed.
+    - Dedicated Temi Tester (njokigituku@gmail.com): Primary=Temi, no fallback
+    - All instances of speaker tags requests: Primary=Assembly, Fallback1=OpenAI, Fallback2=Temi, Fallback3=Deepgram
+    - Free users & One-Day Plan: Primary=Assembly, Fallback1=OpenAI, Fallback2=Temi, Fallback3=Deepgram
+    - Three-Day Plan & One-Week Plan: Primary=OpenAI, Fallback1=Assembly, Fallback2=Temi, Fallback3=Deepgram
+    - Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly, Fallback2=Temi, Fallback3=Deepgram
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
@@ -251,141 +249,100 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     # NEW: Helper to check if Temi is available
     is_temi_available = bool(TEMI_API_KEY)
 
-    # --- Dedicated Tester (njokigituku@gmail.com): Google Cloud STT without fallback ---
-    TEST_GOOGLE_CLOUD_USER_EMAIL = 'njokigituku@gmail.com'
-    if user_email and user_email.lower() == TEST_GOOGLE_CLOUD_USER_EMAIL.lower():
-        logger.info(f"🎯 Job for {user_email}: Dedicated Google Cloud STT tester.")
-        if google_speech_client and GCP_SPEECH_KEY_BASE64:
+    # --- Dedicated Temi Tester (njokigituku@gmail.com): Temi only ---
+    TEST_TEMI_USER_EMAIL = 'njokigituku@gmail.com'
+    if user_email and user_email.lower() == TEST_TEMI_USER_EMAIL.lower():
+        logger.info(f"🎯 Job for {user_email}: Dedicated Temi tester.")
+        if is_temi_available:
             return {
-                "tier_1": "google_cloud",     # TypeMyworDz3
-                "tier_2": None,               # No fallback
-                "tier_3": None,               # No fallback
-                "tier_4": None,               # No fallback
-                "tier_5": None,               # NEW: No fallback for Temi
-                "reason": "dedicated_google_cloud_test_user"
+                "tier_1": "temi", # TypeMyworDz5
+                "tier_2": None,
+                "tier_3": None,
+                "tier_4": None,
+                "reason": "dedicated_temi_test_user"
             }
         else:
-            logger.warning(f"Dedicated Google Cloud STT user {user_email}, but Google Cloud is not fully configured. Falling back to general logic.")
-            # Fall through to general logic if Google Cloud isn't fully configured even for the test user
+            logger.warning(f"Dedicated Temi STT user {user_email}, but Temi is not fully configured. Falling back to general logic.")
+            # Fall through to general logic if Temi isn't fully configured for the test user
 
-    # --- All instances of speaker tags requests: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI, Fallback3=Google Cloud, Fallback4=Temi ---
-    if speaker_labels_enabled:
-        tier_2 = "deepgram" if is_deepgram_available else None
-        tier_3 = "openai_whisper"
-        tier_4 = "google_cloud"
-        tier_5 = "temi" if is_temi_available else None # NEW: Temi as Fallback4
+    # --- General Fallback Logic (4 tiers, Google Cloud removed) ---
+    # Base services for general cases
+    tier_1 = None
+    tier_2 = None
+    tier_3 = None
+    tier_4 = None
 
-        # Dynamically adjust tiers if Deepgram is not available
-        if not is_deepgram_available:
-            tier_2 = "openai_whisper"
-            tier_3 = "google_cloud"
-            tier_4 = "temi" if is_temi_available else None # Temi moves up
-            tier_5 = None
-
-        # Further adjust if Temi is not available
-        if not is_temi_available:
-            if tier_4 == "temi": tier_4 = None
-            if tier_3 == "temi": tier_3 = "google_cloud" if google_speech_client else None
-            if tier_2 == "temi": tier_2 = "openai_whisper"
-
-
-        return {
-            "tier_1": "assemblyai",       # TypeMyworDz1
-            "tier_2": tier_2,
-            "tier_3": tier_3,
-            "tier_4": tier_4,
-            "tier_5": tier_5, # NEW
-            "reason": "speaker_labels_requested_prioritizing_assemblyai"
-        }
-    
-    # --- Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly, Fallback2=Deepgram, Fallback3=Google Cloud, Fallback4=Temi ---
+    # Logic for Monthly Plan, Yearly Plan & Admins: Primary=OpenAI
     if is_admin or user_plan in ['Monthly Plan', 'Yearly Plan']:
-        tier_3 = "deepgram" if is_deepgram_available else None
-        tier_4 = "google_cloud"
-        tier_5 = "temi" if is_temi_available else None # NEW: Temi as Fallback4
-
-        # Dynamically adjust tiers if Deepgram is not available
-        if not is_deepgram_available:
-            tier_3 = "google_cloud"
-            tier_4 = "temi" if is_temi_available else None # Temi moves up
-            tier_5 = None
-
-        # Further adjust if Temi is not available
-        if not is_temi_available:
-            if tier_4 == "temi": tier_4 = None
-            if tier_3 == "temi": tier_3 = "google_cloud" if google_speech_client else None
-            if tier_2 == "temi": tier_2 = "deepgram" if is_deepgram_available else "assemblyai"
-
-
-        return {
-            "tier_1": "openai_whisper",   # TypeMyworDz2
-            "tier_2": "assemblyai",       # TypeMyworDz1
-            "tier_3": tier_3,
-            "tier_4": tier_4,
-            "tier_5": tier_5, # NEW
-            "reason": "admin_or_monthly_yearly_prioritizing_openai"
-        }
-    
-    # --- Three-Day Plan & One-Week Plan users: Primary=Deepgram, Fallback1=Assembly, Fallback2=OpenAI, Fallback3=Google Cloud, Fallback4=Temi ---
-    if user_plan in ['Three-Day Plan', 'One-Week Plan']:
-        tier_1 = "deepgram" if is_deepgram_available else "assemblyai" # If Deepgram unavailable, Assembly is primary
-        tier_2 = "assemblyai" if is_deepgram_available else "openai_whisper"
-        tier_3 = "openai_whisper" if is_deepgram_available else "google_cloud"
-        tier_4 = "google_cloud" if is_deepgram_available else "temi" if is_temi_available else None # Temi moves up
-        tier_5 = "temi" if is_temi_available and is_deepgram_available else None # NEW: Temi as Fallback4
-
-        # Further adjustment if Deepgram was initially Tier 1 but is unavailable
-        if not is_deepgram_available and tier_1 == "assemblyai":
-            tier_1 = "assemblyai"
-            tier_2 = "openai_whisper"
-            tier_3 = "google_cloud"
-            tier_4 = "temi" if is_temi_available else None # Temi moves up
-            tier_5 = None
-        
-        # Further adjust if Temi is not available
-        if not is_temi_available:
-            if tier_4 == "temi": tier_4 = None
-            if tier_3 == "temi": tier_3 = "google_cloud" if google_speech_client else None
-            if tier_2 == "temi": tier_2 = "openai_whisper"
-
-
-        return {
-            "tier_1": tier_1,
-            "tier_2": tier_2,
-            "tier_3": tier_3,
-            "tier_4": tier_4,
-            "tier_5": tier_5, # NEW
-            "reason": f"paid_user_{user_plan}_prioritizing_deepgram"
-        }
-
-    # --- Free users & One-Day Plan: Primary=Assembly, Fallback1=Deepgram, Fallback2=OpenAI, Fallback3=Google Cloud, Fallback4=Temi ---
-    tier_2 = "deepgram" if is_deepgram_available else None
-    tier_3 = "openai_whisper"
-    tier_4 = "google_cloud"
-    tier_5 = "temi" if is_temi_available else None # NEW: Temi as Fallback4
-
-    # Dynamically adjust tiers if Deepgram is not available
-    if not is_deepgram_available:
+        tier_1 = "openai_whisper"
+        tier_2 = "assemblyai"
+        tier_3 = "temi" if is_temi_available else None
+        tier_4 = "deepgram" if is_deepgram_available else None
+        reason = "admin_or_monthly_yearly_prioritizing_openai"
+    # Logic for Three-Day Plan & One-Week Plan users: Primary=OpenAI
+    elif user_plan in ['Three-Day Plan', 'One-Week Plan']:
+        tier_1 = "openai_whisper"
+        tier_2 = "assemblyai"
+        tier_3 = "temi" if is_temi_available else None
+        tier_4 = "deepgram" if is_deepgram_available else None
+        reason = f"paid_user_{user_plan}_prioritizing_openai"
+    # Logic for Free users & One-Day Plan: Primary=Assembly
+    else: # free or One-Day Plan
+        tier_1 = "assemblyai"
         tier_2 = "openai_whisper"
-        tier_3 = "google_cloud"
-        tier_4 = "temi" if is_temi_available else None # Temi moves up
-        tier_5 = None
+        tier_3 = "temi" if is_temi_available else None
+        tier_4 = "deepgram" if is_deepgram_available else None
+        reason = "free_or_oneday_user_prioritizing_assemblyai"
 
-    # Further adjust if Temi is not available
-    if not is_temi_available:
-        if tier_4 == "temi": tier_4 = None
-        if tier_3 == "temi": tier_3 = "google_cloud" if google_speech_client else None
-        if tier_2 == "temi": tier_2 = "openai_whisper"
+    # Speaker labels requested always prioritizes AssemblyAI
+    if speaker_labels_enabled:
+        tier_1 = "assemblyai"
+        tier_2 = "openai_whisper"
+        tier_3 = "temi" if is_temi_available else None
+        tier_4 = "deepgram" if is_deepgram_available else None
+        reason = "speaker_labels_requested_prioritizing_assemblyai"
 
 
+    # Dynamic adjustment based on service availability (Google Cloud is now completely removed)
+    # This logic re-evaluates the tiers to fill gaps if a preferred service is unavailable.
+    available_services = []
+    if tier_1 == "assemblyai" and ASSEMBLYAI_API_KEY: available_services.append("assemblyai")
+    if tier_1 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL: available_services.append("openai_whisper")
+    if tier_1 == "temi" and is_temi_available: available_services.append("temi")
+    if tier_1 == "deepgram" and is_deepgram_available: available_services.append("deepgram")
+
+    if tier_2 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in available_services: available_services.append("assemblyai")
+    if tier_2 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in available_services: available_services.append("openai_whisper")
+    if tier_2 == "temi" and is_temi_available and "temi" not in available_services: available_services.append("temi")
+    if tier_2 == "deepgram" and is_deepgram_available and "deepgram" not in available_services: available_services.append("deepgram")
+
+    if tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in available_services: available_services.append("assemblyai")
+    if tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in available_services: available_services.append("openai_whisper")
+    if tier_3 == "temi" and is_temi_available and "temi" not in available_services: available_services.append("temi")
+    if tier_3 == "deepgram" and is_deepgram_available and "deepgram" not in available_services: available_services.append("deepgram")
+
+    if tier_4 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in available_services: available_services.append("assemblyai")
+    if tier_4 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in available_services: available_services.append("openai_whisper")
+    if tier_4 == "temi" and is_temi_available and "temi" not in available_services: available_services.append("temi")
+    if tier_4 == "deepgram" and is_deepgram_available and "deepgram" not in available_services: available_services.append("deepgram")
+
+    # Ensure unique and ordered list
+    final_tiers = []
+    seen = set()
+    for service in available_services:
+        if service not in seen:
+            final_tiers.append(service)
+            seen.add(service)
+    
+    # Fill up to 4 tiers, ensuring no Nones in between
     return {
-        "tier_1": "assemblyai",       # TypeMyworDz1
-        "tier_2": tier_2,
-        "tier_3": tier_3,
-        "tier_4": tier_4,
-        "tier_5": tier_5, # NEW
-        "reason": "free_or_oneday_user_prioritizing_assemblyai"
+        "tier_1": final_tiers[0] if len(final_tiers) > 0 else None,
+        "tier_2": final_tiers[1] if len(final_tiers) > 1 else None,
+        "tier_3": final_tiers[2] if len(final_tiers) > 2 else None,
+        "tier_4": final_tiers[3] if len(final_tiers) > 3 else None,
+        "reason": reason
     }
+
 
 class PaystackVerificationRequest(BaseModel):
     reference: str
@@ -1122,147 +1079,10 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         pass
 
 
-async def transcribe_with_google_cloud(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
-    """Transcribe audio using Google Cloud Speech-to-Text API."""
-    if not google_speech_client:
-        logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized")
-    if not global_gcp_credentials: # Ensure global credentials are set
-        logger.error(f"Global GCP credentials not available, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"Google Cloud credentials not configured.")
+# REMOVED: transcribe_with_google_cloud function
+# REMOVED: async def transcribe_with_google_cloud(...):
 
-    gcs_uri = None # Initialize GCS URI
-    gcs_object_name = None
-    compressed_audio_duration_seconds = 0 # To store actual duration of compressed audio
 
-    try:
-        logger.info(f"Starting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription for job {job_id}")
-
-        def check_cancellation():
-            if job_id and cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ3_NAME} (Google Cloud Speech) processing")
-                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
-        
-        check_cancellation()
-
-        # Analyze the compressed audio to get its actual duration
-        audio_characteristics = await analyze_audio_characteristics(audio_path)
-        compressed_audio_duration_seconds = audio_characteristics.get("duration_seconds", 0)
-        logger.info(f"Transcribe with Google Cloud Speech: Compressed audio duration for Google Cloud: {compressed_audio_duration_seconds:.1f} seconds")
-
-        audio_source = None
-        if compressed_audio_duration_seconds > 120: # Google's 2-minute limit for inline content
-            logger.info(f"Transcribe with Google Cloud Speech: Audio longer than 2 minutes. Uploading to GCS.")
-            if not GCS_BUCKET_NAME: # Check if env var is set
-                raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME environment variable not set for long audio transcription.")
-
-            bucket_name = GCS_BUCKET_NAME
-            # FIX: Initialize storage.Client correctly using the globally stored credentials
-            storage_client = storage.Client(credentials=global_gcp_credentials)
-            bucket = storage_client.bucket(bucket_name)
-
-            gcs_object_name = f"audio/{job_id}_{os.path.basename(audio_path)}"
-            blob = bucket.blob(gcs_object_name)
-
-            await asyncio.to_thread(blob.upload_from_filename, audio_path)
-            gcs_uri = f"gs://{bucket_name}/{gcs_object_name}"
-            logger.info(f"Transcribe with Google Cloud Speech: Uploaded audio to GCS: {gcs_uri}")
-
-            audio_source = speech.RecognitionAudio(uri=gcs_uri)
-        else:
-            logger.info(f"Transcribe with Google Cloud Speech: Audio 2 minutes or less. Sending inline content.")
-            with open(audio_path, "rb") as f:
-                audio_content = f.read()
-            audio_source = speech.RecognitionAudio(content=audio_content)
-        
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.MP3, # Assuming compressed to MP3
-            sample_rate_hertz=16000, # Assuming 16kHz sample rate after compression
-            language_code=language_code,
-            enable_automatic_punctuation=True,
-            model="default", # Or "video", "phone_call", "command_and_search"
-        )
-
-        if speaker_labels_enabled:
-            config.enable_speaker_diarization = True
-            config.diarization_speaker_count = 2 # Default to 2 speakers, can be dynamic if needed
-            logger.info(f"Transcribe with Google Cloud Speech: Speaker diarization ENABLED for job {job_id}")
-        
-        # Perform the transcription
-        operation = await asyncio.to_thread(google_speech_client.long_running_recognize, config=config, audio=audio_source) # Use audio_source here
-        
-        logger.info(f"Transcribe with Google Cloud Speech: long_running_recognize operation started for job {job_id}. Waiting for result...")
-        
-        # Wait for the operation to complete
-        result = await asyncio.to_thread(operation.result) # This will block until complete or error
-
-        transcription_text = ""
-        has_speaker_labels = False
-
-        if result.results:
-            if speaker_labels_enabled and result.results[0].alternatives[0].words:
-                # Process diarized output
-                speaker_segments = {}
-                for word_info in result.results[0].alternatives[0].words:
-                    speaker_tag = f"Speaker {word_info.speaker_tag}:"
-                    if speaker_tag not in speaker_segments:
-                        speaker_segments[speaker_tag] = []
-                    speaker_segments[speaker_tag].append(word_info.word)
-                
-                # Sort speakers and format
-                sorted_speakers = sorted(speaker_segments.keys())
-                for speaker_tag in sorted_speakers:
-                    transcription_text += f"<strong>{speaker_tag}</strong> {' '.join(speaker_segments[speaker_tag])}\n"
-                has_speaker_labels = True
-            else:
-                # Get non-diarized transcript
-                for res in result.results:
-                    transcription_text += res.alternatives[0].transcript
-            
-            # Estimate duration and word count (Google Cloud doesn't always provide duration directly in results)
-            duration = 0
-            if result.results:
-                # Sum the duration of all recognized segments
-                for res in result.results:
-                    if res.result_end_time:
-                        duration += res.result_end_time.seconds + res.result_end_time.microseconds / 1e6
-            
-            word_count = len(transcription_text.split()) if transcription_text else 0
-
-            logger.info(f"Transcribe with Google Cloud Speech: transcription completed for job {job_id}")
-            return {
-                "status": "completed",
-                "transcription": transcription_text,
-                "language": language_code, # Google Cloud returns language, but using requested for now
-                "duration": duration,
-                "word_count": word_count,
-                "has_speaker_labels": has_speaker_labels
-            }
-        else:
-            raise Exception(f"Transcribe with Google Cloud Speech: returned no transcription results.")
-
-    except asyncio.CancelledError:
-        logger.info(f"Transcribe with Google Cloud Speech: transcription cancelled for job {job_id}")
-        raise
-    except Exception as e:
-        logger.error(f"TypeMyworDz3 (Google Cloud Speech) transcription failed for job {job_id}: {str(e)}")
-        return {
-            "status": "failed",
-            "error": f"TypeMyworDz3 (Google Cloud Speech) transcription failed: {str(e)}"
-        }
-    finally:
-        # Clean up GCS object if it was uploaded
-        if gcs_object_name and 'bucket' in locals():
-            try:
-                # Ensure the bucket object is available in this scope
-                bucket_name = GCS_BUCKET_NAME
-                storage_client = storage.Client(credentials=global_gcp_credentials) # Use global credentials for cleanup
-                bucket = storage_client.bucket(bucket_name)
-                
-                await asyncio.to_thread(bucket.blob(gcs_object_name).delete)
-                logger.info(f"Cleaned up GCS object {gcs_object_name} after Transcribe with Google Cloud Speech processing: {gcs_uri}")
-            except Exception as e:
-                logger.warning(f"Failed to delete GCS object {gcs_object_name}: {e}")
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
     """Transcribe audio using AssemblyAI API"""
     if not ASSEMBLYAI_API_KEY:
@@ -1408,9 +1228,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         tier_2_service = service_config["tier_2"]
         tier_3_service = service_config["tier_3"]
         tier_4_service = service_config["tier_4"]
-        tier_5_service = service_config["tier_5"] # NEW
+        # REMOVED: tier_5_service = service_config["tier_5"] # No longer tier 5
 
-        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service} ({service_config['reason']}), Tier2={tier_2_service}, Tier3={tier_3_service}, Tier4={tier_4_service}, Tier5={tier_5_service}") # UPDATED LOG
+        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service} ({service_config['reason']}), Tier2={tier_2_service}, Tier3={tier_3_service}, Tier4={tier_4_service}") # UPDATED LOG
 
         def get_assemblyai_model(plan: str) -> str:
             if plan == 'free' or plan == 'One-Day Plan':
@@ -1425,7 +1245,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             "tier_2_service": tier_2_service,
             "tier_3_service": tier_3_service,
             "tier_4_service": tier_4_service,
-            "tier_5_service": tier_5_service, # NEW
+            # REMOVED: "tier_5_service": tier_5_service, # No longer tier 5
             "assemblyai_model": assemblyai_model,
             "duration_minutes": duration_minutes,
             "selection_reason": service_config["reason"],
@@ -1473,23 +1293,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
         
-        elif tier_1_service == "google_cloud":
-            if not google_speech_client:
-                logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
-            else:
-                try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 1 Primary) for job {job_id}")
-                    compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                    logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
-                    transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
-                    job_data["tier_1_used"] = "google_cloud"
-                    job_data["tier_1_success"] = True
-                except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 1 Primary) failed: {error}")
-                    job_data["tier_1_error"] = str(error)
-                    job_data["tier_1_success"] = False
-            services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier1")
+        # REMOVED: elif tier_1_service == "google_cloud":
+        # REMOVED:     ... (Google Cloud STT logic)
 
         elif tier_1_service == "deepgram":
             if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
@@ -1571,24 +1376,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
             
-            elif tier_2_service == "google_cloud":
-                if not google_speech_client:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 2 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
-                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_2_used"] = "google_cloud"
-                        job_data["tier_2_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 2 Fallback) failed: {error}")
-                        job_data["tier_2_error"] = str(error)
-                        job_data["tier_2_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier2")
+            # REMOVED: elif tier_2_service == "google_cloud":
+            # REMOVED:     ... (Google Cloud STT logic)
 
             elif tier_2_service == "deepgram":
                 if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
@@ -1671,24 +1460,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
             
-            elif tier_3_service == "google_cloud":
-                if not google_speech_client:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 3 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
-                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_3_used"] = "google_cloud"
-                        job_data["tier_3_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 3 Fallback) failed: {error}")
-                        job_data["tier_3_error"] = str(error)
-                        job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier3")
+            # REMOVED: elif tier_3_service == "google_cloud":
+            # REMOVED:     ... (Google Cloud STT logic)
 
             elif tier_3_service == "deepgram":
                 if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
@@ -1771,24 +1544,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_4_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier4")
             
-            elif tier_4_service == "google_cloud":
-                if not google_speech_client:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 4 for job {job_id}")
-                    job_data["tier_4_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 4 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
-                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_4_used"] = "google_cloud"
-                        job_data["tier_4_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 4 Fallback) failed: {error}")
-                        job_data["tier_4_error"] = str(error)
-                        job_data["tier_4_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier4")
+            # REMOVED: elif tier_4_service == "google_cloud":
+            # REMOVED:     ... (Google Cloud STT logic)
 
             elif tier_4_service == "deepgram":
                 if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
@@ -1828,104 +1585,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # NEW: ATTEMPT TIER 5 SERVICE (FINAL FALLBACK) if Tier 4 failed AND tier_5_service is defined ---
-        if (not transcription_result or transcription_result.get("status") == "failed") and tier_5_service:
-            logger.warning(f"⚠️ Tier 4 service failed, trying Tier 5 fallback ({tier_5_service}) for job {job_id}")
-
-            if tier_5_service == "assemblyai":
-                if not ASSEMBLYAI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 5 for job {job_id}")
-                    job_data["tier_5_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 5 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ1_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
-                        job_data["tier_5_used"] = "assemblyai"
-                        job_data["tier_5_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 5 Fallback) failed: {error}")
-                        job_data["tier_5_error"] = str(error)
-                        job_data["tier_5_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier5")
-                
-            elif tier_5_service == "openai_whisper":
-                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 5 for job {job_id}")
-                    job_data["tier_5_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 5 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
-                        job_data["tier_5_used"] = "openai_whisper"
-                        job_data["tier_5_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 5 Fallback) failed: {error}")
-                        job_data["tier_5_error"] = str(error)
-                        job_data["tier_5_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier5")
-            
-            elif tier_5_service == "google_cloud":
-                if not google_speech_client:
-                    logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping Tier 5 for job {job_id}")
-                    job_data["tier_5_error"] = f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 5 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ3_NAME} (Google Cloud Speech): {compression_stats}")
-                        transcription_result = await transcribe_with_google_cloud(compressed_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_5_used"] = "google_cloud"
-                        job_data["tier_5_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ3_NAME} (Google Cloud Speech) (Tier 5 Fallback) failed: {error}")
-                        job_data["tier_5_error"] = str(error)
-                        job_data["tier_5_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ3_NAME}_tier5")
-
-            elif tier_5_service == "deepgram":
-                if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
-                    logger.error(f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured, skipping Tier 5 for job {job_id}")
-                    job_data["tier_5_error"] = f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ4_NAME} (Tier 5 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ4_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
-                        job_data["tier_5_used"] = "deepgram"
-                        job_data["tier_5_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ4_NAME} (Tier 5 Fallback) failed: {error}")
-                        job_data["tier_5_error"] = str(error)
-                        job_data["tier_5_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ4_NAME}_tier5")
-
-            # NEW: ATTEMPT TIER 5 SERVICE - Temi
-            elif tier_5_service == "temi":
-                if not TEMI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ5_NAME} API Key not configured, skipping Tier 5 for job {job_id}")
-                    job_data["tier_5_error"] = f"{TYPEMYWORDZ5_NAME} API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ5_NAME} (Tier 5 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_temi(tmp_path, language_code, job_id)
-                        job_data["tier_5_used"] = "temi"
-                        job_data["tier_5_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ5_NAME} (Tier 5 Fallback) failed: {error}")
-                        job_data["tier_5_error"] = str(error)
-                        job_data["tier_5_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ5_NAME}_tier5")
-
-        check_cancellation()
+        # REMOVED: ATTEMPT TIER 5 SERVICE (FINAL FALLBACK) if Tier 4 failed AND tier_5_service is defined ---
+        # No longer a Tier 5, as logic is now 4 tiers.
 
         # Final result processing
         if not transcription_result or transcription_result.get("status") == "failed":
@@ -1938,6 +1599,22 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             })
         else:
             logger.info(f"✅ Transcription completed successfully for job {job_id}")
+            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used")) # UPDATED
+            model_used = "N/A" # Default
+
+            if service_used_name == "assemblyai":
+                model_used = job_data.get("assemblyai_model", "unknown")
+            elif service_used_name == "openai_whisper":
+                model_used = "whisper-1"
+            # REMOVED: elif service_used_name == "google_cloud":
+            # REMOVED:     model_used = "default"
+            elif service_used_name == "deepgram":
+                model_used = "nova-3" # Assuming nova-3 as per whisper_service.py
+            elif service_used_name == "temi":
+                model_used = "default" # Temi doesn't expose model name via API
+
+            logger.info(f"📊 Job {job_id} for user {user_email} completed. Service: {service_used_name}, Model: {model_used}")
+
             job_data.update({
                 "status": "completed",
                 "transcription": transcription_result["transcription"],
@@ -1946,7 +1623,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 "word_count": transcription_result.get("word_count", 0),
                 "duration_seconds": transcription_result.get("duration", 0),
                 "speaker_labels": speaker_labels_enabled,
-                "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used") or job_data.get("tier_5_used")), # UPDATED
+                "service_used": service_used_name,
+                "model_used": model_used, # NEW: Store model used
                 "services_attempted": services_attempted
             })
 
@@ -1973,7 +1651,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         # Clean up original temporary file
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
-            logger.info(f"Cleaned up original temporary file: {tmp_path}")
+            logger.info(f"Cleaned up original temp file: {tmp_path}")
         
         if job_id in active_background_tasks:
             del active_background_tasks[job_id]
@@ -2001,7 +1679,7 @@ async def lifespan(app: FastAPI):
     logger.info("All background tasks cancelled and cleanup complete")
 
 logger.info("Creating FastAPI app...")
-app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ3_NAME}, {TYPEMYWORDZ4_NAME}, {TYPEMYWORDZ5_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini", lifespan=lifespan) # UPDATED
+app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ4_NAME}, {TYPEMYWORDZ5_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini", lifespan=lifespan) # UPDATED
 logger.info("FastAPI app created successfully")
 
 app.add_middleware(
@@ -2016,37 +1694,37 @@ logger.info("CORS middleware configured successfully")
 async def root():
     logger.info("Root endpoint called")
     return {
-        "message": f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ3_NAME}, {TYPEMYWORDZ4_NAME}, {TYPEMYWORDZ5_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini is running!", # UPDATED
+        "message": f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ4_NAME}, {TYPEMYWORDZ5_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini is running!", # UPDATED
         "features": [
             f"AssemblyAI integration with smart model selection",
             f"OpenAI Whisper integration for transcription",
-            f"Google Cloud Speech-to-Text integration for transcription",
-            f"Deepgram integration for transcription", # Deepgram re-added
+            # REMOVED: f"Google Cloud Speech-to-Text integration for transcription",
+            f"Deepgram integration for transcription",
             f"Temi integration for transcription", # NEW
-            "Five-tier automatic fallback between services", # UPDATED
+            "Four-tier automatic fallback between services", # UPDATED
             "Paystack payment integration",
-            f"Speaker diarization for AssemblyAI, Google Cloud Speech-to-Text, and Deepgram", # Deepgram re-added
+            f"Speaker diarization for AssemblyAI and Deepgram", # UPDATED
             "Language selection for transcription",
             f"User-driven AI features (summarization, Q&A, and bullet points) via TypeMyworDz AI (Anthropic)",
             f"Admin-driven AI formatting via TypeMyworDz AI (Anthropic) and Google Gemini",
             "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-            "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYTWORZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
-            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+            "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
+            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
             "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
-            "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
-            "deepgram": f"TypeMyworDz4 (Deepgram)", # Deepgram re-added
+            # REMOVED: "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
+            "deepgram": f"TypeMyworDz4 (Deepgram)",
             "temi": f"TypeMyworDz5 (Temi)", # NEW
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
@@ -2278,12 +1956,12 @@ async def paystack_status():
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-        "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
+        # REMOVED: "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
         "google_gemini_configured": bool(GEMINI_API_KEY),
-        "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(DeepgramClient) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL), # Re-added and updated
+        "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(DeepgramClient) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL),
         "temi_configured": bool(TEMI_API_KEY), # NEW
         "admin_emails": ADMIN_EMAILS,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
@@ -2443,7 +2121,7 @@ async def ai_user_query_gemini(
     except Exception as e:
         logger.error(f"Unexpected error processing AI user query with Gemini: {e}")
         # Return a more user-friendly error
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred with Gemini formatting: {str(e)}. Try using Claude instead.")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini formatting: {str(e)}. Try using Claude instead.")
 
 
 @app.post("/ai/admin-format")
@@ -2549,7 +2227,7 @@ async def ai_admin_format_gemini(
     except Exception as e:
         logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
         # Return a more user-friendly error
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini admin formatting: {str(e)}. Try using Claude instead.")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini formatting: {str(e)}. Try using Claude instead.")
 
 @app.post("/transcribe")
 async def transcribe_audio(
@@ -2810,7 +2488,8 @@ async def list_jobs():
             "user_email": job_data.get("user_email", "unknown"),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("tier_1_service"),
-            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used") or job_data.get("tier_5_used")), # UPDATED
+            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used")), # UPDATED
+            "model_used": job_data.get("model_used", "N/A"),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
             "word_count": job_data.get("word_count"),
@@ -2863,7 +2542,7 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
+                # REMOVED: "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
@@ -2872,21 +2551,21 @@ async def health_check():
                 "temi_configured": bool(TEMI_API_KEY) # NEW
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}", # UPDATED
-                "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+                "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
                 "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
-                "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
-                "deepgram": f"TypeMyworDz4 (Deepgram)", # Deepgram re-added
+                # REMOVED: "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
+                "deepgram": f"TypeMyworDz4 (Deepgram)",
                 "temi": f"TypeMyworDz5 (Temi)", # NEW
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
@@ -2909,7 +2588,7 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"TypeMyworDz1 API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"TypeMyworDz2 Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
-logger.info(f"TypeMyworDz3 (Google Cloud Speech) API Key configured: {bool(GCP_SPEECH_KEY_BASE64)}")
+# REMOVED: logger.info(f"TypeMyworDz3 (Google Cloud Speech) API Key configured: {bool(GCP_SPEECH_KEY_BASE64)}")
 logger.info(f"TypeMyworDz4 (Deepgram) API Key configured: {bool(DEEPGRAM_API_KEY)}")
 logger.info(f"TypeMyworDz5 (Temi) API Key configured: {bool(TEMI_API_KEY)}") # NEW
 logger.info(f"TypeMyworDz AI API Key configured: {bool(ANTHROPIC_API_KEY)}")
@@ -2952,13 +2631,13 @@ if __name__ == "__main__":
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
-    logger.info(f"  ✅ TypeMyworDz3 (Google Cloud Speech-to-Text) integrated for transcription")
+    logger.info(f"  ✅ TypeMyworDz3 (Google Cloud Speech-to-Text) integrated for transcription") # REMOVED
     logger.info(f"  ✅ TypeMyworDz4 (Deepgram) integrated for transcription")
     logger.info(f"  ✅ TypeMyworDz5 (Temi) integrated for transcription") # NEW
-    logger.info(f"  ✅ Smart service selection with updated five-tier logic") # UPDATED
-    logger.info(f"  ✅ Five-tier automatic fallback system") # UPDATED
+    logger.info(f"  ✅ Smart service selection with updated four-tier logic") # UPDATED
+    logger.info(f"  ✅ Four-tier automatic fallback system") # UPDATED
     logger.info(f"  ✅ Admin email-based service prioritization")
-    logger.info(f"  ✅ Speaker diarization for TypeMyworDz1, TypeMyworDz3, and TypeMyworDz4")
+    logger.info(f"  ✅ Speaker diarization for TypeMyworDz1 and Deepgram") # UPDATED
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
     logger.info("  ✅ Enhanced error handling and service resilience")
@@ -2973,18 +2652,18 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ4_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME} → Fallback4={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - Dedicated Deepgram Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ4_NAME} (no fallback)")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}") # UPDATED
+    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}") # UPDATED
+    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}") # UPDATED
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}") # UPDATED
+    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}") # UPDATED
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}") # UPDATED
+    logger.info(f"  - Dedicated Temi Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ5_NAME} (no fallback)") # UPDATED
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
-    logger.info(f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)")
+    # REMOVED: f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)")
     logger.info(f"  - {TYPEMYWORDZ4_NAME}: Deepgram (supports speaker labels)")
     logger.info(f"  - {TYPEMYWORDZ5_NAME}: Temi (does NOT support speaker labels via basic API)") # NEW
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
@@ -3005,4 +2684,4 @@ if __name__ == "__main__":
         sys.exit(1)
 else:
     logger.info("Application loaded as module")
-    logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ3_NAME} + {TYPEMYWORDZ4_NAME} + {TYPEMYWORDZ5_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
+    logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ4_NAME} + {TYPEMYWORDZ5_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
