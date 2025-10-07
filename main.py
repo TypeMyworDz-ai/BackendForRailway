@@ -370,9 +370,9 @@ async def update_monthly_revenue_firebase(amount_usd: float):
     try:
         def update_in_transaction_sync(transaction, doc_ref):
             snapshot = doc_ref.get(transaction=transaction) # Pass transaction explicitly
-            current_monthly_revenue = 0
+            current_monthly_revenue = 0.0 # Default to float
             if snapshot.exists:
-                current_monthly_revenue = snapshot.get('monthlyRevenue') or 0
+                current_monthly_revenue = snapshot.get('monthlyRevenue') or 0.0
             else:
                 # If document doesn't exist, create it with initial values
                 transaction.set(doc_ref, {'monthlyRevenue': 0.0, 'lastUpdated': firestore.SERVER_TIMESTAMP})
@@ -1946,25 +1946,38 @@ async def get_admin_revenue_data(
 
     now = datetime.now()
     start_date = None
-    end_date = now
+    end_date_for_query = None # New variable to be exclusive upper bound
 
     if period == "daily":
         start_date = datetime(now.year, now.month, now.day)
+        end_date_for_query = start_date + timedelta(days=1) # Exclusive end for current day
     elif period == "weekly":
-        start_date = now - timedelta(weeks=1)
+        # Start of the current week (Monday)
+        start_date = now - timedelta(days=now.weekday())
         start_date = datetime(start_date.year, start_date.month, start_date.day)
+        end_date_for_query = start_date + timedelta(weeks=1) # Exclusive end for week
     elif period == "monthly":
         start_date = datetime(now.year, now.month, 1)
+        # Calculate start of next month
+        next_month = now.replace(day=28) + timedelta(days=4) # advance to a day in the next month
+        end_date_for_query = datetime(next_month.year, next_month.month, 1) # start of next month
     elif period == "yearly":
         start_date = datetime(now.year, 1, 1)
+        end_date_for_query = datetime(now.year + 1, 1, 1) # start of next year
     elif period == "all_time": # NEW: All time period
         start_date = datetime(1970, 1, 1) # Unix epoch start
+        end_date_for_query = now # Up to current moment for all time
     else:
         raise HTTPException(status_code=400, detail="Invalid period specified. Must be 'daily', 'weekly', 'monthly', 'yearly', or 'all_time'.")
 
     try:
         revenue_ref = db.collection('revenue_transactions')
-        query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<=", end_date))
+        
+        # Use < for exclusive upper bound for all periods except 'all_time' which is <= now
+        if period == "all_time":
+            query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<=", end_date_for_query))
+        else:
+            query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<", end_date_for_query)) 
         
         snapshot = await asyncio.to_thread(query_ref.get)
 
@@ -1983,13 +1996,19 @@ async def get_admin_revenue_data(
         
         logger.info(f"Fetched revenue data for period '{period}': Total USD {total_revenue:.2f}, {transactions_count} transactions.")
 
+        # For display purposes, convert end_date_for_query back to inclusive if it was exclusive
+        display_end_date = end_date_for_query
+        if period != "all_time" and end_date_for_query:
+            display_end_date = end_date_for_query - timedelta(microseconds=1)
+
+
         return {
             "period": period,
             "totalRevenue": total_revenue,
             "revenueByPlan": revenue_by_plan,
             "transactionsCount": transactions_count,
             "startDate": start_date.isoformat(),
-            "endDate": end_date.isoformat()
+            "endDate": display_end_date.isoformat()
         }
     except Exception as e:
         logger.error(f"Error fetching detailed revenue data from Firestore: {e}")
@@ -2193,4 +2212,3 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
-
