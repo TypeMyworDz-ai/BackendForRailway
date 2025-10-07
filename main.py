@@ -4,7 +4,7 @@ import asyncio
 import subprocess
 import os
 import json
-import base64 # For decoding Base64 GCP key
+# REMOVED: import base64 # For decoding Base64 GCP key (not needed as GCP STT removed)
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,19 +27,20 @@ import openai # Keep openai import for GPT-based AI formatting
 # REMOVED: Google Cloud Speech-to-Text libraries
 # REMOVED: from google.cloud import speech_v1p1beta1 as speech
 # REMOVED: from google.oauth2 import service_account
-# REMOVED: from google.cloud import storage # NEW: For Google Cloud Storage operations
+# REMOVED: from google.cloud import storage # For Google Cloud Storage operations
 
 # NEW: Import Google Generative AI libraries
 import google.generativeai as genai
 
-# NEW: Import Deepgram libraries (Re-enabled)
+# NEW: Import Deepgram libraries (Re-enabled and CORRECTED IMPORTS)
+Deepgram = None
+PrerecordedOptions = None
 try:
-    # Based on successful Docker build, DeepgramClient and PrerecordedOptions should be directly available
-    from deepgram import DeepgramClient, PrerecordedOptions
+    from deepgram import Deepgram # Correct client class name
+    from deepgram.options import PrerecordedOptions # Correct options path
 except ImportError as e:
-    DeepgramClient = None
-    PrerecordedOptions = None
     logging.warning(f"Deepgram SDK not installed or import error: {e}. Deepgram features will be disabled.")
+
 
 # NEW: Import Firebase Admin SDK
 import firebase_admin
@@ -86,7 +87,7 @@ logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 # REMOVED: GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # Google Cloud Speech Key
-# REMOVED: GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # NEW: Google Cloud Storage Bucket Name
+# REMOVED: GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # For Google Cloud Storage operations
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -210,10 +211,11 @@ if GEMINI_API_KEY:
 else:
     logger.warning(f"Google Gemini API key is missing, client will not be initialized.")
 
-# NEW: Deepgram Client initialization (Configured to call Render service)
+# NEW: Deepgram Client initialization (Configured to call Render service, using corrected local import)
 # Note: deepgram_client here is just a flag; actual API calls go via httpx to Render service
 deepgram_client_configured = False # Use a flag to indicate if Deepgram is configured
-if DEEPGRAM_API_KEY and DeepgramClient and PrerecordedOptions and DEEPGRAM_SERVICE_RENDER_URL:
+# Corrected check: use Deepgram (the class) and PrerecordedOptions (the class)
+if DEEPGRAM_API_KEY and Deepgram and PrerecordedOptions and DEEPGRAM_SERVICE_RENDER_URL:
     deepgram_client_configured = True
     logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) is configured to use the Render service at {DEEPGRAM_SERVICE_RENDER_URL}.")
 else:
@@ -223,7 +225,7 @@ else:
 def is_paid_ai_user(user_plan: str) -> bool:
     # UPDATED: AI features for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan
     paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
-    return user_plan in paid_plans_for_ai
+    return paid_plans_for_ai.includes(user_plan)
 
 def is_admin_user(user_email: str) -> bool:
     """Check if user is an admin based on email address"""
@@ -245,7 +247,8 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     is_admin = is_admin_user(user_email) if user_email else False
     
     # Helper to check if Deepgram is available for use in the tier logic
-    is_deepgram_available = DEEPGRAM_API_KEY and DeepgramClient and PrerecordedOptions and DEEPGRAM_SERVICE_RENDER_URL
+    # Corrected check: use Deepgram (the class) and PrerecordedOptions (the class)
+    is_deepgram_available = DEEPGRAM_API_KEY and Deepgram and PrerecordedOptions and DEEPGRAM_SERVICE_RENDER_URL
     # NEW: Helper to check if Temi is available
     is_temi_available = bool(TEMI_API_KEY)
 
@@ -305,41 +308,55 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
 
     # Dynamic adjustment based on service availability (Google Cloud is now completely removed)
     # This logic re-evaluates the tiers to fill gaps if a preferred service is unavailable.
-    available_services = []
-    if tier_1 == "assemblyai" and ASSEMBLYAI_API_KEY: available_services.append("assemblyai")
-    if tier_1 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL: available_services.append("openai_whisper")
-    if tier_1 == "temi" and is_temi_available: available_services.append("temi")
-    if tier_1 == "deepgram" and is_deepgram_available: available_services.append("deepgram")
-
-    if tier_2 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in available_services: available_services.append("assemblyai")
-    if tier_2 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in available_services: available_services.append("openai_whisper")
-    if tier_2 == "temi" and is_temi_available and "temi" not in available_services: available_services.append("temi")
-    if tier_2 == "deepgram" and is_deepgram_available and "deepgram" not in available_services: available_services.append("deepgram")
-
-    if tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in available_services: available_services.append("assemblyai")
-    if tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in available_services: available_services.append("openai_whisper")
-    if tier_3 == "temi" and is_temi_available and "temi" not in available_services: available_services.append("temi")
-    if tier_3 == "deepgram" and is_deepgram_available and "deepgram" not in available_services: available_services.append("deepgram")
-
-    if tier_4 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in available_services: available_services.append("assemblyai")
-    if tier_4 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in available_services: available_services.append("openai_whisper")
-    if tier_4 == "temi" and is_temi_available and "temi" not in available_services: available_services.append("temi")
-    if tier_4 == "deepgram" and is_deepgram_available and "deepgram" not in available_services: available_services.append("deepgram")
-
-    # Ensure unique and ordered list
-    final_tiers = []
-    seen = set()
-    for service in available_services:
-        if service not in seen:
-            final_tiers.append(service)
-            seen.add(service)
+    # It ensures that if a service is chosen for a tier, it's actually available.
+    final_tiers_list = []
     
-    # Fill up to 4 tiers, ensuring no Nones in between
+    # Tier 1
+    if tier_1 == "assemblyai" and ASSEMBLYAI_API_KEY:
+        final_tiers_list.append("assemblyai")
+    elif tier_1 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+        final_tiers_list.append("openai_whisper")
+    elif tier_1 == "temi" and is_temi_available:
+        final_tiers_list.append("temi")
+    elif tier_1 == "deepgram" and is_deepgram_available:
+        final_tiers_list.append("deepgram")
+
+    # Tier 2 (only if not already in Tier 1 and is available)
+    if tier_2 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list:
+        final_tiers_list.append("assemblyai")
+    elif tier_2 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
+        final_tiers_list.append("openai_whisper")
+    elif tier_2 == "temi" and is_temi_available and "temi" not in final_tiers_list:
+        final_tiers_list.append("temi")
+    elif tier_2 == "deepgram" and is_deepgram_available and "deepgram" not in final_tiers_list:
+        final_tiers_list.append("deepgram")
+
+    # Tier 3 (only if not already in higher tiers and is available)
+    if tier_3 == "temi" and is_temi_available and "temi" not in final_tiers_list:
+        final_tiers_list.append("temi")
+    elif tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list: # Fill if Temi was unavailable
+         final_tiers_list.append("assemblyai")
+    elif tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
+        final_tiers_list.append("openai_whisper")
+    elif tier_3 == "deepgram" and is_deepgram_available and "deepgram" not in final_tiers_list:
+        final_tiers_list.append("deepgram")
+
+    # Tier 4 (only if not already in higher tiers and is available)
+    if tier_4 == "deepgram" and is_deepgram_available and "deepgram" not in final_tiers_list:
+        final_tiers_list.append("deepgram")
+    elif tier_4 == "temi" and is_temi_available and "temi" not in final_tiers_list: # Fill if Deepgram was unavailable
+        final_tiers_list.append("temi")
+    elif tier_4 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list:
+        final_tiers_list.append("assemblyai")
+    elif tier_4 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
+        final_tiers_list.append("openai_whisper")
+
+    # Ensure the list does not exceed 4 tiers and fills Nones if less than 4
     return {
-        "tier_1": final_tiers[0] if len(final_tiers) > 0 else None,
-        "tier_2": final_tiers[1] if len(final_tiers) > 1 else None,
-        "tier_3": final_tiers[2] if len(final_tiers) > 2 else None,
-        "tier_4": final_tiers[3] if len(final_tiers) > 3 else None,
+        "tier_1": final_tiers_list[0] if len(final_tiers_list) > 0 else None,
+        "tier_2": final_tiers_list[1] if len(final_tiers_list) > 1 else None,
+        "tier_3": final_tiers_list[2] if len(final_tiers_list) > 2 else None,
+        "tier_4": final_tiers_list[3] if len(final_tiers_list) > 3 else None,
         "reason": reason
     }
 
@@ -1297,7 +1314,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         # REMOVED:     ... (Google Cloud STT logic)
 
         elif tier_1_service == "deepgram":
-            if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+            if not DEEPGRAM_API_KEY or not Deepgram or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Corrected check
                 logger.error(f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured, skipping Tier 1 for job {job_id}")
                 job_data["tier_1_error"] = f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured"
             else:
@@ -1380,7 +1397,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             # REMOVED:     ... (Google Cloud STT logic)
 
             elif tier_2_service == "deepgram":
-                if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                if not DEEPGRAM_API_KEY or not Deepgram or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Corrected check
                     logger.error(f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured, skipping Tier 2 for job {job_id}")
                     job_data["tier_2_error"] = f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured"
                 else:
@@ -1464,7 +1481,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             # REMOVED:     ... (Google Cloud STT logic)
 
             elif tier_3_service == "deepgram":
-                if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                if not DEEPGRAM_API_KEY or not Deepgram or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Corrected check
                     logger.error(f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured, skipping Tier 3 for job {job_id}")
                     job_data["tier_3_error"] = f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured"
                 else:
@@ -1548,7 +1565,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             # REMOVED:     ... (Google Cloud STT logic)
 
             elif tier_4_service == "deepgram":
-                if not DEEPGRAM_API_KEY or not DeepgramClient or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Check if Deepgram is truly available
+                if not DEEPGRAM_API_KEY or not Deepgram or not PrerecordedOptions or not DEEPGRAM_SERVICE_RENDER_URL: # Corrected check
                     logger.error(f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured, skipping Tier 4 for job {job_id}")
                     job_data["tier_4_error"] = f"{TYPEMYWORDZ4_NAME} client, PrerecordedOptions, or Render URL not configured"
                 else:
@@ -1584,9 +1601,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"{TYPEMYWORDZ5_NAME}_tier4")
 
         check_cancellation()
-
-        # REMOVED: ATTEMPT TIER 5 SERVICE (FINAL FALLBACK) if Tier 4 failed AND tier_5_service is defined ---
-        # No longer a Tier 5, as logic is now 4 tiers.
 
         # Final result processing
         if not transcription_result or transcription_result.get("status") == "failed":
@@ -1714,7 +1728,7 @@ async def root():
             "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
             "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
             "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
-            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYTWORZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
+            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
             "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
@@ -1961,7 +1975,7 @@ async def paystack_status():
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
         "google_gemini_configured": bool(GEMINI_API_KEY),
-        "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(DeepgramClient) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL),
+        "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(Deepgram) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL), # CORRECTED check
         "temi_configured": bool(TEMI_API_KEY), # NEW
         "admin_emails": ADMIN_EMAILS,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
@@ -2112,14 +2126,14 @@ async def ai_user_query_gemini(
         # Handle safety filter or empty response case
         if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
             logger.warning(f"Gemini response was filtered or empty. Finish reason: {response.candidates[0].finish_reason if response.candidates else 'unknown'}")
-            return {"ai_response": "The AI was unable to process this content due to content safety filters. Please try reformulating your request or use Claude instead."}
+            return {"formatted_transcript": "The AI was unable to process this content due to content safety filters. Please try reformulating your request or use Claude instead."}
         
         gemini_response = response.text
-        logger.info(f"Successfully processed AI user query with Gemini model: {model}.")
-        return {"ai_response": gemini_response}
+        logger.info(f"Successfully processed AI admin format request with Gemini model: {model}.")
+        return {"formatted_transcript": gemini_response}
 
     except Exception as e:
-        logger.error(f"Unexpected error processing AI user query with Gemini: {e}")
+        logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
         # Return a more user-friendly error
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini formatting: {str(e)}. Try using Claude instead.")
 
@@ -2547,7 +2561,7 @@ async def health_check():
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
                 "google_gemini_configured": bool(GEMINI_API_KEY),
-                "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(DeepgramClient) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL),
+                "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(Deepgram) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL), # CORRECTED check
                 "temi_configured": bool(TEMI_API_KEY) # NEW
             },
             "transcription_logic": {
@@ -2631,13 +2645,13 @@ if __name__ == "__main__":
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
-    logger.info(f"  ✅ TypeMyworDz3 (Google Cloud Speech-to-Text) integrated for transcription") # REMOVED
+    # REMOVED: f"  ✅ TypeMyworDz3 (Google Cloud Speech-to-Text) integrated for transcription")
     logger.info(f"  ✅ TypeMyworDz4 (Deepgram) integrated for transcription")
     logger.info(f"  ✅ TypeMyworDz5 (Temi) integrated for transcription") # NEW
     logger.info(f"  ✅ Smart service selection with updated four-tier logic") # UPDATED
     logger.info(f"  ✅ Four-tier automatic fallback system") # UPDATED
     logger.info(f"  ✅ Admin email-based service prioritization")
-    logger.info(f"  ✅ Speaker diarization for TypeMyworDz1 and Deepgram") # UPDATED
+    logger.info(f"  ✅ Speaker diarization for AssemblyAI and Deepgram") # UPDATED
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
     logger.info("  ✅ Enhanced error handling and service resilience")
