@@ -31,17 +31,11 @@ RUN echo "--- Installing ALL Python dependencies from requirements.txt with forc
     pip install --no-cache-dir --force-reinstall -r requirements.txt
 # --- END Deepgram Fix for Main Backend ---
 
-# --- NEW DIAGNOSTIC STEP: Inspect Deepgram module ---
-# This will print the location and contents of the 'deepgram' module Python finds
-RUN echo "--- DIAGNOSTIC: Inspecting 'deepgram' module ---" && \
-    python -c "import deepgram; print(f'Deepgram module found at: {deepgram.__file__}'); print(f'Deepgram module contents: {dir(deepgram)}') if hasattr(deepgram, '__file__') else print('Deepgram module is a built-in or namespace package.')" || \
-    (echo "!!! DIAGNOSTIC ERROR: Could not import or inspect 'deepgram' module. !!!" && exit 1)
-
-
-# --- DIAGNOSTIC STEP 1: Verify Deepgram base import (Original check, kept for consistency) ---
-RUN echo "--- Verifying Deepgram SDK (base module) ---" && \
-    python -c "from deepgram import DeepgramClient, PrerecordedOptions; print('Deepgram SDK (DeepgramClient, PrerecordedOptions) imported successfully.')" || \
-    (echo "!!! ERROR: Deepgram SDK (DeepgramClient, PrerecordedOptions) failed to import. Check above logs for details. !!!" && exit 1)
+# --- DIAGNOSTIC STEP: Inspect Deepgram module (Corrected import check) ---
+# This will now correctly verify the Deepgram SDK's main client and options class
+RUN echo "--- Verifying Deepgram SDK (Deepgram, PrerecordedOptions) imports ---" && \
+    python -c "from deepgram import Deepgram; from deepgram.options import PrerecordedOptions; print('Deepgram SDK (Deepgram, PrerecordedOptions) imported successfully.')" || \
+    (echo "!!! ERROR: Deepgram SDK (Deepgram, PrerecordedOptions) failed to import. Check above logs for details. !!!" && exit 1)
 
 # --- DIAGNOSTIC STEP 2: Verify Uvicorn import ---
 RUN echo "--- Verifying Uvicorn module ---" && \
@@ -51,7 +45,7 @@ RUN echo "--- Verifying Uvicorn module ---" && \
 # --- DIAGNOSTIC STEP 3: Verify FastAPI import ---
 RUN echo "--- Verifying FastAPI module ---" && \
     python -c "import fastapi; print('FastAPI module imported successfully.')" || \
-    (echo "!!! ERROR: FastAPI module failed to import. Check above logs for details. !!!" & && exit 1)
+    (echo "!!! ERROR: FastAPI module failed to import. Check above logs for details. !!!" && exit 1)
 
 # --- DIAGNOSTIC STEP 4: Verify Requests import ---
 RUN echo "--- Verifying Requests module ---" && \
