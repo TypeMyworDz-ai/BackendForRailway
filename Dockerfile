@@ -27,8 +27,9 @@ RUN echo "--- Installing ALL Python dependencies from requirements.txt with forc
 # WARNING: This will expose part of your Firebase key in the build logs.
 # REMOVE THIS STEP AFTER DEBUGGING!
 COPY diagnose_firebase.py .
+# Explicitly pass the env var to the python script's environment
 RUN echo "--- DIAGNOSTIC: Inspecting FIREBASE_ADMIN_SDK_CONFIG_BASE64 (using diagnose_firebase.py) ---" && \
-    python diagnose_firebase.py || \
+    FIREBASE_ADMIN_SDK_CONFIG_BASE64=${FIREBASE_ADMIN_SDK_CONFIG_BASE64} python diagnose_firebase.py || \
     (echo "!!! DIAGNOSTIC ERROR: Firebase config inspection failed. !!!" && exit 1)
 
 
