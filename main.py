@@ -752,7 +752,13 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             return {'success': False, 'error': f"User {email} not found in Firestore."}
 
         # 2. Update user's plan in Firestore
-        await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None)
+        await asyncio.to_thread(db.collection('users').document(user_id).update, {
+            'plan': plan_name,
+            'lastAccessed': firestore.SERVER_TIMESTAMP,
+            'paystackReferenceId': None, # Assuming reference is not stored on user, but in transaction
+            'hasReceivedInitialFreeMinutes': True,
+            'totalMinutesUsed': 0
+        })
 
         # 3. Store detailed revenue transaction
         # Convert amount to USD if it's in a local currency for consistent storage
@@ -1912,6 +1918,7 @@ async def get_admin_monthly_revenue():
             monthly_revenue = doc_snap.get('monthlyRevenue') or 0.0
             logger.info(f"Fetched current monthly revenue from Firestore: USD {monthly_revenue:.2f}") # ADDED LOG
             return {"monthlyRevenue": monthly_revenue}
+        # If document doesn't exist, return 0.0 and log
         logger.info("Admin stats document not found, returning 0 monthly revenue.")
         return {"monthlyRevenue": 0.0}
     except Exception as e:
@@ -1922,7 +1929,7 @@ async def get_admin_monthly_revenue():
 @app.get("/api/admin/revenue-data")
 async def get_admin_revenue_data(
     request: Request,
-    period: str = "monthly"  # "daily", "weekly", "monthly", "yearly"
+    period: str = "monthly"  # "daily", "weekly", "monthly", "yearly", "all_time"
 ):
     """
     Fetches aggregated revenue data for a given period.
@@ -1950,8 +1957,10 @@ async def get_admin_revenue_data(
         start_date = datetime(now.year, now.month, 1)
     elif period == "yearly":
         start_date = datetime(now.year, 1, 1)
+    elif period == "all_time": # NEW: All time period
+        start_date = datetime(1970, 1, 1) # Unix epoch start
     else:
-        raise HTTPException(status_code=400, detail="Invalid period specified. Must be 'daily', 'weekly', 'monthly', or 'yearly'.")
+        raise HTTPException(status_code=400, detail="Invalid period specified. Must be 'daily', 'weekly', 'monthly', 'yearly', or 'all_time'.")
 
     try:
         revenue_ref = db.collection('revenue_transactions')
