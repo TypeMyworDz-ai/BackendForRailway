@@ -1066,7 +1066,9 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                         else:
                             speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
                         
-                        formatted_transcript += f"<strong>{speaker_num}:</strong> {utterance['text']}\n"
+                        # MODIFICATION STARTS HERE
+                        formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
+                        # MODIFICATION ENDS HERE
                     transcription_text = formatted_transcript.strip()
 
                 return {
@@ -2168,7 +2170,7 @@ async def list_jobs():
             "file_size_mb": job_data.get("file_size_mb", 0),
             "duration_minutes": job_data.get("duration_minutes", 0),
             "user_plan": job_data.get("user_plan", "unknown"),
-            "user_email": job_data.get("user_email", "unknown"),
+            "user_email": job_data.get("user_email", ""),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("tier_1_service"),
             "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used")), # UPDATED
@@ -2367,3 +2369,4 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ5_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
+
