@@ -155,6 +155,8 @@ logger.info("Environment variables loaded successfully")
 
 # NEW: Initialize Firebase Admin SDK
 db = None
+# Store credentials object globally for reuse
+global_gcp_credentials = None 
 if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
     try:
         service_account_info = json.loads(base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8'))
@@ -183,8 +185,9 @@ if GCP_SPEECH_KEY_BASE64:
     try:
         # Decode the Base64 key
         service_account_info = json.loads(base64.b64decode(GCP_SPEECH_KEY_BASE64).decode('utf-8'))
-        credentials = service_account.Credentials.from_service_account_info(service_account_info)
-        google_speech_client = speech.SpeechClient(credentials=credentials)
+        # Store credentials globally for reuse by Storage client
+        global_gcp_credentials = service_account.Credentials.from_service_account_info(service_account_info)
+        google_speech_client = speech.SpeechClient(credentials=global_gcp_credentials)
         logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client initialized successfully.")
     except Exception as e:
         logger.error(f"Error initializing {TYPEMYWORDZ3_NAME} (Google Cloud Speech) client: {e}")
@@ -266,7 +269,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         if not is_deepgram_available:
             tier_2 = "openai_whisper"
             tier_3 = "google_cloud"
-            tier4 = None # Only 3 tiers now
+            tier_4 = None # Only 3 tiers now
 
         return {
             "tier_1": "assemblyai",       # TypeMyworDz1
@@ -435,7 +438,6 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         updates['subscriptionStartDate'] = None
 
     try:
-        # FIX: Removed 'await' from user_ref.update() as it's synchronous
         await asyncio.to_thread(user_ref.update, updates) 
         logger.info(f"User {user_id} plan updated to {new_plan} in Firestore.")
         return {'success': True}
@@ -452,21 +454,20 @@ async def update_monthly_revenue_firebase(amount_usd: float):
     admin_stats_ref = db.collection('admin_stats').document('current')
 
     try:
-        # Use a transaction to safely increment the revenue
-        @firestore.transactional
-        async def update_in_transaction(transaction, doc_ref):
-            # FIX: Removed 'await' from transaction.get() as it's synchronous
-            snapshot = transaction.get(doc_ref) 
+        # Change to a synchronous function for db.run_transaction
+        def update_in_transaction_sync(transaction, doc_ref):
+            snapshot = doc_ref.get(transaction=transaction) # Pass transaction explicitly
             current_monthly_revenue = 0
             if snapshot.exists:
                 current_monthly_revenue = snapshot.get('monthlyRevenue') or 0
             
             new_monthly_revenue = current_monthly_revenue + amount_usd
             transaction.set(doc_ref, {'monthlyRevenue': new_monthly_revenue, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
-            logger.info(f"📊 Monthly Revenue updated by USD {amount_usd:.2f} to USD {new_monthly_revenue:.2f} in Firestore.")
+            logger.info(f"📊 Monthly Revenue updated by USD {amount_usd:.2f} to USD {new_monthly_revenue:.2f} in Firestore (in transaction).")
             return new_monthly_revenue
 
-        await asyncio.to_thread(db.run_transaction, update_in_transaction, admin_stats_ref)
+        # Run the synchronous transaction in a separate thread
+        await asyncio.to_thread(db.run_transaction, update_in_transaction_sync, admin_stats_ref)
         return {'success': True}
     except Exception as e:
         logger.error(f"Error updating monthly revenue in Firestore: {e}")
@@ -480,7 +481,6 @@ async def get_user_profile_by_email_firestore(email: str):
     try:
         users_ref = db.collection('users')
         query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1) # Use FieldFilter
-        # FIX: Removed 'await' from query_ref.get() as it's synchronous
         snapshot = await asyncio.to_thread(query_ref.get) 
 
         for doc in snapshot: # Iterate directly over the snapshot
@@ -744,7 +744,7 @@ async def health_monitor():
             import psutil
             memory_info = psutil.virtual_memory()
             cpu_percent = psutil.cpu_percent(interval=1)
-            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: 14.9%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
+            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
             logger.info(f"Active jobs: {len(jobs)}, Active background tasks: {len(active_background_tasks)}, Cancellation flags: {len(cancellation_flags)}")
             await asyncio.sleep(30)
         except Exception as e:
@@ -837,11 +837,11 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             return {'success': False, 'error': f"User {email} not found in Firestore."}
 
         # 2. Update user's plan in Firestore
-        # FIX: Removed 'await' from update_user_plan_firestore as it's now synchronous
-        user_plan_update_result = await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None)
-        if not user_plan_update_result['success']:
-            logger.error(f"Failed to update user plan in Firestore for {email}: {user_plan_update_result['error']}")
-            return {'success': False, 'error': user_plan_update_result['error']}
+        await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None)
+        # Check result of update_user_plan_firestore if needed, but for now assuming it logs errors internally
+        # if not user_plan_update_result['success']:
+        #     logger.error(f"Failed to update user plan in Firestore for {email}: {user_plan_update_result['error']}")
+        #     return {'success': False, 'error': user_plan_update_result['error']}
 
         # 3. Optionally update monthly revenue if requested and currency is USD
         if update_admin_revenue:
@@ -850,7 +850,6 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             if currency != 'USD':
                 logger.warning(f"Revenue update: Received {amount} {currency}. Assuming this is the USD equivalent for simplicity. For accurate revenue, pass original USD amount from frontend.")
                 
-            # FIX: Removed 'await' from update_monthly_revenue_firebase as it's now synchronous
             revenue_update_result = await update_monthly_revenue_firebase(amount_usd)
             if not revenue_update_result['success']:
                 logger.error(f"Failed to update monthly revenue in Firestore: {revenue_update_result['error']}")
@@ -997,6 +996,9 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
     if not google_speech_client:
         logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized, skipping for job {job_id}")
         raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client not initialized")
+    if not global_gcp_credentials: # Ensure global credentials are set
+        logger.error(f"Global GCP credentials not available, skipping {TYPEMYWORDZ3_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"Google Cloud credentials not configured.")
 
     gcs_uri = None # Initialize GCS URI
     gcs_object_name = None
@@ -1019,12 +1021,13 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
 
         audio_source = None
         if compressed_audio_duration_seconds > 120: # Google's 2-minute limit for inline content
-            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Audio longer than 2 minutes. Uploading to GCS.")
+            logger.info(f"Transcribe with Google Cloud Speech: Audio longer than 2 minutes. Uploading to GCS.")
             if not GCS_BUCKET_NAME: # Check if env var is set
                 raise HTTPException(status_code=500, detail="GCS_BUCKET_NAME environment variable not set for long audio transcription.")
 
             bucket_name = GCS_BUCKET_NAME
-            storage_client = storage.Client(credentials=google_speech_client._credentials) # Use existing credentials
+            # FIX: Initialize storage.Client correctly using the globally stored credentials
+            storage_client = storage.Client(credentials=global_gcp_credentials)
             bucket = storage_client.bucket(bucket_name)
 
             gcs_object_name = f"audio/{job_id}_{os.path.basename(audio_path)}"
@@ -1032,11 +1035,11 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
 
             await asyncio.to_thread(blob.upload_from_filename, audio_path)
             gcs_uri = f"gs://{bucket_name}/{gcs_object_name}"
-            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Uploaded audio to GCS: {gcs_uri}")
+            logger.info(f"Transcribe with Google Cloud Speech: Uploaded audio to GCS: {gcs_uri}")
 
             audio_source = speech.RecognitionAudio(uri=gcs_uri)
         else:
-            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Audio 2 minutes or less. Sending inline content.")
+            logger.info(f"Transcribe with Google Cloud Speech: Audio 2 minutes or less. Sending inline content.")
             with open(audio_path, "rb") as f:
                 audio_content = f.read()
             audio_source = speech.RecognitionAudio(content=audio_content)
@@ -1052,12 +1055,12 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
         if speaker_labels_enabled:
             config.enable_speaker_diarization = True
             config.diarization_speaker_count = 2 # Default to 2 speakers, can be dynamic if needed
-            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech): Speaker diarization ENABLED for job {job_id}")
+            logger.info(f"Transcribe with Google Cloud Speech: Speaker diarization ENABLED for job {job_id}")
         
         # Perform the transcription
         operation = await asyncio.to_thread(google_speech_client.long_running_recognize, config=config, audio=audio_source) # Use audio_source here
         
-        logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) long_running_recognize operation started for job {job_id}. Waiting for result...")
+        logger.info(f"Transcribe with Google Cloud Speech: long_running_recognize operation started for job {job_id}. Waiting for result...")
         
         # Wait for the operation to complete
         result = await asyncio.to_thread(operation.result) # This will block until complete or error
@@ -1086,7 +1089,6 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
                     transcription_text += res.alternatives[0].transcript
             
             # Estimate duration and word count (Google Cloud doesn't always provide duration directly in results)
-            # FIX: Correctly access seconds and microseconds from timedelta
             duration = 0
             if result.results:
                 # Sum the duration of all recognized segments
@@ -1096,7 +1098,7 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
             
             word_count = len(transcription_text.split()) if transcription_text else 0
 
-            logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription completed for job {job_id}")
+            logger.info(f"Transcribe with Google Cloud Speech: transcription completed for job {job_id}")
             return {
                 "status": "completed",
                 "transcription": transcription_text,
@@ -1106,16 +1108,16 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
                 "has_speaker_labels": has_speaker_labels
             }
         else:
-            raise Exception(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) returned no transcription results.")
+            raise Exception(f"Transcribe with Google Cloud Speech: returned no transcription results.")
 
     except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription cancelled for job {job_id}")
+        logger.info(f"Transcribe with Google Cloud Speech: transcription cancelled for job {job_id}")
         raise
     except Exception as e:
-        logger.error(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription failed for job {job_id}: {str(e)}")
+        logger.error(f"TypeMyworDz3 (Google Cloud Speech) transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) transcription failed: {str(e)}"
+            "error": f"TypeMyworDz3 (Google Cloud Speech) transcription failed: {str(e)}"
         }
     finally:
         # Clean up GCS object if it was uploaded
@@ -1123,11 +1125,11 @@ async def transcribe_with_google_cloud(audio_path: str, language_code: str, spea
             try:
                 # Ensure the bucket object is available in this scope
                 bucket_name = GCS_BUCKET_NAME
-                storage_client = storage.Client(credentials=google_speech_client._credentials)
+                storage_client = storage.Client(credentials=global_gcp_credentials) # Use global credentials for cleanup
                 bucket = storage_client.bucket(bucket_name)
                 
                 await asyncio.to_thread(bucket.blob(gcs_object_name).delete)
-                logger.info(f"Cleaned up GCS object {gcs_object_name} after {TYPEMYWORDZ3_NAME} (Google Cloud Speech) processing: {gcs_uri}")
+                logger.info(f"Cleaned up GCS object {gcs_object_name} after Transcribe with Google Cloud Speech processing: {gcs_uri}")
             except Exception as e:
                 logger.warning(f"Failed to delete GCS object {gcs_object_name}: {e}")
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
@@ -1224,7 +1226,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                         else:
                             speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
                         
-                        formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
+                        formatted_transcript += f"<strong>{speaker_num}:</strong> {utterance['text']}\n"
                     transcription_text = formatted_transcript.strip()
 
                 return {
@@ -2464,62 +2466,6 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
         logger.error(f"Error compressing file for download: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to compress audio file: {str(e)}")
 
-@app.delete("/cleanup")
-async def cleanup_old_jobs():
-    logger.info("Cleanup endpoint called")
-    
-    current_time = datetime.now()
-    jobs_to_remove = []
-    tasks_to_cancel = []
-    flags_to_remove = []
-    
-    for job_id, job_data in jobs.items():
-        created_at = datetime.fromisoformat(job_data["created_at"])
-        age_hours = (current_time - created_at).total_seconds() / 3600
-        
-        if age_hours > 1 and job_data["status"] in ["completed", "failed", "cancelled"]:
-            jobs_to_remove.append(job_id)
-            
-            if job_id in active_background_tasks:
-                task = active_background_tasks[job_id]
-                if not task.done():
-                    tasks_to_cancel.append((job_id, task))
-                    
-            if job_id in cancellation_flags:
-                flags_to_remove.append(job_id)
-    
-    for job_id, task in tasks_to_cancel:
-        try:
-            task.cancel()
-            logger.info(f"Cancelled old background task for job: {job_id}")
-        except Exception as e:
-            logger.error(f"Error cancelling old task {job_id}: {e}")
-    
-    for job_id in jobs_to_remove:
-        del jobs[job_id]
-        logger.info(f"Cleaned up old job: {job_id}")
-        
-    for job_id in flags_to_remove:
-        if job_id in active_background_tasks:
-            del active_background_tasks[job_id]
-        if job_id in cancellation_flags:
-            del cancellation_flags[job_id]
-    
-    cleanup_stats = {
-        "jobs_removed": len(jobs_to_remove),
-        "tasks_cancelled": len(tasks_to_cancel),
-        "flags_cleared": len(flags_to_remove),
-        "remaining_jobs": len(jobs),
-        "active_tasks": len(active_background_tasks),
-        "active_flags": len(cancellation_flags)
-    }
-    
-    logger.info(f"Cleanup completed: {cleanup_stats}")
-    return {
-        "message": f"Cleaned up {len(jobs_to_remove)} old jobs",
-        "stats": cleanup_stats
-    }
-
 # NEW: Endpoint to fetch monthly revenue for Admin Dashboard
 @app.get("/api/admin/monthly-revenue")
 async def get_admin_monthly_revenue():
@@ -2530,11 +2476,10 @@ async def get_admin_monthly_revenue():
 
     admin_stats_ref = db.collection('admin_stats').document('current')
     try:
-        # Use asyncio.to_thread for potentially blocking Firestore get() call
         doc_snap = await asyncio.to_thread(admin_stats_ref.get)
         if doc_snap.exists:
             monthly_revenue = doc_snap.get('monthlyRevenue') or 0.0
-            logger.info(f"Fetched current monthly revenue: USD {monthly_revenue:.2f}")
+            logger.info(f"Fetched current monthly revenue from Firestore: USD {monthly_revenue:.2f}") # ADDED LOG
             return {"monthlyRevenue": monthly_revenue}
         logger.info("Admin stats document not found, returning 0 monthly revenue.")
         return {"monthlyRevenue": 0.0}
@@ -2661,7 +2606,7 @@ logger.info(f"TypeMyworDz AI API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
-logger.info(f"Firebase Admin SDK configured: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64) and bool(db)}") # NEW
+logger.info(f"Firebase Admin SDK configured: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64) and bool(db)} 부분") # NEW
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)") # UPDATED
 logger.info(f"Job tracking systems initialized:")
@@ -2717,7 +2662,7 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYTWORZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ4_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
     logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ4_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME} → Fallback3={TYPEMYWORDZ3_NAME}")
