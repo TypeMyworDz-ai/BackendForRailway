@@ -4,7 +4,7 @@ import asyncio
 import subprocess
 import os
 import json
-# REMOVED: import base64 # For decoding Base64 GCP key (not needed as GCP STT removed)
+import base64
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
