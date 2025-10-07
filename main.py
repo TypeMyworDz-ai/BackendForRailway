@@ -37,7 +37,7 @@ Deepgram = None
 PrerecordedOptions = None
 try:
     from deepgram import Deepgram # Correct client class name
-    from deepgram.options import PrerecordedOptions # Correct options path
+    from deepgram.transcription import PrerecordedOptions # Correct options path for deepgram-sdk 2.x
 except ImportError as e:
     logging.warning(f"Deepgram SDK not installed or import error: {e}. Deepgram features will be disabled.")
 
@@ -225,7 +225,7 @@ else:
 def is_paid_ai_user(user_plan: str) -> bool:
     # UPDATED: AI features for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan
     paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
-    return paid_plans_for_ai.includes(user_plan)
+    return user_plan in paid_plans_for_ai
 
 def is_admin_user(user_email: str) -> bool:
     """Check if user is an admin based on email address"""
@@ -1721,7 +1721,7 @@ async def root():
             "Language selection for transcription",
             f"User-driven AI features (summarization, Q&A, and bullet points) via TypeMyworDz AI (Anthropic)",
             f"Admin-driven AI formatting via TypeMyworDz AI (Anthropic) and Google Gemini",
-            "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
+            "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS"
         ],
         "logic": {
             "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME} → Fallback3={TYPEMYWORDZ4_NAME}", # UPDATED
