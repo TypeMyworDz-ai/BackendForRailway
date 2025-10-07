@@ -736,8 +736,11 @@ async def verify_paystack_payment(reference: str) -> dict:
         }
 
 # UPDATED: update_user_credits_paystack to interact with Firestore and store revenue transactions
-async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False):
-    """Update user credits/plan in Firestore and optionally admin revenue based on Paystack payment."""
+async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None):
+    """
+    Update user credits/plan in Firestore and optionally admin revenue based on Paystack payment.
+    Ensures that the USD equivalent is always stored for revenue tracking.
+    """
     if not db:
         logger.error(f"Firestore client not initialized. Cannot update credits for {email}.")
         return {'success': False, 'error': 'Firestore not initialized'}
@@ -760,13 +763,23 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'totalMinutesUsed': 0
         })
 
-        # 3. Store detailed revenue transaction
-        # Convert amount to USD if it's in a local currency for consistent storage
-        amount_usd_for_storage = amount
-        if currency != 'USD' and amount_usd_for_storage: # Assuming 'amount' here is already the USD equivalent from frontend or webhook metadata
-            logger.warning(f"Revenue transaction: Storing {amount_usd_for_storage} USD (converted from {amount} {currency}) for plan {plan_name}.")
-        
-        if amount_usd_for_storage:
+        # 3. Determine the actual USD amount to store for revenue tracking
+        # The 'amount' here is the transaction amount in its original currency.
+        # We need to convert it to USD if it's not already USD.
+        amount_usd_for_storage = 0.0
+        if currency == 'USD':
+            amount_usd_for_storage = amount
+        elif country_code and country_code in USD_TO_LOCAL_RATES:
+            rate = USD_TO_LOCAL_RATES[country_code]
+            if isinstance(rate, (int, float)) and rate != 0:
+                amount_usd_for_storage = round(amount / rate, 2)
+                logger.info(f"Converted {amount} {currency} to USD {amount_usd_for_storage} using rate {rate} for {country_code}.")
+            else:
+                logger.warning(f"Invalid or zero conversion rate for {country_code}. Storing {currency} amount as 0 USD for revenue.")
+        else:
+            logger.warning(f"No conversion rate found for {currency}/{country_code}. Storing {currency} amount as 0 USD for revenue.")
+
+        if amount_usd_for_storage > 0:
             revenue_transaction_data = {
                 'userId': user_id,
                 'email': email,
@@ -776,7 +789,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
                 'timestamp': firestore.SERVER_TIMESTAMP
             }
             await asyncio.to_thread(db.collection('revenue_transactions').add, revenue_transaction_data)
-            logger.info(f"✅ Revenue transaction recorded for {email} in Firestore.")
+            logger.info(f"✅ Revenue transaction recorded for {email} in Firestore: USD {amount_usd_for_storage}.")
 
 
         # 4. Optionally update monthly revenue if requested and currency is USD
@@ -1273,6 +1286,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
             'metadata': {
                 'plan': request.plan_name,
                 'base_usd_amount': request.amount, # NEW: Store base USD amount for revenue tracking
+                'country_code': request.country_code, # IMPORTANT: Pass country code in metadata
                 'custom_fields': [
                     {
                         'display_name': "Plan Type",
@@ -1335,13 +1349,13 @@ async def verify_payment(request: PaystackVerificationRequest):
             currency = verification_result['currency']
             reference = verification_result['reference']
             
-            # Extract base_usd_amount from raw_data if available for accurate revenue tracking
+            # Extract base_usd_amount and country_code from raw_data metadata
             base_usd_amount = verification_result['raw_data'].get('metadata', {}).get('base_usd_amount')
+            country_code = verification_result['raw_data'].get('metadata', {}).get('country_code')
             update_admin_revenue_flag = verification_result['raw_data'].get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
 
-            # Pass base_usd_amount for revenue if available, otherwise `amount` (which is transaction currency)
-            # Ensure update_admin_revenue_flag is passed
-            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag) 
+            # Pass base_usd_amount, country_code, and update_admin_revenue_flag
+            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code) 
             
             if credit_result['success']:
                 logger.info(f"✅ Payment verified and credits updated for {email}")
@@ -1427,13 +1441,14 @@ async def paystack_webhook(request: Request):
             reference = data.get('reference')
             plan_name = data.get('metadata', {}).get('plan', 'Unknown')
             base_usd_amount = data.get('metadata', {}).get('base_usd_amount') # NEW: Get base USD amount from metadata
+            country_code = data.get('metadata', {}).get('country_code') # IMPORTANT: Get country code from metadata
             update_admin_revenue_flag = data.get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true' # NEW: Get flag
 
-            logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}. Base USD: {base_usd_amount}, Update Revenue: {update_admin_revenue_flag}")
+            logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}. Base USD: {base_usd_amount}, Country: {country_code}, Update Revenue: {update_admin_revenue_flag}")
             
             if customer_email:
                 # Use base_usd_amount for revenue tracking if available, otherwise `amount`
-                credit_result = await update_user_credits_paystack(customer_email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag)
+                credit_result = await update_user_credits_paystack(customer_email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code)
                 if credit_result['success']:
                     logger.info(f"✅ Webhook: Credits updated automatically for {customer_email} in Firestore.")
                 else:
@@ -1512,7 +1527,7 @@ async def list_gemini_models():
                     "input_token_limit": m.input_token_limit,
                     "output_token_limit": m.output_token_limit
                 })
-        logger.info(f"Found {len(gemini_models_info)} Gemini models.")
+        logger.info(f"Found {len(gemini_models_info)} Gemini models.&quot;")
         return {"available_gemini_models": gemini_models_info}
     except Exception as e:
         logger.error(f"Error listing Gemini models: {e}")
@@ -1966,7 +1981,7 @@ async def get_admin_revenue_data(
         end_date_for_query = datetime(now.year + 1, 1, 1) # start of next year
     elif period == "all_time": # NEW: All time period
         start_date = datetime(1970, 1, 1) # Unix epoch start
-        end_date_for_query = now # Up to current moment for all time
+        end_date_for_query = now + timedelta(days=1) # Up to current moment + 1 day to ensure all current day transactions are included
     else:
         raise HTTPException(status_code=400, detail="Invalid period specified. Must be 'daily', 'weekly', 'monthly', 'yearly', or 'all_time'.")
 
@@ -1974,10 +1989,7 @@ async def get_admin_revenue_data(
         revenue_ref = db.collection('revenue_transactions')
         
         # Use < for exclusive upper bound for all periods except 'all_time' which is <= now
-        if period == "all_time":
-            query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<=", end_date_for_query))
-        else:
-            query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<", end_date_for_query)) 
+        query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<", end_date_for_query)) 
         
         snapshot = await asyncio.to_thread(query_ref.get)
 
@@ -2212,4 +2224,4 @@ if __name__ == "__main__":
 else:
     logger.info("Application loaded as module")
     logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
-#End of Main.py Code
+
