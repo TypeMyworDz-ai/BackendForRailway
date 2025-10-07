@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     build-essential \
     python3-dev \
-    && rm -rf /var/lib/apt/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements.txt
 COPY requirements.txt .
@@ -17,10 +17,19 @@ COPY requirements.txt .
 # Upgrade pip, setuptools, and wheel first to ensure a robust installation environment
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
+# --- START Deepgram Fix for Main Backend ---
+# Explicitly uninstall deepgram-sdk first to clear any corrupted/conflicting installs.
+# '|| true' prevents the build from failing if the package isn't found initially.
+RUN echo "--- Attempting to uninstall deepgram-sdk (if present) ---" && \
+    pip uninstall -y deepgram-sdk || true 
+
 # --- Install ALL Python dependencies from requirements.txt (No filtering, no individual installs) ---
-# This is the single source of truth for Python packages.
-RUN echo "--- Installing ALL Python dependencies from requirements.txt ---" && \
-    pip install --no-cache-dir -r requirements.txt
+# Force a clean re-installation of all requirements, ensuring deepgram-sdk is fresh.
+# '--no-cache-dir' prevents pip from using any local cache.
+# '--force-reinstall' ensures existing packages are reinstalled.
+RUN echo "--- Installing ALL Python dependencies from requirements.txt with force-reinstall ---" && \
+    pip install --no-cache-dir --force-reinstall -r requirements.txt
+# --- END Deepgram Fix for Main Backend ---
 
 # --- DIAGNOSTIC STEP 1: Verify Deepgram base import ---
 RUN echo "--- Verifying Deepgram SDK (base module) ---" && \
