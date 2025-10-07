@@ -47,9 +47,6 @@ logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 # Service Names
 TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
-# REMOVED: TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
-# REMOVED: TYPEMYWORDZ4_NAME = "TypeMyworDz4" # Deepgram
-# REMOVED: TYPEMYWORDZ5_NAME = "TypeMyworDz5" # Temi (NEW) - REMOVED
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google Gemini
 
 # Admin email addresses
@@ -79,7 +76,6 @@ PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
 OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # URL for the Render-deployed OpenAI service
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # NEW: Google Gemini API Key
 FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64") # NEW: Firebase Admin SDK config
-# REMOVED: TEMI_API_KEY = os.environ.get("TEMI_API_KEY") # NEW: Temi API Key debug - REMOVED
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
@@ -91,7 +87,6 @@ logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOO
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}") # NEW
-# REMOVED: logger.info(f"DEBUG: TEMI_API_KEY loaded value: {bool(TEMI_API_KEY)}") # NEW: Temi API Key debug - REMOVED
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
@@ -124,9 +119,6 @@ else:
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
-
-# REMOVED: if not TEMI_API_KEY: # NEW: Temi API Key check - REMOVED
-# REMOVED:     logger.warning(f"{TYPEMYWORDZ5_NAME} (Temi) API Key environment variable not set! Temi transcription will be disabled.")
 
 if PAYSTACK_SECRET_KEY:
     logger.info("Paystack configuration found - payment verification enabled")
@@ -195,10 +187,6 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     
     is_admin = is_admin_user(user_email) if user_email else False
     
-    # REMOVED: is_temi_available check - Temi is removed
-
-    # REMOVED: Dedicated Temi Tester (njokigituku@gmail.com) logic - njokigituku is now a normal user
-
     # --- General Fallback Logic (2 tiers now) ---
     # Base services for general cases
     tier_1 = None
@@ -357,36 +345,7 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         logger.error(f"Error updating user {user_id} plan in Firestore: {e}")
         return {'success': False, 'error': str(e)}
 
-async def update_monthly_revenue_firebase(amount_usd: float):
-    """Updates the monthly revenue in Firestore using Firebase Admin SDK.
-       Also ensures the admin_stats document exists with a default revenue if not found.
-    """
-    if not db:
-        logger.error("Firestore client not initialized. Cannot update monthly revenue.")
-        return {'success': False, 'error': 'Firestore not initialized'}
-
-    admin_stats_ref = db.collection('admin_stats').document('current')
-
-    try:
-        def update_in_transaction_sync(transaction, doc_ref):
-            snapshot = doc_ref.get(transaction=transaction) # Pass transaction explicitly
-            current_monthly_revenue = 0.0 # Default to float
-            if snapshot.exists:
-                current_monthly_revenue = snapshot.get('monthlyRevenue') or 0.0
-            else:
-                # If document doesn't exist, create it with initial values
-                transaction.set(doc_ref, {'monthlyRevenue': 0.0, 'lastUpdated': firestore.SERVER_TIMESTAMP})
-
-            new_monthly_revenue = current_monthly_revenue + amount_usd
-            transaction.set(doc_ref, {'monthlyRevenue': new_monthly_revenue, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
-            logger.info(f"📊 Monthly Revenue updated by USD {amount_usd:.2f} to USD {new_monthly_revenue:.2f} in Firestore (in transaction).")
-            return new_monthly_revenue
-
-        await asyncio.to_thread(db.run_transaction, update_in_transaction_sync, admin_stats_ref)
-        return {'success': True}
-    except Exception as e:
-        logger.error(f"Error updating monthly revenue in Firestore: {e}")
-        return {'success': False, 'error': str(e)}
+# REMOVED: update_monthly_revenue_firebase function
 
 async def get_user_profile_by_email_firestore(email: str):
     """Fetches user profile by email to get UID (for webhook processing)."""
@@ -735,11 +694,10 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
 
-# UPDATED: update_user_credits_paystack to interact with Firestore and store revenue transactions
 async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None):
     """
-    Update user credits/plan in Firestore and optionally admin revenue based on Paystack payment.
-    Ensures that the USD equivalent is always stored for revenue tracking.
+    Update user credits/plan in Firestore.
+    The real-time revenue counter logic is now handled purely on the frontend.
     """
     if not db:
         logger.error(f"Firestore client not initialized. Cannot update credits for {email}.")
@@ -758,45 +716,13 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         await asyncio.to_thread(db.collection('users').document(user_id).update, {
             'plan': plan_name,
             'lastAccessed': firestore.SERVER_TIMESTAMP,
-            'paystackReferenceId': None, # Assuming reference is not stored on user, but in transaction
+            'paystackReferenceId': None, 
             'hasReceivedInitialFreeMinutes': True,
             'totalMinutesUsed': 0
         })
 
-        # 3. Determine the actual USD amount to store for revenue tracking
-        # The 'amount' here is the transaction amount in its original currency.
-        # We need to convert it to USD if it's not already USD.
-        amount_usd_for_storage = 0.0
-        if currency == 'USD':
-            amount_usd_for_storage = amount
-        elif country_code and country_code in USD_TO_LOCAL_RATES:
-            rate = USD_TO_LOCAL_RATES[country_code]
-            if isinstance(rate, (int, float)) and rate != 0:
-                amount_usd_for_storage = round(amount / rate, 2)
-                logger.info(f"Converted {amount} {currency} to USD {amount_usd_for_storage} using rate {rate} for {country_code}.")
-            else:
-                logger.warning(f"Invalid or zero conversion rate for {country_code}. Storing {currency} amount as 0 USD for revenue.")
-        else:
-            logger.warning(f"No conversion rate found for {currency}/{country_code}. Storing {currency} amount as 0 USD for revenue.")
-
-        if amount_usd_for_storage > 0:
-            revenue_transaction_data = {
-                'userId': user_id,
-                'email': email,
-                'planName': plan_name,
-                'amountUsd': amount_usd_for_storage,
-                'currency': currency, # Original transaction currency
-                'timestamp': firestore.SERVER_TIMESTAMP
-            }
-            await asyncio.to_thread(db.collection('revenue_transactions').add, revenue_transaction_data)
-            logger.info(f"✅ Revenue transaction recorded for {email} in Firestore: USD {amount_usd_for_storage}.")
-
-
-        # 4. Optionally update monthly revenue if requested and currency is USD
-        if update_admin_revenue:
-            revenue_update_result = await update_monthly_revenue_firebase(amount_usd_for_storage)
-            if not revenue_update_result['success']:
-                logger.error(f"Failed to update monthly revenue in Firestore: {revenue_update_result['error']}")
+        # REMOVED: Logic for storing detailed revenue transactions and updating monthlyRevenue in Firebase
+        # This is now handled by the frontend's real-time counter.
         
         logger.info(f"✅ Credits and plan updated successfully for {email} in Firestore.")
         return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount, 'currency': currency}
@@ -804,9 +730,6 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
     except Exception as e:
         logger.error(f"❌ Error updating user credits in Firestore: {str(e)}")
         return {'success': False, 'error': str(e)}
-
-# REMOVED: NEW: transcribe_with_temi function - REMOVED
-# REMOVED: async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str) -> dict:
 
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
@@ -961,9 +884,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                         else:
                             speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
                         
-                        # MODIFICATION STARTS HERE
                         formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
-                        # MODIFICATION ENDS HERE
                     transcription_text = formatted_transcript.strip()
 
                 return {
@@ -1012,7 +933,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         service_config = get_transcription_services(user_plan, speaker_labels_enabled, user_email)
         tier_1_service = service_config["tier_1"]
         tier_2_service = service_config["tier_2"]
-        # REMOVED: tier_3_service = service_config["tier_3"] # Temi is removed
 
         logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service} ({service_config['reason']}), Tier2={tier_2_service}") # UPDATED LOG
 
@@ -1137,8 +1057,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 model_used = job_data.get("assemblyai_model", "unknown")
             elif service_used_name == "openai_whisper":
                 model_used = "whisper-1"
-            # REMOVED: elif service_used_name == "temi": - REMOVED
-            # REMOVED:    model_used = "default" # Temi doesn't expose model name via API
 
             logger.info(f"📊 Job {job_id} for user {user_email} completed. Service: {service_used_name}, Model: {model_used}")
 
@@ -1240,7 +1158,6 @@ async def root():
             "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
             "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
-            # REMOVED: "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
             "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
@@ -1494,8 +1411,8 @@ async def paystack_status():
             "ai_user_query_gemini": "/ai/user-query-gemini",
             "ai_admin_format": "/ai/admin-format",
             "ai_admin_format_gemini": "/ai/admin-format-gemini",
-            "admin_monthly_revenue": "/api/admin/monthly-revenue", # NEW: Added revenue endpoint
-            "admin_revenue_data": "/api/admin/revenue-data" # NEW: Added detailed revenue endpoint
+            # REMOVED: "admin_monthly_revenue": "/api/admin/monthly-revenue",
+            # REMOVED: "admin_revenue_data": "/api/admin/revenue-data"
         },
         "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"], # USD is always supported, other local currencies if applicable
         "supported_plans": [
@@ -1527,7 +1444,7 @@ async def list_gemini_models():
                     "input_token_limit": m.input_token_limit,
                     "output_token_limit": m.output_token_limit
                 })
-        logger.info(f"Found {len(gemini_models_info)} Gemini models.&quot;")
+        logger.info(f"Found {len(gemini_models_info)} Gemini models.")
         return {"available_gemini_models": gemini_models_info}
     except Exception as e:
         logger.error(f"Error listing Gemini models: {e}")
@@ -1918,114 +1835,9 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
         logger.error(f"Error compressing file for download: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to compress audio file: {str(e)}")
 
-# NEW: Endpoint to fetch monthly revenue for Admin Dashboard
-@app.get("/api/admin/monthly-revenue")
-async def get_admin_monthly_revenue():
-    """Fetches the current monthly revenue from Firestore."""
-    if not db:
-        logger.error("Firestore client not initialized. Cannot fetch monthly revenue.")
-        raise HTTPException(status_code=500, detail="Firestore not initialized")
+# REMOVED: get_admin_monthly_revenue endpoint
 
-    admin_stats_ref = db.collection('admin_stats').document('current')
-    try:
-        doc_snap = await asyncio.to_thread(admin_stats_ref.get)
-        if doc_snap.exists:
-            monthly_revenue = doc_snap.get('monthlyRevenue') or 0.0
-            logger.info(f"Fetched current monthly revenue from Firestore: USD {monthly_revenue:.2f}") # ADDED LOG
-            return {"monthlyRevenue": monthly_revenue}
-        # If document doesn't exist, return 0.0 and log
-        logger.info("Admin stats document not found, returning 0 monthly revenue.")
-        return {"monthlyRevenue": 0.0}
-    except Exception as e:
-        logger.error(f"Error fetching monthly revenue from Firestore: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch monthly revenue: {str(e)}")
-
-# NEW: Endpoint to fetch detailed revenue data for Admin Dashboard
-@app.get("/api/admin/revenue-data")
-async def get_admin_revenue_data(
-    request: Request,
-    period: str = "monthly"  # "daily", "weekly", "monthly", "yearly", "all_time"
-):
-    """
-    Fetches aggregated revenue data for a given period.
-    Only accessible by admin users.
-    """
-    user_email = request.headers.get("X-User-Email")
-    if not is_admin_user(user_email):
-        logger.warning(f"Unauthorized attempt to access revenue data by {user_email}")
-        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
-
-    if not db:
-        logger.error("Firestore client not initialized. Cannot fetch revenue data.")
-        raise HTTPException(status_code=500, detail="Firestore not initialized")
-
-    now = datetime.now()
-    start_date = None
-    end_date_for_query = None # New variable to be exclusive upper bound
-
-    if period == "daily":
-        start_date = datetime(now.year, now.month, now.day)
-        end_date_for_query = start_date + timedelta(days=1) # Exclusive end for current day
-    elif period == "weekly":
-        # Start of the current week (Monday)
-        start_date = now - timedelta(days=now.weekday())
-        start_date = datetime(start_date.year, start_date.month, start_date.day)
-        end_date_for_query = start_date + timedelta(weeks=1) # Exclusive end for week
-    elif period == "monthly":
-        start_date = datetime(now.year, now.month, 1)
-        # Calculate start of next month
-        next_month = now.replace(day=28) + timedelta(days=4) # advance to a day in the next month
-        end_date_for_query = datetime(next_month.year, next_month.month, 1) # start of next month
-    elif period == "yearly":
-        start_date = datetime(now.year, 1, 1)
-        end_date_for_query = datetime(now.year + 1, 1, 1) # start of next year
-    elif period == "all_time": # NEW: All time period
-        start_date = datetime(1970, 1, 1) # Unix epoch start
-        end_date_for_query = now + timedelta(days=1) # Up to current moment + 1 day to ensure all current day transactions are included
-    else:
-        raise HTTPException(status_code=400, detail="Invalid period specified. Must be 'daily', 'weekly', 'monthly', 'yearly', or 'all_time'.")
-
-    try:
-        revenue_ref = db.collection('revenue_transactions')
-        
-        # Use < for exclusive upper bound for all periods except 'all_time' which is <= now
-        query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<", end_date_for_query)) 
-        
-        snapshot = await asyncio.to_thread(query_ref.get)
-
-        total_revenue = 0.0
-        revenue_by_plan = {}
-        transactions_count = 0
-
-        for doc in snapshot:
-            transaction = doc.to_dict()
-            amount_usd = transaction.get('amountUsd', 0.0)
-            plan_name = transaction.get('planName', 'Unknown Plan')
-
-            total_revenue += amount_usd
-            revenue_by_plan[plan_name] = revenue_by_plan.get(plan_name, 0.0) + amount_usd
-            transactions_count += 1
-        
-        logger.info(f"Fetched revenue data for period '{period}': Total USD {total_revenue:.2f}, {transactions_count} transactions.")
-
-        # For display purposes, convert end_date_for_query back to inclusive if it was exclusive
-        display_end_date = end_date_for_query
-        if period != "all_time" and end_date_for_query:
-            display_end_date = end_date_for_query - timedelta(microseconds=1)
-
-
-        return {
-            "period": period,
-            "totalRevenue": total_revenue,
-            "revenueByPlan": revenue_by_plan,
-            "transactionsCount": transactions_count,
-            "startDate": start_date.isoformat(),
-            "endDate": display_end_date.isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error fetching detailed revenue data from Firestore: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch revenue data: {str(e)}")
-
+# REMOVED: get_admin_revenue_data endpoint
 
 @app.get("/jobs")
 async def list_jobs():
@@ -2109,7 +1921,6 @@ async def health_check():
                 "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
                 "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
-                # REMOVED: "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
@@ -2158,8 +1969,6 @@ logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payme
 logger.info("  POST /api/verify-payment - Verify Paystack payment")
 logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
 logger.info("  GET /api/paystack-status - Get integration status")
-logger.info("  GET /api/admin/monthly-revenue - Get admin monthly revenue (NEW)") # NEW: Log new endpoint
-logger.info("  GET /api/admin/revenue-data - Get detailed admin revenue data (NEW)") # NEW: Log new endpoint
 logger.info("  GET /api/list-gemini-models - List available Gemini models")
 logger.info("  GET /status/{job_id} - Check job status")
 logger.info("  POST /cancel/{job_id} - Cancel transcription job")
