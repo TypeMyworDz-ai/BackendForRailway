@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN echo "--- Installing ALL Python dependencies from requirements.txt with force-reinstall ---" && \
     pip install --no-cache-dir --force-reinstall -r requirements.txt
 
-# --- NEW DIAGNOSTIC STEP: Inspect Firebase Admin SDK config (CORRECTED SYNTAX) ---
+# --- NEW DIAGNOSTIC STEP: Inspect Firebase Admin SDK config (CORRECTED SYNTAX - using .format()) ---
 # This will try to decode and print the Firebase Admin SDK config.
 # WARNING: This will expose part of your Firebase key in the build logs.
 # REMOVE THIS STEP AFTER DEBUGGING!
@@ -34,11 +34,14 @@ RUN echo "--- DIAGNOSTIC: Inspecting FIREBASE_ADMIN_SDK_CONFIG_BASE64 ---" && \
                    try: \
                        decoded_json = base64.b64decode(config_base64).decode('utf-8'); \
                        parsed_json = json.loads(decoded_json); \
-                       print('Firebase config decoded and parsed successfully. Project ID: ' + parsed_json.get('project_id', 'N/A') + ', Client Email: ' + parsed_json.get('client_email', 'N/A')); \
+                       print('Firebase config decoded and parsed successfully. Project ID: {project_id}, Client Email: {client_email}'.format( \
+                           project_id=parsed_json.get('project_id', 'N/A'), \
+                           client_email=parsed_json.get('client_email', 'N/A') \
+                       )); \
                        # Optionally print more, but keep it brief for security \
                        # print('Full decoded JSON (WARNING - sensitive!): ' + decoded_json) \
                    except Exception as e: \
-                       print(f'ERROR: Failed to decode/parse Firebase config: {e}'); \
+                       print('ERROR: Failed to decode/parse Firebase config: {}'.format(e)); \
                        exit(1); \
                else: \
                    print('FIREBASE_ADMIN_SDK_CONFIG_BASE64 environment variable is NOT set in Dockerfile context.'); \
