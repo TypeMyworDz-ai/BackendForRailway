@@ -311,7 +311,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     # Tier 3 (only if not already in higher tiers and is available)
     if tier_3 == "temi" and is_temi_available and "temi" not in final_tiers_list:
         final_tiers_list.append("temi")
-    elif tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list:
+    elif tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list: # Fill if Temi was unavailable
          final_tiers_list.append("assemblyai")
     elif tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
         final_tiers_list.append("openai_whisper")
@@ -335,7 +335,7 @@ class PaystackInitializationRequest(BaseModel):
     user_id: str
     country_code: str
     callback_url: str
-    update_admin_revenue: Optional[bool] = False # NEW: Added for explicit revenue update flag
+    update_admin_revenue: Optional[bool] = False # NEW: Added for explicit revenue revenue update flag
 
 class PaystackWebhookRequest(BaseModel):
     event: str
@@ -859,8 +859,8 @@ async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str)
         files = {'media': (os.path.basename(audio_path), open(audio_path, 'rb'), 'audio/mpeg')}
         headers = {'Authorization': f'Bearer {TEMI_API_KEY}'}
         
-        # Temi's API for submitting a new transcription job
-        submit_url = "https://api.temi.com/api/v1/transcriptions"
+        # Temi's API for submitting a new transcription job (CORRECTED URL)
+        submit_url = "https://api.temi.com/v1/jobs"
 
         async with httpx.AsyncClient() as client:
             submit_response = await client.post(submit_url, headers=headers, files=files, timeout=300.0)
@@ -870,8 +870,8 @@ async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str)
         temi_job_id = submit_result['id']
         logger.info(f"{TYPEMYWORDZ5_NAME} transcription job submitted with ID: {temi_job_id}")
 
-        # Poll for transcription status
-        poll_url = f"https://api.temi.com/api/v1/transcriptions/{temi_job_id}"
+        # Poll for transcription status (CORRECTED URL)
+        poll_url = f"https://api.temi.com/v1/jobs/{temi_job_id}"
         while True:
             await asyncio.sleep(10) # Poll every 10 seconds
             
@@ -883,10 +883,13 @@ async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str)
             status = poll_result['status']
             
             if status == "completed":
-                # Fetch the transcript
-                transcript_url = f"https://api.temi.com/api/v1/transcriptions/{temi_job_id}/transcript"
+                # Fetch the transcript (CORRECTED URL)
+                transcript_url = f"https://api.temi.com/v1/jobs/{temi_job_id}/transcript"
+                # Temi documentation shows Accept header for format. We want text/plain.
+                transcript_headers = {'Authorization': f'Bearer {TEMI_API_KEY}', 'Accept': 'text/plain'}
+                
                 async with httpx.AsyncClient() as client:
-                    transcript_response = await client.get(transcript_url, headers=headers, timeout=30.0)
+                    transcript_response = await client.get(transcript_url, headers=transcript_headers, timeout=30.0)
                     transcript_response.raise_for_status()
                 
                 transcription_text = transcript_response.text
@@ -895,12 +898,12 @@ async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str)
                     "status": "completed",
                     "transcription": transcription_text,
                     "language": language_code, # Temi usually auto-detects, but we can pass requested
-                    "duration": poll_result.get("duration", 0),
+                    "duration": poll_result.get("duration_seconds", 0), # Corrected key
                     "word_count": len(transcription_text.split()) if transcription_text else 0,
                     "has_speaker_labels": False # Temi's basic API might not support speaker labels by default
                 }
             elif status in ["failed", "error"]:
-                raise Exception(f"{TYPEMYWORDZ5_NAME} service returned status: {status}. Error details: {poll_result.get('error_message', 'No error message provided.')}")
+                raise Exception(f"{TYPEMYWORDZ5_NAME} service returned status: {status}. Error details: {poll_result.get('failure_detail', 'No error message provided.')}") # Corrected key
             else:
                 logger.info(f"{TYPEMYWORDZ5_NAME} status: {status} for job {job_id}")
                 continue
@@ -981,10 +984,10 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
             "error": f"{TYPEMYWORDZ2_NAME} service network error: {e}"
         }
     except Exception as e:
-        logger.error(f"{TYPEMYWORDZ2_NAME} service transcription failed for job {job_id}: {str(e)}")
+        logger.error(f"{TYPEMYWORDZ2_NAME} transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} service transcription failed: {str(e)}"
+            "error": f"{TYPEMYWORDZ2_NAME} transcription failed: {str(e)}"
         }
     finally:
         pass
@@ -1117,7 +1120,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
         }
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float, user_email: str = ""):
-    """Updated transcription processing with new four-tier service logic and admin email checking."""
+    """Updated transcription processing with new three-tier service logic and admin email checking."""
     logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}, email: {user_email}, speaker_labels: {speaker_labels_enabled}")
     job_data = jobs[job_id]
     
@@ -1156,7 +1159,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             "tier_1_service": tier_1_service,
             "tier_2_service": tier_2_service,
             "tier_3_service": tier_3_service,
-            # REMOVED: "tier_4_service": tier_4_service, # No longer tier 4
             "assemblyai_model": assemblyai_model,
             "duration_minutes": duration_minutes,
             "selection_reason": service_config["reason"],
@@ -1357,9 +1359,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         check_cancellation()
 
-        # REMOVED: ATTEMPT TIER 4 SERVICE (FALLBACK 3) if Tier 3 failed AND tier_4_service is defined ---
-        # No longer tier 4, as logic is now 3 tiers.
-
         # Final result processing
         if not transcription_result or transcription_result.get("status") == "failed":
             logger.error(f"❌ All transcription services failed for job {job_id}. Services attempted: {services_attempted}")
@@ -1378,8 +1377,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 model_used = job_data.get("assemblyai_model", "unknown")
             elif service_used_name == "openai_whisper":
                 model_used = "whisper-1"
-            # REMOVED: elif service_used_name == "deepgram":
-            # REMOVED:     model_used = "nova-3"
             elif service_used_name == "temi":
                 model_used = "default" # Temi doesn't expose model name via API
 
@@ -1512,7 +1509,6 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
     logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
     
     if not PAYSTACK_SECRET_KEY:
-        logger.error("❌ PAYSTACK_SECRET_KEY is not set in environment variables.")
         raise HTTPException(status_code=500, detail="Paystack configuration missing")
     
     try:
@@ -2308,6 +2304,7 @@ logger.info("Performing final system validation...")
 logger.info(f"TypeMyworDz1 API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"TypeMyworDz2 Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 # REMOVED: logger.info(f"TypeMyworDz3 (Google Cloud Speech) API Key configured: {bool(GCP_SPEECH_KEY_BASE64)}")
+# REMOVED: logger.info(f"TypeMyworDz4 (Deepgram) API Key configured: {bool(DEEPGRAM_API_KEY)}")
 logger.info(f"TypeMyworDz5 (Temi) API Key configured: {bool(TEMI_API_KEY)}") # NEW
 logger.info(f"TypeMyworDz AI API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
