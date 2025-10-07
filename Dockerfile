@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN echo "--- Installing ALL Python dependencies from requirements.txt with force-reinstall ---" && \
     pip install --no-cache-dir --force-reinstall -r requirements.txt
 
-# --- NEW DIAGNOSTIC STEP: Inspect Firebase Admin SDK config (CORRECTED SYNTAX - using .format()) ---
+# --- NEW DIAGNOSTIC STEP: Inspect Firebase Admin SDK config (CORRECTED SYNTAX - escaped newlines) ---
 # This will try to decode and print the Firebase Admin SDK config.
 # WARNING: This will expose part of your Firebase key in the build logs.
 # REMOVE THIS STEP AFTER DEBUGGING!
