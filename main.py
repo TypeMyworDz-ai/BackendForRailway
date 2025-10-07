@@ -24,18 +24,8 @@ import re
 import anthropic
 import openai # Keep openai import for GPT-based AI formatting
 
-# REMOVED: Google Cloud Speech-to-Text libraries
-# REMOVED: from google.cloud import speech_v1p1beta1 as speech
-# REMOVED: from google.oauth2 import service_account
-# REMOVED: from google.cloud import storage # For Google Cloud Storage operations
-
 # NEW: Import Google Generative AI libraries
 import google.generativeai as genai
-
-# REMOVED: Deepgram imports
-# REMOVED: from deepgram import Deepgram
-# REMOVED: from deepgram.transcription import PrerecordedOptions
-
 
 # NEW: Import Firebase Admin SDK
 import firebase_admin
@@ -59,7 +49,7 @@ TYPEMYWORDZ1_NAME = "TypeMyworDz1" # AssemblyAI
 TYPEMYWORDZ2_NAME = "TypeMyworDz2" # OpenAI Whisper
 # REMOVED: TYPEMYWORDZ3_NAME = "TypeMyworDz3" # Google Cloud Speech-to-Text
 # REMOVED: TYPEMYWORDZ4_NAME = "TypeMyworDz4" # Deepgram
-TYPEMYWORDZ5_NAME = "TypeMyworDz5" # Temi (NEW)
+# REMOVED: TYPEMYWORDZ5_NAME = "TypeMyworDz5" # Temi (NEW) - REMOVED
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google Gemini
 
 # Admin email addresses
@@ -81,8 +71,6 @@ install_ffmpeg()
 logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
-# REMOVED: GCP_SPEECH_KEY_BASE64 = os.environ.get("GCP_SPEECH_KEY_BASE64") # Google Cloud Speech Key
-# REMOVED: GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME") # For Google Cloud Storage operations
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
@@ -90,10 +78,8 @@ PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
 OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # URL for the Render-deployed OpenAI service
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # NEW: Google Gemini API Key
-# REMOVED: DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY") # Deepgram API Key
-# REMOVED: DEEPGRAM_SERVICE_RENDER_URL = os.environ.get("DEEPGRAM_SERVICE_RENDER_URL")
 FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64") # NEW: Firebase Admin SDK config
-TEMI_API_KEY = os.environ.get("TEMI_API_KEY") # NEW: Temi API Key
+# REMOVED: TEMI_API_KEY = os.environ.get("TEMI_API_KEY") # NEW: Temi API Key debug - REMOVED
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
@@ -105,7 +91,7 @@ logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOO
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}") # NEW
-logger.info(f"DEBUG: TEMI_API_KEY loaded value: {bool(TEMI_API_KEY)}") # NEW: Temi API Key debug
+# REMOVED: logger.info(f"DEBUG: TEMI_API_KEY loaded value: {bool(TEMI_API_KEY)}") # NEW: Temi API Key debug - REMOVED
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
@@ -139,8 +125,8 @@ else:
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
 
-if not TEMI_API_KEY: # NEW: Temi API Key check
-    logger.warning(f"{TYPEMYWORDZ5_NAME} (Temi) API Key environment variable not set! Temi transcription will be disabled.")
+# REMOVED: if not TEMI_API_KEY: # NEW: Temi API Key check - REMOVED
+# REMOVED:     logger.warning(f"{TYPEMYWORDZ5_NAME} (Temi) API Key environment variable not set! Temi transcription will be disabled.")
 
 if PAYSTACK_SECRET_KEY:
     logger.info("Paystack configuration found - payment verification enabled")
@@ -200,69 +186,48 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    Logic for service selection based on new rules, with Temi as Tier 3.
-    Deepgram and Google Cloud STT are removed.
-    - Dedicated Temi Tester (njokigituku@gmail.com): Primary=Temi, no fallback
-    - All instances of speaker tags requests: Primary=Assembly, Fallback1=OpenAI, Fallback2=Temi
-    - Free users & One-Day Plan: Primary=Assembly, Fallback1=OpenAI, Fallback2=Temi
-    - Three-Day Plan & One-Week Plan: Primary=OpenAI, Fallback1=Assembly, Fallback2=Temi
-    - Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly, Fallback2=Temi
+    Logic for service selection based on new rules.
+    - All instances of speaker tags requests: Primary=Assembly, Fallback1=OpenAI
+    - Free users & One-Day Plan: Primary=Assembly, Fallback1=OpenAI
+    - Three-Day Plan & One-Week Plan: Primary=OpenAI, Fallback1=Assembly
+    - Monthly Plan, Yearly Plan & Admins: Primary=OpenAI, Fallback1=Assembly
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
     
-    # NEW: Helper to check if Temi is available
-    is_temi_available = bool(TEMI_API_KEY)
+    # REMOVED: is_temi_available check - Temi is removed
 
-    # --- Dedicated Temi Tester (njokigituku@gmail.com): Temi only ---
-    TEST_TEMI_USER_EMAIL = 'njokigituku@gmail.com'
-    if user_email and user_email.lower() == TEST_TEMI_USER_EMAIL.lower():
-        logger.info(f"🎯 Job for {user_email}: Dedicated Temi tester.")
-        if is_temi_available:
-            return {
-                "tier_1": "temi", # TypeMyworDz5
-                "tier_2": None,
-                "tier_3": None,
-                "reason": "dedicated_temi_test_user"
-            }
-        else:
-            logger.warning(f"Dedicated Temi STT user {user_email}, but Temi is not fully configured. Falling back to general logic.")
-            # Fall through to general logic if Temi isn't fully configured for the test user
+    # REMOVED: Dedicated Temi Tester (njokigituku@gmail.com) logic - njokigituku is now a normal user
 
-    # --- General Fallback Logic (3 tiers, Deepgram and Google Cloud removed) ---
+    # --- General Fallback Logic (2 tiers now) ---
     # Base services for general cases
     tier_1 = None
     tier_2 = None
-    tier_3 = None
 
     # Logic for Monthly Plan, Yearly Plan & Admins: Primary=OpenAI
     if is_admin or user_plan in ['Monthly Plan', 'Yearly Plan']:
         tier_1 = "openai_whisper"
         tier_2 = "assemblyai"
-        tier_3 = "temi" if is_temi_available else None
         reason = "admin_or_monthly_yearly_prioritizing_openai"
     # Logic for Three-Day Plan & One-Week Plan users: Primary=OpenAI
     elif user_plan in ['Three-Day Plan', 'One-Week Plan']:
         tier_1 = "openai_whisper"
         tier_2 = "assemblyai"
-        tier_3 = "temi" if is_temi_available else None
         reason = f"paid_user_{user_plan}_prioritizing_openai"
     # Logic for Free users & One-Day Plan: Primary=Assembly
     else: # free or One-Day Plan
         tier_1 = "assemblyai"
         tier_2 = "openai_whisper"
-        tier_3 = "temi" if is_temi_available else None
         reason = "free_or_oneday_user_prioritizing_assemblyai"
 
-    # Speaker labels requested always prioritizes AssemblyAI (Temi does not support speaker labels)
+    # Speaker labels requested always prioritizes AssemblyAI (OpenAI does not reliably support speaker labels)
     if speaker_labels_enabled:
         tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = None # Temi does not support speaker labels, so it's not a fallback here
+        tier_2 = "openai_whisper" # OpenAI is a fallback, but might not provide speaker labels
         reason = "speaker_labels_requested_prioritizing_assemblyai"
 
 
-    # Dynamic adjustment based on service availability (Deepgram and Google Cloud are now completely removed)
+    # Dynamic adjustment based on service availability
     final_tiers_list = []
     
     # Tier 1
@@ -270,30 +235,18 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         final_tiers_list.append("assemblyai")
     elif tier_1 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL:
         final_tiers_list.append("openai_whisper")
-    elif tier_1 == "temi" and is_temi_available:
-        final_tiers_list.append("temi")
 
     # Tier 2 (only if not already in Tier 1 and is available)
     if tier_2 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list:
         final_tiers_list.append("assemblyai")
     elif tier_2 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
         final_tiers_list.append("openai_whisper")
-    elif tier_2 == "temi" and is_temi_available and "temi" not in final_tiers_list:
-        final_tiers_list.append("temi")
 
-    # Tier 3 (only if not already in higher tiers and is available)
-    if tier_3 == "temi" and is_temi_available and "temi" not in final_tiers_list:
-        final_tiers_list.append("temi")
-    elif tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list: # Fill if Temi was unavailable
-         final_tiers_list.append("assemblyai")
-    elif tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
-        final_tiers_list.append("openai_whisper")
-
-    # Ensure the list does not exceed 3 tiers and fills Nones if less than 3
+    # Ensure the list does not exceed 2 tiers and fills Nones if less than 2
     return {
         "tier_1": final_tiers_list[0] if len(final_tiers_list) > 0 else None,
         "tier_2": final_tiers_list[1] if len(final_tiers_list) > 1 else None,
-        "tier_3": final_tiers_list[2] if len(final_tiers_list) > 2 else None,
+        "tier_3": None, # Explicitly None as Temi is removed
         "reason": reason
     }
 
@@ -405,7 +358,9 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         return {'success': False, 'error': str(e)}
 
 async def update_monthly_revenue_firebase(amount_usd: float):
-    """Updates the monthly revenue in Firestore using Firebase Admin SDK."""
+    """Updates the monthly revenue in Firestore using Firebase Admin SDK.
+       Also ensures the admin_stats document exists with a default revenue if not found.
+    """
     if not db:
         logger.error("Firestore client not initialized. Cannot update monthly revenue.")
         return {'success': False, 'error': 'Firestore not initialized'}
@@ -418,7 +373,10 @@ async def update_monthly_revenue_firebase(amount_usd: float):
             current_monthly_revenue = 0
             if snapshot.exists:
                 current_monthly_revenue = snapshot.get('monthlyRevenue') or 0
-            
+            else:
+                # If document doesn't exist, create it with initial values
+                transaction.set(doc_ref, {'monthlyRevenue': 0.0, 'lastUpdated': firestore.SERVER_TIMESTAMP})
+
             new_monthly_revenue = current_monthly_revenue + amount_usd
             transaction.set(doc_ref, {'monthlyRevenue': new_monthly_revenue, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
             logger.info(f"📊 Monthly Revenue updated by USD {amount_usd:.2f} to USD {new_monthly_revenue:.2f} in Firestore (in transaction).")
@@ -777,7 +735,7 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
 
-# UPDATED: update_user_credits_paystack to interact with Firestore
+# UPDATED: update_user_credits_paystack to interact with Firestore and store revenue transactions
 async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False):
     """Update user credits/plan in Firestore and optionally admin revenue based on Paystack payment."""
     if not db:
@@ -795,19 +753,29 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
 
         # 2. Update user's plan in Firestore
         await update_user_plan_firestore(user_id, plan_name, None, amount if currency == 'USD' else None)
-        # Check result of update_user_plan_firestore if needed, but for now assuming it logs errors internally
-        # if not user_plan_update_result['success']:
-        #     logger.error(f"Failed to update user plan in Firestore for {email}: {user_plan_update_result['error']}")
-        #     return {'success': False, 'error': user_plan_update_result['error']}
 
-        # 3. Optionally update monthly revenue if requested and currency is USD
+        # 3. Store detailed revenue transaction
+        # Convert amount to USD if it's in a local currency for consistent storage
+        amount_usd_for_storage = amount
+        if currency != 'USD' and amount_usd_for_storage: # Assuming 'amount' here is already the USD equivalent from frontend or webhook metadata
+            logger.warning(f"Revenue transaction: Storing {amount_usd_for_storage} USD (converted from {amount} {currency}) for plan {plan_name}.")
+        
+        if amount_usd_for_storage:
+            revenue_transaction_data = {
+                'userId': user_id,
+                'email': email,
+                'planName': plan_name,
+                'amountUsd': amount_usd_for_storage,
+                'currency': currency, # Original transaction currency
+                'timestamp': firestore.SERVER_TIMESTAMP
+            }
+            await asyncio.to_thread(db.collection('revenue_transactions').add, revenue_transaction_data)
+            logger.info(f"✅ Revenue transaction recorded for {email} in Firestore.")
+
+
+        # 4. Optionally update monthly revenue if requested and currency is USD
         if update_admin_revenue:
-            # Convert amount to USD if it's in a local currency
-            amount_usd = amount
-            if currency != 'USD':
-                logger.warning(f"Revenue update: Received {amount} {currency}. Assuming this is the USD equivalent for simplicity. For accurate revenue, pass original USD amount from frontend.")
-                
-            revenue_update_result = await update_monthly_revenue_firebase(amount_usd)
+            revenue_update_result = await update_monthly_revenue_firebase(amount_usd_for_storage)
             if not revenue_update_result['success']:
                 logger.error(f"Failed to update monthly revenue in Firestore: {revenue_update_result['error']}")
         
@@ -818,93 +786,8 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         logger.error(f"❌ Error updating user credits in Firestore: {str(e)}")
         return {'success': False, 'error': str(e)}
 
-# NEW: transcribe_with_temi function
-async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str) -> dict:
-    """Transcribe audio using Temi API."""
-    if not TEMI_API_KEY:
-        logger.error(f"{TYPEMYWORDZ5_NAME} (Temi) API Key not configured, skipping {TYPEMYWORDZ5_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ5_NAME} API Key not configured")
-
-    try:
-        logger.info(f"Starting {TYPEMYWORDZ5_NAME} transcription for job {job_id}")
-        
-        # Temi API requires file upload
-        files = {'media': (os.path.basename(audio_path), open(audio_path, 'rb'), 'audio/mpeg')}
-        headers = {'Authorization': f'Bearer {TEMI_API_KEY}'}
-        
-        # Temi's API for submitting a new transcription job (CORRECTED URL)
-        submit_url = "https://api.temi.com/v1/jobs"
-
-        async with httpx.AsyncClient() as client:
-            submit_response = await client.post(submit_url, headers=headers, files=files, timeout=300.0)
-            submit_response.raise_for_status()
-        
-        submit_result = submit_response.json()
-        temi_job_id = submit_result['id']
-        logger.info(f"{TYPEMYWORDZ5_NAME} transcription job submitted with ID: {temi_job_id}")
-
-        # Poll for transcription status (CORRECTED URL)
-        poll_url = f"https://api.temi.com/v1/jobs/{temi_job_id}"
-        while True:
-            await asyncio.sleep(10) # Poll every 10 seconds
-            
-            async with httpx.AsyncClient() as client:
-                poll_response = await client.get(poll_url, headers=headers, timeout=30.0)
-                poll_response.raise_for_status()
-            
-            poll_result = poll_response.json()
-            status = poll_result['status']
-            
-            if status == "completed":
-                # Fetch the transcript (CORRECTED URL)
-                transcript_url = f"https://api.temi.com/v1/jobs/{temi_job_id}/transcript"
-                # Temi documentation shows Accept header for format. We want text/plain.
-                transcript_headers = {'Authorization': f'Bearer {TEMI_API_KEY}', 'Accept': 'text/plain'}
-                
-                async with httpx.AsyncClient() as client:
-                    transcript_response = await client.get(transcript_url, headers=transcript_headers, timeout=30.0)
-                    transcript_response.raise_for_status()
-                
-                transcription_text = transcript_response.text
-                logger.info(f"{TYPEMYWORDZ5_NAME} transcription completed for job {job_id}")
-                return {
-                    "status": "completed",
-                    "transcription": transcription_text,
-                    "language": language_code, # Temi usually auto-detects, but we can pass requested
-                    "duration": poll_result.get("duration_seconds", 0), # Corrected key
-                    "word_count": len(transcription_text.split()) if transcription_text else 0,
-                    "has_speaker_labels": False # Temi's basic API might not support speaker labels by default
-                }
-            elif status in ["failed", "error"]:
-                raise Exception(f"{TYPEMYWORDZ5_NAME} service returned status: {status}. Error details: {poll_result.get('failure_detail', 'No error message provided.')}") # Corrected key
-            else:
-                logger.info(f"{TYPEMYWORDZ5_NAME} status: {status} for job {job_id}")
-                continue
-
-    except asyncio.CancelledError:
-        logger.info(f"{TYPEMYWORDZ5_NAME} transcription cancelled for job {job_id}")
-        raise
-    except httpx.HTTPStatusError as e:
-        logger.error(f"{TYPEMYWORDZ5_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
-        return {
-            "status": "failed",
-            "error": f"{TYPEMYWORDZ5_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
-        }
-    except httpx.RequestError as e:
-        logger.error(f"{TYPEMYWORDZ5_NAME} service network error for job {job_id}: {e}")
-        return {
-            "status": "failed",
-            "error": f"{TYPEMYWORDZ5_NAME} service network error: {e}"
-        }
-    except Exception as e:
-        logger.error(f"{TYPEMYWORDZ5_NAME} transcription failed for job {job_id}: {str(e)}")
-        return {
-            "status": "failed",
-            "error": f"{TYPEMYWORDZ5_NAME} transcription failed: {str(e)}"
-        }
-    finally:
-        pass
-
+# REMOVED: NEW: transcribe_with_temi function - REMOVED
+# REMOVED: async def transcribe_with_temi(audio_path: str, language_code: str, job_id: str) -> dict:
 
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
@@ -964,13 +847,6 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
         }
     finally:
         pass
-
-# REMOVED: Deepgram transcription function (No longer needed)
-# REMOVED: async def transcribe_with_deepgram(...):
-
-# REMOVED: transcribe_with_google_cloud function
-# REMOVED: async def transcribe_with_google_cloud(...):
-
 
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
     """Transcribe audio using AssemblyAI API"""
@@ -1095,7 +971,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
         }
 async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float, user_email: str = ""):
-    """Updated transcription processing with new three-tier service logic and admin email checking."""
+    """Updated transcription processing with new two-tier service logic and admin email checking."""
     logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}, email: {user_email}, speaker_labels: {speaker_labels_enabled}")
     job_data = jobs[job_id]
     
@@ -1117,10 +993,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         service_config = get_transcription_services(user_plan, speaker_labels_enabled, user_email)
         tier_1_service = service_config["tier_1"]
         tier_2_service = service_config["tier_2"]
-        tier_3_service = service_config["tier_3"]
-        # REMOVED: tier_4_service = service_config["tier_4"] # No longer tier 4
+        # REMOVED: tier_3_service = service_config["tier_3"] # Temi is removed
 
-        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service} ({service_config['reason']}), Tier2={tier_2_service}, Tier3={tier_3_service}") # UPDATED LOG
+        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service} ({service_config['reason']}), Tier2={tier_2_service}") # UPDATED LOG
 
         def get_assemblyai_model(plan: str) -> str:
             if plan == 'free' or plan == 'One-Day Plan':
@@ -1133,7 +1008,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         job_data.update({
             "tier_1_service": tier_1_service,
             "tier_2_service": tier_2_service,
-            "tier_3_service": tier_3_service,
             "assemblyai_model": assemblyai_model,
             "duration_minutes": duration_minutes,
             "selection_reason": service_config["reason"],
@@ -1181,28 +1055,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
         
-        # REMOVED: elif tier_1_service == "deepgram":
-        # REMOVED:     ... (Deepgram logic)
-        
-        # NEW: ATTEMPT TIER 1 SERVICE - Temi
-        elif tier_1_service == "temi":
-            if not TEMI_API_KEY:
-                logger.error(f"{TYPEMYWORDZ5_NAME} API Key not configured, skipping Tier 1 for job {job_id}")
-                job_data["tier_1_error"] = f"{TYPEMYWORDZ5_NAME} API Key not configured"
-            else:
-                try:
-                    logger.info(f"🚀 Attempting {TYPEMYWORDZ5_NAME} (Tier 1 Primary) for job {job_id}")
-                    # Temi handles its own compression/processing, so pass original path
-                    transcription_result = await transcribe_with_temi(tmp_path, language_code, job_id)
-                    job_data["tier_1_used"] = "temi"
-                    job_data["tier_1_success"] = True
-                except Exception as error:
-                    logger.error(f"❌ {TYPEMYWORDZ5_NAME} (Tier 1 Primary) failed: {error}")
-                    job_data["tier_1_error"] = str(error)
-                    job_data["tier_1_success"] = False
-            services_attempted.append(f"{TYPEMYWORDZ5_NAME}_tier1")
-
-
         check_cancellation()
         # --- ATTEMPT TIER 2 SERVICE (FALLBACK 1) if Tier 1 failed AND tier_2_service is defined ---
         if (not transcription_result or transcription_result.get("status") == "failed") and tier_2_service:
@@ -1246,89 +1098,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
             
-            # REMOVED: elif tier_2_service == "deepgram":
-            # REMOVED:     ... (Deepgram logic)
-            
-            # NEW: ATTEMPT TIER 2 SERVICE - Temi
-            elif tier_2_service == "temi":
-                if not TEMI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ5_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
-                    job_data["tier_2_error"] = f"{TYPEMYWORDZ5_NAME} API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ5_NAME} (Tier 2 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_temi(tmp_path, language_code, job_id)
-                        job_data["tier_2_used"] = "temi"
-                        job_data["tier_2_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ5_NAME} (Tier 2 Fallback) failed: {error}")
-                        job_data["tier_2_error"] = str(error)
-                        job_data["tier_2_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ5_NAME}_tier2")
-
-
-        check_cancellation()
-
-        # --- ATTEMPT TIER 3 SERVICE (FALLBACK 2) if Tier 2 failed AND tier_3_service is defined ---
-        if (not transcription_result or transcription_result.get("status") == "failed") and tier_3_service:
-            logger.warning(f"⚠️ Tier 2 service failed, trying Tier 3 fallback ({tier_3_service}) for job {job_id}")
-
-            if tier_3_service == "assemblyai":
-                if not ASSEMBLYAI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ1_NAME} (Tier 3 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ1_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
-                        job_data["tier_3_used"] = "assemblyai"
-                        job_data["tier_3_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ1_NAME} (Tier 3 Fallback) failed: {error}")
-                        job_data["tier_3_error"] = str(error)
-                        job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ1_NAME}_tier3")
-                
-            elif tier_3_service == "openai_whisper":
-                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-                    logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ2_NAME} Service URL not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) for job {job_id}")
-                        if compressed_path is None:
-                            compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                            logger.info(f"Audio compressed for {TYPEMYWORDZ2_NAME}: {compression_stats}")
-                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
-                        job_data["tier_3_used"] = "openai_whisper"
-                        job_data["tier_3_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ2_NAME} (Tier 3 Fallback) failed: {error}")
-                        job_data["tier_3_error"] = str(error)
-                        job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
-            
-            # NEW: ATTEMPT TIER 3 SERVICE - Temi
-            elif tier_3_service == "temi":
-                if not TEMI_API_KEY:
-                    logger.error(f"{TYPEMYWORDZ5_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
-                    job_data["tier_3_error"] = f"{TYPEMYWORDZ5_NAME} API Key not configured"
-                else:
-                    try:
-                        logger.info(f"🔄 Attempting {TYPEMYWORDZ5_NAME} (Tier 3 Fallback) for job {job_id}")
-                        transcription_result = await transcribe_with_temi(tmp_path, language_code, job_id)
-                        job_data["tier_3_used"] = "temi"
-                        job_data["tier_3_success"] = True
-                    except Exception as error:
-                        logger.error(f"❌ {TYPEMYWORDZ5_NAME} (Tier 3 Fallback) failed: {error}")
-                        job_data["tier_3_error"] = str(error)
-                        job_data["tier_3_success"] = False
-                services_attempted.append(f"{TYPEMYWORDZ5_NAME}_tier3")
-
-
         check_cancellation()
 
         # Final result processing
@@ -1342,15 +1111,15 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             })
         else:
             logger.info(f"✅ Transcription completed successfully for job {job_id}")
-            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used")) # UPDATED
+            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used")) # UPDATED
             model_used = "N/A" # Default
 
             if service_used_name == "assemblyai":
                 model_used = job_data.get("assemblyai_model", "unknown")
             elif service_used_name == "openai_whisper":
                 model_used = "whisper-1"
-            elif service_used_name == "temi":
-                model_used = "default" # Temi doesn't expose model name via API
+            # REMOVED: elif service_used_name == "temi": - REMOVED
+            # REMOVED:    model_used = "default" # Temi doesn't expose model name via API
 
             logger.info(f"📊 Job {job_id} for user {user_email} completed. Service: {service_used_name}, Model: {model_used}")
 
@@ -1418,7 +1187,7 @@ async def lifespan(app: FastAPI):
     logger.info("All background tasks cancelled and cleanup complete")
 
 logger.info("Creating FastAPI app...")
-app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ5_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini", lifespan=lifespan) # UPDATED
+app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini", lifespan=lifespan) # UPDATED
 logger.info("FastAPI app created successfully")
 
 app.add_middleware(
@@ -1433,14 +1202,11 @@ logger.info("CORS middleware configured successfully")
 async def root():
     logger.info("Root endpoint called")
     return {
-        "message": f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ5_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini is running!", # UPDATED
+        "message": f"Enhanced Transcription Service with {TYPEMYWORDZ1_NAME}, {TYPEMYWORDZ2_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini is running!", # UPDATED
         "features": [
             f"AssemblyAI integration with smart model selection",
             f"OpenAI Whisper integration for transcription",
-            # REMOVED: f"Google Cloud Speech-to-Text integration for transcription",
-            # REMOVED: f"Deepgram integration for transcription",
-            f"Temi integration for transcription", # NEW
-            "Three-tier automatic fallback between services", # UPDATED
+            "Two-tier automatic fallback between services", # UPDATED
             "Paystack payment integration",
             f"Speaker diarization for AssemblyAI", # UPDATED
             "Language selection for transcription",
@@ -1449,22 +1215,19 @@ async def root():
             "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
+            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
+            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
+            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
-            "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
+            # REMOVED: "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
             "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
             "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
             "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
-            # REMOVED: "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
-            # REMOVED: "deepgram": f"TypeMyworDz4 (Deepgram)",
-            "temi": f"TypeMyworDz5 (Temi)", # NEW
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
             "admin_emails": ADMIN_EMAILS
@@ -1694,13 +1457,10 @@ async def paystack_status():
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-        # REMOVED: "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
         "anthropic_configured": bool(ANTHROPIC_API_KEY),
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
         "google_gemini_configured": bool(GEMINI_API_KEY),
-        # REMOVED: "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(Deepgram) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL), # CORRECTED check
-        "temi_configured": bool(TEMI_API_KEY), # NEW
         "admin_emails": ADMIN_EMAILS,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
         "endpoints": {
@@ -1713,7 +1473,8 @@ async def paystack_status():
             "ai_user_query_gemini": "/ai/user-query-gemini",
             "ai_admin_format": "/ai/admin-format",
             "ai_admin_format_gemini": "/ai/admin-format-gemini",
-            "admin_monthly_revenue": "/api/admin/monthly-revenue" # NEW: Added revenue endpoint
+            "admin_monthly_revenue": "/api/admin/monthly-revenue", # NEW: Added revenue endpoint
+            "admin_revenue_data": "/api/admin/revenue-data" # NEW: Added detailed revenue endpoint
         },
         "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"], # USD is always supported, other local currencies if applicable
         "supported_plans": [
@@ -2157,6 +1918,75 @@ async def get_admin_monthly_revenue():
         logger.error(f"Error fetching monthly revenue from Firestore: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch monthly revenue: {str(e)}")
 
+# NEW: Endpoint to fetch detailed revenue data for Admin Dashboard
+@app.get("/api/admin/revenue-data")
+async def get_admin_revenue_data(
+    request: Request,
+    period: str = "monthly"  # "daily", "weekly", "monthly", "yearly"
+):
+    """
+    Fetches aggregated revenue data for a given period.
+    Only accessible by admin users.
+    """
+    user_email = request.headers.get("X-User-Email")
+    if not is_admin_user(user_email):
+        logger.warning(f"Unauthorized attempt to access revenue data by {user_email}")
+        raise HTTPException(status_code=403, detail="Access denied. Admin privileges required.")
+
+    if not db:
+        logger.error("Firestore client not initialized. Cannot fetch revenue data.")
+        raise HTTPException(status_code=500, detail="Firestore not initialized")
+
+    now = datetime.now()
+    start_date = None
+    end_date = now
+
+    if period == "daily":
+        start_date = datetime(now.year, now.month, now.day)
+    elif period == "weekly":
+        start_date = now - timedelta(weeks=1)
+        start_date = datetime(start_date.year, start_date.month, start_date.day)
+    elif period == "monthly":
+        start_date = datetime(now.year, now.month, 1)
+    elif period == "yearly":
+        start_date = datetime(now.year, 1, 1)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid period specified. Must be 'daily', 'weekly', 'monthly', or 'yearly'.")
+
+    try:
+        revenue_ref = db.collection('revenue_transactions')
+        query_ref = revenue_ref.where(filter=FieldFilter("timestamp", ">=", start_date)).where(filter=FieldFilter("timestamp", "<=", end_date))
+        
+        snapshot = await asyncio.to_thread(query_ref.get)
+
+        total_revenue = 0.0
+        revenue_by_plan = {}
+        transactions_count = 0
+
+        for doc in snapshot:
+            transaction = doc.to_dict()
+            amount_usd = transaction.get('amountUsd', 0.0)
+            plan_name = transaction.get('planName', 'Unknown Plan')
+
+            total_revenue += amount_usd
+            revenue_by_plan[plan_name] = revenue_by_plan.get(plan_name, 0.0) + amount_usd
+            transactions_count += 1
+        
+        logger.info(f"Fetched revenue data for period '{period}': Total USD {total_revenue:.2f}, {transactions_count} transactions.")
+
+        return {
+            "period": period,
+            "totalRevenue": total_revenue,
+            "revenueByPlan": revenue_by_plan,
+            "transactionsCount": transactions_count,
+            "startDate": start_date.isoformat(),
+            "endDate": end_date.isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error fetching detailed revenue data from Firestore: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch revenue data: {str(e)}")
+
+
 @app.get("/jobs")
 async def list_jobs():
     logger.info("Jobs list endpoint called")
@@ -2173,7 +2003,7 @@ async def list_jobs():
             "user_email": job_data.get("user_email", ""),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("tier_1_service"),
-            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used")), # UPDATED
+            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used")), # UPDATED
             "model_used": job_data.get("model_used", "N/A"),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
@@ -2227,31 +2057,25 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                # REMOVED: "google_cloud_configured": bool(GCP_SPEECH_KEY_BASE64),
                 "anthropic_configured": bool(ANTHROPIC_API_KEY),
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
-                "google_gemini_configured": bool(GEMINI_API_KEY),
-                # REMOVED: "deepgram_configured": bool(DEEPGRAM_API_KEY) and bool(Deepgram) and bool(PrerecordedOptions) and bool(DEEPGRAM_SERVICE_RENDER_URL), # CORRECTED check
-                "temi_configured": bool(TEMI_API_KEY) # NEW
+                "google_gemini_configured": bool(GEMINI_API_KEY)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
-                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}", # UPDATED
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
+                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
+                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
+                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}", # UPDATED
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME}", # UPDATED
-                "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
+                # REMOVED: "dedicated_temi_test_user": "njokigituku@gmail.com (Temi only, no fallback)", # UPDATED
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
                 "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # UPDATED
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # UPDATED
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
                 "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
-                # REMOVED: "google_cloud_speech": f"TypeMyworDz3 (Google Cloud Speech-to-Text)",
-                # REMOVED: "deepgram": f"TypeMyworDz4 (Deepgram)",
-                "temi": f"TypeMyworDz5 (Temi)", # NEW
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
                 "admin_emails": ADMIN_EMAILS
@@ -2273,9 +2097,6 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"TypeMyworDz1 API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"TypeMyworDz2 Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
-# REMOVED: logger.info(f"TypeMyworDz3 (Google Cloud Speech) API Key configured: {bool(GCP_SPEECH_KEY_BASE64)}")
-# REMOVED: logger.info(f"TypeMyworDz4 (Deepgram) API Key configured: {bool(DEEPGRAM_API_KEY)}")
-logger.info(f"TypeMyworDz5 (Temi) API Key configured: {bool(TEMI_API_KEY)}") # NEW
 logger.info(f"TypeMyworDz AI API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
@@ -2298,6 +2119,7 @@ logger.info("  POST /api/verify-payment - Verify Paystack payment")
 logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
 logger.info("  GET /api/paystack-status - Get integration status")
 logger.info("  GET /api/admin/monthly-revenue - Get admin monthly revenue (NEW)") # NEW: Log new endpoint
+logger.info("  GET /api/admin/revenue-data - Get detailed admin revenue data (NEW)") # NEW: Log new endpoint
 logger.info("  GET /api/list-gemini-models - List available Gemini models")
 logger.info("  GET /status/{job_id} - Check job status")
 logger.info("  POST /cancel/{job_id} - Cancel transcription job")
@@ -2316,11 +2138,8 @@ if __name__ == "__main__":
     
     logger.info(f"Starting enhanced transcription service on {host}:{port}")
     logger.info("🚀 NEW ENHANCED FEATURES:")
-    # REMOVED: f"  ✅ TypeMyworDz3 (Google Cloud Speech-to-Text) integrated for transcription")
-    # REMOVED: f"  ✅ TypeMyworDz4 (Deepgram) integrated for transcription")
-    logger.info(f"  ✅ TypeMyworDz5 (Temi) integrated for transcription") # NEW
-    logger.info(f"  ✅ Smart service selection with updated three-tier logic") # UPDATED
-    logger.info(f"  ✅ Three-tier automatic fallback system") # UPDATED
+    logger.info(f"  ✅ Smart service selection with updated two-tier logic") # UPDATED
+    logger.info(f"  ✅ Two-tier automatic fallback system") # UPDATED
     logger.info(f"  ✅ Admin email-based service prioritization")
     logger.info(f"  ✅ Speaker diarization for AssemblyAI") # UPDATED
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
@@ -2336,20 +2155,16 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}") # UPDATED
-    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ5_NAME}") # UPDATED
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME}") # UPDATED
+    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME}") # UPDATED
+    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}") # UPDATED
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}") # UPDATED
+    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME}") # UPDATED
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME}") # UPDATED
-    logger.info(f"  - Dedicated Temi Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ5_NAME} (no fallback)") # UPDATED
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
     logger.info(f"  - {TYPEMYWORDZ2_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
-    # REMOVED: f"  - {TYPEMYWORDZ3_NAME}: Google Cloud Speech-to-Text (supports speaker labels)")
-    # REMOVED: f"  - {TYPEMYWORDZ4_NAME}: Deepgram (supports speaker labels)")
-    logger.info(f"  - {TYPEMYWORDZ5_NAME}: Temi (does NOT support speaker labels via basic API)") # NEW
     logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
     logger.info(f"  - Google Gemini for AI text processing - NOW AVAILABLE FOR ALL PAID AI USERS")
     
@@ -2368,5 +2183,5 @@ if __name__ == "__main__":
         sys.exit(1)
 else:
     logger.info("Application loaded as module")
-    logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ5_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
+    logger.info(f"Ready to handle requests with {TYPEMYWORDZ1_NAME} + {TYPEMYWORDZ2_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration") # UPDATED
 
