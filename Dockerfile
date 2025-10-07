@@ -17,40 +17,16 @@ COPY requirements.txt .
 # Upgrade pip, setuptools, and wheel first to ensure a robust installation environment
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# --- START Deepgram Fix for Main Backend ---
-# Explicitly uninstall deepgram-sdk first to clear any corrupted/conflicting installs.
-# '|| true' prevents the build from failing if the package isn't found initially.
-RUN echo "--- Attempting to uninstall deepgram-sdk (if present) ---" && \
-    pip uninstall -y deepgram-sdk || true 
-
-# --- Install ALL Python dependencies from requirements.txt (No filtering, no individual installs) ---
-# Force a clean re-installation of all requirements, ensuring deepgram-sdk is fresh.
-# '--no-cache-dir' prevents pip from using any local cache.
-# '--force-reinstall' ensures existing packages are reinstalled.
+# --- Install ALL Python dependencies from requirements.txt ---
+# Force a clean re-installation of all requirements, ensuring no cache is used.
 RUN echo "--- Installing ALL Python dependencies from requirements.txt with force-reinstall ---" && \
     pip install --no-cache-dir --force-reinstall -r requirements.txt
-# --- END Deepgram Fix for Main Backend ---
 
-# --- DIAGNOSTIC STEP: Inspect Deepgram module (Corrected import check) ---
-# This will now correctly verify the Deepgram SDK's main client and options class
-RUN echo "--- Verifying Deepgram SDK (Deepgram, PrerecordedOptions) imports ---" && \
-    python -c "from deepgram import Deepgram; from deepgram.options import PrerecordedOptions; print('Deepgram SDK (Deepgram, PrerecordedOptions) imported successfully.')" || \
-    (echo "!!! ERROR: Deepgram SDK (Deepgram, PrerecordedOptions) failed to import. Check above logs for details. !!!" && exit 1)
-
-# --- DIAGNOSTIC STEP 2: Verify Uvicorn import ---
-RUN echo "--- Verifying Uvicorn module ---" && \
-    python -c "import uvicorn; print('Uvicorn module imported successfully.')" || \
-    (echo "!!! ERROR: Uvicorn module failed to import. Check above logs for details. !!!" && exit 1)
-
-# --- DIAGNOSTIC STEP 3: Verify FastAPI import ---
-RUN echo "--- Verifying FastAPI module ---" && \
-    python -c "import fastapi; print('FastAPI module imported successfully.')" || \
-    (echo "!!! ERROR: FastAPI module failed to import. Check above logs for details. !!!" && exit 1)
-
-# --- DIAGNOSTIC STEP 4: Verify Requests import ---
-RUN echo "--- Verifying Requests module ---" && \
-    python -c "import requests; print('Requests module imported successfully.')" || \
-    (echo "!!! ERROR: Requests module failed to import. Check above logs for details. !!!" && exit 1)
+# --- DIAGNOSTIC STEP: Verify essential modules ---
+# This will now correctly verify modules that are still present
+RUN echo "--- Verifying essential modules ---" && \
+    python -c "import uvicorn; import fastapi; import requests; print('Uvicorn, FastAPI, and Requests modules imported successfully.')" || \
+    (echo "!!! ERROR: Essential modules failed to import. Check above logs for details. !!!" && exit 1)
 
 # Check for any broken dependencies (this can sometimes reveal conflicts)
 RUN echo "--- Running pip check for broken dependencies ---" && \
