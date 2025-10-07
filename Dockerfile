@@ -22,19 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN echo "--- Installing ALL Python dependencies from requirements.txt with force-reinstall ---" && \
     pip install --no-cache-dir --force-reinstall -r requirements.txt
 
-# --- NEW DIAGNOSTIC STEP: Inspect FIREBASE_ADMIN_SDK_CONFIG_BASE64 (using dedicated script) ---
-# This will try to decode and print the Firebase Admin SDK config.
-# WARNING: This will expose part of your Firebase key in the build logs.
-# REMOVE THIS STEP AFTER DEBUGGING!
-COPY diagnose_firebase.py .
-# Explicitly pass the env var to the python script's environment
-RUN echo "--- DIAGNOSTIC: Inspecting FIREBASE_ADMIN_SDK_CONFIG_BASE64 (using diagnose_firebase.py) ---" && \
-    FIREBASE_ADMIN_SDK_CONFIG_BASE64=${FIREBASE_ADMIN_SDK_CONFIG_BASE64} python diagnose_firebase.py || \
-    (echo "!!! DIAGNOSTIC ERROR: Firebase config inspection failed. !!!" && exit 1)
-
-
-# --- DIAGNOSTIC STEP: Verify essential modules ---
-# This will now correctly verify modules that are still present
+# --- DIAGNOSTIC STEP: Verify essential modules (kept for general sanity check) ---
 RUN echo "--- Verifying essential modules ---" && \
     python -c "import uvicorn; import fastapi; import requests; print('Uvicorn, FastAPI, and Requests modules imported successfully.')" || \
     (echo "!!! ERROR: Essential modules failed to import. Check above logs for details. !!!" && exit 1)
@@ -46,7 +34,7 @@ RUN echo "--- Running pip check for broken dependencies ---" && \
 
 
 # Copy the rest of your application code
-COPY . .
+COPY . /app
 
 # Expose the port that Uvicorn will listen on
 EXPOSE 8000

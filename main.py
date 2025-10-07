@@ -97,8 +97,6 @@ TEMI_API_KEY = os.environ.get("TEMI_API_KEY") # NEW: Temi API Key
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
-# REMOVED: logger.info(f"DEBUG: GCP_SPEECH_KEY_BASE64 loaded value: {bool(GCP_SPEECH_KEY_BASE64)}")
-# REMOVED: logger.info(f"DEBUG: GCS_BUCKET_NAME loaded value: {bool(GCS_BUCKET_NAME)}")
 logger.info(f"DEBUG: ANTHROPIC_API_KEY loaded value: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
@@ -106,8 +104,6 @@ logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
-# REMOVED: logger.info(f"DEBUG: DEEPGRAM_API_KEY loaded value: {bool(DEEPGRAM_API_KEY)}")
-# REMOVED: logger.info(f"DEBUG: DEEPGRAM_SERVICE_RENDER_URL loaded value: {bool(DEEPGRAM_SERVICE_RENDER_URL)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}") # NEW
 logger.info(f"DEBUG: TEMI_API_KEY loaded value: {bool(TEMI_API_KEY)}") # NEW: Temi API Key debug
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
@@ -128,16 +124,17 @@ if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
 if not GEMINI_API_KEY:
     logger.warning("Google Gemini API Key environment variable not set! Google Gemini AI features will be disabled.")
 
-# REMOVED: Deepgram API Key check
-# REMOVED: if not DEEPGRAM_API_KEY:
-# REMOVED:     logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) API Key environment variable not set! Deepgram transcription will be disabled.")
-
-# REMOVED: Deepgram Render service URL check
-# REMOVED: if not DEEPGRAM_SERVICE_RENDER_URL:
-# REMOVED:     logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) Render Service URL not configured! Deepgram transcription will be disabled.")
-
 if not FIREBASE_ADMIN_SDK_CONFIG_BASE64: # NEW
     logger.error("FIREBASE_ADMIN_SDK_CONFIG_BASE64 environment variable not set! Firebase Admin SDK features (user/revenue updates) will be disabled.")
+else:
+    # NEW DIAGNOSTIC: Check Firebase Admin SDK config at runtime
+    try:
+        decoded_json_test = base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8')
+        parsed_json_test = json.loads(decoded_json_test)
+        logger.info(f"DIAGNOSTIC (Runtime): Firebase config decoded and parsed successfully. Project ID: {parsed_json_test.get('project_id', 'N/A')}, Client Email: {parsed_json_test.get('client_email', 'N/A')}")
+    except Exception as e:
+        logger.error(f"DIAGNOSTIC (Runtime): ERROR: Failed to decode/parse FIREBASE_ADMIN_SDK_CONFIG_BASE64 at runtime: {e}")
+
 
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
@@ -154,7 +151,6 @@ logger.info("Environment variables loaded successfully")
 
 # NEW: Initialize Firebase Admin SDK
 db = None
-# REMOVED: global_gcp_credentials = None # Global credentials no longer needed for STT
 if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
     try:
         service_account_info = json.loads(base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8'))
@@ -177,19 +173,6 @@ if ANTHROPIC_API_KEY:
 else:
     logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API key is missing, Claude client will not be initialized.")
 
-# REMOVED: Google Cloud Speech Client initialization
-# REMOVED: google_speech_client = None
-# REMOVED: if GCP_SPEECH_KEY_BASE64:
-# REMOVED:     try:
-# REMOVED:         service_account_info = json.loads(base64.b64decode(GCP_SPEECH_KEY_BASE64).decode('utf-8'))
-# REMOVED:         global_gcp_credentials = service_account.Credentials.from_service_account_info(service_account_info)
-# REMOVED:         google_speech_client = speech.SpeechClient(credentials=global_gcp_credentials)
-# REMOVED:         logger.info(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) client initialized successfully.")
-# REMOVED:     except Exception as e:
-# REMOVED:         logger.error(f"Error initializing {TYPEMYWORDZ3_NAME} (Google Cloud Speech) client: {e}")
-# REMOVED: else:
-# REMOVED:     logger.warning(f"{TYPEMYWORDZ3_NAME} (Google Cloud Speech) API key is missing, client will not be initialized.")
-
 # NEW: Google Gemini Client initialization
 gemini_client = None
 if GEMINI_API_KEY:
@@ -202,14 +185,6 @@ if GEMINI_API_KEY:
         logger.error(f"Error initializing Google Gemini client: {e}")
 else:
     logger.warning(f"Google Gemini API key is missing, client will not be initialized.")
-
-# REMOVED: Deepgram Client initialization
-# REMOVED: deepgram_client_configured = False
-# REMOVED: if DEEPGRAM_API_KEY and Deepgram and PrerecordedOptions and DEEPGRAM_SERVICE_RENDER_URL:
-# REMOVED:     deepgram_client_configured = True
-# REMOVED:     logger.info(f"{TYPEMYWORDZ4_NAME} (Deepgram) is configured to use the Render service at {DEEPGRAM_SERVICE_RENDER_URL}.")
-# REMOVED: else:
-# REMOVED:     logger.warning(f"{TYPEMYWORDZ4_NAME} (Deepgram) client initialization skipped (API key, SDK components, or Render URL missing).")
 
 
 def is_paid_ai_user(user_plan: str) -> bool:
@@ -236,8 +211,6 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     
     is_admin = is_admin_user(user_email) if user_email else False
     
-    # REMOVED: Helper to check if Deepgram is available for use in the tier logic
-    # REMOVED: is_deepgram_available = DEEPGRAM_API_KEY and Deepgram and PrerecordedOptions and DEEPGRAM_SERVICE_RENDER_URL
     # NEW: Helper to check if Temi is available
     is_temi_available = bool(TEMI_API_KEY)
 
@@ -1336,9 +1309,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
             
-            # REMOVED: elif tier_3_service == "deepgram":
-            # REMOVED:     ... (Deepgram logic)
-
             # NEW: ATTEMPT TIER 3 SERVICE - Temi
             elif tier_3_service == "temi":
                 if not TEMI_API_KEY:
@@ -1976,8 +1946,6 @@ async def transcribe_audio(
         duration_seconds = audio_characteristics.get("duration_seconds", 0)
         duration_minutes = duration_seconds / 60.0
         
-        logger.info(f"Audio analysis: {duration_minutes:.1f} minutes, {file_size_mb:.2f} MB")
-        
         jobs[job_id] = {
             "status": "processing",
             "filename": file.filename,
@@ -2356,7 +2324,6 @@ if __name__ == "__main__":
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
     logger.info("  ✅ Enhanced error handling and service resilience")
-    logger.info("  ✅ Comprehensive job tracking and cancellation")
     logger.info("  ✅ Paystack payment integration")
     logger.info("  ✅ Multi-language support")
     logger.info("  ✅ Formatted Word document generation")
