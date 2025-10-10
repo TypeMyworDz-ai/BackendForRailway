@@ -30,7 +30,8 @@ import google.generativeai as genai
 # NEW: Import Deepgram libraries
 try:
     from deepgram import DeepgramClient
-    from deepgram.options import PrerecordedOptions
+    # Correct import path for PrerecordedOptions in Deepgram SDK v3.x
+    from deepgram.transcription import PrerecordedOptions 
 except ImportError as e:
     DeepgramClient = None
     PrerecordedOptions = None
