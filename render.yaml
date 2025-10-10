@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: TypeMyworDz AI
+    # env: python # REMOVE THIS
+    # runtime: python3.10 # REMOVE THIS
+    buildCommand: pip install -r requirements.txt # This will be ignored for Docker
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT # This will be ignored for Docker
+    headers:
+      - name: Access-Control-Allow-Origin
+        value: "https://typemywordzaiapp-git-main-james-gitukus-projects.vercel.app"
+      - name: Access-Control-Allow-Methods
+        value: "GET, POST, OPTIONS"
+      - name: Access-Control-Allow-Headers
+        value: "Content-Type, Authorization"
+      - name: Access-Control-Allow-Credentials
+        value: "true"
