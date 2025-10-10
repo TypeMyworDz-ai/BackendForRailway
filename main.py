@@ -188,9 +188,9 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     """
     Logic for service selection based on new rules, including Deepgram.
     - OpenAI: First option for Weekly, Monthly, Yearly subscribers and Admins (Admins gets this logic no matter what plans they have subscribed to). Fallback is Assembly > Deepgram.
-    - Assembly: First option for free and one-day subscribers. Fallback Deepgram > OpenAI (free and one-day subscribers don't get TypeMyworDz Assistant)
-    - Deepgram: First option for three-day plans users. fallback is Assembly > OpenAI.
-    - All instances of speaker tags requests: First option Assembly, fallback Deepgram > OpenAI.
+    - Deepgram: First option for free and one-day subscribers. Fallback Assembly > OpenAI (free and one-day subscribers don't get TypeMyworDz Assistant)
+    - Assembly: First option for three-day plans users. fallback is OpenAI > Deepgram.
+    - All instances of speaker tags requests: First option Assembly, fallback Deepgram.
     - njokigituku@gmail.com is still the dedicated TESTER of Deepgram, which means for them there is no fallback if Deepgram fails.
     """
     
@@ -219,25 +219,25 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     if speaker_labels_enabled:
         tier_1 = "assemblyai"
         tier_2 = "deepgram"
-        tier_3 = "openai_whisper"
+        tier_3 = None  # No OpenAI for speaker tags as per request (only Assembly > Deepgram)
         reason = "speaker_labels_requested_prioritizing_assemblyai"
     
     # --- Plan-based Logic (if speaker labels are not enabled or already set) ---
-    elif is_admin or user_plan in ['Monthly Plan', 'Yearly Plan', 'One-Week Plan']: # Weekly, Monthly, Yearly and Admins
+    elif is_admin or user_plan in ['One-Week Plan', 'Monthly Plan', 'Yearly Plan']: # Weekly, Monthly, Yearly and Admins
         tier_1 = "openai_whisper"
         tier_2 = "assemblyai"
         tier_3 = "deepgram"
         reason = f"admin_or_{user_plan.lower().replace(' ', '_')}_prioritizing_openai"
     elif user_plan == 'Free' or user_plan == 'One-Day Plan': # Free and One-Day Plan
-        tier_1 = "assemblyai"
-        tier_2 = "deepgram"
-        tier_3 = "openai_whisper"
-        reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_assemblyai"
-    elif user_plan == 'Three-Day Plan': # Three-Day Plan
         tier_1 = "deepgram"
         tier_2 = "assemblyai"
         tier_3 = "openai_whisper"
         reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_deepgram"
+    elif user_plan == 'Three-Day Plan': # Three-Day Plan
+        tier_1 = "assemblyai"
+        tier_2 = "openai_whisper"
+        tier_3 = "deepgram"
+        reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_assemblyai"
     
     # --- Dynamic adjustment based on service availability ---
     final_tiers_list = []
@@ -325,7 +325,6 @@ class UserAIGeminiRequest_Pydantic(BaseModel):
 # Pydantic model for Gemini Admin formatting
 class AdminAIFormatGeminiRequest_Pydantic(BaseModel):
     transcript: str
-
     formatting_instructions: str = "Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."
     model: str = "models/gemini-pro-latest" # Default Gemini model
     max_tokens: int = 4000
@@ -381,7 +380,22 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         logger.error(f"Error updating user {user_id} plan in Firestore: {e}")
         return {'success': False, 'error': str(e)}
 
-# REMOVED: update_monthly_revenue_firebase function
+async def update_monthly_revenue_firestore(amount: float):
+    """Updates the cumulative monthly revenue in Firestore."""
+    if not db:
+        logger.error("Firestore client not initialized. Cannot update monthly revenue.")
+        return {'success': False, 'error': 'Firestore not initialized'}
+
+    admin_stats_ref = db.collection('admin_stats').document('current')
+    try:
+        await asyncio.to_thread(admin_stats_ref.update, {
+            'monthlyRevenue': firestore.Increment(amount)
+        })
+        logger.info(f"Monthly revenue updated by {amount} in Firestore.")
+        return {'success': True}
+    except Exception as e:
+        logger.error(f"Error updating monthly revenue in Firestore: {e}")
+        return {'success': False, 'error': str(e)}
 
 async def get_user_profile_by_email_firestore(email: str):
     """Fetches user profile by email to get UID (for webhook processing)."""
@@ -757,8 +771,13 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'totalMinutesUsed': 0
         })
 
-        # REMOVED: Logic for storing detailed revenue transactions and updating monthlyRevenue in Firebase
-        # This is now handled by the frontend's real-time counter.
+        # 3. Update monthly revenue if flag is True
+        if update_admin_revenue:
+            revenue_update_result = await update_monthly_revenue_firestore(amount)
+            if revenue_update_result['success']:
+                logger.info(f"✅ Monthly revenue updated successfully for payment of {amount} {currency}.")
+            else:
+                logger.warning(f"⚠️ Failed to update monthly revenue: {revenue_update_result.get('error')}")
         
         logger.info(f"✅ Credits and plan updated successfully for {email} in Firestore.")
         return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount, 'currency': currency}
