@@ -4,19 +4,38 @@ import asyncio
 import subprocess
 import os
 import json
+import base64
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
-from datetime import datetime
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
 import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+import httpx
+from docx import Document
+from docx.shared import Inches
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+import re
+import anthropic
+import openai # Keep openai import for GPT-based AI formatting
 
-# Configure logging to be very verbose
+# NEW: Import Google Generative AI libraries
+import google.generativeai as genai
+
+# NEW: Import Deepgram libraries
+try:
+    from deepgram import DeepgramClient
+    from deepgram.options import PrerecordedOptions
+except ImportError as e:
+    DeepgramClient = None
+    PrerecordedOptions = None
+    logging.warning(f"Deepgram SDK not installed or import error: {e}. Deepgram features will be disabled.")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -26,52 +45,87 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-logger.info("=== STARTING FASTAPI APPLICATION ===")
+logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
-# Install ffmpeg if not available
+# Service Names (UPDATED BASED ON USER'S NEW MAPPING)
+TYPEMYWORDZ_OPENAI_NAME = "TypeMyworDz1 (OpenAI Whisper)"
+TYPEMYWORDZ_ASSEMBLYAI_NAME = "TypeMyworDz2 (AssemblyAI)"
+TYPEMYWORDZ_DEEPGRAM_NAME = "TypeMyworDz3 (Deepgram)"
+# Google Cloud Speech-to-Text (TYPEMYWORDZ3_NAME in old mapping) is removed.
+TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google Gemini
+
+# Admin email addresses
+ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
+
 def install_ffmpeg():
     try:
-        # Test if ffmpeg is available
         subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
         logger.info("ffmpeg is already installed")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.info("Installing ffmpeg...")
+        logger.info("Installing ffmpeg... (This might not be strictly necessary if pydub uses a pre-installed one on Railway)")
         try:
-            # Try to install ffmpeg on Ubuntu/Debian (Railway uses Ubuntu)
             subprocess.run(['apt-get', 'update'], check=True)
             subprocess.run(['apt-get', 'install', '-y', 'ffmpeg'], check=True)
             logger.info("ffmpeg installed successfully")
         except subprocess.CalledProcessError as e:
             logger.error(f"Failed to install ffmpeg: {e}")
-            # Continue without ffmpeg - basic conversion will still work
 
-# Install ffmpeg on startup
 install_ffmpeg()
-# Load environment variables
 logger.info("Loading environment variables...")
-load_dotenv()
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-DEEPGRAM_SERVICE_URL = os.getenv("DEEPGRAM_SERVICE_URL") # NEW: Deepgram Service URL
 
-# Paystack environment variables
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
-PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
-PAYSTACK_WEBHOOK_SECRET = os.getenv("PAYSTACK_WEBHOOK_SECRET")
+# Environment variables for transcription services
+ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
+OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL")
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY") # This is the API key for direct SDK calls, not the Render service URL
 
-logger.info(f"Attempted to load ASSEMBLYAI_API_KEY. Value found: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"Attempted to load DEEPGRAM_SERVICE_URL. Value found: {bool(DEEPGRAM_SERVICE_URL)}") # NEW: Log Deepgram URL status
-logger.info(f"Attempted to load PAYSTACK_SECRET_KEY. Value found: {bool(PAYSTACK_SECRET_KEY)}")
-logger.info(f"Attempted to load PAYSTACK_PUBLIC_KEY. Value found: {bool(PAYSTACK_PUBLIC_KEY)}")
+# Environment variables for Generative AIs
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Environment variables for Paystack
+PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
+PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
+PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+
+# Environment variable for Deepgram Render service URL (for external call)
+DEEPGRAM_RENDER_SERVICE_URL = os.environ.get("DEEPGRAM_SERVICE_URL") # This is the URL of your deployed Deepgram service on Render
+
+logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
+logger.info(f"DEBUG: {TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key loaded value: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"DEBUG: {TYPEMYWORDZ_OPENAI_NAME} Service URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
+logger.info(f"DEBUG: {TYPEMYWORDZ_DEEPGRAM_NAME} API Key (for SDK) loaded value: {bool(DEEPGRAM_API_KEY)}")
+logger.info(f"DEBUG: {TYPEMYWORDZ_DEEPGRAM_NAME} Render Service URL loaded value: {bool(DEEPGRAM_RENDER_SERVICE_URL)}")
+logger.info(f"DEBUG: {TYPEMYWORDZ_AI_NAME} (Anthropic) API Key loaded value: {bool(ANTHROPIC_API_KEY)}")
+logger.info(f"DEBUG: OpenAI API Key (for GPT if direct) loaded value: {bool(OPENAI_API_KEY)}")
+logger.info(f"DEBUG: Google Gemini API Key loaded value: {bool(GEMINI_API_KEY)}")
+logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
+logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
+logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
+logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
+logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
-    logger.error("ASSEMBLYAI_API_KEY environment variable not set! AssemblyAI features will be disabled.")
-    # sys.exit(1) # Removed sys.exit to allow other services to run
+    logger.error(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key environment variable not set! {TYPEMYWORDZ_ASSEMBLYAI_NAME} will not work as primary or fallback.")
 
-# Paystack validation
+if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+    logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured! OpenAI Whisper transcription and GPT formatting will be disabled.")
+
+if not DEEPGRAM_API_KEY and not DEEPGRAM_RENDER_SERVICE_URL:
+    logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} API Key (for SDK) or Render Service URL not configured! Deepgram transcription will be disabled.")
+
+if not ANTHROPIC_API_KEY:
+    logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key environment variable not set! Anthropic AI features will be disabled.")
+
+if not OPENAI_API_KEY:
+    logger.warning(f"OPENAI_API_KEY (for GPT if direct) environment variable not set! Direct OpenAI GPT calls disabled.")
+
+if not GEMINI_API_KEY:
+    logger.warning("Google Gemini API Key environment variable not set! Google Gemini AI features will be disabled.")
+
 if not PAYSTACK_SECRET_KEY:
     logger.warning("PAYSTACK_SECRET_KEY environment variable not set! Paystack features will be disabled.")
 
-# Paystack initialization check
 if PAYSTACK_SECRET_KEY:
     logger.info("Paystack configuration found - payment verification enabled")
 else:
@@ -79,17 +133,121 @@ else:
 
 logger.info("Environment variables loaded successfully")
 
-# Pydantic models for Paystack requests
+# Generative AI client initializations
+claude_client = None
+if ANTHROPIC_API_KEY:
+    try:
+        claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        logger.info(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) client initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing {TYPEMYWORDZ_AI_NAME} (Anthropic) client: {e}")
+else:
+    logger.warning(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API key is missing, Claude client will not be initialized.")
+
+gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_client = genai.GenerativeModel('models/gemini-pro-latest')
+        logger.info(f"Google Gemini client initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing Google Gemini client: {e}")
+else:
+    logger.warning(f"Google Gemini API key is missing, client will not be initialized.")
+
+# Deepgram Client initialization (for direct SDK calls, if used)
+deepgram_sdk_client = None
+if DEEPGRAM_API_KEY and DeepgramClient:
+    try:
+        deepgram_sdk_client = DeepgramClient(DEEPGRAM_API_KEY)
+        logger.info(f"{TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) SDK client initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing {TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) SDK client: {e}")
+else:
+    logger.warning(f"{TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) SDK API key is missing or SDK not installed, client will not be initialized.")
+
+
+def is_paid_ai_user(user_plan: str) -> bool:
+    paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
+    return user_plan in paid_plans_for_ai
+
+def is_admin_user(user_email: str) -> bool:
+    """Check if user is an admin based on email address"""
+    if not user_email:
+        return False
+    return user_email.lower().strip() in [email.lower() for email in ADMIN_EMAILS]
+
+def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
+    """
+    Logic for service selection based on new rules:
+    - Dedicated Deepgram Tester (njokigituku@gmail.com): Deepgram only, no fallback.
+    - All instances of speaker tags requests: Primary=AssemblyAI, Fallback1=Deepgram, Fallback2=OpenAI.
+    - OpenAI: First option for Weekly, Monthly, Yearly subscribers and Admins. Fallback AssemblyAI > Deepgram.
+    - AssemblyAI: First option for Free and One-Day subscribers. Fallback Deepgram > OpenAI.
+    - Deepgram: First option for Three-Day Plan users. Fallback AssemblyAI > OpenAI.
+    """
+    
+    is_admin = is_admin_user(user_email) if user_email else False
+    
+    # Dedicated Deepgram Test User (njokigituku@gmail.com)
+    TEST_DEEPGRAM_USER_EMAIL = 'njokigituku@gmail.com'
+    if user_email and user_email.lower() == TEST_DEEPGRAM_USER_EMAIL.lower():
+        logger.info(f"🎯 Job for {user_email}: Dedicated Deepgram user. Deepgram only, no fallback.")
+        return {
+            "tier_1": "deepgram",
+            "tier_2": None,
+            "tier_3": None,
+            "reason": "dedicated_deepgram_test_user"
+        }
+
+    # All instances of speaker tags requests: Primary=AssemblyAI, fallback Deepgram > OpenAI.
+    if speaker_labels_enabled:
+        logger.info(f"🎯 Job for {user_email}: Speaker labels requested. Prioritizing {TYPEMYWORDZ_ASSEMBLYAI_NAME}.")
+        return {
+            "tier_1": "assemblyai",       # TYPEMYWORDZ_ASSEMBLYAI_NAME
+            "tier_2": "deepgram",         # TYPEMYWORDZ_DEEPGRAM_NAME
+            "tier_3": "openai_whisper",   # TYPEMYWORDZ_OPENAI_NAME
+            "reason": "speaker_labels_requested_prioritizing_assemblyai"
+        }
+    
+    # OpenAI: First option for Weekly, Monthly, Yearly Plan, and Admins
+    if is_admin or user_plan in ['One-Week Plan', 'Monthly Plan', 'Yearly Plan']:
+        logger.info(f"🎯 Job for {user_email}: Admin or Weekly/Monthly/Yearly plan. Prioritizing {TYPEMYWORDZ_OPENAI_NAME}.")
+        return {
+            "tier_1": "openai_whisper",   # TYPEMYWORDZ_OPENAI_NAME
+            "tier_2": "assemblyai",       # TYPEMYWORDZ_ASSEMBLYAI_NAME
+            "tier_3": "deepgram",         # TYPEMYWORDZ_DEEPGRAM_NAME
+            "reason": "admin_or_monthly_yearly_prioritizing_openai"
+        }
+    
+    # Deepgram: First option for Three-Day Plan users
+    if user_plan == 'Three-Day Plan':
+        logger.info(f"🎯 Job for {user_email}: Three-Day Plan. Prioritizing {TYPEMYWORDZ_DEEPGRAM_NAME}.")
+        return {
+            "tier_1": "deepgram",         # TYPEMYWORDZ_DEEPGRAM_NAME
+            "tier_2": "assemblyai",       # TYPEMYWORDZ_ASSEMBLYAI_NAME
+            "tier_3": "openai_whisper",   # TYPEMYWORDZ_OPENAI_NAME
+            "reason": f"paid_user_{user_plan}_prioritizing_deepgram"
+        }
+
+    # AssemblyAI: First option for Free and One-Day subscribers (Default case)
+    logger.info(f"🎯 Job for {user_email}: Free or One-Day Plan. Prioritizing {TYPEMYWORDZ_ASSEMBLYAI_NAME}.")
+    return {
+        "tier_1": "assemblyai",       # TYPEMYWORDZ_ASSEMBLYAI_NAME
+        "tier_2": "deepgram",         # TYPEMYWORDZ_DEEPGRAM_NAME
+        "tier_3": "openai_whisper",   # TYPEMYWORDZ_OPENAI_NAME
+        "reason": "free_or_oneday_user_prioritizing_assemblyai"
+    }
+
 class PaystackVerificationRequest(BaseModel):
     reference: str
 
-# UPDATED: Added country_code to initialization request
 class PaystackInitializationRequest(BaseModel):
     email: str
-    amount: float # This is the base USD amount
+    amount: float
     plan_name: str
     user_id: str
-    country_code: str # NEW: For dynamic currency and channels
+    country_code: str
     callback_url: str
 
 class PaystackWebhookRequest(BaseModel):
@@ -104,87 +262,130 @@ class CreditUpdateRequest(BaseModel):
     duration_hours: Optional[int] = None
     duration_days: Optional[int] = None
 
-# Job tracking with better cancellation support
+class FormattedWordDownloadRequest(BaseModel):
+    transcription_html: str
+    filename: Optional[str] = "transcription.docx"
+
+class UserAIRequest_Pydantic(BaseModel):
+    transcript: str
+    user_prompt: str
+    model: str = "claude-3-haiku-20240307"
+    max_tokens: int = 1000
+
+class AdminAIFormatRequest_Pydantic(BaseModel):
+    transcript: str
+    formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
+    model: str = "claude-3-5-haiku-20241022"
+    max_tokens: int = 4000
+
+class UserAIGeminiRequest_Pydantic(BaseModel):
+    transcript: str
+    user_prompt: str
+    model: str = "models/gemini-pro-latest"
+    max_tokens: int = 1000
+
+class AdminAIFormatGeminiRequest_Pydantic(BaseModel):
+    transcript: str
+    formatting_instructions: str = "Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."
+    model: str = "models/gemini-pro-latest"
+    max_tokens: int = 4000
+
 jobs = {}
-active_background_tasks = {}  # Track background tasks for cancellation
-cancellation_flags = {}  # Track cancellation flags for each job
+active_background_tasks = {}
+cancellation_flags = {}
 
 logger.info("Enhanced job tracking initialized")
-# Ultra aggressive compression function with cancellation checks
+
+async def analyze_audio_characteristics(audio_path: str) -> dict:
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        duration_seconds = len(audio) / 1000.0
+        
+        if audio.dBFS < -50:
+            quality_score = 0.1
+        elif audio.dBFS < -30:
+            quality_score = 0.4
+        else:
+            quality_score = 0.8
+            
+        language = "unknown" # pydub cannot detect language
+        return {
+            "duration_seconds": duration_seconds,
+            "quality_score": quality_score,
+            "language": language,
+            "channels": audio.channels,
+            "sample_rate": audio.frame_rate,
+            "size_mb": os.path.getsize(audio_path) / (1024 * 1024)
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing audio characteristics: {e}")
+        return {
+            "duration_seconds": 0,
+            "quality_score": 0,
+            "language": "unknown",
+            "channels": 0,
+            "sample_rate": 0,
+            "size_mb": 0,
+            "error": str(e)
+        }
+
 def compress_audio_for_transcription(input_path: str, output_path: str = None, job_id: str = None) -> tuple[str, dict]:
-    """Compress audio file optimally for AssemblyAI transcription with cancellation support"""
+    """Compress audio file optimally for transcription with cancellation support"""
     if output_path is None:
         base_name = os.path.splitext(input_path)[0]
         output_path = f"{base_name}_compressed.mp3"
     
     try:
-        # Check for cancellation before starting
         if job_id and cancellation_flags.get(job_id, False):
             logger.info(f"Job {job_id} cancelled during compression setup")
             raise asyncio.CancelledError(f"Job {job_id} was cancelled")
             
         logger.info(f"Compressing {input_path} for transcription...")
         
-        # Get original file size
-        input_size = os.path.getsize(input_path) / (1024 * 1024)  # MB
+        input_size = os.path.getsize(input_path) / (1024 * 1024)
         logger.info(f"Original file size: {input_size:.2f} MB")
         
-        # Load audio file
         audio = AudioSegment.from_file(input_path)
         logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
         
-        # Check for cancellation after loading
         if job_id and cancellation_flags.get(job_id, False):
             logger.info(f"Job {job_id} cancelled during audio loading")
             raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
-        # ULTRA AGGRESSIVE compression for transcription:
-        # 1. Convert to mono
         if audio.channels > 1:
             audio = audio.set_channels(1)
             logger.info("Converted to mono audio")
         
-        # 2. Drastically reduce sample rate for speech
-        target_sample_rate = 8000  # Even lower - telephone quality
+        target_sample_rate = 16000
         audio = audio.set_frame_rate(target_sample_rate)
         logger.info(f"Reduced sample rate to {target_sample_rate} Hz")
         
-        # Check for cancellation after sample rate conversion
         if job_id and cancellation_flags.get(job_id, False):
             logger.info(f"Job {job_id} cancelled during sample rate conversion")
             raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
-        # 3. Reduce volume slightly to avoid clipping during compression
-        audio = audio - 3  # Reduce by 3dB
-        
-        # 4. Apply normalization
+        audio = audio - 3
         audio = audio.normalize()
         logger.info("Applied audio normalization")
         
-        # Final cancellation check before export
         if job_id and cancellation_flags.get(job_id, False):
             logger.info(f"Job {job_id} cancelled before export")
             raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
-        # 5. Export with ULTRA aggressive compression settings
         audio.export(
             output_path, 
             format="mp3",
-            bitrate="16k",  # Extremely low bitrate
+            bitrate="64k",
             parameters=[
-                "-q:a", "9",    # Lowest quality = highest compression
-                "-ac", "1",     # Force mono
-                "-ar", str(target_sample_rate),  # Force very low sample rate
-                "-compression_level", "10",  # Maximum compression
-                "-joint_stereo", "0",  # Disable joint stereo
-                "-reservoir", "0"  # Disable bit reservoir
+                "-q:a", "9",
+                "-ac", "1",
+                "-ar", str(target_sample_rate)
             ]
         )
-        logger.info("Used ultra-aggressive compression settings")
+        logger.info("Audio compression complete")
         
-        # Calculate compression stats
         if os.path.exists(output_path):
-            output_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+            output_size = os.path.getsize(output_path) / (1024 * 1024)
             
             size_difference = input_size - output_size
             if input_size > 0:
@@ -200,7 +401,7 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
                 "duration_seconds": len(audio) / 1000.0
             }
             
-            logger.info(f"Ultra compression result:")
+            logger.info(f"Compression result:")
             logger.info(f"  Original: {stats['original_size_mb']} MB")
             logger.info(f"  Processed: {stats['compressed_size_mb']} MB")
             if size_difference > 0:
@@ -212,26 +413,21 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
         
     except asyncio.CancelledError:
         logger.info(f"Compression cancelled for job {job_id}")
-        # Clean up partial files
         if os.path.exists(output_path):
             os.unlink(output_path)
         raise
         
     except Exception as e:
         logger.error(f"Error compressing audio: {e}")
-        # If compression fails, try basic fallback
         try:
-            # Check cancellation before fallback
             if job_id and cancellation_flags.get(job_id, False):
                 raise asyncio.CancelledError(f"Job {job_id} was cancelled")
                 
             audio = AudioSegment.from_file(input_path)
-            # Basic fallback compression
-            audio = audio.set_channels(1)  # Mono
-            audio = audio.set_frame_rate(8000)  # Very low sample rate
-            audio.export(output_path, format="mp3", bitrate="16k")
+            audio = audio.set_channels(1)
+            audio = audio.set_frame_rate(16000)
+            audio.export(output_path, format="mp3", bitrate="64k")
             
-            # Recalculate stats for fallback
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
             compression_ratio = (size_difference / input_size) * 100 if input_size > 0 else 0
@@ -268,27 +464,24 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
         
         audio = AudioSegment.from_file(input_path)
         
-        # Quality settings - FIXED to ensure compression
         if quality == "high":
-            bitrate = "128k"  # Reduced from 192k
+            bitrate = "128k"
             sample_rate = 44100
             channels = 2 if audio.channels > 1 else 1
         elif quality == "medium":
-            bitrate = "96k"   # Reduced from 128k
-            sample_rate = 22050  # Reduced sample rate
-            channels = 1      # Force mono
-        else:  # low quality
+            bitrate = "96k"
+            sample_rate = 22050
+            channels = 1
+        else:
             bitrate = "64k"
             sample_rate = 16000
             channels = 1
         
-        # Apply settings
         if audio.channels != channels:
             audio = audio.set_channels(channels)
         if audio.frame_rate != sample_rate:
             audio = audio.set_frame_rate(sample_rate)
         
-        # Export with settings
         audio.export(
             output_path,
             format="mp3",
@@ -306,13 +499,14 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
     except Exception as e:
         logger.error(f"Error compressing audio for download: {e}")
         raise
-# --- NEW: Currency Conversion and Channel Mapping Logic ---
+
+# Currency Conversion and Channel Mapping Logic
 USD_TO_LOCAL_RATES = {
-    'KE': 145.0,  # 1 USD to KES (example rate, actual rates fluctuate)
-    'NG': 1500.0, # 1 USD to NGN (example rate, highly volatile)
-    'GH': 15.0,   # 1 USD to GHS (example rate)
-    'ZA': 19.0,   # 1 USD to ZAR (example rate)
-    # For 'OTHER_AFRICA' or unsupported countries, we default to USD
+    'KE': 145.0,
+    'NG': 1500.0,
+    'GH': 15.0,
+    'ZA': 19.0,
+    'OTHER_AFRICA': 'USD',
 }
 
 COUNTRY_CURRENCY_MAP = {
@@ -320,7 +514,7 @@ COUNTRY_CURRENCY_MAP = {
     'NG': 'NGN',
     'GH': 'GHS',
     'ZA': 'ZAR',
-    'OTHER_AFRICA': 'USD', # Default for others
+    'OTHER_AFRICA': 'USD',
 }
 
 COUNTRY_CHANNELS_MAP = {
@@ -328,23 +522,42 @@ COUNTRY_CHANNELS_MAP = {
     'NG': ['bank', 'ussd', 'mobile_money', 'card'],
     'GH': ['mobile_money', 'card'],
     'ZA': ['eft', 'card'],
-    'OTHER_AFRICA': ['card'], # Default for others
+    'OTHER_AFRICA': ['card'],
 }
 
-def get_local_amount_and_currency(base_usd_amount: float, country_code: str) -> tuple[float, str]:
+def get_local_amount_and_currency(base_usd_amount: float, country_code: str, plan_name: str = None) -> tuple[float, str]:
+    # For Monthly and Yearly plans, force USD
+    if plan_name in ['Monthly Plan', 'Yearly Plan']:
+        return base_usd_amount, 'USD'
+
     currency = COUNTRY_CURRENCY_MAP.get(country_code, 'USD')
     if currency == 'USD':
         return base_usd_amount, 'USD'
     
-    rate = USD_TO_LOCAL_RATES.get(country_code, 1.0) # Default to 1 if no rate found
+    rate = USD_TO_LOCAL_RATES.get(country_code, 1.0)
     local_amount = round(base_usd_amount * rate, 2)
     return local_amount, currency
 
-def get_payment_channels(country_code: str) -> list[str]:
-    return COUNTRY_CHANNELS_MAP.get(country_code, ['card']) # Default to card if country not mapped
-# --- END NEW LOGIC ---
+def get_payment_channels(country_code: str, plan_name: str = None) -> list[str]:
+    # For Monthly and Yearly plans, only card payments
+    if plan_name in ['Monthly Plan', 'Yearly Plan']:
+        return ['card']
+    return COUNTRY_CHANNELS_MAP.get(country_code, ['card'])
 
-# Paystack helper functions
+async def health_monitor():
+    logger.info("Starting health monitor background task")
+    while True:
+        try:
+            import psutil
+            memory_info = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=1)
+            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
+            logger.info(f"Active jobs: {len(jobs)}, Active background tasks: {len(active_background_tasks)}, Cancellation flags: {len(cancellation_flags)}")
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"Health monitor error: {e}")
+            await asyncio.sleep(30)
+
 async def verify_paystack_payment(reference: str) -> dict:
     """Verify Paystack payment using reference"""
     if not PAYSTACK_SECRET_KEY:
@@ -367,9 +580,8 @@ async def verify_paystack_payment(reference: str) -> dict:
             payment_data = response.json()
             
             if payment_data['status'] and payment_data['data']['status'] == 'success':
-                # Payment is successful - extract details
-                amount_kobo = payment_data['data']['amount']  # Amount in kobo/cents
-                amount = amount_kobo / 100  # Convert to main currency unit
+                amount_kobo = payment_data['data']['amount']
+                amount = amount_kobo / 100
                 customer_email = payment_data['data']['customer']['email']
                 currency = payment_data['data']['currency']
                 plan_name = payment_data['data']['metadata'].get('plan', 'Unknown')
@@ -411,33 +623,26 @@ async def verify_paystack_payment(reference: str) -> dict:
         logger.error(f"❌ Unexpected error during Paystack verification: {str(e)}")
         return {
             'status': 'error',
-            'error': 'Payment verification failed',
+            "error": 'Payment verification failed',
             'details': str(e)
         }
 
 async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str):
-    """
-    Update user credits based on Paystack payment
-    This is where you'll integrate with your user management system
-    """
+    """Update user credits based on Paystack payment"""
     try:
         logger.info(f"📝 Updating credits for {email} - {plan_name} ({amount} {currency})")
         
-        # Determine credit duration based on plan name
         duration_info = {}
-        if '24 Hours' in plan_name or '24 hours' in plan_name.lower():
-            duration_info = {'hours': 24}
-        elif '5 Days' in plan_name or '5 days' in plan_name.lower():
-            duration_info = {'days': 5}
-        
-        # TODO: Implement actual database/Firebase update logic
-        # Examples:
-        # user = get_user_by_email(email)
-        # if duration_info.get('hours'):
-        #     user.add_pro_access(hours=duration_info['hours'])
-        # elif duration_info.get('days'):
-        #     user.add_pro_access(days=duration_info['days'])
-        # user.save_payment_record(amount, currency, plan_name)
+        if plan_name == 'One-Day Plan':
+            duration_info = {'days': 1}
+        elif plan_name == 'Three-Day Plan':
+            duration_info = {'days': 3}
+        elif plan_name == 'One-Week Plan':
+            duration_info = {'days': 7}
+        elif plan_name == 'Monthly Plan':
+            duration_info = {'days': 30}
+        elif plan_name == 'Yearly Plan':
+            duration_info = {'days': 365}
         
         logger.info(f"✅ Credits updated successfully for {email}")
         return {
@@ -456,302 +661,642 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             'error': str(e)
         }
 
-# Background task to monitor application health
-async def health_monitor():
-    logger.info("Starting health monitor background task")
-    while True:
-        try:
-            import psutil
-            memory_info = psutil.virtual_memory()
-            cpu_percent = psutil.cpu_percent(interval=1)
-            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
-            logger.info(f"Active jobs: {len(jobs)}, Active background tasks: {len(active_background_tasks)}, Cancellation flags: {len(cancellation_flags)}")
-            await asyncio.sleep(30)  # Log every 30 seconds
-        except Exception as e:
-            logger.error(f"Health monitor error: {e}")
-            await asyncio.sleep(30)
+async def transcribe_with_openai_whisper_service(audio_path: str, language_code: str, job_id: str) -> dict:
+    """Calls the dedicated OpenAI Whisper service deployed on Railway."""
+    if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+        logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured, skipping {TYPEMYWORDZ_OPENAI_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured")
 
-# Refactored Background task with comprehensive cancellation support for multiple models and fallback
-async def process_transcription_job(job_id: str, tmp_path: str, filename: str, model_choice: str, user_email: Optional[str], language_code: str, speaker_labels_enabled: bool, content_type: str):
-    logger.info(f"Background task started for job ID: {job_id} with initial model: {model_choice}, user: {user_email}")
+    try:
+        logger.info(f"Calling {TYPEMYWORDZ_OPENAI_NAME} service for job {job_id} at {OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe")
+        
+        with open(audio_path, "rb") as f:
+            audio_content = f.read()
+
+        files = {'file': (os.path.basename(audio_path), audio_content, 'audio/mpeg')}
+        data = {'language_code': language_code}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe",
+                files=files,
+                data=data,
+                timeout=300.0
+            )
+            response.raise_for_status()
+
+        result = response.json()
+        
+        if result.get("status") == "completed" and result.get("transcription"):
+            logger.info(f"{TYPEMYWORDZ_OPENAI_NAME} service transcription completed for job {job_id}")
+            return result
+        else:
+            raise Exception(f"{TYPEMYWORDZ_OPENAI_NAME} service returned an incomplete or failed status: {result}")
+
+    except asyncio.CancelledError:
+        logger.info(f"{TYPEMYWORDZ_OPENAI_NAME} service call cancelled for job {job_id}")
+        raise
+    except httpx.HTTPStatusError as e:
+        logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ_OPENAI_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
+        }
+    except httpx.RequestError as e:
+        logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} service network error for job {job_id}: {e}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ_OPENAI_NAME} service network error: {e}"
+        }
+    except Exception as e:
+        logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} service transcription failed for job {job_id}: {str(e)}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ_OPENAI_NAME} service transcription failed: {str(e)}"
+        }
+
+async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str, content_type: str) -> dict:
+    """Transcribe audio using Deepgram, prioritizing the Render service, falling back to SDK if configured."""
+    
+    # Try the external Render service first
+    if DEEPGRAM_RENDER_SERVICE_URL:
+        logger.info(f"Attempting {TYPEMYWORDZ_DEEPGRAM_NAME} transcription via Render service for job {job_id}")
+        try:
+            with open(audio_path, "rb") as f:
+                audio_content = f.read()
+
+            files = {'file': (os.path.basename(audio_path), audio_content, content_type)}
+            data = {
+                'language_code': language_code,
+                'speaker_labels_enabled': 'true' if speaker_labels_enabled else 'false'
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    DEEPGRAM_RENDER_SERVICE_URL,
+                    files=files,
+                    data=data,
+                    timeout=60.0
+                )
+                response.raise_for_status()
+            
+            result = response.json()
+            if result.get("status") == "completed":
+                logger.info(f"{TYPEMYWORDZ_DEEPGRAM_NAME} transcription via Render service completed for job {job_id}")
+                return {
+                    "status": "completed",
+                    "transcription": result.get("transcription"),
+                    "language": result.get("language"),
+                    "duration": result.get("duration", 0),
+                    "word_count": result.get("word_count", 0),
+                    "has_speaker_labels": result.get("has_speaker_labels", False)
+                }
+            else:
+                raise Exception(f"Deepgram Render service returned non-completed status: {result.get('detail', 'Unknown error')}")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} Render service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}. Attempting SDK fallback.")
+            # Fallback to SDK if Render service fails
+        except httpx.RequestError as e:
+            logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} Render service network error for job {job_id}: {e}. Attempting SDK fallback.")
+            # Fallback to SDK if Render service fails
+        except Exception as e:
+            logger.error(f"Error calling {TYPEMYWORDZ_DEEPGRAM_NAME} Render service for job {job_id}: {e}. Attempting SDK fallback.")
+            # Fallback to SDK if Render service fails
+    
+    # If Render service is not configured or failed, try direct SDK call
+    if not deepgram_sdk_client:
+        logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} SDK client not initialized and Render service failed/not configured, skipping for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized or service unavailable")
+
+    try:
+        logger.info(f"Starting {TYPEMYWORDZ_DEEPGRAM_NAME} transcription via SDK for job {job_id}")
+        
+        def check_cancellation():
+            if job_id and cancellation_flags.get(job_id, False):
+                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) processing")
+                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+        
+        check_cancellation()
+        
+        with open(audio_path, "rb") as audio:
+            buffer_data = audio.read()
+
+        payload = {
+            "buffer": buffer_data,
+        }
+
+        options = PrerecordedOptions(
+            model="nova-3",
+            language=language_code,
+            smart_format=True,
+            punctuate=True,
+            diarize=speaker_labels_enabled,
+            utterances=speaker_labels_enabled
+        )
+
+        check_cancellation()
+
+        response = await asyncio.to_thread(
+            deepgram_sdk_client.listen.rest.v("1").transcribe_file,
+            payload,
+            options
+        )
+
+        check_cancellation()
+
+        response_dict = response.to_dict()
+        
+        transcript_text = ""
+        if "results" in response_dict and "channels" in response_dict["results"] and len(response_dict["results"]["channels"]) > 0:
+            if "alternatives" in response_dict["results"]["channels"][0] and len(response_dict["results"]["channels"][0]["alternatives"]) > 0:
+                transcript_text = response_dict["results"]["channels"][0]["alternatives"][0].get("transcript", "")
+        
+        has_speaker_labels = False
+        
+        if speaker_labels_enabled and "utterances" in response_dict.get("results", {}):
+            try:
+                utterances = response_dict["results"]["utterances"]
+                if utterances:
+                    logger.info(f"Processing {len(utterances)} utterances with speaker labels")
+                    formatted_diarized_text = []
+                    for utterance in utterances:
+                        if isinstance(utterance, dict) and 'speaker' in utterance and 'transcript' in utterance:
+                            speaker_num = utterance['speaker'] + 1
+                            utterance_text = utterance['transcript']
+                            formatted_diarized_text.append(f"<strong>Speaker {speaker_num}:</strong> {utterance_text}")
+                        else:
+                            logger.warning(f"Unexpected utterance format in Deepgram response: {utterance}")
+                    
+                    if formatted_diarized_text:
+                        transcript_text = "\n".join(formatted_diarized_text)
+                        has_speaker_labels = True
+                        logger.info(f"Successfully processed speaker diarization for job {job_id}")
+                    else:
+                        logger.warning(f"No valid utterances found in Deepgram diarization for job {job_id}. Falling back to single transcript.")
+                        has_speaker_labels = False
+                else:
+                    logger.warning(f"Deepgram response indicated speaker labels enabled but 'utterances' list was empty for job {job_id}. Falling back to single transcript.")
+                    has_speaker_labels = False
+            except Exception as e:
+                logger.error(f"Error processing speaker diarization for job {job_id}: {e}")
+                has_speaker_labels = False
+        
+        duration = 0
+        try:
+            if "metadata" in response_dict and "duration" in response_dict["metadata"]:
+                duration = response_dict["metadata"]["duration"]
+            elif "results" in response_dict and "channels" in response_dict["results"] and len(response_dict["results"]["channels"]) > 0:
+                channel = response_dict["results"]["channels"][0]
+                if "alternatives" in channel and len(channel["alternatives"]) > 0:
+                    alt = channel["alternatives"][0]
+                    if isinstance(alt, dict) and 'duration' in alt:
+                        duration = alt['duration']
+        except (AttributeError, KeyError, TypeError) as e:
+            logger.warning(f"Could not extract duration from Deepgram response for job {job_id}: {e}")
+            
+        word_count = len(transcript_text.split()) if transcript_text else 0
+
+        logger.info(f"{TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) transcription via SDK completed for job {job_id}")
+        return {
+            "status": "completed",
+            "transcription": transcript_text,
+            "language": language_code,
+            "duration": duration,
+            "word_count": word_count,
+            "has_speaker_labels": has_speaker_labels
+        }
+
+    except asyncio.CancelledError:
+        logger.info(f"{TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) transcription cancelled for job {job_id}")
+        raise
+    except Exception as e:
+        logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) transcription failed for job {job_id}: {str(e)}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ_DEEPGRAM_NAME} (Deepgram) transcription failed: {str(e)}"
+        }
+
+async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
+    """Transcribe audio using AssemblyAI API"""
+    if not ASSEMBLYAI_API_KEY:
+        logger.error(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured, skipping {TYPEMYWORDZ_ASSEMBLYAI_NAME} for job {job_id}")
+        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured")
+
+    try:
+        logger.info(f"Starting {TYPEMYWORDZ_ASSEMBLYAI_NAME} transcription with {model} model for job {job_id}")
+        
+        def check_cancellation():
+            if job_id and cancellation_flags.get(job_id, False):
+                logger.info(f"Job {job_id} was cancelled during {TYPEMYWORDZ_ASSEMBLYAI_NAME} processing")
+                raise asyncio.CancelledError(f"Job {job_id} was cancelled")
+        
+        check_cancellation()
+        
+        compressed_path, compression_stats = compress_audio_for_transcription(audio_path, job_id=job_id)
+        logger.info(f"Audio compressed for {TYPEMYWORDZ_ASSEMBLYAI_NAME}: {compression_stats}")
+
+        check_cancellation()
+        
+        logger.info(f"Uploading audio to {TYPEMYWORDZ_ASSEMBLYAI_NAME}...")
+        headers = {"authorization": ASSEMBLYAI_API_KEY}
+        upload_endpoint = "https://api.assemblyai.com/v2/upload"
+        
+        with open(compressed_path, "rb") as f:
+            upload_response = requests.post(upload_endpoint, headers=headers, data=f)
+        
+        if upload_response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Failed to upload audio to {TYPEMYWORDZ_ASSEMBLYAI_NAME}: {upload_response.text}")
+        
+        upload_result = upload_response.json()
+        audio_url = upload_result["upload_url"]
+        logger.info(f"Audio uploaded to {TYPEMYWORDZ_ASSEMBLYAI_NAME}: {audio_url}")
+
+        check_cancellation()
+
+        headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
+        transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
+        json_data = {
+            "audio_url": audio_url,
+            "language_code": language_code,
+            "punctuate": True,
+            "format_text": True,
+            "speaker_labels": speaker_labels_enabled,
+            "speech_model": model,
+            "word_boost": []
+        }
+        
+        transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
+        
+        if transcript_response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Failed to start transcription on {TYPEMYWORDZ_ASSEMBLYAI_NAME}: {transcript_response.text}")
+        
+        transcript_result = transcript_response.json()
+        transcript_id = transcript_result["id"]
+        logger.info(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} transcription started with ID: {transcript_id}")
+        
+        if os.path.exists(compressed_path):
+            os.unlink(compressed_path)
+            logger.info(f"Cleaned up compressed file: {compressed_path}")
+
+        while True:
+            check_cancellation()
+            
+            await asyncio.sleep(5)
+            
+            status_response = requests.get(f"https://api.assemblyai.com/v2/transcript/{transcript_id}", headers={"authorization": ASSEMBLYAI_API_KEY})
+            
+            if status_response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"Failed to get status from {TYPEMYWORDZ_ASSEMBLYAI_NAME}: {status_response.text}")
+            
+            status_result = status_response.json()
+            
+            if status_result["status"] == "completed":
+                transcription_text = status_result["text"]
+                
+                if speaker_labels_enabled and status_result.get("utterances"):
+                    formatted_transcript = ""
+                    for utterance in status_result.get("utterances"):
+                        speaker_letter = utterance['speaker']
+                        if speaker_letter == 'A':
+                            speaker_num = '1'
+                        elif speaker_letter == 'B':
+                            speaker_num = '2'
+                        elif speaker_letter == 'C':
+                            speaker_num = '3'
+                        elif speaker_letter == 'D':
+                            speaker_num = '4'
+                        elif speaker_letter == 'E':
+                            speaker_num = '5'
+                        else:
+                            speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
+                        
+                        formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
+                    transcription_text = formatted_transcript.strip()
+
+                return {
+                    "status": "completed",
+                    "transcription": transcription_text,
+                    "language": status_result["language_code"],
+                    "duration": status_result.get("audio_duration", 0),
+                    "word_count": len(transcription_text.split()) if transcription_text else 0,
+                    "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances"))
+                }
+            elif status_result["status"] == "error":
+                raise HTTPException(status_code=500, detail=status_result.get("error", f"Transcription failed on {TYPEMYWORDZ_ASSEMBLYAI_NAME}"))
+            else:
+                logger.info(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} status: {status_result['status']}")
+                continue
+        
+    except asyncio.CancelledError:
+        logger.info(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} transcription cancelled for job {job_id}")
+        raise
+    except Exception as e:
+        logger.error(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} transcription failed for job {job_id}: {str(e)}")
+        return {
+            "status": "failed",
+            "error": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} transcription failed: {str(e)}"
+        }
+
+async def process_transcription_job(job_id: str, tmp_path: str, filename: str, language_code: Optional[str], speaker_labels_enabled: bool, user_plan: str, duration_minutes: float, user_email: str = "", content_type: str = "audio/mpeg"):
+    """Updated transcription processing with new four-tier service logic and admin email checking."""
+    logger.info(f"Starting transcription job {job_id}: {filename}, duration: {duration_minutes:.1f}min, plan: {user_plan}, email: {user_email}, speaker_labels: {speaker_labels_enabled}")
     job_data = jobs[job_id]
     
-    # Store the task reference for potential cancellation
     active_background_tasks[job_id] = asyncio.current_task()
-    # Initialize cancellation flag
     cancellation_flags[job_id] = False
 
     try:
-        # Multiple cancellation checkpoints with detailed logging
         def check_cancellation():
             if cancellation_flags.get(job_id, False) or job_data.get("status") == "cancelled":
                 logger.info(f"Job {job_id} was cancelled - stopping processing")
                 raise asyncio.CancelledError(f"Job {job_id} was cancelled")
             return True
 
-        # Check if job was cancelled before processing
         check_cancellation()
 
-        # Read audio file content once for all services
-        with open(tmp_path, "rb") as f:
-            audio_file_bytes = f.read()
-
-        current_model = model_choice
+        # Get service configuration based on new logic
+        service_config = get_transcription_services(user_plan, speaker_labels_enabled, user_email)
+        tier_1_service = service_config["tier_1"]
+        tier_2_service = service_config["tier_2"]
+        tier_3_service = service_config["tier_3"]
         
-        while True: # Loop for potential fallbacks
-            transcript = None
-            error_message = None
-            service_used_in_attempt = None
+        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service} ({service_config['reason']}), Tier2={tier_2_service}, Tier3={tier_3_service}")
 
-            if current_model == "Deepgram":
-                logger.info(f"Job {job_id}: Attempting transcription with Deepgram.")
-                deepgram_render_url = os.getenv("DEEPGRAM_SERVICE_URL")
-                
-                if not deepgram_render_url:
-                    error_message = "Deepgram service URL not configured."
-                    logger.error(f"Job {job_id}: {error_message}")
-                else:
-                    try:
-                        check_cancellation()
-                        # Deepgram service expects file as multipart/form-data
-                        files = {'file': (filename, audio_file_bytes, content_type)}
-                        data = {
-                            'language_code': language_code,
-                            'speaker_labels_enabled': 'true' if speaker_labels_enabled else 'false'
-                        }
-                        
-                        response = await asyncio.to_thread(
-                            requests.post,
-                            deepgram_render_url,
-                            files=files,
-                            data=data,
-                            timeout=60 # Increased timeout for external service
-                        )
-                        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-                        deepgram_result = response.json()
-                        
-                        if deepgram_result.get("status") == "completed":
-                            transcript = deepgram_result.get("transcription")
-                            service_used_in_attempt = "deepgram"
-                            job_data["language"] = deepgram_result.get("language")
-                            job_data["has_speaker_labels"] = deepgram_result.get("has_speaker_labels")
-                            job_data["word_count"] = len(transcript.split()) if transcript else 0
-                            # Deepgram service doesn't directly return audio_duration in this format,
-                            # so we'll leave job_data["duration_seconds"] as its initial value (0) or derive it
-                        else:
-                            error_message = deepgram_result.get("detail", "Deepgram transcription failed with unknown status.")
-                            logger.error(f"Job {job_id}: Deepgram returned non-completed status: {deepgram_result}")
-                            
-                    except requests.exceptions.RequestException as e:
-                        error_message = f"Deepgram service request failed: {e}"
-                        logger.error(f"Job {job_id}: {error_message}")
-                    except json.JSONDecodeError as e:
-                        error_message = f"Deepgram service response JSON error: {e}"
-                        logger.error(f"Job {job_id}: {error_message}")
-                    except Exception as e:
-                        error_message = f"Unexpected error calling Deepgram: {e}"
-                        logger.error(f"Job {job_id}: {error_message}")
-
-                if transcript: # Deepgram succeeded
-                    job_data.update({
-                        "status": "completed",
-                        "transcription": transcript,
-                        "completed_at": datetime.now().isoformat(),
-                        "service_used": service_used_in_attempt,
-                        "error": None
-                    })
-                    break # Exit loop, job is done
-                else: # Deepgram failed
-                    if user_email == "njokigituku@gmail.com":
-                        logger.warning(f"Job {job_id}: Deepgram failed for {user_email}. No fallback as per rule.")
-                        job_data.update({
-                            "status": "failed",
-                            "error": f"Deepgram transcription failed: {error_message}. No fallback for this user.",
-                            "completed_at": datetime.now().isoformat(),
-                            "service_used": "deepgram"
-                        })
-                        return # Exit function, no fallback for this user
-                    else:
-                        logger.warning(f"Job {job_id}: Deepgram failed for {user_email}. Attempting fallback to AssemblyAI. Error: {error_message}")
-                        current_model = "AssemblyAI" # Set for next iteration
-                        job_data["deepgram_failure_reason"] = error_message # Store Deepgram failure for debugging
-                        continue # Continue loop to try fallback
-
-            elif current_model == "AssemblyAI":
-                logger.info(f"Job {job_id}: Attempting transcription with AssemblyAI.")
-                if not ASSEMBLYAI_API_KEY:
-                    error_message = "AssemblyAI API Key not configured. Skipping AssemblyAI."
-                    logger.error(f"Job {job_id}: {error_message}")
-                else:
-                    try:
-                        # Existing AssemblyAI logic (with compression)
-                        compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
-                        check_cancellation()
-                        job_data["compression_stats"] = compression_stats
-
-                        logger.info("Uploading compressed audio to AssemblyAI...")
-                        headers = {"authorization": ASSEMBLYAI_API_KEY}
-                        upload_endpoint = "https://api.assemblyai.com/v2/upload"
-                        check_cancellation()
-                        
-                        with open(compressed_path, "rb") as f:
-                            upload_response = await asyncio.to_thread(requests.post, upload_endpoint, headers=headers, data=f)
-                        
-                        check_cancellation()
-                        if upload_response.status_code != 200:
-                            error_message = f"Failed to upload audio to AssemblyAI: {upload_response.status_code} - {upload_response.text}"
-                            logger.error(f"Job {job_id}: {error_message}")
-                        else:
-                            upload_result = upload_response.json()
-                            audio_url = upload_result["upload_url"]
-                            logger.info(f"Audio uploaded to AssemblyAI: {audio_url}")
-                            check_cancellation()
-
-                            headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
-                            transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
-                            json_data = {
-                                "audio_url": audio_url,
-                                "language_code": language_code.replace('-', '_'), # AssemblyAI expects underscores
-                                "punctuate": True,
-                                "format_text": True,
-                                "speaker_labels": speaker_labels_enabled # AssemblyAI speaker labels
-                            }
-                            
-                            transcript_response = await asyncio.to_thread(requests.post, transcript_endpoint, headers=headers, json=json_data)
-                            check_cancellation()
-                            if transcript_response.status_code != 200:
-                                error_message = f"Failed to start transcription on AssemblyAI: {transcript_response.status_code} - {transcript_response.text}"
-                                logger.error(f"Job {job_id}: {error_message}")
-                            else:
-                                transcript_result = transcript_response.json()
-                                transcript_id = transcript_result["id"]
-                                job_data["assemblyai_id"] = transcript_id
-                                service_used_in_attempt = "assemblyai"
-                                logger.info(f"AssemblyAI transcription started with ID: {transcript_id}")
-                                
-                                if os.path.exists(compressed_path):
-                                    os.unlink(compressed_path)
-                                    logger.info(f"Cleaned up compressed file: {compressed_path}")
-                                
-                                # AssemblyAI needs polling for completion, so we just set status to processing and let get_job_status handle it
-                                job_data.update({
-                                    "status": "processing", # Will be updated by get_job_status
-                                    "service_used": service_used_in_attempt,
-                                    "error": None
-                                })
-                                break # Exit loop, AssemblyAI job initiated (will be polled)
-                    except Exception as e:
-                        error_message = f"Unexpected error calling AssemblyAI: {e}"
-                        logger.error(f"Job {job_id}: {error_message}")
-                
-                if error_message: # AssemblyAI failed
-                    logger.warning(f"Job {job_id}: AssemblyAI failed. No further fallback implemented.")
-                    job_data.update({
-                        "status": "failed",
-                        "error": f"AssemblyAI transcription failed: {error_message}",
-                        "completed_at": datetime.now().isoformat(),
-                        "service_used": "assemblyai"
-                    })
-                    return # Exit, no further fallback
-
-            elif current_model == "OpenAI_Whisper":
-                logger.info(f"Job {job_id}: Attempting transcription with OpenAI Whisper (placeholder).")
-                # Placeholder for OpenAI Whisper integration
-                error_message = "OpenAI Whisper service not yet implemented."
-                logger.error(f"Job {job_id}: {error_message}")
-
-                job_data.update({
-                    "status": "failed",
-                    "error": error_message,
-                    "completed_at": datetime.now().isoformat(),
-                    "service_used": "openai_whisper"
-                })
-                return # Exit, no further fallback
-
+        def get_assemblyai_model(plan: str) -> str:
+            if plan == 'free' or plan == 'One-Day Plan':
+                return "nano"  
             else:
-                error_message = f"Invalid transcription model choice: {current_model}"
-                logger.error(f"Job {job_id}: {error_message}")
-                job_data.update({
-                    "status": "failed",
-                    "error": error_message,
-                    "completed_at": datetime.now().isoformat()
-                })
-                return # Exit loop, invalid model
+                return "best"  
+
+        assemblyai_model = get_assemblyai_model(user_plan)
+
+        job_data.update({
+            "tier_1_service": tier_1_service,
+            "tier_2_service": tier_2_service,
+            "tier_3_service": tier_3_service,
+            "assemblyai_model": assemblyai_model,
+            "duration_minutes": duration_minutes,
+            "selection_reason": service_config["reason"],
+            "user_email": user_email,
+            "is_admin": is_admin_user(user_email)
+        })
+
+        transcription_result = None
+        services_attempted = []
+
+        # --- ATTEMPT TIER 1 SERVICE ---
+        if tier_1_service == "openai_whisper":
+            if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured"
+            else:
+                try:
+                    logger.info(f"🚀 Attempting {TYPEMYWORDZ_OPENAI_NAME} (Tier 1 Primary) for job {job_id}")
+                    transcription_result = await transcribe_with_openai_whisper_service(tmp_path, language_code, job_id)
+                    job_data["tier_1_used"] = "openai_whisper"
+                    job_data["tier_1_success"] = True
+                except Exception as error:
+                    logger.error(f"❌ {TYPEMYWORDZ_OPENAI_NAME} (Tier 1 Primary) failed: {error}")
+                    job_data["tier_1_error"] = str(error)
+                    job_data["tier_1_success"] = False
+            services_attempted.append(f"{TYPEMYWORDZ_OPENAI_NAME}_tier1")
             
-            # If we reach here, it means a service failed and there was no further fallback or it was the last option.
-            break # Break out of the while loop if no further fallback
+        elif tier_1_service == "assemblyai":
+            if not ASSEMBLYAI_API_KEY:
+                logger.error(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured"
+            else:
+                try:
+                    logger.info(f"🚀 Attempting {TYPEMYWORDZ_ASSEMBLYAI_NAME} (Tier 1 Primary) for job {job_id}")
+                    transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                    job_data["tier_1_used"] = "assemblyai"
+                    job_data["tier_1_success"] = True
+                except Exception as error:
+                    logger.error(f"❌ {TYPEMYWORDZ_ASSEMBLYAI_NAME} (Tier 1 Primary) failed: {error}")
+                    job_data["tier_1_error"] = str(error)
+                    job_data["tier_1_success"] = False
+            services_attempted.append(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME}_tier1")
+
+        elif tier_1_service == "deepgram":
+            if not DEEPGRAM_API_KEY and not DEEPGRAM_RENDER_SERVICE_URL:
+                logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized, skipping Tier 1 for job {job_id}")
+                job_data["tier_1_error"] = f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized"
+            else:
+                try:
+                    logger.info(f"🚀 Attempting {TYPEMYWORDZ_DEEPGRAM_NAME} (Tier 1 Primary) for job {job_id}")
+                    transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id, content_type)
+                    job_data["tier_1_used"] = "deepgram"
+                    job_data["tier_1_success"] = True
+                except Exception as error:
+                    logger.error(f"❌ {TYPEMYWORDZ_DEEPGRAM_NAME} (Tier 1 Primary) failed: {error}")
+                    job_data["tier_1_error"] = str(error)
+                    job_data["tier_1_success"] = False
+            services_attempted.append(f"{TYPEMYWORDZ_DEEPGRAM_NAME}_tier1")
+
+        check_cancellation()
+
+        # Special handling for njokigituku@gmail.com if Deepgram (Tier 1) failed
+        if user_email and user_email.lower() == 'njokigituku@gmail.com' and \
+           (not transcription_result or transcription_result.get("status") == "failed") and \
+           tier_1_service == "deepgram":
+            logger.warning(f"Job {job_id}: Deepgram failed for {user_email}. No fallback as per rule.")
+            job_data.update({
+                "status": "failed",
+                "error": f"Deepgram transcription failed: {job_data.get('tier_1_error', 'Unknown error')}. No fallback for this user.",
+                "completed_at": datetime.now().isoformat(),
+                "service_used": "deepgram"
+            })
+            return # Exit function, no fallback for this user
+
+        # --- ATTEMPT TIER 2 SERVICE (FALLBACK 1) if Tier 1 failed AND tier_2_service is defined ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_2_service:
+            logger.warning(f"⚠️ Tier 1 service failed, trying Tier 2 fallback ({tier_2_service}) for job {job_id}")
+            
+            if tier_2_service == "openai_whisper":
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ_OPENAI_NAME} (Tier 2 Fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_openai_whisper_service(tmp_path, language_code, job_id)
+                        job_data["tier_2_used"] = "openai_whisper"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ_OPENAI_NAME} (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ_OPENAI_NAME}_tier2")
+                
+            elif tier_2_service == "assemblyai":
+                if not ASSEMBLYAI_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ_ASSEMBLYAI_NAME} (Tier 2 Fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        job_data["tier_2_used"] = "assemblyai"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ_ASSEMBLYAI_NAME} (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME}_tier2")
+
+            elif tier_2_service == "deepgram":
+                if not DEEPGRAM_API_KEY and not DEEPGRAM_RENDER_SERVICE_URL:
+                    logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized, skipping Tier 2 for job {job_id}")
+                    job_data["tier_2_error"] = f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ_DEEPGRAM_NAME} (Tier 2 Fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id, content_type)
+                        job_data["tier_2_used"] = "deepgram"
+                        job_data["tier_2_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ_DEEPGRAM_NAME} (Tier 2 Fallback) failed: {error}")
+                        job_data["tier_2_error"] = str(error)
+                        job_data["tier_2_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ_DEEPGRAM_NAME}_tier2")
+        
+        check_cancellation()
+
+        # --- ATTEMPT TIER 3 SERVICE (FALLBACK 2) if Tier 2 failed AND tier_3_service is defined ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_3_service:
+            logger.warning(f"⚠️ Tier 2 service failed, trying Tier 3 fallback ({tier_3_service}) for job {job_id}")
+
+            if tier_3_service == "openai_whisper":
+                if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                    logger.error(f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ_OPENAI_NAME} Service URL not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ_OPENAI_NAME} (Tier 3 Fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_openai_whisper_service(tmp_path, language_code, job_id)
+                        job_data["tier_3_used"] = "openai_whisper"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ_OPENAI_NAME} (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ_OPENAI_NAME}_tier3")
+            
+            elif tier_3_service == "assemblyai":
+                if not ASSEMBLYAI_API_KEY:
+                    logger.error(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key not configured"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ_ASSEMBLYAI_NAME} (Tier 3 Fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_assemblyai(tmp_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                        job_data["tier_3_used"] = "assemblyai"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ_ASSEMBLYAI_NAME} (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME}_tier3")
+
+            elif tier_3_service == "deepgram":
+                if not DEEPGRAM_API_KEY and not DEEPGRAM_RENDER_SERVICE_URL:
+                    logger.error(f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized, skipping Tier 3 for job {job_id}")
+                    job_data["tier_3_error"] = f"{TYPEMYWORDZ_DEEPGRAM_NAME} client not initialized"
+                else:
+                    try:
+                        logger.info(f"🔄 Attempting {TYPEMYWORDZ_DEEPGRAM_NAME} (Tier 3 Fallback) for job {job_id}")
+                        transcription_result = await transcribe_with_deepgram(tmp_path, language_code, speaker_labels_enabled, job_id, content_type)
+                        job_data["tier_3_used"] = "deepgram"
+                        job_data["tier_3_success"] = True
+                    except Exception as error:
+                        logger.error(f"❌ {TYPEMYWORDZ_DEEPGRAM_NAME} (Tier 3 Fallback) failed: {error}")
+                        job_data["tier_3_error"] = str(error)
+                        job_data["tier_3_success"] = False
+                services_attempted.append(f"{TYPEMYWORDZ_DEEPGRAM_NAME}_tier3")
+        
+        check_cancellation()
+
+        # Final result processing
+        if not transcription_result or transcription_result.get("status") == "failed":
+            logger.error(f"❌ All transcription services failed for job {job_id}. Services attempted: {services_attempted}. Last error: {job_data.get('tier_3_error') or job_data.get('tier_2_error') or job_data.get('tier_1_error')}")
+            job_data.update({
+                "status": "failed",
+                "error": f"All transcription services failed. Services attempted: {', '.join(services_attempted)}",
+                "completed_at": datetime.now().isoformat(),
+                "service_used": "none",
+                "services_attempted": services_attempted
+            })
+        else:
+            logger.info(f"✅ Transcription completed successfully for job {job_id} using {transcription_result.get('service_used', 'unknown')}")
+            job_data.update({
+                "status": "completed",
+                "transcription": transcription_result["transcription"],
+                "language": transcription_result.get("language", language_code),
+                "completed_at": datetime.now().isoformat(),
+                "word_count": transcription_result.get("word_count", 0),
+                "duration_seconds": transcription_result.get("duration", 0),
+                "speaker_labels_enabled": speaker_labels_enabled, # Keep original request value
+                "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used")),
+                "services_attempted": services_attempted
+            })
 
     except asyncio.CancelledError:
-        logger.info(f"Background task for job {job_id} was cancelled")
-        # Update job status to cancelled if not already set
+        logger.info(f"Transcription job {job_id} was cancelled")
         if job_data.get("status") != "cancelled":
             job_data.update({
                 "status": "cancelled",
                 "cancelled_at": datetime.now().isoformat(),
                 "error": "Job was cancelled by user"
             })
-        # Clean up any files
-        if 'compressed_path' in locals() and os.path.exists(compressed_path):
-            os.unlink(compressed_path)
-            logger.info(f"Cleaned up compressed file after cancellation: {compressed_path}")
-        raise  # Re-raise to properly cancel the task
+        raise
         
     except Exception as e:
-        logger.error(f"Background task: ERROR during transcription for job {job_id}: {str(e)}")
+        logger.error(f"Transcription job: ERROR during processing for job {job_id}: {str(e)}")
         import traceback
-        logger.error(f"Background task: Full traceback: {traceback.format_exc()}")
+        logger.error(f"Transcription job: Full traceback: {traceback.format_exc()}")
         job_data.update({
             "status": "failed",
             "error": f"Internal server error during transcription: {str(e)}",
             "completed_at": datetime.now().isoformat(),
-            "service_used": job_data.get("service_used", "unknown_during_crash") # Keep track of which service failed
+            "service_used": job_data.get("service_used", "unknown_during_crash")
         })
     finally:
-        # Clean up the original temporary file
         if os.path.exists(tmp_path):
-            logger.info(f"Background task: Cleaning up original temporary file: {tmp_path}")
             os.unlink(tmp_path)
+            logger.info(f"Cleaned up original temporary file: {tmp_path}")
         
-        # Remove from active tasks and cancellation flags
         if job_id in active_background_tasks:
             del active_background_tasks[job_id]
         if job_id in cancellation_flags:
             del cancellation_flags[job_id]
             
-        logger.info(f"Background task completed for job ID: {job_id}")
+        logger.info(f"Transcription job completed for job ID: {job_id}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger.info("Application lifespan startup")
-    # Start background health monitoring
     health_task = asyncio.create_task(health_monitor())
     logger.info("Health monitor task created")
     yield
-    # Shutdown
     logger.info("Application lifespan shutdown")
     health_task.cancel()
-    # Cancel all active background tasks
     for job_id, task in active_background_tasks.items():
         if not task.done():
             logger.info(f"Cancelling background task for job {job_id}")
             cancellation_flags[job_id] = True
             task.cancel()
-    # Clear all tracking dictionaries
     jobs.clear()
     active_background_tasks.clear()
     cancellation_flags.clear()
     logger.info("All background tasks cancelled and cleanup complete")
-# Create the FastAPI app
+
 logger.info("Creating FastAPI app...")
-app = FastAPI(title="Enhanced Transcription Service with Paystack Payments", lifespan=lifespan)
+app = FastAPI(title=f"Enhanced Transcription Service with {TYPEMYWORDZ_OPENAI_NAME}, {TYPEMYWORDZ_ASSEMBLYAI_NAME}, {TYPEMYWORDZ_DEEPGRAM_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini", lifespan=lifespan)
 logger.info("FastAPI app created successfully")
 
-# Add CORS middleware with proper configuration
-logger.info("Setting up CORS middleware...")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for development
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -762,17 +1307,38 @@ logger.info("CORS middleware configured successfully")
 async def root():
     logger.info("Root endpoint called")
     return {
-        "message": "Enhanced Transcription Service with Paystack Payments is running!",
+        "message": f"Enhanced Transcription Service with {TYPEMYWORDZ_OPENAI_NAME}, {TYPEMYWORDZ_ASSEMBLYAI_NAME}, {TYPEMYWORDZ_DEEPGRAM_NAME}, {TYPEMYWORDZ_AI_NAME} & Google Gemini is running!",
         "features": [
-            "Ultra-aggressive audio compression",
-            "Proper job cancellation",
-            "Background task management",
-            "Real-time status tracking",
+            f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} integration with smart model selection",
+            f"{TYPEMYWORDZ_OPENAI_NAME} integration for transcription",
+            f"{TYPEMYWORDZ_DEEPGRAM_NAME} integration for transcription",
+            "Three-tier automatic fallback between services",
             "Paystack payment integration",
-            "Subscription management",
-            "Multiple Transcription Models (AssemblyAI, Deepgram, OpenAI_Whisper placeholder)", # NEW
-            "User-specific Deepgram fallback logic" # NEW
+            f"Speaker diarization for {TYPEMYWORDZ_ASSEMBLYAI_NAME} and {TYPEMYWORDZ_DEEPGRAM_NAME}",
+            "Language selection for transcription",
+            f"User-driven AI features (summarization, Q&A, and bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic Claude)",
+            f"Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic Claude) and Google Gemini",
+            "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS"
         ],
+        "logic": {
+            "free_user_transcription": f"Primary={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ_OPENAI_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_DEEPGRAM_NAME}",
+            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ_OPENAI_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_DEEPGRAM_NAME}",
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ_ASSEMBLYAI_NAME} first → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+            "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
+            "free_users_assemblyai_model": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} nano model",
+            "paid_users_assemblyai_model": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} best model",
+            "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
+            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+            "openai_whisper": f"{TYPEMYWORDZ_OPENAI_NAME}",
+            "assemblyai": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME}",
+            "deepgram": f"{TYPEMYWORDZ_DEEPGRAM_NAME}",
+            "anthropic_ai": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude)",
+            "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
+            "admin_emails": ADMIN_EMAILS
+        },
         "stats": {
             "active_jobs": len(jobs),
             "background_tasks": len(active_background_tasks),
@@ -780,10 +1346,8 @@ async def root():
         }
     }
 
-# UPDATED: Paystack payment initialization endpoint
 @app.post("/api/initialize-paystack-payment")
 async def initialize_paystack_payment(request: PaystackInitializationRequest):
-    """Initialize Paystack payment with dynamic currency and channels"""
     logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
     
     if not PAYSTACK_SECRET_KEY:
@@ -791,12 +1355,10 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         raise HTTPException(status_code=500, detail="Paystack configuration missing")
     
     try:
-        # Determine local amount and currency
-        local_amount, local_currency = get_local_amount_and_currency(request.amount, request.country_code)
-        payment_channels = get_payment_channels(request.country_code)
+        local_amount, local_currency = get_local_amount_and_currency(request.amount, request.country_code, request.plan_name)
+        payment_channels = get_payment_channels(request.country_code, request.plan_name)
 
-        # Convert local amount to kobo for Paystack
-        amount_kobo = int(local_amount * 100) # Paystack always expects amount in minor unit
+        amount_kobo = int(local_amount * 100)
         
         headers = {
             'Authorization': f'Bearer {PAYSTACK_SECRET_KEY}',
@@ -806,14 +1368,12 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         payload = {
             'email': request.email,
             'amount': amount_kobo,
-            'currency': local_currency, # Use dynamically determined local currency
+            'currency': local_currency,
             'callback_url': request.callback_url,
-            'channels': payment_channels, # Use dynamically determined channels
+            'channels': payment_channels,
             'metadata': {
                 'plan': request.plan_name,
-                'user_id': request.user_id,
-                'country_code': request.country_code, # Pass original country code
-                'base_usd_amount': request.amount, # Store original USD amount
+                'base_usd_amount': request.amount,
                 'custom_fields': [
                     {
                         'display_name': "Plan Type",
@@ -830,7 +1390,6 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         }
         
         logger.info(f"DEBUG: Paystack payload for {request.country_code}: Amount={local_amount} {local_currency}, Channels={payment_channels}")
-        logger.info(f"DEBUG: Sending payload to Paystack: {payload}")
 
         response = requests.post(
             'https://api.paystack.co/transaction/initialize',
@@ -846,7 +1405,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
                 'status': True,
                 'authorization_url': result['data']['authorization_url'],
                 'reference': result['data']['reference'],
-                'local_amount': local_amount, # Return for frontend info if needed
+                'local_amount': local_amount,
                 'local_currency': local_currency
             }
         else:
@@ -857,23 +1416,20 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         import traceback
         logger.error(f"❌ Error initializing Paystack payment: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Payment initialization failed: {str(e)}")
+
 @app.post("/api/verify-payment")
 async def verify_payment(request: PaystackVerificationRequest):
-    """Verify Paystack payment and update user credits"""
     logger.info(f"Payment verification request for reference: {request.reference}")
     
     try:
-        # Verify payment with Paystack
         verification_result = await verify_paystack_payment(request.reference)
         
         if verification_result['status'] == 'success':
-            # Payment verified successfully
             email = verification_result['email']
             plan_name = verification_result['plan']
             amount = verification_result['amount']
             currency = verification_result['currency']
             
-            # Update user credits
             credit_result = await update_user_credits_paystack(email, plan_name, amount, currency)
             
             if credit_result['success']:
@@ -906,7 +1462,6 @@ async def verify_payment(request: PaystackVerificationRequest):
                     }
                 }
         else:
-            # Payment verification failed
             logger.warning(f"❌ Payment verification failed for reference: {request.reference}")
             raise HTTPException(
                 status_code=400, 
@@ -925,17 +1480,11 @@ async def verify_payment(request: PaystackVerificationRequest):
 
 @app.post("/api/paystack-webhook")
 async def paystack_webhook(request: Request):
-    """Handle Paystack webhook events"""
     try:
-        # Get the raw body and signature
         body = await request.body()
         signature = request.headers.get('x-paystack-signature')
         
         logger.info(f"Received Paystack webhook with signature: {bool(signature)}")
-        
-        # TODO: Implement proper signature verification
-        # For now, we'll parse the webhook without verification
-        # In production, you should verify the webhook signature using HMAC
         
         if not body:
             logger.warning("Empty webhook body received")
@@ -951,17 +1500,15 @@ async def paystack_webhook(request: Request):
         logger.info(f"Processing Paystack webhook event: {event_type}")
         
         if event_type == 'charge.success':
-            # Handle successful payment
             data = webhook_data.get('data', {})
             customer_email = data.get('customer', {}).get('email')
-            amount = data.get('amount', 0) / 100  # Convert from kobo
+            amount = data.get('amount', 0) / 100
             currency = data.get('currency')
             reference = data.get('reference')
             plan_name = data.get('metadata', {}).get('plan', 'Unknown')
             
             logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}")
             
-            # Update user credits automatically
             if customer_email:
                 credit_result = await update_user_credits_paystack(customer_email, plan_name, amount, currency)
                 if credit_result['success']:
@@ -970,7 +1517,6 @@ async def paystack_webhook(request: Request):
                     logger.warning(f"⚠️ Webhook: Failed to update credits for {customer_email}")
             
         elif event_type == 'charge.failed':
-            # Handle failed payment
             data = webhook_data.get('data', {})
             customer_email = data.get('customer', {}).get('email')
             reference = data.get('reference')
@@ -987,124 +1533,402 @@ async def paystack_webhook(request: Request):
     except Exception as e:
         logger.error(f"❌ Error processing Paystack webhook: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Webhook processing failed: {str(e)}")
+
 @app.get("/api/paystack-status")
 async def paystack_status():
-    """Get Paystack integration status"""
     return {
         "paystack_configured": bool(PAYSTACK_SECRET_KEY),
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
+        "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
+        "anthropic_configured": bool(ANTHROPIC_API_KEY),
+        "openai_configured": bool(OPENAI_API_KEY),
+        "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
+        "google_gemini_configured": bool(GEMINI_API_KEY),
+        "deepgram_configured": bool(DEEPGRAM_API_KEY) or bool(DEEPGRAM_RENDER_SERVICE_URL), # Check both SDK key and Render URL
+        "admin_emails": ADMIN_EMAILS,
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
             "webhook": "/api/paystack-webhook",
-            "status": "/api/paystack-status"
+            "status": "/api/paystack-status",
+            "transcribe": "/transcribe",
+            "ai_user_query": "/ai/user-query",
+            "ai_user_query_gemini": "/ai/user-query-gemini",
+            "ai_admin_format": "/ai/admin-format",
+            "ai_admin_format_gemini": "/ai/admin-format-gemini"
         },
         "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"],
         "supported_plans": [
-            "24 Hours Pro Access",
-            "5 Days Pro Access"
+            "One-Day Plan",
+            "Three-Day Plan",
+            "One-Week Plan",
+            "Monthly Plan",
+            "Yearly Plan"
         ],
-        "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES # NEW: Expose rates for frontend debug/info
+        "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES
     }
 
-@app.post("/transcribe")
-async def transcribe_file(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
-    transcription_model: Optional[str] = Form("AssemblyAI"), # NEW: Allow client to choose model
-    user_email: Optional[str] = Form(None), # NEW: For user-specific logic
-    language_code: Optional[str] = Form("en"), # NEW: Language code for transcription
-    speaker_labels_enabled: bool = Form(False) # NEW: Enable/disable speaker labels
-):
-    logger.info(f"Transcribe endpoint called with file: {file.filename}, model: {transcription_model}, user: {user_email}, lang: {language_code}, speakers: {speaker_labels_enabled}")
+@app.get("/api/list-gemini-models")
+async def list_gemini_models():
+    logger.info("Listing available Gemini models...")
+    if not gemini_client:
+        raise HTTPException(status_code=503, detail="Google Gemini service is not initialized (API key missing or invalid).")
     
-    # Validate chosen transcription model
-    allowed_models = ["AssemblyAI", "Deepgram", "OpenAI_Whisper"]
-    if transcription_model not in allowed_models:
-        logger.warning(f"Invalid transcription model requested: {transcription_model}")
-        raise HTTPException(status_code=400, detail=f"Invalid transcription model specified. Allowed models: {', '.join(allowed_models)}")
+    try:
+        models = genai.list_models()
+        gemini_models_info = []
+        for m in models:
+            if 'gemini' in m.name and 'generateContent' in m.supported_generation_methods:
+                gemini_models_info.append({
+                    "name": m.name,
+                    "display_name": m.display_name,
+                    "version": m.version,
+                    "supported_generation_methods": m.supported_generation_methods,
+                    "input_token_limit": m.input_token_limit,
+                    "output_token_limit": m.output_token_limit
+                })
+        logger.info(f"Found {len(gemini_models_info)} Gemini models.")
+        return {"available_gemini_models": gemini_models_info}
+    except Exception as e:
+        logger.error(f"Error listing Gemini models: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list Gemini models: {str(e)}")
 
-    # Check if file is audio or video
+@app.post("/ai/user-query")
+async def ai_user_query(
+    transcript: str = Form(...),
+    user_prompt: str = Form(...),
+    model: str = Form("claude-3-haiku-20240307"),
+    max_tokens: int = Form(1000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+
+    if not claude_client:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 100000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        if len(user_prompt) > 1000:
+            raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
+
+        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
+
+        message = claude_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            timeout=30.0,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ]
+        )
+        ai_response = message.content[0].text
+        logger.info(f"Successfully processed AI user query with {model}.")
+        return {"ai_response": ai_response}
+
+    except anthropic.APIError as e:
+        error_message = "AI service error"
+        error_details = str(e)
+        
+        if hasattr(e, 'body'):
+            try:
+                error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
+                error_details = error_data
+                logger.error(f"Anthropic API Error for user query: {error_data}")
+            except:
+                logger.error(f"Anthropic API Error for user query: {str(e)}")
+        else:
+            logger.error(f"Anthropic API Error for user query: {str(e)}")
+            
+        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
+    
+    except anthropic.APITimeoutError as e:
+        logger.error(f"Anthropic API Timeout for user query: {e}")
+        raise HTTPException(status_code=504, detail="AI service timeout. Please try again.")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI user query: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.post("/ai/user-query-gemini")
+async def ai_user_query_gemini(
+    transcript: str = Form(...),
+    user_prompt: str = Form(...),
+    model: str = Form("models/gemini-pro-latest"),
+    max_tokens: int = Form(1000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI user query endpoint (Gemini) called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+
+    if not gemini_client:
+        logger.error("Gemini client is not initialized in /ai/user-query-gemini. Check GEMINI_API_KEY.")
+        raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 100000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        if len(user_prompt) > 1000:
+            raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
+
+        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
+
+        response = gemini_client.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=40
+            )
+        )
+        if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
+            logger.warning(f"Gemini response was filtered or empty. Finish reason: {response.candidates[0].finish_reason if response.candidates else 'unknown'}")
+            return {"ai_response": "The AI was unable to process this content due to content safety filters. Please try reformulating your request or use Claude instead."}
+        
+        gemini_response = response.text
+        logger.info(f"Successfully processed AI user query with Gemini model: {model}.")
+        return {"ai_response": gemini_response}
+
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI user query with Gemini: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred with Gemini formatting: {str(e)}. Try using Claude instead.")
+
+
+@app.post("/ai/admin-format")
+async def ai_admin_format(
+    transcript: str = Form(...),
+    formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
+    model: str = Form("claude-3-5-haiku-20241022"),
+    max_tokens: int = Form(4000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+
+    if not claude_client:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 200000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
+
+        message = claude_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            timeout=60.0,
+            messages=[
+                {"role": "user", "content": full_prompt}
+            ]
+        )
+        ai_response = message.content[0].text
+        logger.info(f"Successfully processed AI admin format request with {model}.")
+        return {"formatted_transcript": ai_response}
+
+    except anthropic.APIError as e:
+        error_message = "AI service error for admin formatting"
+        error_details = str(e)
+        
+        if hasattr(e, 'body'):
+            try:
+                error_data = e.body if isinstance(e.body, dict) else {"error": str(e.body)}
+                error_details = error_data
+                logger.error(f"Anthropic API Error for admin format: {error_data}")
+            except:
+                logger.error(f"Anthropic API Error for admin format: {str(e)}")
+        else:
+            logger.error(f"Anthropic API Error for admin format: {str(e)}")
+            
+        raise HTTPException(status_code=500, detail=f"{error_message}: {error_details}")
+    
+    except anthropic.APITimeoutError as e:
+        logger.error(f"Anthropic API Timeout for admin format: {e}")
+        raise HTTPException(status_code=504, detail="AI service timeout. Please try again with a shorter transcript.")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI admin format request: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during admin formatting: {str(e)}")
+
+@app.post("/ai/admin-format-gemini")
+async def ai_admin_format_gemini(
+    transcript: str = Form(...),
+    formatting_instructions: str = Form("Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."),
+    model: str = Form("models/gemini-pro-latest"),
+    max_tokens: int = Form(4000),
+    user_plan: str = Form("free")
+):
+    logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+
+    if not gemini_client:
+        logger.error("Gemini client is not initialized in /ai/admin-format-gemini. Check GEMINI_API_KEY.")
+        raise HTTPException(status_code=503, detail=f"Google Gemini service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 200000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+        
+        full_prompt = f"Please apply the following formatting and polishing instructions to the provided transcript:\n\nInstructions: {formatting_instructions}\n\nTranscript to format:\n{transcript}"
+
+        response = gemini_client.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+                top_p=0.95,
+                top_k=40
+            )
+        )
+        if not response.candidates or not response.candidates[0].content or not response.candidates[0].content.parts:
+            logger.warning(f"Gemini response was filtered or empty. Finish reason: {response.candidates[0].finish_reason if response.candidates else 'unknown'}")
+            return {"formatted_transcript": "The AI was unable to process this content due to content safety filters. Please try reformulating your request or use Claude instead."}
+        
+        gemini_response = response.text
+        logger.info(f"Successfully processed AI admin format request with Gemini model: {model}.")
+        return {"formatted_transcript": gemini_response}
+
+    except Exception as e:
+        logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini admin formatting: {str(e)}. Try using Claude instead.")
+
+@app.post("/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    language_code: Optional[str] = Form("en"),
+    speaker_labels_enabled: bool = Form(False),
+    user_plan: str = Form("free"),
+    user_email: str = Form(""),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    logger.info(f"Main transcription endpoint called with file: {file.filename}, language: {language_code}, speaker_labels: {speaker_labels_enabled}, user_plan: {user_plan}, user_email: {user_email}")
+    
     if not file.content_type.startswith(('audio/', 'video/')):
         logger.warning(f"Invalid file type: {file.content_type}")
         raise HTTPException(status_code=400, detail="Please upload an audio or video file")
     
-    # Create a unique job ID
     job_id = str(uuid.uuid4())
-    logger.info(f"Created job ID: {job_id}")
+    logger.info(f"Created transcription job ID: {job_id}")
     
-    # Initialize job status with enhanced tracking
-    jobs[job_id] = {
-        "status": "processing",
-        "filename": file.filename,
-        "created_at": datetime.now().isoformat(),
-        "assemblyai_id": None, # Only for AssemblyAI
-        "compression_stats": None, # Only for AssemblyAI
-        "file_size_mb": 0,
-        "content_type": file.content_type,
-        "model_choice": transcription_model, # Store chosen model
-        "user_email": user_email, # Store user email
-        "language_code": language_code, # Store language code
-        "speaker_labels_enabled": speaker_labels_enabled, # Store speaker labels setting
-        "service_used": None, # To track which service actually processed it
-        "transcription": None, # Store immediate transcription result for Deepgram
-        "error": None, # Store error if any
-        "completed_at": None
-    }
-    
-    # Initialize cancellation flag
-    cancellation_flags[job_id] = False
-    logger.info(f"Job {job_id} initialized with status 'processing' for model {transcription_model}")
-    
-    # Save the uploaded file temporarily
     try:
         logger.info(f"Saving uploaded file {file.filename} temporarily...")
-        # Save original file
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
         
-        # Calculate and store file size
         file_size_mb = len(content) / (1024 * 1024)
-        jobs[job_id]["file_size_mb"] = round(file_size_mb, 2)
         
-        logger.info(f"File saved to: {tmp_path} (Size: {file_size_mb:.2f} MB)")
+        audio_characteristics = await analyze_audio_characteristics(tmp_path)
+        duration_seconds = audio_characteristics.get("duration_seconds", 0)
+        duration_minutes = duration_seconds / 60.0
+        
+        logger.info(f"Audio analysis: {duration_minutes:.1f} minutes, {file_size_mb:.2f} MB")
+        
+        jobs[job_id] = {
+            "status": "processing",
+            "filename": file.filename,
+            "created_at": datetime.now().isoformat(),
+            "file_size_mb": round(file_size_mb, 2),
+            "content_type": file.content_type,
+            "requested_language": language_code,
+            "speaker_labels_enabled": speaker_labels_enabled,
+            "user_plan": user_plan,
+            "user_email": user_email,
+            "duration_minutes": duration_minutes,
+            "duration_seconds": duration_seconds
+        }
+        
+        cancellation_flags[job_id] = False
+        logger.info(f"Job {job_id} initialized with status 'processing'")
         
     except Exception as e:
         logger.error(f"ERROR processing file for job {job_id}: {str(e)}")
-        # Clean up job tracking
         if job_id in jobs:
             del jobs[job_id]
         if job_id in cancellation_flags:
             del cancellation_flags[job_id]
         raise HTTPException(status_code=500, detail="Failed to process audio file")
 
-    # Add the processing to background task, passing all relevant parameters
     background_tasks.add_task(
         process_transcription_job, 
         job_id, 
         tmp_path, 
         file.filename, 
-        transcription_model, 
+        language_code, 
+        speaker_labels_enabled, 
+        user_plan, 
+        duration_minutes,
         user_email,
-        language_code,
-        speaker_labels_enabled,
-        file.content_type # Pass content_type for Deepgram service
+        file.content_type
     )
     
-    # Return immediate response with enhanced info
     logger.info(f"Returning immediate response for job ID: {job_id}")
     return {
         "job_id": job_id, 
         "status": jobs[job_id]["status"],
         "filename": file.filename,
         "file_size_mb": jobs[job_id]["file_size_mb"],
+        "duration_minutes": duration_minutes,
         "created_at": jobs[job_id]["created_at"],
-        "model_choice": transcription_model,
-        "user_email": user_email
+        "logic_used": f"UserPlan:{user_plan}, Email:{user_email}, Admin:{is_admin_user(user_email)}"
     }
+
+@app.post("/generate-formatted-word")
+async def generate_formatted_word(request: FormattedWordDownloadRequest):
+    logger.info(f"Generating formatted Word document for {request.filename}")
+    try:
+        document = Document()
+        lines = request.transcription_html.split('\n')
+        
+        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)</strong>(.*)')
+        
+        for line in lines:
+            if line.strip():
+                p = document.add_paragraph()
+                
+                match = speaker_tag_pattern.match(line)
+                if match:
+                    speaker_label_text = match.group(1)
+                    remaining_text = match.group(2).strip()
+
+                    run = p.add_run(speaker_label_text)
+                    run.bold = True
+                    
+                    if remaining_text:
+                        p.add_run(" " + remaining_text)
+                else:
+                    clean_line = re.sub(r'<[^>]*>', '', line).strip()
+                    if clean_line:
+                        p.add_run(clean_line)
+
+        file_stream = BytesIO()
+        document.save(file_stream)
+        file_stream.seek(0)
+
+        return StreamingResponse(
+            file_stream,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename={request.filename}"}
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating formatted Word document: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate formatted Word document: {str(e)}")
 
 @app.get("/status/{job_id}")
 async def get_job_status(job_id: str):
@@ -1115,95 +1939,70 @@ async def get_job_status(job_id: str):
     
     job_data = jobs[job_id]
     
-    # If job is cancelled, return cancelled status immediately
     if job_data["status"] == "cancelled" or cancellation_flags.get(job_id, False):
         logger.info(f"Job {job_id} was cancelled, returning cancelled status")
-        job_data["status"] = "cancelled"  # Ensure status is set correctly
-        return job_data
+        job_data["status"] = "cancelled"
     
-    # If a service that requires polling (like AssemblyAI) was used and is still processing
-    if job_data.get("service_used") == "assemblyai" and job_data["status"] == "processing" and job_data["assemblyai_id"]:
-        logger.info(f"Polling AssemblyAI for status of transcript ID: {job_data['assemblyai_id']}")
-        headers = {"authorization": ASSEMBLYAI_API_KEY}
-        transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{job_data['assemblyai_id']}"
-        
-        try:
-            # Check for cancellation before making API call
-            if cancellation_flags.get(job_id, False):
-                logger.info(f"Job {job_id} was cancelled during status check")
-                job_data.update({
-                    "status": "cancelled",
-                    "cancelled_at": datetime.now().isoformat(),
-                    "error": "Job was cancelled by user"
-                })
-                return job_data
+    # AssemblyAI requires polling, so check its status if it was the last service attempted and is still processing
+    if job_data.get("service_used") == "assemblyai" and job_data["status"] == "processing":
+        assemblyai_id = job_data.get("assemblyai_id")
+        if assemblyai_id:
+            logger.info(f"Polling AssemblyAI for status of transcript ID: {assemblyai_id}")
+            headers = {"authorization": ASSEMBLYAI_API_KEY}
+            transcript_endpoint = f"https://api.assemblyai.com/v2/transcript/{assemblyai_id}"
             
-            response_data = requests.get(transcript_endpoint, headers=headers)
-            
-            if response_data.status_code != 200:
-                logger.error(f"AssemblyAI status check failed: {response_data.status_code} - {response_data.text}")
-                job_data.update({
-                    "status": "failed",
-                    "error": f"Failed to get status from AssemblyAI: {response_data.text}",
-                    "completed_at": datetime.now().isoformat()
-                })
-                return job_data
-            
-            assemblyai_result = response_data.json()
-            
-            # Check if job was cancelled while AssemblyAI was processing
-            if cancellation_flags.get(job_id, False) or job_data["status"] == "cancelled":
-                logger.info(f"Job {job_id} was cancelled during AssemblyAI processing")
-                job_data.update({
-                    "status": "cancelled",
-                    "cancelled_at": datetime.now().isoformat(),
-                    "error": "Job was cancelled by user"
-                })
-                return job_data
-            
-            if assemblyai_result["status"] == "completed":
-                logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} completed.")
-                job_data.update({
-                    "status": "completed",
-                    "transcription": assemblyai_result["text"],
-                    "language": assemblyai_result["language_code"],
-                    "completed_at": datetime.now().isoformat(),
-                    "word_count": len(assemblyai_result["text"].split()) if assemblyai_result["text"] else 0,
-                    "duration_seconds": assemblyai_result.get("audio_duration", 0)
-                })
-            elif assemblyai_result["status"] == "error":
-                logger.error(f"AssemblyAI transcription {job_data['assemblyai_id']} failed: {assemblyai_result.get('error', 'Unknown error')}")
-                job_data.update({
-                    "status": "failed",
-                    "error": assemblyai_result.get("error", "Transcription failed on AssemblyAI"),
-                    "completed_at": datetime.now().isoformat()
-                })
-            else:
-                logger.info(f"AssemblyAI transcription {job_data['assemblyai_id']} status: {assemblyai_result['status']}")
-                # Update job with current AssemblyAI status for better tracking
-                job_data["assemblyai_status"] = assemblyai_result["status"]
-        
-        except Exception as e:
-            logger.error(f"Error polling AssemblyAI status: {str(e)}")
-            job_data.update({
-                "status": "failed",
-                "error": f"Error checking transcription status: {str(e)}",
-                "completed_at": datetime.now().isoformat()
-            })
-    # If Deepgram was used, its transcription is handled synchronously within process_transcription_job.
-    # So, if Deepgram was the chosen service, the status in job_data should already be final (completed/failed).
-    # No further polling is needed here.
-    elif job_data.get("service_used") == "deepgram" and job_data["status"] == "processing":
-        # This case implies the background task for Deepgram is still running or just finished.
-        # The `process_transcription_job` updates the status directly for Deepgram.
-        # So we just return the current `job_data` which will reflect the final state once the task completes.
-        pass
+            try:
+                if cancellation_flags.get(job_id, False):
+                    logger.info(f"Job {job_id} was cancelled during AssemblyAI status check")
+                    job_data.update({"status": "cancelled", "cancelled_at": datetime.now().isoformat(), "error": "Job was cancelled by user"})
+                    return job_data
+                
+                response_data = requests.get(transcript_endpoint, headers=headers)
+                if response_data.status_code != 200:
+                    logger.error(f"AssemblyAI status check failed: {response_data.status_code} - {response_data.text}")
+                    job_data.update({"status": "failed", "error": f"Failed to get status from AssemblyAI: {response_data.text}", "completed_at": datetime.now().isoformat()})
+                    return job_data
+                
+                assemblyai_result = response_data.json()
+                
+                if cancellation_flags.get(job_id, False):
+                    logger.info(f"Job {job_id} was cancelled during AssemblyAI processing update")
+                    job_data.update({"status": "cancelled", "cancelled_at": datetime.now().isoformat(), "error": "Job was cancelled by user"})
+                    return job_data
+                
+                if assemblyai_result["status"] == "completed":
+                    logger.info(f"AssemblyAI transcription {assemblyai_id} completed.")
+                    transcription_text = assemblyai_result["text"]
+                    if job_data.get("speaker_labels_enabled") and assemblyai_result.get("utterances"):
+                        formatted_transcript = ""
+                        for utterance in assemblyai_result.get("utterances"):
+                            speaker_letter = utterance['speaker']
+                            speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
+                            formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
+                        transcription_text = formatted_transcript.strip()
+
+                    job_data.update({
+                        "status": "completed",
+                        "transcription": transcription_text,
+                        "language": assemblyai_result["language_code"],
+                        "completed_at": datetime.now().isoformat(),
+                        "word_count": len(transcription_text.split()) if transcription_text else 0,
+                        "duration_seconds": assemblyai_result.get("audio_duration", 0)
+                    })
+                elif assemblyai_result["status"] == "error":
+                    logger.error(f"AssemblyAI transcription {assemblyai_id} failed: {assemblyai_result.get('error', 'Unknown error')}")
+                    job_data.update({"status": "failed", "error": assemblyai_result.get("error", "Transcription failed on AssemblyAI"), "completed_at": datetime.now().isoformat()})
+                else:
+                    logger.info(f"AssemblyAI transcription {assemblyai_id} status: {assemblyai_result['status']}")
+                    job_data["assemblyai_status"] = assemblyai_result["status"] # Update status
+            except Exception as e:
+                logger.error(f"Error polling AssemblyAI status for job {job_id}: {str(e)}")
+                job_data.update({"status": "failed", "error": f"Error checking transcription status: {str(e)}", "completed_at": datetime.now().isoformat()})
     
     return job_data
 
 @app.post("/cancel/{job_id}")
 async def cancel_job(job_id: str):
-    """Enhanced cancel endpoint with comprehensive job termination"""
     logger.info(f"Cancel request received for job ID: {job_id}")
     
     if job_id not in jobs:
@@ -1213,24 +2012,21 @@ async def cancel_job(job_id: str):
     job_data = jobs[job_id]
     
     try:
-        # Set cancellation flag immediately
         cancellation_flags[job_id] = True
         logger.info(f"Cancellation flag set for job {job_id}")
         
-        # Cancel the background task if it's still running
         if job_id in active_background_tasks:
             task = active_background_tasks[job_id]
             if not task.done():
                 logger.info(f"Cancelling active background task for job {job_id}")
                 task.cancel()
                 try:
-                    await asyncio.wait_for(task, timeout=2.0)  # Wait up to 2 seconds for graceful cancellation
+                    await asyncio.wait_for(task, timeout=2.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     logger.info(f"Background task for job {job_id} cancelled (timeout/cancelled)")
             else:
                 logger.info(f"Background task for job {job_id} was already completed")
         
-        # Update job status to cancelled
         job_data.update({
             "status": "cancelled",
             "cancelled_at": datetime.now().isoformat(),
@@ -1253,13 +2049,13 @@ async def cancel_job(job_id: str):
         
     except Exception as e:
         logger.error(f"Error cancelling job {job_id}: {str(e)}")
-        # Even if there's an error, mark the job as cancelled
         job_data.update({
             "status": "cancelled",
             "cancelled_at": datetime.now().isoformat(),
             "error": f"Job cancelled with errors: {str(e)}"
         })
         raise HTTPException(status_code=500, detail=f"Job cancelled but with errors: {str(e)}")
+
 @app.post("/compress-download")
 async def compress_download(file: UploadFile = File(...), quality: str = "high"):
     """Endpoint to compress audio files for download"""
@@ -1270,24 +2066,19 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
         raise HTTPException(status_code=400, detail="Please upload an audio or video file")
     
     try:
-        # Save uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
             content = await file.read()
             tmp.write(content)
             input_path = tmp.name
         
-        # Compress for download
         output_path = compress_audio_for_download(input_path, quality=quality)
         
-        # Read compressed file
         with open(output_path, 'rb') as f:
             compressed_content = f.read()
         
-        # Clean up files
         os.unlink(input_path)
         os.unlink(output_path)
         
-        # Return compressed file
         from fastapi.responses import Response as FastAPIResponse
         return FastAPIResponse(
             content=compressed_content,
@@ -1297,11 +2088,10 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
         
     except Exception as e:
         logger.error(f"Error compressing file for download: {e}")
-        raise HTTPException(status_code=500, detail="Failed to compress audio file")
+        raise HTTPException(status_code=500, detail=f"Failed to compress audio file: {str(e)}")
 
 @app.delete("/cleanup")
 async def cleanup_old_jobs():
-    """Enhanced cleanup endpoint with better job management"""
     logger.info("Cleanup endpoint called")
     
     current_time = datetime.now()
@@ -1310,14 +2100,12 @@ async def cleanup_old_jobs():
     flags_to_remove = []
     
     for job_id, job_data in jobs.items():
-        # Remove jobs older than 1 hour
         created_at = datetime.fromisoformat(job_data["created_at"])
         age_hours = (current_time - created_at).total_seconds() / 3600
         
         if age_hours > 1 and job_data["status"] in ["completed", "failed", "cancelled"]:
             jobs_to_remove.append(job_id)
             
-            # Also clean up related tracking
             if job_id in active_background_tasks:
                 task = active_background_tasks[job_id]
                 if not task.done():
@@ -1326,7 +2114,6 @@ async def cleanup_old_jobs():
             if job_id in cancellation_flags:
                 flags_to_remove.append(job_id)
     
-    # Cancel old background tasks
     for job_id, task in tasks_to_cancel:
         try:
             task.cancel()
@@ -1334,7 +2121,6 @@ async def cleanup_old_jobs():
         except Exception as e:
             logger.error(f"Error cancelling old task {job_id}: {e}")
     
-    # Remove old jobs and tracking data
     for job_id in jobs_to_remove:
         del jobs[job_id]
         logger.info(f"Cleaned up old job: {job_id}")
@@ -1362,7 +2148,6 @@ async def cleanup_old_jobs():
 
 @app.get("/jobs")
 async def list_jobs():
-    """Enhanced jobs list endpoint with better information"""
     logger.info("Jobs list endpoint called")
     
     job_summary = {}
@@ -1370,19 +2155,21 @@ async def list_jobs():
         job_summary[job_id] = {
             "status": job_data["status"],
             "filename": job_data.get("filename", "unknown"),
-            "created_at": job_data["created_at"],
+            "created_at": datetime.fromisoformat(job_data["created_at"]).strftime('%Y-%m-%d %H:%M:%S'),
             "file_size_mb": job_data.get("file_size_mb", 0),
-            "model_choice": job_data.get("model_choice", "unknown"), # NEW
-            "service_used": job_data.get("service_used", "pending"), # NEW
-            "user_email": job_data.get("user_email", "N/A"), # NEW
-            "language_code": job_data.get("language_code", "en"), # NEW
-            "speaker_labels_enabled": job_data.get("speaker_labels_enabled", False), # NEW
-            "assemblyai_id": job_data.get("assemblyai_id"),
-            "assemblyai_status": job_data.get("assemblyai_status"),
+            "duration_minutes": job_data.get("duration_minutes", 0),
+            "user_plan": job_data.get("user_plan", "unknown"),
+            "user_email": job_data.get("user_email", "unknown"),
+            "is_admin": is_admin_user(job_data.get("user_email", "")),
+            "primary_service": job_data.get("tier_1_service"),
+            "service_used": job_data.get("service_used"),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
             "word_count": job_data.get("word_count"),
-            "duration_seconds": job_data.get("duration_seconds")
+            "duration_seconds": job_data.get("duration_seconds"),
+            "requested_language": job_data.get("requested_language", "en"),
+            "speaker_labels_enabled": job_data.get("speaker_labels_enabled", False),
+            "selection_reason": job_data.get("selection_reason", "unknown")
         }
     
     return {
@@ -1390,6 +2177,8 @@ async def list_jobs():
         "active_background_tasks": len(active_background_tasks),
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
+        "admin_emails": ADMIN_EMAILS,
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -1400,7 +2189,6 @@ async def list_jobs():
 
 @app.get("/health")
 async def health_check():
-    """Enhanced health check endpoint"""
     logger.info("Health check endpoint called")
     
     try:
@@ -1427,8 +2215,30 @@ async def health_check():
             },
             "integrations": {
                 "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "deepgram_configured": bool(DEEPGRAM_SERVICE_URL), # NEW
-                "paystack_configured": bool(PAYSTACK_SECRET_KEY)
+                "anthropic_configured": bool(ANTHROPIC_API_KEY),
+                "openai_configured": bool(OPENAI_API_KEY),
+                "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
+                "google_gemini_configured": bool(GEMINI_API_KEY),
+                "deepgram_configured": bool(DEEPGRAM_API_KEY) or bool(DEEPGRAM_RENDER_SERVICE_URL)
+            },
+            "transcription_logic": {
+                "free_user_transcription": f"Primary={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ_OPENAI_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_DEEPGRAM_NAME}",
+                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ_OPENAI_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_DEEPGRAM_NAME}",
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ_ASSEMBLYAI_NAME} first → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}",
+                "dedicated_deepgram_test_user": "njokigituku@gmail.com (Deepgram only, no fallback)",
+                "free_users_assemblyai_model": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} nano model",
+                "paid_users_assemblyai_model": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} best model",
+                "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
+                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+                "openai_whisper": f"{TYPEMYWORDZ_OPENAI_NAME}",
+                "assemblyai": f"{TYPEMYWORDZ_ASSEMBLYAI_NAME}",
+                "deepgram": f"{TYPEMYWORDZ_DEEPGRAM_NAME}",
+                "anthropic_ai": f"{TYPEMYWORDZ_AI_NAME} (Anthropic Claude)",
+                "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
+                "admin_emails": ADMIN_EMAILS
             }
         }
         
@@ -1444,69 +2254,82 @@ async def health_check():
 
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
-# Final validation and startup logging
 logger.info("Performing final system validation...")
-logger.info(f"AssemblyAI API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
-logger.info(f"Deepgram Service URL configured: {bool(DEEPGRAM_SERVICE_URL)}") # NEW
+logger.info(f"{TYPEMYWORDZ_ASSEMBLYAI_NAME} API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
+logger.info(f"{TYPEMYWORDZ_OPENAI_NAME} Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
+logger.info(f"{TYPEMYWORDZ_DEEPGRAM_NAME} API Key configured: {bool(DEEPGRAM_API_KEY)}")
+logger.info(f"{TYPEMYWORDZ_DEEPGRAM_NAME} Render Service URL configured: {bool(DEEPGRAM_RENDER_SERVICE_URL)}")
+logger.info(f"{TYPEMYWORDZ_AI_NAME} (Anthropic) API Key configured: {bool(ANTHROPIC_API_KEY)}")
+logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
+logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
+logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
+logger.info(f"UPDATED: Google Gemini and Anthropic Claude now available for ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
 logger.info(f"  - Cancellation flags: {len(cancellation_flags)} flags")
-
-# Log all available endpoints
-logger.info("Available API endpoints (updated):")
-logger.info("  POST /transcribe - Start new transcription job (supports AssemblyAI, Deepgram, OpenAI_Whisper)") # UPDATED
-logger.info("  GET /status/{job_id} - Check job status")
-logger.info("  POST /cancel/{job_id} - Cancel transcription job")
-logger.info("  POST /compress-download - Compress audio for download")
+logger.info("Available API endpoints:")
+logger.info("  POST /transcribe - Main transcription endpoint with smart service selection")
+logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points) with Claude")
+logger.info("  POST /ai/user-query-gemini - Process user-driven AI queries with Gemini (NOW FOR ALL PAID USERS)")
+logger.info("  POST /ai/admin-format - Process admin-driven AI formatting requests (Anthropic Claude)")
+logger.info("  POST /ai/admin-format-gemini - Process admin-driven AI formatting requests (Google Gemini - NOW FOR ALL PAID USERS)")
 logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payment")
 logger.info("  POST /api/verify-payment - Verify Paystack payment")
 logger.info("  POST /api/paystack-webhook - Handle Paystack webhooks")
-logger.info("  GET /api/paystack-status - Get Paystack integration status")
+logger.info("  GET /api/paystack-status - Get integration status")
+logger.info("  GET /api/list-gemini-models - List available Gemini models")
+logger.info("  GET /status/{job_id} - Check job status")
+logger.info("  POST /cancel/{job_id} - Cancel transcription job")
+logger.info("  POST /compress-download - Compress audio for download")
+logger.info("  POST /generate-formatted-word - Generate formatted Word document with speaker labels")
 logger.info("  GET /jobs - List all jobs")
 logger.info("  GET /health - System health check")
 logger.info("  DELETE /cleanup - Clean up old jobs")
 logger.info("  GET / - Root endpoint with service info")
 
-# Run this if the file is executed directly
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     host = os.environ.get("HOST", "0.0.0.0")
     
-    logger.info(f"Starting enhanced transcription service with Paystack payments on {host}:{port}")
-    logger.info("🚀 ENHANCED FEATURES ENABLED:")
-    logger.info("  ✅ Ultra-aggressive audio compression (16k bitrate, 8kHz)")
-    logger.info("  ✅ Comprehensive job cancellation system")
-    logger.info("  ✅ Background task management with proper cleanup")
-    logger.info("  ✅ Real-time status tracking with AssemblyAI polling")
-    logger.info("  ✅ Enhanced error handling and recovery")
-    logger.info("  ✅ System health monitoring every 30 seconds")
-    logger.info("  ✅ Automatic cleanup of old jobs (1+ hours)")
-    logger.info("  ✅ Detailed logging and debugging support")
-    logger.info("  ✅ CORS enabled for frontend integration")
-    logger.info("  ✅ Multiple cancellation checkpoints during processing")
+    logger.info(f"Starting enhanced transcription service on {host}:{port}")
+    logger.info("🚀 NEW ENHANCED FEATURES:")
+    logger.info(f"  ✅ {TYPEMYWORDZ_DEEPGRAM_NAME} integrated for transcription")
+    logger.info(f"  ✅ Smart service selection with updated three-tier logic")
+    logger.info(f"  ✅ Three-tier automatic fallback system")
+    logger.info(f"  ✅ Admin email-based service prioritization")
+    logger.info(f"  ✅ Speaker diarization for {TYPEMYWORDZ_ASSEMBLYAI_NAME} and {TYPEMYWORDZ_DEEPGRAM_NAME}")
+    logger.info(f"  ✅ Dynamic {TYPEMYWORDZ_ASSEMBLYAI_NAME} model selection (nano for free, best for paid)")
+    logger.info("  ✅ Unified transcription processing pipeline")
+    logger.info("  ✅ Enhanced error handling and service resilience")
+    logger.info("  ✅ Comprehensive job tracking and cancellation")
     logger.info("  ✅ Paystack payment integration")
-    logger.info("  ✅ Webhook handling for payment events")
-    logger.info("  ✅ Subscription management endpoints (via Paystack/future 2Checkout)")
-    logger.info("  ✅ Multi-currency support (NGN, KES, GHS, ZAR, USD)")
-    logger.info("  ✅ Multiple transcription models (AssemblyAI, Deepgram, OpenAI_Whisper placeholder)") # NEW
-    logger.info("  ✅ User-specific fallback logic for Deepgram") # NEW
+    logger.info("  ✅ Multi-language support")
+    logger.info("  ✅ Formatted Word document generation")
+    logger.info(f"  ✅ User-driven AI features (summarization, Q&A, and bullet points) via {TYPEMYWORDZ_AI_NAME} (Anthropic Claude)")
+    logger.info(f"  ✅ Admin-driven AI formatting via {TYPEMYWORDZ_AI_NAME} (Anthropic Claude) and Google Gemini")
+    logger.info(f"  ✅ Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS")
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
+    logger.info("  🆕 UPDATED: Google Gemini and Anthropic Claude now accessible to ALL paid AI users, not just admins")
     
-    logger.info("🔧 TECHNICAL IMPROVEMENTS:")
-    logger.info("  - Cancellation flags prevent race conditions")
-    logger.info("  - Background tasks are properly tracked and cancelled")
-    logger.info("  - File cleanup happens even on cancellation")
-    logger.info("  - AssemblyAI jobs continue but results are ignored when cancelled")
-    logger.info("  - Enhanced status endpoint with detailed job information")
-    logger.info("  - Comprehensive health monitoring and system stats")
-    logger.info("  - Paystack payment verification and webhook handling")
-    logger.info("  - Secure webhook signature verification (TODO)")
-    logger.info("  - Single payment system for global coverage (Paystack first, then 2Checkout)")
-    logger.info("  - Dynamic model selection for transcription") # NEW
-    logger.info("  - Robust fallback mechanism for Deepgram failures") # NEW
+    logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}")
+    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}")
+    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ_OPENAI_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_DEEPGRAM_NAME}")
+    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ_OPENAI_NAME} → Fallback1={TYPEMYWORDZ_ASSEMBLYAI_NAME} → Fallback2={TYPEMYWORDZ_DEEPGRAM_NAME}")
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ_ASSEMBLYAI_NAME} first → Fallback1={TYPEMYWORDZ_DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ_OPENAI_NAME}")
+    logger.info(f"  - Dedicated Deepgram Test User (njokigituku@gmail.com): Primary={TYPEMYWORDZ_DEEPGRAM_NAME} (no fallback)")
+    logger.info(f"  - Free users: {TYPEMYWORDZ_ASSEMBLYAI_NAME} nano model")
+    logger.info(f"  - Paid users: {TYPEMYWORDZ_ASSEMBLYAI_NAME} best model")
+    logger.info(f"  - {TYPEMYWORDZ_OPENAI_NAME}: OpenAI Whisper-1 (typically does NOT support speaker labels)")
+    logger.info(f"  - {TYPEMYWORDZ_ASSEMBLYAI_NAME}: AssemblyAI (supports speaker labels)")
+    logger.info(f"  - {TYPEMYWORDZ_DEEPGRAM_NAME}: Deepgram (supports speaker labels)")
+    logger.info(f"  - {TYPEMYWORDZ_AI_NAME} (Anthropic Claude 3 Haiku / 3.5 Haiku) for user AI text processing")
+    logger.info(f"  - Google Gemini for AI text processing - NOW AVAILABLE FOR ALL PAID AI USERS")
     
     try:
         uvicorn.run(
@@ -1515,12 +2338,12 @@ if __name__ == "__main__":
             port=port,
             log_level="info",
             access_log=True,
-            reload=False,  # Disable reload in production
-            workers=1      # Single worker to maintain job state consistency
+            reload=False,
+            workers=1
         )
     except Exception as e:
         logger.error(f"Failed to start server: {e}")
         sys.exit(1)
 else:
     logger.info("Application loaded as module")
-    logger.info("Ready to handle requests with enhanced job cancellation & Paystack payment support")
+    logger.info(f"Ready to handle requests with {TYPEMYWORDZ_OPENAI_NAME} + {TYPEMYWORDZ_ASSEMBLYAI_NAME} + {TYPEMYWORDZ_DEEPGRAM_NAME} + {TYPEMYWORDZ_AI_NAME} (Anthropic) + Google Gemini integration")
