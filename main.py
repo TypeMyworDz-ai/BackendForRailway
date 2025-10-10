@@ -790,7 +790,10 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
     """Calls the dedicated OpenAI Whisper service deployed on Render."""
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
         logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping {TYPEMYWORDZ2_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ2_NAME} Service URL not configured")
+        return {
+            "status": "failed",
+            "error": "Transcription service unavailable. Please try again later."
+        }
 
     try:
         logger.info(f"Calling {TYPEMYWORDZ2_NAME} service for job {job_id} at {OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe")
@@ -828,19 +831,19 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
         logger.error(f"{TYPEMYWORDZ2_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
+            "error": "Transcription failed due to a service error. Please try again."
         }
     except httpx.RequestError as e:
         logger.error(f"{TYPEMYWORDZ2_NAME} service network error for job {job_id}: {e}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} service network error: {e}"
+            "error": "Transcription failed due to a network issue. Please check your connection and try again."
         }
     except Exception as e:
         logger.error(f"{TYPEMYWORDZ2_NAME} transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ2_NAME} transcription failed: {str(e)}"
+            "error": "Transcription failed. Please try again later."
         }
     finally:
         pass
@@ -849,7 +852,10 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
     """Transcribe audio using AssemblyAI API"""
     if not ASSEMBLYAI_API_KEY:
         logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping {TYPEMYWORDZ1_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{TYPEMYWORDZ1_NAME} API Key not configured")
+        return {
+            "status": "failed",
+            "error": "Transcription service unavailable. Please try again later."
+        }
 
     try:
         logger.info(f"Starting {TYPEMYWORDZ1_NAME} transcription with {model} model for job {job_id}")
@@ -874,7 +880,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             upload_response = requests.post(upload_endpoint, headers=headers, data=f)
         
         if upload_response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Failed to upload audio to {TYPEMYWORDZ1_NAME}: {upload_response.text}")
+            raise Exception(f"Failed to upload audio to {TYPEMYWORDZ1_NAME}: {upload_response.text}")
         
         upload_result = upload_response.json()
         audio_url = upload_result["upload_url"]
@@ -897,7 +903,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
         transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
         
         if transcript_response.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Failed to start transcription on {TYPEMYWORDZ1_NAME}: {transcript_response.text}")
+            raise Exception(f"Failed to start transcription on {TYPEMYWORDZ1_NAME}: {transcript_response.text}")
         
         transcript_result = transcript_response.json()
         transcript_id = transcript_result["id"]
@@ -915,7 +921,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             status_response = requests.get(f"https://api.assemblyai.com/v2/transcript/{transcript_id}", headers={"authorization": ASSEMBLYAI_API_KEY})
             
             if status_response.status_code != 200:
-                raise HTTPException(status_code=500, detail=f"Failed to get status from {TYPEMYWORDZ1_NAME}: {status_response.text}")
+                raise Exception(f"Failed to get status from {TYPEMYWORDZ1_NAME}: {status_response.text}")
             
             status_result = status_response.json()
             
@@ -951,7 +957,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                     "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances"))
                 }
             elif status_result["status"] == "error":
-                raise HTTPException(status_code=500, detail=status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}"))
+                raise Exception(status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}"))
             else:
                 logger.info(f"{TYPEMYWORDZ1_NAME} status: {status_result['status']}")
                 continue
@@ -963,14 +969,17 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
         logger.error(f"{TYPEMYWORDZ1_NAME} transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{TYPEMYWORDZ1_NAME} transcription failed: {str(e)}"
+            "error": "Transcription failed. Please try again later."
         }
 
 async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Calls the dedicated Deepgram service deployed on Render."""
     if not DEEPGRAM_SERVICE_RAILWAY_URL: # NEW: Check for URL
         logger.error(f"{DEEPGRAM_NAME} Service URL not configured, skipping {DEEPGRAM_NAME} for job {job_id}")
-        raise HTTPException(status_code=500, detail=f"{DEEPGRAM_NAME} Service URL not configured")
+        return {
+            "status": "failed",
+            "error": "Transcription service unavailable. Please try again later."
+        }
 
     try:
         logger.info(f"Calling {DEEPGRAM_NAME} service for job {job_id} at {DEEPGRAM_SERVICE_RAILWAY_URL}/transcribe") # NEW: Call Render URL
@@ -1011,19 +1020,19 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         logger.error(f"{DEEPGRAM_NAME} service HTTP error for job {job_id}: {e.response.status_code} - {e.response.text}")
         return {
             "status": "failed",
-            "error": f"{DEEPGRAM_NAME} service HTTP error: {e.response.status_code} - {e.response.text}"
+            "error": "Transcription failed due to a service error. Please try again."
         }
     except httpx.RequestError as e:
         logger.error(f"{DEEPGRAM_NAME} service network error for job {job_id}: {e}")
         return {
             "status": "failed",
-            "error": f"{DEEPGRAM_NAME} service network error: {e}"
+            "error": "Transcription failed due to a network issue. Please check your connection and try again."
         }
     except Exception as e:
         logger.error(f"{DEEPGRAM_NAME} transcription failed for job {job_id}: {str(e)}")
         return {
             "status": "failed",
-            "error": f"{DEEPGRAM_NAME} transcription failed: {str(e)}"
+            "error": "Transcription failed. Please try again later."
         }
     finally:
         pass
@@ -1265,7 +1274,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.error(f"❌ All transcription services failed for job {job_id}. Services attempted: {services_attempted}")
             job_data.update({
                 "status": "failed",
-                "error": f"All transcription services failed. Services attempted: {', '.join(services_attempted)}",
+                "error": "Transcription failed after multiple attempts. Please try again later.",
                 "completed_at": datetime.now().isoformat(),
                 "services_attempted": services_attempted
             })
@@ -1312,7 +1321,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         logger.error(f"Transcription job: Full traceback: {traceback.format_exc()}")
         job_data.update({
             "status": "failed",
-            "error": f"Internal server error during transcription: {str(e)}",
+            "error": "An unexpected error occurred during transcription. Please try again later.",
             "completed_at": datetime.now().isoformat()
         })
     finally:
