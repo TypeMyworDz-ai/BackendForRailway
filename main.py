@@ -52,8 +52,8 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 
 # Admin email addresses
 ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
-# Dedicated Deepgram Tester
-DEEPGRAM_TESTER_EMAIL = 'njokigituku@gmail.com'
+# Dedicated AssemblyAI Tester
+ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com' # Renamed from DEEPGRAM_TESTER_EMAIL
 
 def install_ffmpeg():
     try:
@@ -94,7 +94,7 @@ logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}")
 logger.info(f"DEBUG: DEEPGRAM_SERVICE_RAILWAY_URL loaded value: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}") # NEW
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"DEBUG: Deepgram Tester email: {DEEPGRAM_TESTER_EMAIL}")
+logger.info(f"DEBUG: AssemblyAI Tester email: {ASSEMBLYAI_TESTER_EMAIL}") # Updated log
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -175,7 +175,7 @@ else:
 
 
 def is_paid_ai_user(user_plan: str) -> bool:
-    paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
+    paid_plans_for_ai = ['Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan'] # Updated for new plan names
     return user_plan in paid_plans_for_ai
 
 def is_admin_user(user_email: str) -> bool:
@@ -187,15 +187,14 @@ def is_admin_user(user_email: str) -> bool:
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
     Logic for service selection based on new rules, including Deepgram.
-    - OpenAI: First option for Weekly, Monthly, Yearly subscribers and Admins (Admins gets this logic no matter what plans they have subscribed to). Fallback is Assembly > Deepgram.
-    - Deepgram: First option for free and one-day subscribers. Fallback Assembly > OpenAI (free and one-day subscribers don't get TypeMyworDz Assistant)
-    - Assembly: First option for three-day plans users. fallback is OpenAI > Deepgram.
-    - All instances of speaker tags requests: First option Assembly, fallback Deepgram.
-    - njokigituku@gmail.com is still the dedicated TESTER of Deepgram, which means for them there is no fallback if Deepgram fails.
+    - OpenAI: First option for weekly subscribers, yearly, and Admins (Admins gets this logic no matter what plans they have subscribed to). Fallback is Assembly > Deepgram.
+    - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
+    - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
+    - njokigituku@gmail.com will now be using AssemblyAI, which means for them there is no fallback if Assembly fails.
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
-    is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
+    is_assemblyai_tester = (user_email and user_email.lower().strip() == ASSEMBLYAI_TESTER_EMAIL.lower()) # Updated variable
 
     # --- Initialize tiers ---
     tier_1 = None
@@ -203,10 +202,10 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     tier_3 = None
     reason = "default_logic"
 
-    # --- Dedicated Deepgram Tester Logic ---
-    if is_deepgram_tester:
-        tier_1 = "deepgram"
-        reason = "dedicated_deepgram_tester"
+    # --- Dedicated AssemblyAI Tester Logic ---
+    if is_assemblyai_tester: # Updated variable
+        tier_1 = "assemblyai" 
+        reason = "dedicated_assemblyai_tester" # Updated reason
         # No fallbacks for the dedicated tester as per requirement
         return {
             "tier_1": tier_1,
@@ -215,29 +214,33 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "reason": reason
         }
 
-    # --- Speaker Labels Logic (Overrides other plan-based logic if enabled) ---
+    # --- Speaker Labels Logic ---
+    # As per request: "All instances of speaker tags requests: First option Assembly, fallback Deepgram."
     if speaker_labels_enabled:
         tier_1 = "assemblyai"
         tier_2 = "deepgram"
-        tier_3 = None  # No OpenAI for speaker tags as per request (only Assembly > Deepgram)
+        tier_3 = None  # No OpenAI for speaker tags as per request
         reason = "speaker_labels_requested_prioritizing_assemblyai"
     
     # --- Plan-based Logic (if speaker labels are not enabled or already set) ---
-    elif is_admin or user_plan in ['One-Week Plan', 'Monthly Plan', 'Yearly Plan']: # Weekly, Monthly, Yearly and Admins
+    # OpenAI: First option for weekly subscribers, yearly, and Admins. Fallback is Assembly > Deepgram.
+    elif is_admin or user_plan in ['One-Week Plan', 'Yearly Plan']:
         tier_1 = "openai_whisper"
         tier_2 = "assemblyai"
         tier_3 = "deepgram"
         reason = f"admin_or_{user_plan.lower().replace(' ', '_')}_prioritizing_openai"
-    elif user_plan == 'Free' or user_plan == 'One-Day Plan': # Free and One-Day Plan
-        tier_1 = "deepgram"
-        tier_2 = "assemblyai"
-        tier_3 = "openai_whisper"
-        reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_deepgram"
-    elif user_plan == 'Three-Day Plan': # Three-Day Plan
+    # Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant)
+    elif user_plan == 'Free':
         tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = "deepgram"
+        tier_2 = "deepgram"
+        tier_3 = None # No TypeMyworDz Assistant (OpenAI fallback) for free users
         reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_assemblyai"
+    # Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly.
+    elif user_plan in ['Three-Day Plan', 'Monthly Plan']: # 'Monthly Plan' is the renamed economy plan
+        tier_1 = "deepgram"
+        tier_2 = "openai_whisper"
+        tier_3 = "assemblyai"
+        reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_deepgram"
     
     # --- Dynamic adjustment based on service availability ---
     final_tiers_list = []
@@ -352,13 +355,11 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
     }
 
     plan_duration_days = 0
-    if new_plan == 'One-Day Plan':
-        plan_duration_days = 1
-    elif new_plan == 'Three-Day Plan':
+    if new_plan == 'Three-Day Plan': # Three-day plan
         plan_duration_days = 3
-    elif new_plan == 'One-Week Plan':
+    elif new_plan == 'One-Week Plan': # One-week plan
         plan_duration_days = 7
-    elif new_plan == 'Monthly Plan':
+    elif new_plan == 'Monthly Plan': # Renamed economy plan
         plan_duration_days = 30
     elif new_plan == 'Yearly Plan':
         plan_duration_days = 365
@@ -1065,7 +1066,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service} ({service_config['reason']})") # UPDATED LOG
 
         def get_assemblyai_model(plan: str) -> str:
-            if plan == 'free' or plan == 'One-Day Plan':
+            if plan == 'Free' or plan == 'Monthly Plan': # 'Monthly Plan' is the new economy plan
                 return "nano"  
             else:
                 return "best"  
@@ -1385,24 +1386,25 @@ async def root():
             "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-            "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-            "deepgram_tester_transcription": f"Always use {DEEPGRAM_NAME} (no fallback for {DEEPGRAM_TESTER_EMAIL})",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None", # Updated fallback
+            "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Updated logic
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Updated logic
+            "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Monthly is now Deepgram primary
+            "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Yearly is OpenAI primary
+            "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Admin is OpenAI primary
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+            "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})", # Updated tester and email
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
-            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+            "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # Updated plan name
+            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
             "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
             "deepgram": f"Deepgram",
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
             "admin_emails": ADMIN_EMAILS,
-            "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
+            "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL # Updated email
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1637,8 +1639,8 @@ async def paystack_status():
         "google_gemini_configured": bool(GEMINI_API_KEY),
         "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL), # NEW: Check for URL
         "admin_emails": ADMIN_EMAILS,
-        "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL,
-        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL, # Updated email
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -1654,10 +1656,9 @@ async def paystack_status():
         },
         "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"], # USD is always supported, other local currencies if applicable
         "supported_plans": [
-            "One-Day Plan",
-            "Three-Day Plan",
+            "Three-Day Plan", # Updated order and name
             "One-Week Plan",
-            "Monthly Plan",
+            "Monthly Plan", # Renamed economy plan
             "Yearly Plan"
         ],
         "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES
@@ -1699,7 +1700,7 @@ async def ai_user_query(
     logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.") # Updated plan name
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1760,7 +1761,7 @@ async def ai_admin_format(
     logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.") # Updated plan name
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1818,7 +1819,7 @@ async def ai_admin_format_gemini(
     logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.") # Updated plan name
 
     if not gemini_client:
         logger.error("Gemini client is not initialized in /ai/admin-format-gemini. Check GEMINI_API_KEY.")
@@ -2110,8 +2111,8 @@ async def list_jobs():
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
-        "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL,
-        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL, # Updated email
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -2155,24 +2156,25 @@ async def health_check():
                 "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL) # NEW: Check for URL
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "one_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "monthly_yearly_or_admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}",
-                "deepgram_tester_transcription": f"Always use {DEEPGRAM_NAME} (no fallback for {DEEPGRAM_TESTER_EMAIL})",
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None", # Updated fallback
+                "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Updated logic
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Updated logic
+                "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Monthly is now Deepgram primary
+                "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Yearly is OpenAI primary
+                "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Admin is OpenAI primary
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+                "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})", # Updated tester and email
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-                "ai_features_access": "Only for One-Day, Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
-                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
+                "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # Updated plan name
+                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
                 "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
                 "deepgram": f"Deepgram",
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
                 "admin_emails": ADMIN_EMAILS,
-                "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
+                "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL # Updated email
             }
         }
         
@@ -2198,8 +2200,8 @@ logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Firebase Admin SDK configured: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64) and bool(db)}")
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"Deepgram Tester email configured: {DEEPGRAM_TESTER_EMAIL}")
-logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
+logger.info(f"AssemblyAI Tester email configured: {ASSEMBLYAI_TESTER_EMAIL}") # Updated email
+logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)") # Updated plan name
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
@@ -2235,7 +2237,7 @@ if __name__ == "__main__":
     logger.info(f"  ✅ Smart service selection with updated three-tier logic")
     logger.info(f"  ✅ Three-tier automatic fallback system")
     logger.info(f"  ✅ Admin email-based service prioritization")
-    logger.info(f"  ✅ Dedicated Deepgram tester logic")
+    logger.info(f"  ✅ Dedicated AssemblyAI tester logic") # Updated tester
     logger.info(f"  ✅ Speaker diarization for AssemblyAI and Deepgram")
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
@@ -2246,17 +2248,17 @@ if __name__ == "__main__":
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, and bullet points) via TypeMyworDz AI (Anthropic)")
     logger.info(f"  ✅ Admin-driven AI formatting via TypeMyworDz AI (Anthropic) and Google Gemini")
     logger.info(f"  ✅ Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS")
-    logger.info(f"  ✅ AI Assistant features restricted to paid users (One-Day, Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)") # Updated plan name
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - One-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Three-Day Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
-    logger.info(f"  - Monthly Plan & Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
-    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ2_NAME}")
-    logger.info(f"  - Dedicated Deepgram Tester ({DEEPGRAM_TESTER_EMAIL}): Primary={DEEPGRAM_NAME} (no fallback)")
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None") # Updated fallback
+    logger.info(f"  - Three-Day Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}") # Updated logic
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}") # Updated logic
+    logger.info(f"  - Monthly Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}") # Monthly is now Deepgram primary
+    logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}") # Updated logic
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
+    logger.info(f"  - Dedicated AssemblyAI Tester ({ASSEMBLYAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ1_NAME} (no fallback)") # Updated tester and email
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
