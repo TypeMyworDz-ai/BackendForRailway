@@ -10,27 +10,25 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, R
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
-from datetime import datetime, timedelta # Import timedelta for plan durations
+from datetime import datetime, timedelta
 import requests
 from pydub import AudioSegment
 from pydantic import BaseModel
 from typing import Optional, List
-import httpx # Used for making HTTP requests to other services
+import httpx
 from docx import Document
 from docx.shared import Inches
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re
 import anthropic
-import openai # Keep openai import for GPT-based AI formatting
+import openai
 
-# NEW: Import Google Generative AI libraries
 import google.generativeai as genai
 
-# NEW: Import Firebase Admin SDK
 import firebase_admin
 from firebase_admin import credentials, firestore, initialize_app
-from google.cloud.firestore_v1.base_query import FieldFilter # For explicit FieldFilter import
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 
 logging.basicConfig(
@@ -53,7 +51,7 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # Admin email addresses
 ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
 # Dedicated AssemblyAI Tester
-ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com' # Renamed from DEEPGRAM_TESTER_EMAIL
+ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com'
 
 def install_ffmpeg():
     try:
@@ -73,14 +71,14 @@ logger.info("Loading environment variables...")
 
 ASSEMBLYAI_API_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # Still needed for GPT-based AI formatting if not fully moved
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
-OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL") # URL for the Render-deployed OpenAI service
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") # Google Gemini API Key
-FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64") # Firebase Admin SDK config
-DEEPGRAM_SERVICE_RAILWAY_URL = os.environ.get("DEEPGRAM_SERVICE_RAILWAY_URL") # NEW: Deepgram Service URL
+OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64")
+DEEPGRAM_SERVICE_RAILWAY_URL = os.environ.get("DEEPGRAM_SERVICE_RAILWAY_URL")
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
 logger.info(f"DEBUG: ASSEMBLYAI_API_KEY loaded value: {bool(ASSEMBLYAI_API_KEY)}")
@@ -92,9 +90,9 @@ logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOO
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}")
-logger.info(f"DEBUG: DEEPGRAM_SERVICE_RAILWAY_URL loaded value: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}") # NEW
+logger.info(f"DEBUG: DEEPGRAM_SERVICE_RAILWAY_URL loaded value: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"DEBUG: AssemblyAI Tester email: {ASSEMBLYAI_TESTER_EMAIL}") # Updated log
+logger.info(f"DEBUG: AssemblyAI Tester email: {ASSEMBLYAI_TESTER_EMAIL}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -112,7 +110,7 @@ if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
 if not GEMINI_API_KEY:
     logger.warning("Google Gemini API Key environment variable not set! Google Gemini AI features will be disabled.")
 
-if not DEEPGRAM_SERVICE_RAILWAY_URL: # NEW
+if not DEEPGRAM_SERVICE_RAILWAY_URL:
     logger.error(f"{DEEPGRAM_NAME} Service URL not configured! {DEEPGRAM_NAME} will not work as primary or fallback.")
 
 if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
@@ -165,7 +163,6 @@ gemini_client = None
 if GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        # You can choose different Gemini models, e.g., 'models/gemini-pro-latest'
         gemini_client = genai.GenerativeModel('models/gemini-pro-latest')
         logger.info(f"Google Gemini client initialized successfully.")
     except Exception as e:
@@ -175,7 +172,7 @@ else:
 
 
 def is_paid_ai_user(user_plan: str) -> bool:
-    paid_plans_for_ai = ['Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan'] # Updated for new plan names
+    paid_plans_for_ai = ['Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
     return user_plan in paid_plans_for_ai
 
 def is_admin_user(user_email: str) -> bool:
@@ -194,7 +191,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
-    is_assemblyai_tester = (user_email and user_email.lower().strip() == ASSEMBLYAI_TESTER_EMAIL.lower()) # Updated variable
+    is_assemblyai_tester = (user_email and user_email.lower().strip() == ASSEMBLYAI_TESTER_EMAIL.lower())
 
     # --- Initialize tiers ---
     tier_1 = None
@@ -203,9 +200,9 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     reason = "default_logic"
 
     # --- Dedicated AssemblyAI Tester Logic ---
-    if is_assemblyai_tester: # Updated variable
+    if is_assemblyai_tester:
         tier_1 = "assemblyai" 
-        reason = "dedicated_assemblyai_tester" # Updated reason
+        reason = "dedicated_assemblyai_tester"
         # No fallbacks for the dedicated tester as per requirement
         return {
             "tier_1": tier_1,
@@ -214,12 +211,12 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "reason": reason
         }
 
-    # --- Speaker Labels Logic ---
+    # --- Speaker Labels Logic (Global Override) ---
     # As per request: "All instances of speaker tags requests: First option Assembly, fallback Deepgram."
     if speaker_labels_enabled:
         tier_1 = "assemblyai"
         tier_2 = "deepgram"
-        tier_3 = None  # No OpenAI for speaker tags as per request
+        tier_3 = None  # No OpenAI for speaker tags as per request for this flow
         reason = "speaker_labels_requested_prioritizing_assemblyai"
     
     # --- Plan-based Logic (if speaker labels are not enabled or already set) ---
@@ -230,13 +227,13 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         tier_3 = "deepgram"
         reason = f"admin_or_{user_plan.lower().replace(' ', '_')}_prioritizing_openai"
     # Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant)
-    elif user_plan == 'Free':
+    elif user_plan == 'free': # FIX: Changed 'Free' to 'free'
         tier_1 = "assemblyai"
         tier_2 = "deepgram"
         tier_3 = None # No TypeMyworDz Assistant (OpenAI fallback) for free users
         reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_assemblyai"
     # Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly.
-    elif user_plan in ['Three-Day Plan', 'Monthly Plan']: # 'Monthly Plan' is the renamed economy plan
+    elif user_plan in ['Three-Day Plan', 'Monthly Plan']:
         tier_1 = "deepgram"
         tier_2 = "openai_whisper"
         tier_3 = "assemblyai"
@@ -250,7 +247,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         final_tiers_list.append("assemblyai")
     elif tier_1 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL:
         final_tiers_list.append("openai_whisper")
-    elif tier_1 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL: # NEW: Check for URL
+    elif tier_1 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL:
         final_tiers_list.append("deepgram")
 
     # Tier 2 (only if not already in Tier 1 and is available)
@@ -258,7 +255,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         final_tiers_list.append("assemblyai")
     elif tier_2 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
         final_tiers_list.append("openai_whisper")
-    elif tier_2 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL and "deepgram" not in final_tiers_list: # NEW: Check for URL
+    elif tier_2 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL and "deepgram" not in final_tiers_list:
         final_tiers_list.append("deepgram")
 
     # Tier 3 (only if not already in Tier 1 or 2 and is available)
@@ -266,7 +263,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         final_tiers_list.append("assemblyai")
     elif tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
         final_tiers_list.append("openai_whisper")
-    elif tier_3 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL and "deepgram" not in final_tiers_list: # NEW: Check for URL
+    elif tier_3 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL and "deepgram" not in final_tiers_list:
         final_tiers_list.append("deepgram")
 
     # Ensure the list does not exceed 3 tiers and fills Nones if less than 3
@@ -288,7 +285,7 @@ class PaystackInitializationRequest(BaseModel):
     user_id: str
     country_code: str
     callback_url: str
-    update_admin_revenue: Optional[bool] = False # Added for explicit revenue revenue update flag
+    update_admin_revenue: Optional[bool] = False
 
 class PaystackWebhookRequest(BaseModel):
     event: str
@@ -322,14 +319,14 @@ class AdminAIFormatRequest_Pydantic(BaseModel):
 class UserAIGeminiRequest_Pydantic(BaseModel):
     transcript: str
     user_prompt: str
-    model: str = "models/gemini-pro-latest" # Default Gemini model
+    model: str = "models/gemini-pro-latest"
     max_tokens: int = 1000
 
 # Pydantic model for Gemini Admin formatting
 class AdminAIFormatGeminiRequest_Pydantic(BaseModel):
     transcript: str
     formatting_instructions: str = "Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."
-    model: str = "models/gemini-pro-latest" # Default Gemini model
+    model: str = "models/gemini-pro-latest"
     max_tokens: int = 4000
 
 jobs = {}
@@ -348,18 +345,18 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
     user_ref = db.collection('users').document(user_id)
     updates = {
         'plan': new_plan,
-        'lastAccessed': firestore.SERVER_TIMESTAMP, # Use server timestamp for consistency
+        'lastAccessed': firestore.SERVER_TIMESTAMP,
         'paystackReferenceId': reference_id,
-        'hasReceivedInitialFreeMinutes': True, # Any paid plan means initial free minutes are considered used
-        'totalMinutesUsed': 0 # Reset for paid plans as they get unlimited
+        'hasReceivedInitialFreeMinutes': True,
+        'totalMinutesUsed': 0
     }
 
     plan_duration_days = 0
-    if new_plan == 'Three-Day Plan': # Three-day plan
+    if new_plan == 'Three-Day Plan':
         plan_duration_days = 3
-    elif new_plan == 'One-Week Plan': # One-week plan
+    elif new_plan == 'One-Week Plan':
         plan_duration_days = 7
-    elif new_plan == 'Monthly Plan': # Renamed economy plan
+    elif new_plan == 'Monthly Plan':
         plan_duration_days = 30
     elif new_plan == 'Yearly Plan':
         plan_duration_days = 365
@@ -405,11 +402,11 @@ async def get_user_profile_by_email_firestore(email: str):
         return None
     try:
         users_ref = db.collection('users')
-        query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1) # Use FieldFilter
+        query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
         snapshot = await asyncio.to_thread(query_ref.get) 
 
-        for doc in snapshot: # Iterate directly over the snapshot
-            return doc.id # Return UID
+        for doc in snapshot:
+            return doc.id
         return None
     except Exception as e:
         logger.error(f"Error fetching user by email {email}: {e}")
@@ -465,7 +462,6 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
         logger.info(f"Original file size: {input_size:.2f} MB")
         
         audio = AudioSegment.from_file(input_path)
-        # FIX: Ensure these log lines use actual audio properties instead of hardcoded values
         logger.info(f"Original audio: {audio.channels} channels, {audio.frame_rate}Hz, {len(audio)}ms")
         
         if job_id and cancellation_flags.get(job_id, False):
@@ -624,7 +620,7 @@ USD_TO_LOCAL_RATES = {
     'NG': 1500.0,
     'GH': 15.0,
     'ZA': 19.0,
-    'OTHER_AFRICA': 'USD',
+    'OTHER_AFRICA': 'USD', # 'USD' indicates no conversion, direct USD payment
 }
 
 COUNTRY_CURRENCY_MAP = {
@@ -644,8 +640,8 @@ COUNTRY_CHANNELS_MAP = {
 }
 
 def get_local_amount_and_currency(base_usd_amount: float, country_code: str, plan_name: str = None) -> tuple[float, str]:
-    # For Monthly and Yearly plans, force USD
-    if plan_name in ['Monthly Plan', 'Yearly Plan']:
+    # REMOVED: 'Monthly Plan' from this condition. Now only Yearly Plan forces USD.
+    if plan_name in ['Yearly Plan']:
         return base_usd_amount, 'USD'
 
     currency = COUNTRY_CURRENCY_MAP.get(country_code, 'USD')
@@ -657,8 +653,8 @@ def get_local_amount_and_currency(base_usd_amount: float, country_code: str, pla
     return local_amount, currency
 
 def get_payment_channels(country_code: str, plan_name: str = None) -> list[str]:
-    # For Monthly and Yearly plans, only card payments
-    if plan_name in ['Monthly Plan', 'Yearly Plan']:
+    # REMOVED: 'Monthly Plan' from this condition. Now only Yearly Plan forces card payments.
+    if plan_name in ['Yearly Plan']:
         return ['card']
     return COUNTRY_CHANNELS_MAP.get(country_code, ['card'])
 
@@ -701,7 +697,7 @@ async def verify_paystack_payment(reference: str) -> dict:
                 amount_kobo = payment_data['data']['amount']
                 amount = amount_kobo / 100
                 customer_email = payment_data['data']['customer']['email']
-                currency = payment_data['data']['currency']
+                currency = payment_data['data']['data']['currency'] # Corrected: access currency from data.data
                 plan_name = payment_data['data']['metadata'].get('plan', 'Unknown')
                 
                 logger.info(f"✅ Paystack payment verified: {customer_email} paid {amount} {currency} for {plan_name}")
@@ -813,15 +809,15 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
                 f"{OPENAI_WHISPER_SERVICE_RAILWAY_URL}/transcribe",
                 files=files,
                 data=data,
-                timeout=300.0 # 5 min timeout for transcription
+                timeout=300.0
             )
-            response.raise_for_status() # Raise an exception for HTTP errors
+            response.raise_for_status()
 
         result = response.json()
         
         if result.get("status") == "completed" and result.get("transcription"):
             logger.info(f"{TYPEMYWORDZ2_NAME} service transcription completed for job {job_id}")
-            return result # The dedicated service returns a dict similar to what we expect
+            return result
         else:
             raise Exception(f"{TYPEMYWORDZ2_NAME} service returned an incomplete or failed status: {result}")
 
@@ -975,7 +971,7 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
 
 async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Calls the dedicated Deepgram service deployed on Render."""
-    if not DEEPGRAM_SERVICE_RAILWAY_URL: # NEW: Check for URL
+    if not DEEPGRAM_SERVICE_RAILWAY_URL:
         logger.error(f"{DEEPGRAM_NAME} Service URL not configured, skipping {DEEPGRAM_NAME} for job {job_id}")
         return {
             "status": "failed",
@@ -983,7 +979,7 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         }
 
     try:
-        logger.info(f"Calling {DEEPGRAM_NAME} service for job {job_id} at {DEEPGRAM_SERVICE_RAILWAY_URL}/transcribe") # NEW: Call Render URL
+        logger.info(f"Calling {DEEPGRAM_NAME} service for job {job_id} at {DEEPGRAM_SERVICE_RAILWAY_URL}/transcribe")
         
         # Read the audio file content
         with open(audio_path, "rb") as f:
@@ -993,24 +989,24 @@ async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_
         files = {'file': (os.path.basename(audio_path), audio_content, 'audio/mpeg')}
         data = {
             'language_code': language_code,
-            'speaker_labels_enabled': str(speaker_labels_enabled).lower() # Pass as string
+            'speaker_labels_enabled': str(speaker_labels_enabled).lower()
         }
 
         # Make HTTP POST request to the dedicated Deepgram service
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{DEEPGRAM_SERVICE_RAILWAY_URL}/transcribe", # NEW: Call Render URL
+                f"{DEEPGRAM_SERVICE_RAILWAY_URL}/transcribe",
                 files=files,
                 data=data,
-                timeout=300.0 # 5 min timeout for transcription
+                timeout=300.0
             )
-            response.raise_for_status() # Raise an exception for HTTP errors
+            response.raise_for_status()
 
         result = response.json()
         
         if result.get("status") == "completed" and result.get("transcription"):
             logger.info(f"{DEEPGRAM_NAME} service transcription completed for job {job_id}")
-            return result # The dedicated service returns a dict similar to what we expect
+            return result
         else:
             raise Exception(f"{DEEPGRAM_NAME} service returned an incomplete or failed status: {result}")
 
@@ -1046,7 +1042,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
     active_background_tasks[job_id] = asyncio.current_task()
     cancellation_flags[job_id] = False
 
-    compressed_path = None # Initialize compressed_path here
+    compressed_path = None
 
     try:
         def check_cancellation():
@@ -1063,10 +1059,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         tier_2_service = service_config["tier_2"]
         tier_3_service = service_config["tier_3"]
 
-        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service} ({service_config['reason']})") # UPDATED LOG
+        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service} ({service_config['reason']})")
 
         def get_assemblyai_model(plan: str) -> str:
-            if plan == 'Free' or plan == 'Monthly Plan': # 'Monthly Plan' is the new economy plan
+            if plan == 'free' or plan == 'Monthly Plan':
                 return "nano"  
             else:
                 return "best"  
@@ -1124,8 +1120,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
         
-        elif tier_1_service == "deepgram": # Deepgram Tier 1
-            if not DEEPGRAM_SERVICE_RAILWAY_URL: # NEW: Check for URL
+        elif tier_1_service == "deepgram":
+            if not DEEPGRAM_SERVICE_RAILWAY_URL:
                 logger.error(f"{DEEPGRAM_NAME} Service URL not configured, skipping Tier 1 for job {job_id}")
                 job_data["tier_1_error"] = f"{DEEPGRAM_NAME} Service URL not configured"
             else:
@@ -1186,8 +1182,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_2_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier2")
             
-            elif tier_2_service == "deepgram": # Deepgram Tier 2
-                if not DEEPGRAM_SERVICE_RAILWAY_URL: # NEW: Check for URL
+            elif tier_2_service == "deepgram":
+                if not DEEPGRAM_SERVICE_RAILWAY_URL:
                     logger.error(f"{DEEPGRAM_NAME} Service URL not configured, skipping Tier 2 for job {job_id}")
                     job_data["tier_2_error"] = f"{DEEPGRAM_NAME} Service URL not configured"
                 else:
@@ -1249,8 +1245,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier3")
             
-            elif tier_3_service == "deepgram": # Deepgram Tier 3
-                if not DEEPGRAM_SERVICE_RAILWAY_URL: # NEW: Check for URL
+            elif tier_3_service == "deepgram":
+                if not DEEPGRAM_SERVICE_RAILWAY_URL:
                     logger.error(f"{DEEPGRAM_NAME} Service URL not configured, skipping Tier 3 for job {job_id}")
                     job_data["tier_3_error"] = f"{DEEPGRAM_NAME} Service URL not configured"
                 else:
@@ -1282,14 +1278,14 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         else:
             logger.info(f"✅ Transcription completed successfully for job {job_id}")
             service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used"))
-            model_used = "N/A" # Default
+            model_used = "N/A"
 
             if service_used_name == "assemblyai":
                 model_used = job_data.get("assemblyai_model", "unknown")
             elif service_used_name == "openai_whisper":
                 model_used = "whisper-1"
-            elif service_used_name == "deepgram": # NEW
-                model_used = "deepgram-nova" # Assuming a common Deepgram model or let the service decide
+            elif service_used_name == "deepgram":
+                model_used = "deepgram-nova"
 
             logger.info(f"📊 Job {job_id} for user {user_email} completed. Service: {service_used_name}, Model: {model_used}")
 
@@ -1302,7 +1298,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 "duration_seconds": transcription_result.get("duration", 0),
                 "speaker_labels": speaker_labels_enabled,
                 "service_used": service_used_name,
-                "model_used": model_used, # Store model used
+                "model_used": model_used,
                 "services_attempted": services_attempted
             })
 
@@ -1386,25 +1382,25 @@ async def root():
             "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None", # Updated fallback
-            "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Updated logic
-            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Updated logic
-            "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Monthly is now Deepgram primary
-            "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Yearly is OpenAI primary
-            "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Admin is OpenAI primary
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+            "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+            "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
-            "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})", # Updated tester and email
+            "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
             "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
             "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-            "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # Updated plan name
-            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
+            "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
+            "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
             "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
             "deepgram": f"Deepgram",
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
             "admin_emails": ADMIN_EMAILS,
-            "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL # Updated email
+            "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1421,7 +1417,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         raise HTTPException(status_code=500, detail="Paystack configuration missing")
     
     try:
-        # Determine local amount and currency, forcing USD for Monthly/Yearly plans
+        # Determine local amount and currency, now Monthly Plan does NOT force USD
         local_amount, local_currency = get_local_amount_and_currency(request.amount, request.country_code, request.plan_name)
         payment_channels = get_payment_channels(request.country_code, request.plan_name)
 
@@ -1435,13 +1431,13 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         payload = {
             'email': request.email,
             'amount': amount_kobo,
-            'currency': local_currency, # Use the determined local_currency
+            'currency': local_currency,
             'callback_url': request.callback_url,
             'channels': payment_channels,
             'metadata': {
                 'plan': request.plan_name,
-                'base_usd_amount': request.amount, # Store base USD amount for revenue tracking
-                'country_code': request.country_code, # IMPORTANT: Pass country code in metadata
+                'base_usd_amount': request.amount,
+                'country_code': request.country_code,
                 'custom_fields': [
                     {
                         'display_name': "Plan Type",
@@ -1453,7 +1449,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
                         'variable_name': "country",
                         'value': request.country_code
                     },
-                    { # Pass update_admin_revenue flag through metadata
+                    {
                         'display_name': "Update Admin Revenue",
                         'variable_name': "update_admin_revenue",
                         'value': str(request.update_admin_revenue)
@@ -1500,7 +1496,7 @@ async def verify_payment(request: PaystackVerificationRequest):
         if verification_result['status'] == 'success':
             email = verification_result['email']
             plan_name = verification_result['plan']
-            amount = verification_result['amount'] # This is in transaction currency
+            amount = verification_result['amount']
             currency = verification_result['currency']
             reference = verification_result['reference']
             
@@ -1591,18 +1587,17 @@ async def paystack_webhook(request: Request):
         if event_type == 'charge.success':
             data = webhook_data.get('data', {})
             customer_email = data.get('customer', {}).get('email')
-            amount = data.get('amount', 0) / 100 # This is in transaction currency
+            amount = data.get('amount', 0) / 100
             currency = data.get('currency')
             reference = data.get('reference')
             plan_name = data.get('metadata', {}).get('plan', 'Unknown')
-            base_usd_amount = data.get('metadata', {}).get('base_usd_amount') # Get base USD amount from metadata
-            country_code = data.get('metadata', {}).get('country_code') # IMPORTANT: Get country code from metadata
-            update_admin_revenue_flag = data.get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true' # Get flag
+            base_usd_amount = data.get('metadata', {}).get('base_usd_amount')
+            country_code = data.get('metadata', {}).get('country_code')
+            update_admin_revenue_flag = data.get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
 
             logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}. Base USD: {base_usd_amount}, Country: {country_code}, Update Revenue: {update_admin_revenue_flag}")
             
             if customer_email:
-                # Use base_usd_amount for revenue tracking if available, otherwise `amount`
                 credit_result = await update_user_credits_paystack(customer_email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code)
                 if credit_result['success']:
                     logger.info(f"✅ Webhook: Credits updated automatically for {customer_email} in Firestore.")
@@ -1637,10 +1632,10 @@ async def paystack_status():
         "openai_configured": bool(OPENAI_API_KEY),
         "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
         "google_gemini_configured": bool(GEMINI_API_KEY),
-        "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL), # NEW: Check for URL
+        "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL),
         "admin_emails": ADMIN_EMAILS,
-        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL, # Updated email
-        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
+        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
             "verify_payment": "/api/verify-payment",
@@ -1651,14 +1646,12 @@ async def paystack_status():
             "ai_user_query_gemini": "/ai/user-query-gemini",
             "ai_admin_format": "/ai/admin-format",
             "ai_admin_format_gemini": "/ai/admin-format-gemini",
-            # REMOVED: "admin_monthly_revenue": "/api/admin/monthly-revenue",
-            # REMOVED: "admin_revenue_data": "/api/admin/revenue-data"
         },
-        "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"], # USD is always supported, other local currencies if applicable
+        "supported_currencies": ["NGN", "USD", "GHS", "ZAR", "KES"],
         "supported_plans": [
-            "Three-Day Plan", # Updated order and name
+            "Three-Day Plan",
             "One-Week Plan",
-            "Monthly Plan", # Renamed economy plan
+            "Monthly Plan",
             "Yearly Plan"
         ],
         "conversion_rates_usd_to_local": USD_TO_LOCAL_RATES
@@ -1700,7 +1693,7 @@ async def ai_user_query(
     logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.") # Updated plan name
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1761,7 +1754,7 @@ async def ai_admin_format(
     logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.") # Updated plan name
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not claude_client:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized (API key missing or invalid).")
@@ -1819,7 +1812,7 @@ async def ai_admin_format_gemini(
     logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
     if not is_paid_ai_user(user_plan):
-        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.") # Updated plan name
+        raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not gemini_client:
         logger.error("Gemini client is not initialized in /ai/admin-format-gemini. Check GEMINI_API_KEY.")
@@ -1851,7 +1844,6 @@ async def ai_admin_format_gemini(
 
     except Exception as e:
         logger.error(f"Unexpected error processing AI admin format request with Gemini: {e}")
-        # Return a more user-friendly error
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during Gemini formatting: {str(e)}. Try using Claude instead.")
 
 @app.post("/transcribe")
@@ -1941,7 +1933,7 @@ async def generate_formatted_word(request: FormattedWordDownloadRequest):
         document = Document()
         lines = request.transcription_html.split('\n')
         
-        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)</strong>(.*)') # Corrected regex
+        speaker_tag_pattern = re.compile(r'<strong>(Speaker \d+:)</strong>(.*)')
         
         for line in lines:
             if line.strip():
@@ -2074,10 +2066,6 @@ async def compress_download(file: UploadFile = File(...), quality: str = "high")
         logger.error(f"Error compressing file for download: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to compress audio file: {str(e)}")
 
-# REMOVED: get_admin_monthly_revenue endpoint
-
-# REMOVED: get_admin_revenue_data endpoint
-
 @app.get("/jobs")
 async def list_jobs():
     logger.info("Jobs list endpoint called")
@@ -2111,8 +2099,8 @@ async def list_jobs():
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
-        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL, # Updated email
-        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
+        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+        "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "system_stats": {
             "jobs_by_status": {
                 status: len([j for j in jobs.values() if j["status"] == status])
@@ -2153,28 +2141,28 @@ async def health_check():
                 "openai_configured": bool(OPENAI_API_KEY),
                 "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
                 "google_gemini_configured": bool(GEMINI_API_KEY),
-                "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL) # NEW: Check for URL
+                "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None", # Updated fallback
-                "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Updated logic
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Updated logic
-                "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}", # Monthly is now Deepgram primary
-                "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Yearly is OpenAI primary
-                "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}", # Admin is OpenAI primary
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+                "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
+                "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
-                "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})", # Updated tester and email
+                "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
                 "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
                 "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
-                "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans", # Updated plan name
-                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)", # Updated plan name
+                "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
+                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
                 "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
                 "deepgram": f"Deepgram",
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
                 "admin_emails": ADMIN_EMAILS,
-                "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL # Updated email
+                "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL
             }
         }
         
@@ -2193,15 +2181,15 @@ logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 logger.info("Performing final system validation...")
 logger.info(f"TypeMyworDz1 API Key configured: {bool(ASSEMBLYAI_API_KEY)}")
 logger.info(f"TypeMyworDz2 Service URL configured: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
-logger.info(f"Deepgram Service URL configured: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}") # NEW
+logger.info(f"Deepgram Service URL configured: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}")
 logger.info(f"TypeMyworDz AI API Key configured: {bool(ANTHROPIC_API_KEY)}")
 logger.info(f"OpenAI GPT API Key configured: {bool(OPENAI_API_KEY)}")
 logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Firebase Admin SDK configured: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64) and bool(db)}")
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"AssemblyAI Tester email configured: {ASSEMBLYAI_TESTER_EMAIL}") # Updated email
-logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)") # Updated plan name
+logger.info(f"AssemblyAI Tester email configured: {ASSEMBLYAI_TESTER_EMAIL}")
+logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
 logger.info(f"  - Active background tasks: {len(active_background_tasks)} tasks")
@@ -2237,7 +2225,7 @@ if __name__ == "__main__":
     logger.info(f"  ✅ Smart service selection with updated three-tier logic")
     logger.info(f"  ✅ Three-tier automatic fallback system")
     logger.info(f"  ✅ Admin email-based service prioritization")
-    logger.info(f"  ✅ Dedicated AssemblyAI tester logic") # Updated tester
+    logger.info(f"  ✅ Dedicated AssemblyAI tester logic")
     logger.info(f"  ✅ Speaker diarization for AssemblyAI and Deepgram")
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
@@ -2248,17 +2236,17 @@ if __name__ == "__main__":
     logger.info(f"  ✅ User-driven AI features (summarization, Q&A, and bullet points) via TypeMyworDz AI (Anthropic)")
     logger.info(f"  ✅ Admin-driven AI formatting via TypeMyworDz AI (Anthropic) and Google Gemini")
     logger.info(f"  ✅ Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID AI USERS")
-    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)") # Updated plan name
+    logger.info(f"  ✅ AI Assistant features restricted to paid users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None") # Updated fallback
-    logger.info(f"  - Three-Day Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}") # Updated logic
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}") # Updated logic
-    logger.info(f"  - Monthly Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}") # Monthly is now Deepgram primary
-    logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}") # Updated logic
+    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
+    logger.info(f"  - Three-Day Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
+    logger.info(f"  - Monthly Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
+    logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
-    logger.info(f"  - Dedicated AssemblyAI Tester ({ASSEMBLYAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ1_NAME} (no fallback)") # Updated tester and email
+    logger.info(f"  - Dedicated AssemblyAI Tester ({ASSEMBLYAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ1_NAME} (no fallback)")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
