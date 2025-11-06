@@ -692,14 +692,20 @@ async def verify_paystack_payment(reference: str) -> dict:
         
         if response.status_code == 200:
             payment_data = response.json()
-            
-            if payment_data['status'] and payment_data['data']['status'] == 'success':
+            logger.info(f"Paystack verification raw response for {reference}: {payment_data}") # Added for debugging
+
+            # Safely check if 'status' is true and 'data' is a dictionary with 'status' as 'success'
+            if payment_data.get('status') is True and \
+               isinstance(payment_data.get('data'), dict) and \
+               payment_data['data'].get('status') == 'success':
+
                 amount_kobo = payment_data['data']['amount']
                 amount = amount_kobo / 100
                 customer_email = payment_data['data']['customer']['email']
-                currency = payment_data['data']['data']['currency'] # Corrected: access currency from data.data
+                # Corrected: Access currency directly from payment_data['data']
+                currency = payment_data['data']['currency']
                 plan_name = payment_data['data']['metadata'].get('plan', 'Unknown')
-                
+
                 logger.info(f"✅ Paystack payment verified: {customer_email} paid {amount} {currency} for {plan_name}")
                 
                 return {
@@ -712,14 +718,14 @@ async def verify_paystack_payment(reference: str) -> dict:
                     'raw_data': payment_data['data']
                 }
             else:
-                logger.warning(f"❌ Paystack payment verification failed: {payment_data}")
+                logger.warning(f"❌ Paystack payment verification failed (non-success status or missing 'data' key): {payment_data}")
                 return {
                     'status': 'failed',
                     'error': payment_data.get('message', 'Payment verification failed'),
                     'raw_data': payment_data
                 }
         else:
-            logger.error(f"❌ Paystack API error: {response.status_code} - {response.text}")
+            logger.error(f"❌ Paystack API error (non-200 status): {response.status_code} - {response.text}")
             return {
                 'status': 'error',
                 'error': f'Paystack API error: {response.status_code}',
@@ -734,7 +740,8 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
     except Exception as e:
-        logger.error(f"❌ Unexpected error during Paystack verification: {str(e)}")
+        # Log the type of exception for better debugging
+        logger.error(f"❌ Unexpected error during Paystack verification: {type(e).__name__}: {str(e)}")
         return {
             'status': 'error',
             "error": 'Payment verification failed',
