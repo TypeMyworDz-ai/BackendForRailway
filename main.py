@@ -49,7 +49,7 @@ DEEPGRAM_NAME = "Deepgram" # Deepgram
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google Gemini
 
 # Admin email addresses
-ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com']
+ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com', 'kagochi12@gmail.com']
 # Dedicated AssemblyAI Tester
 ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com'
 
