@@ -895,13 +895,13 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
         headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
         transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
         json_data = {
-            "audio_url": audio_url,
+            "audio_url": "<URL>",
             "language_code": language_code,
             "punctuate": True,
             "format_text": True,
             "speaker_labels": speaker_labels_enabled,
-            "speech_model": model,
-            "word_boost": []
+            "speech_model": ["universal-3-pro","universal-2"],
+            "keyterms_prompt": []
         }
         
         transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
