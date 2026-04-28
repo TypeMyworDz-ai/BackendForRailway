@@ -231,8 +231,8 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     # AssemblyAI first for One-Week Plan users (THIS IS THE CHANGE)
     elif user_plan == 'One-Week Plan':
         tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = "deepgram"
+        tier_2 = "deepgram"
+        tier_3 = "openai_whisper"
         reason = "one_week_plan_prioritizing_assemblyai"
     
     # AssemblyAI first for free users
