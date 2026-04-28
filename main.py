@@ -219,20 +219,30 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         tier_3 = None  # No OpenAI for speaker tags as per request for this flow
         reason = "speaker_labels_requested_prioritizing_assemblyai"
     
-    # --- Plan-based Logic (if speaker labels are not enabled or already set) ---
-    # OpenAI: First option for weekly subscribers, yearly, and Admins. Fallback is Assembly > Deepgram.
-    elif is_admin or user_plan in ['One-Week Plan', 'Yearly Plan']:
+        # --- Plan-based Logic (if speaker labels are not enabled or already set) ---
+    
+    # OpenAI first for Admins and Yearly Plan users
+    if is_admin or user_plan == 'Yearly Plan':
         tier_1 = "openai_whisper"
         tier_2 = "assemblyai"
         tier_3 = "deepgram"
-        reason = f"admin_or_{user_plan.lower().replace(' ', '_')}_prioritizing_openai"
-    # Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant)
-    elif user_plan == 'free': # FIX: Changed 'Free' to 'free'
+        reason = "admin_or_yearly_prioritizing_openai"
+    
+    # AssemblyAI first for One-Week Plan users (THIS IS THE CHANGE)
+    elif user_plan == 'One-Week Plan':
+        tier_1 = "assemblyai"
+        tier_2 = "openai_whisper"
+        tier_3 = "deepgram"
+        reason = "one_week_plan_prioritizing_assemblyai"
+    
+    # AssemblyAI first for free users
+    elif user_plan == 'free':
         tier_1 = "assemblyai"
         tier_2 = "deepgram"
-        tier_3 = None # No TypeMyworDz Assistant (OpenAI fallback) for free users
-        reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_assemblyai"
-    # Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly.
+        tier_3 = None
+        reason = "free_plan_prioritizing_assemblyai"
+    
+    # Deepgram first for Three-Day and Monthly plans
     elif user_plan in ['Three-Day Plan', 'Monthly Plan']:
         tier_1 = "deepgram"
         tier_2 = "openai_whisper"
