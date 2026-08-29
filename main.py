@@ -862,6 +862,46 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
     finally:
         pass
 
+def build_segments_from_words(words: list, max_chars: int = 240) -> list:
+    """Group word-level timings into sentence-sized, clickable segments.
+
+    A transcript without speaker labels arrives as one long block of prose.
+    Handing the editor every individual word would be unusable, so words are
+    gathered up until a sentence ends or the line gets too long. Each segment
+    keeps its own start and end time and the lowest word confidence it
+    contains, which is what lets the editor flag words worth checking.
+    """
+    segments = []
+    current = []
+
+    def flush():
+        if not current:
+            return
+        text = " ".join(w.get("text", "") for w in current).strip()
+        if not text:
+            current.clear()
+            return
+        confidences = [w.get("confidence") for w in current if w.get("confidence") is not None]
+        segments.append({
+            "start": round(current[0].get("start", 0) / 1000.0, 3),
+            "end": round(current[-1].get("end", 0) / 1000.0, 3),
+            "speaker": None,
+            "text": text,
+            "confidence": round(min(confidences), 4) if confidences else None
+        })
+        current.clear()
+
+    for word in words:
+        current.append(word)
+        text = (word.get("text") or "").strip()
+        ends_sentence = text.endswith((".", "?", "!"))
+        too_long = sum(len(w.get("text", "")) + 1 for w in current) >= max_chars
+        if ends_sentence or too_long:
+            flush()
+
+    flush()
+    return segments
+
 async def transcribe_with_assemblyai(audio_path: str, language_code: str, speaker_labels_enabled: bool, model: str, job_id: str) -> dict:
     """Transcribe audio using AssemblyAI API"""
     if not ASSEMBLYAI_API_KEY:
@@ -942,6 +982,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             if status_result["status"] == "completed":
                 transcription_text = status_result["text"]
                 
+                segments = []
+
                 if speaker_labels_enabled and status_result.get("utterances"):
                     formatted_transcript = ""
                     for utterance in status_result.get("utterances"):
@@ -960,7 +1002,23 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                             speaker_num = str(ord(speaker_letter.upper()) - ord('A') + 1)
                         
                         formatted_transcript += f"<strong>Speaker {speaker_num}:</strong> {utterance['text']}\n"
+
+                        # One segment per utterance, in the same order as the
+                        # lines above, so the editor can pair line N of the
+                        # transcript with segment N without re-parsing text.
+                        segments.append({
+                            "start": round(utterance.get("start", 0) / 1000.0, 3),
+                            "end": round(utterance.get("end", 0) / 1000.0, 3),
+                            "speaker": f"Speaker {speaker_num}",
+                            "text": utterance.get("text", ""),
+                            "confidence": utterance.get("confidence")
+                        })
                     transcription_text = formatted_transcript.strip()
+                else:
+                    # No speaker labels, so the transcript is one block of prose.
+                    # Group the word-level timings into sentences to give the
+                    # editor something of a sensible size to jump between.
+                    segments = build_segments_from_words(status_result.get("words") or [])
 
                 return {
                     "status": "completed",
@@ -968,7 +1026,9 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                     "language": status_result["language_code"],
                     "duration": status_result.get("audio_duration", 0),
                     "word_count": len(transcription_text.split()) if transcription_text else 0,
-                    "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances"))
+                    "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances")),
+                    "segments": segments,
+                    "timings_source": TYPEMYWORDZ1_NAME
                 }
             elif status_result["status"] == "error":
                 raise Exception(status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}"))
@@ -1316,7 +1376,11 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 "speaker_labels": speaker_labels_enabled,
                 "service_used": service_used_name,
                 "model_used": model_used,
-                "services_attempted": services_attempted
+                "services_attempted": services_attempted,
+                # Word timings, when the service that ran provides them.
+                # Absent for services that do not, and the editor copes.
+                "segments": transcription_result.get("segments") or [],
+                "timings_source": transcription_result.get("timings_source")
             })
 
     except asyncio.CancelledError:
