@@ -218,36 +218,40 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         tier_2 = "deepgram"
         tier_3 = None  # No OpenAI for speaker tags as per request for this flow
         reason = "speaker_labels_requested_prioritizing_assemblyai"
-    
-        # --- Plan-based Logic (if speaker labels are not enabled or already set) ---
-    
-    # OpenAI first for Admins and Yearly Plan users
-    if is_admin or user_plan == 'Yearly Plan':
+
+    # --- Plan-based logic ---
+    # Note the elif: when speaker labels are requested the rule above wins
+    # and none of these run. Between April and now this was an "if", which
+    # quietly overrode the speaker-label rule for admins and yearly users.
+
+    # AssemblyAI first for admins, Three-Day and One-Week plans.
+    elif is_admin or user_plan in ['Three-Day Plan', 'One-Week Plan']:
+        tier_1 = "assemblyai"
+        tier_2 = "openai_whisper"
+        tier_3 = "deepgram"
+        reason = "admin_or_short_plan_prioritizing_assemblyai"
+
+    # Yearly is the most expensive plan, so it gets the same order as admins.
+    elif user_plan == 'Yearly Plan':
+        tier_1 = "assemblyai"
+        tier_2 = "openai_whisper"
+        tier_3 = "deepgram"
+        reason = "yearly_plan_prioritizing_assemblyai"
+
+    # Monthly subscribers start on OpenAI.
+    elif user_plan == 'Monthly Plan':
         tier_1 = "openai_whisper"
         tier_2 = "assemblyai"
         tier_3 = "deepgram"
-        reason = "admin_or_yearly_prioritizing_openai"
-    
-    # AssemblyAI first for One-Week Plan users (THIS IS THE CHANGE)
-    elif user_plan == 'One-Week Plan':
-        tier_1 = "assemblyai"
-        tier_2 = "deepgram"
-        tier_3 = "openai_whisper"
-        reason = "one_week_plan_prioritizing_assemblyai"
-    
-    # AssemblyAI first for free users
+        reason = "monthly_plan_prioritizing_openai"
+
+    # Free trial. Best model, so the first transcript someone ever sees
+    # is the most accurate one we can produce.
     elif user_plan == 'free':
         tier_1 = "assemblyai"
         tier_2 = "deepgram"
         tier_3 = None
-        reason = "free_plan_prioritizing_assemblyai"
-    
-    # Deepgram first for Three-Day and Monthly plans
-    elif user_plan in ['Three-Day Plan', 'Monthly Plan']:
-        tier_1 = "deepgram"
-        tier_2 = "openai_whisper"
-        tier_3 = "assemblyai"
-        reason = f"{user_plan.lower().replace(' ', '_')}_prioritizing_deepgram"
+        reason = "free_trial_prioritizing_assemblyai"
     
     # --- Dynamic adjustment based on service availability ---
     final_tiers_list = []
@@ -945,13 +949,12 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
         headers = {"authorization": ASSEMBLYAI_API_KEY, "content-type": "application/json"}
         transcript_endpoint = "https://api.assemblyai.com/v2/transcript"
         json_data = {
-            "audio_url": "<URL>",
+            "audio_url": audio_url,
             "language_code": language_code,
             "punctuate": True,
             "format_text": True,
             "speaker_labels": speaker_labels_enabled,
-            "speech_model": ["universal-3-pro","universal-2"],
-            "keyterms_prompt": []
+            "speech_models": model,
         }
         
         transcript_response = requests.post(transcript_endpoint, headers=headers, json=json_data)
@@ -1028,7 +1031,10 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                     "word_count": len(transcription_text.split()) if transcription_text else 0,
                     "has_speaker_labels": speaker_labels_enabled and bool(status_result.get("utterances")),
                     "segments": segments,
-                    "timings_source": TYPEMYWORDZ1_NAME
+                    "timings_source": TYPEMYWORDZ1_NAME,
+                    # Which model actually ran. We send a preference list,
+                    # so this can differ from what was requested.
+                    "model_used": status_result.get("speech_model_used")
                 }
             elif status_result["status"] == "error":
                 raise Exception(status_result.get("error", f"Transcription failed on {TYPEMYWORDZ1_NAME}"))
@@ -1138,11 +1144,12 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service} ({service_config['reason']})")
 
-        def get_assemblyai_model(plan: str) -> str:
-            if plan == 'free' or plan == 'Monthly Plan':
-                return "nano"  
-            else:
-                return "best"  
+        def get_assemblyai_model(plan: str) -> list:
+            # Everyone, including free-trial users, gets the highest
+            # accuracy model. universal-2 is listed second so that
+            # languages universal-3-5-pro does not support still work
+            # instead of failing outright.
+            return ["universal-3-5-pro", "universal-2"]
 
         assemblyai_model = get_assemblyai_model(user_plan)
 
@@ -1358,7 +1365,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             model_used = "N/A"
 
             if service_used_name == "assemblyai":
-                model_used = job_data.get("assemblyai_model", "unknown")
+                model_used = (transcription_result.get("model_used")
+                              or job_data.get("assemblyai_model", "unknown"))
             elif service_used_name == "openai_whisper":
                 model_used = "whisper-1"
             elif service_used_name == "deepgram":
@@ -1464,15 +1472,14 @@ async def root():
         ],
         "logic": {
             "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
-            "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
-            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-            "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
-            "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-            "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "three_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "one_week_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "monthly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
+            "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
             "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
-            "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
-            "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
+            "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
             "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
@@ -2226,15 +2233,14 @@ async def health_check():
             },
             "transcription_logic": {
                 "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
-                "three_day_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "monthly_plan_transcription": f"Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}",
-                "yearly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "admin_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "monthly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
+                "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
                 "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
-                "free_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} nano model",
-                "paid_users_assemblyai_model": f"{TYPEMYWORDZ1_NAME} best model",
+                "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
                 "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
                 "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
@@ -2321,11 +2327,11 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free users: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
-    logger.info(f"  - Three-Day Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
-    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
-    logger.info(f"  - Monthly Plan: Primary={DEEPGRAM_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={TYPEMYWORDZ1_NAME}")
-    logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
+    logger.info(f"  - Free trial: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
+    logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
+    logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
+    logger.info(f"  - Monthly Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
+    logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
     logger.info(f"  - Dedicated AssemblyAI Tester ({ASSEMBLYAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ1_NAME} (no fallback)")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
