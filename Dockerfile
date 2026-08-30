@@ -4,18 +4,22 @@ FROM python:3.10-slim-bullseye
 # Set the working directory in the container
 WORKDIR /app
 
-# Copy the current directory contents into the container at /app
-COPY . /app
+# Install system dependencies. ffmpeg is used by pydub / ffmpeg-python
+# to compress audio before it is sent to a transcription service.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install system dependencies for Whisper (like ffmpeg)
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+# A current pip resolves this dependency set far more reliably than the
+# one bundled with the base image.
+RUN pip install --no-cache-dir --upgrade pip
 
-# Install CPU-only PyTorch separately to avoid CUDA dependencies
-# This URL is for Python 3.10 and CPU. Verify on pytorch.org if your Python version changes.
-RUN pip install --no-cache-dir torch==2.1.1+cpu torchvision==0.16.1+cpu torchaudio==2.1.1+cpu --index-url https://download.pytorch.org/whl/cpu
-
-# Install any needed packages specified in requirements.txt
+# Install dependencies before copying the app, so that changing main.py
+# does not invalidate the cached dependency layer on every deploy.
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the application itself
+COPY . /app
 
 # Make port 8000 available (informational, Railway overrides this)
 EXPOSE 8000
