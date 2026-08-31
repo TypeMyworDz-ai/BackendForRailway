@@ -59,6 +59,18 @@ ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com'
 # visible in testing instead of being quietly masked by another provider.
 DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
 
+# Outgoing email (Resend). The API key lives only in the environment, never in
+# the repository. If it is missing the app still works: welcome emails are
+# simply skipped and logged, rather than breaking anyone's signup.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_ENDPOINT = "https://api.resend.com/emails"
+# The sending subdomain is verified with Resend. It is deliberately a
+# subdomain so that Resend's bounce handling cannot collide with the Zoho
+# mailbox that receives mail on the root domain.
+EMAIL_FROM = "TypeMyworDz <noreply@send.typemywordz.ai>"
+SUPPORT_EMAIL = "info@typemywordz.ai"
+APP_URL = "https://typemywordz.ai"
+
 def install_ffmpeg():
     try:
         subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
@@ -2219,6 +2231,130 @@ async def list_jobs():
             }
         }
     }
+
+class WelcomeEmailRequest(BaseModel):
+    email: str
+    name: Optional[str] = ""
+
+
+def build_welcome_email(name: str, free_minutes: int = 5):
+    """Build the subject and HTML body of the welcome email.
+
+    Kept as a plain function with no network access so it can be unit tested.
+    House style: no emoji, green only for things the client can act on,
+    neutral greys for everything else.
+    """
+    first = (name or "").strip().split(" ")[0] if (name or "").strip() else ""
+    greeting = "Welcome, %s" % first if first else "Welcome to TypeMyworDz"
+    subject = "Welcome to TypeMyworDz"
+
+    html = """<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f8f8f9;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8f8f9;padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+                 style="max-width:560px;background:#ffffff;border:1px solid #e5e6ea;border-radius:10px;padding:32px;
+                        font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+            <tr><td style="font-size:20px;font-weight:700;color:#14161a;padding-bottom:4px;">
+              <span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
+            </td></tr>
+            <tr><td style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#858a95;padding-bottom:24px;">
+              You Talk, We Type
+            </td></tr>
+            <tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">GREETING</td></tr>
+            <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">
+              Your account is ready. You have MINUTES minutes of free transcription to try it out,
+              so you can judge the quality on your own audio before you decide anything.
+            </td></tr>
+            <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:24px;">
+              Upload a recording, and when it is done you can proofread it against the audio,
+              copy it in one click, or export it as a Word or text file.
+            </td></tr>
+            <tr><td style="padding-bottom:28px;">
+              <a href="APPURL" style="display:inline-block;background:#28a745;color:#ffffff;text-decoration:none;
+                 font-size:15px;font-weight:600;padding:12px 22px;border-radius:7px;">Start transcribing</a>
+            </td></tr>
+            <tr><td style="font-size:14px;line-height:1.6;color:#3f434c;border-top:1px solid #e5e6ea;padding-top:20px;">
+              One thing worth knowing: we keep your transcripts, but we delete the audio as soon as it has been
+              transcribed. Keep your own copy of any recording you may want to proofread against later.
+            </td></tr>
+            <tr><td style="font-size:14px;line-height:1.6;color:#3f434c;padding-top:16px;">
+              Any questions, just reply to this address or write to
+              <a href="mailto:SUPPORT" style="color:#28a745;">SUPPORT</a>. A real person answers.
+            </td></tr>
+            <tr><td style="font-size:12px;color:#858a95;padding-top:24px;">
+              You are receiving this because an account was created with this address at TypeMyworDz.
+            </td></tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+    html = html.replace("GREETING", greeting)
+    html = html.replace("MINUTES", str(free_minutes))
+    html = html.replace("APPURL", APP_URL)
+    html = html.replace("SUPPORT", SUPPORT_EMAIL)
+
+    text = (
+        "%s\n\n"
+        "Your account is ready. You have %d minutes of free transcription to try it out.\n\n"
+        "Start here: %s\n\n"
+        "One thing worth knowing: we keep your transcripts, but we delete the audio as soon as it "
+        "has been transcribed. Keep your own copy of any recording you may want to proofread against later.\n\n"
+        "Any questions, write to %s. A real person answers.\n"
+    ) % (greeting, free_minutes, APP_URL, SUPPORT_EMAIL)
+
+    return subject, html, text
+
+
+@app.post("/api/send-welcome-email")
+async def send_welcome_email(payload: WelcomeEmailRequest):
+    """Send the one-off welcome email to a brand new account.
+
+    This deliberately never fails loudly. Signing up must not break because an
+    email provider is having a bad day, so every problem is logged and reported
+    back as sent=false instead of raising.
+    """
+    address = (payload.email or "").strip()
+    if not address or "@" not in address:
+        return {"sent": False, "reason": "invalid_address"}
+
+    if not RESEND_API_KEY:
+        logger.warning("Welcome email skipped for %s: RESEND_API_KEY is not set", address)
+        return {"sent": False, "reason": "not_configured"}
+
+    subject, html, text = build_welcome_email(payload.name or "")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                RESEND_ENDPOINT,
+                headers={
+                    "Authorization": "Bearer %s" % RESEND_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": EMAIL_FROM,
+                    "to": [address],
+                    "reply_to": SUPPORT_EMAIL,
+                    "subject": subject,
+                    "html": html,
+                    "text": text,
+                },
+            )
+        if r.status_code >= 400:
+            logger.error("Welcome email rejected for %s: %s %s", address, r.status_code, r.text[:300])
+            return {"sent": False, "reason": "provider_error"}
+        logger.info("Welcome email sent to %s", address)
+        return {"sent": True}
+    except Exception as e:
+        logger.error("Welcome email failed for %s: %s", address, e)
+        return {"sent": False, "reason": "exception"}
+
 
 @app.get("/health")
 async def health_check():
