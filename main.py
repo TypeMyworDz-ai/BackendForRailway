@@ -52,6 +52,10 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 ADMIN_EMAILS = ['typemywordz@gmail.com', 'gracenyaitara@gmail.com', 'kagochi12@gmail.com']
 # Dedicated AssemblyAI Tester
 ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com'
+# Dedicated Deepgram test account. Like the AssemblyAI tester above, this one
+# always goes to Deepgram and never falls back, so that a Deepgram failure is
+# visible in testing instead of being quietly masked by another provider.
+DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
 
 def install_ffmpeg():
     try:
@@ -188,10 +192,12 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
     - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
     - njokigituku@gmail.com will now be using AssemblyAI, which means for them there is no fallback if Assembly fails.
+    - info@typemywordztest.com is the equivalent dedicated Deepgram tester: Deepgram only, no fallback.
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
     is_assemblyai_tester = (user_email and user_email.lower().strip() == ASSEMBLYAI_TESTER_EMAIL.lower())
+    is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
 
     # --- Initialize tiers ---
     tier_1 = None
@@ -209,6 +215,17 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "tier_2": None,
             "tier_3": None,
             "reason": reason
+        }
+
+    # --- Dedicated Deepgram Tester Logic ---
+    # Placed before the speaker-label override on purpose: this account exists to
+    # exercise Deepgram and nothing else, so even a speaker-tag request stays on it.
+    if is_deepgram_tester:
+        return {
+            "tier_1": "deepgram",
+            "tier_2": None,
+            "tier_3": None,
+            "reason": "dedicated_deepgram_tester"
         }
 
     # --- Speaker Labels Logic (Global Override) ---
@@ -1479,6 +1496,7 @@ async def root():
             "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
             "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
+            "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
             "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
             "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
@@ -1488,7 +1506,8 @@ async def root():
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
             "admin_emails": ADMIN_EMAILS,
-            "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL
+            "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+            "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
         },
         "stats": {
             "active_jobs": len(jobs),
@@ -1723,6 +1742,7 @@ async def paystack_status():
         "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL),
         "admin_emails": ADMIN_EMAILS,
         "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+        "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "endpoints": {
             "initialize_payment": "/api/initialize-paystack-payment",
@@ -2188,6 +2208,7 @@ async def list_jobs():
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
         "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+        "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "system_stats": {
             "jobs_by_status": {
@@ -2240,6 +2261,7 @@ async def health_check():
                 "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
                 "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
+                "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
                 "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
                 "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
@@ -2249,7 +2271,8 @@ async def health_check():
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
                 "admin_emails": ADMIN_EMAILS,
-                "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL
+                "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+                "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
             }
         }
         
@@ -2313,6 +2336,7 @@ if __name__ == "__main__":
     logger.info(f"  ✅ Three-tier automatic fallback system")
     logger.info(f"  ✅ Admin email-based service prioritization")
     logger.info(f"  ✅ Dedicated AssemblyAI tester logic")
+    logger.info(f"  ✅ Dedicated Deepgram tester logic ({DEEPGRAM_TESTER_EMAIL})")
     logger.info(f"  ✅ Speaker diarization for AssemblyAI and Deepgram")
     logger.info(f"  ✅ Dynamic TypeMyworDz1 model selection (nano for free, best for paid)")
     logger.info("  ✅ Unified transcription processing pipeline")
