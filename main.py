@@ -189,6 +189,118 @@ else:
     logger.warning(f"Google Gemini API key is missing, client will not be initialized.")
 
 
+# ---------------------------------------------------------------------------
+# Ask TypeMyworDz model catalogue.
+#
+# Every id below has been called successfully on this account. The page sends
+# the id the client picked, but the SERVER decides whether that id is allowed
+# for their plan, so nobody can unlock a premium model by editing the page.
+#
+# "standard" models come with any paid plan. "premium" models are part of what
+# the Monthly and Yearly plans are for.
+# ---------------------------------------------------------------------------
+
+ASK_MODEL_CATALOGUE = [
+    {
+        "id": "claude-haiku-4-5-20251001",
+        "provider": "claude",
+        "label": "Claude Haiku 4.5",
+        "blurb": "Quick and sharp. The best choice for most questions.",
+        "tier": "standard",
+    },
+    {
+        "id": "claude-sonnet-4-6",
+        "provider": "claude",
+        "label": "Claude Sonnet 4.6",
+        "blurb": "Thinks harder. Good for long or complicated material.",
+        "tier": "standard",
+    },
+    {
+        "id": "gemini-3.6-flash",
+        "provider": "gemini",
+        "label": "Gemini 3.6 Flash",
+        "blurb": "Google's quick model. Strong at reading images.",
+        "tier": "standard",
+    },
+    {
+        "id": "gemini-pro-latest",
+        "provider": "gemini",
+        "label": "Gemini Pro",
+        "blurb": "Google's deeper model for harder questions.",
+        "tier": "standard",
+    },
+    {
+        "id": "claude-sonnet-5",
+        "provider": "claude",
+        "label": "Claude Sonnet 5",
+        "blurb": "The newest Sonnet. An excellent all-rounder.",
+        "tier": "premium",
+    },
+    {
+        "id": "claude-opus-4-6",
+        "provider": "claude",
+        "label": "Claude Opus 4.6",
+        "blurb": "The most capable Claude. Slower, best for difficult work.",
+        "tier": "premium",
+    },
+    {
+        "id": "gemini-3.1-pro-preview",
+        "provider": "gemini",
+        "label": "Gemini 3.1 Pro",
+        "blurb": "Google's most capable model.",
+        "tier": "premium",
+    },
+]
+
+ASK_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+
+# Plans that also get the premium models.
+PREMIUM_AI_PLANS = ['Monthly Plan', 'Yearly Plan']
+
+
+def ask_models_for(user_plan: str, user_email: str = ""):
+    """Which models may this caller choose from?
+
+    Admins get everything. Monthly and Yearly get the premium models on top of
+    the standard ones. Every other paid plan gets the standard set.
+    """
+    if not is_ai_allowed(user_plan, user_email):
+        return []
+    premium_ok = (
+        is_admin_user(user_email)
+        or (user_plan in PREMIUM_AI_PLANS)
+    )
+    return [
+        m for m in ASK_MODEL_CATALOGUE
+        if m["tier"] == "standard" or premium_ok
+    ]
+
+
+def resolve_ask_model(requested: str, user_plan: str, user_email: str = ""):
+    """Turn a requested model id into (model_id, provider), safely.
+
+    An unknown id, or one the caller's plan does not include, quietly falls
+    back to the default rather than failing. A client should never see an
+    error because they had a stale model saved in their settings.
+    """
+    allowed = ask_models_for(user_plan, user_email)
+    if not allowed:
+        return ASK_DEFAULT_MODEL, "claude"
+    wanted = (requested or "").strip()
+    for m in allowed:
+        if m["id"] == wanted:
+            return m["id"], m["provider"]
+    # Older versions of the page sent "claude" or "gemini" rather than an id.
+    if wanted in ("claude", "gemini"):
+        for m in allowed:
+            if m["provider"] == wanted:
+                return m["id"], m["provider"]
+    for m in allowed:
+        if m["id"] == ASK_DEFAULT_MODEL:
+            return m["id"], m["provider"]
+    return allowed[0]["id"], allowed[0]["provider"]
+
+
 def is_paid_ai_user(user_plan: str) -> bool:
     paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
     return user_plan in paid_plans_for_ai
@@ -1943,7 +2055,14 @@ ASK_SYSTEM_PROMPT = (
     "You are TypeMyworDz Assistant, the assistant inside a transcription service. "
     "Answer clearly and directly, in plain language, without padding or flattery. "
     "When you are given a transcript, base your answer on it and say so if the "
-    "answer is not in it rather than guessing. Do not use emoji."
+    "answer is not in it rather than guessing. Do not use emoji. "
+    "Never describe your own situation or setup to the user. In particular, do "
+    "not begin with phrases such as 'Based on general knowledge', 'As no "
+    "transcript was provided', 'Here is', or any other preamble about what you "
+    "were or were not given. Simply answer the question. "
+    "Formatting: you may use **bold**, bullet lines beginning with '- ', and "
+    "numbered lines beginning with '1. '. Do not use tables, headings marked "
+    "with '#', code fences, or single asterisks for emphasis."
 )
 
 
@@ -2007,12 +2126,28 @@ async def ai_user_query(
         logger.error(f"Unexpected error processing AI user query: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
+@app.get("/ai/models")
+async def ai_models(user_plan: str = "free", user_email: str = ""):
+    """The models this caller is allowed to pick from.
+
+    The Settings page calls this so that the list a client sees always matches
+    what the server will actually accept.
+    """
+    allowed = ask_models_for(user_plan, user_email)
+    return {
+        "models": allowed,
+        "default": ASK_DEFAULT_MODEL if allowed else None,
+        "premium_included": any(m["tier"] == "premium" for m in allowed),
+    }
+
+
 @app.post("/ai/ask")
 async def ai_ask(
     user_prompt: str = Form(...),
     history: str = Form(""),
     transcript: str = Form(""),
     provider: str = Form("claude"),
+    model: str = Form(""),
     max_tokens: int = Form(2000),
     user_plan: str = Form("free"),
     user_email: str = Form(""),
@@ -2025,7 +2160,7 @@ async def ai_ask(
     via the history field, accepts attachments, and puts no limit on the length
     of the question.
     """
-    logger.info(f"Ask endpoint called. provider={provider}, plan={user_plan}, files={len(files or [])}")
+    logger.info(f"Ask endpoint called. model={model or provider}, plan={user_plan}, files={len(files or [])}")
 
     if not is_ai_allowed(user_plan, user_email):
         raise HTTPException(status_code=403, detail="Ask TypeMyworDz is available on any paid plan. Choose a plan to switch it on.")
@@ -2062,8 +2197,12 @@ async def ai_ask(
 
     turns = parse_history(history)
 
+    # The client asks; the server decides. An id the plan does not include
+    # falls back to the default rather than raising.
+    chosen_model, chosen_provider = resolve_ask_model(model or provider, user_plan, user_email)
+
     try:
-        if provider == "gemini":
+        if chosen_provider == "gemini":
             if not gemini_client:
                 raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} Gemini service is not initialized.")
             convo = [ASK_SYSTEM_PROMPT]
@@ -2073,12 +2212,13 @@ async def ai_ask(
             parts = ["\n\n".join(convo)]
             for img in images:
                 parts.append({"mime_type": img['media_type'], "data": base64.b64decode(img['data'])})
-            response = gemini_client.generate_content(
+            picked = genai.GenerativeModel(chosen_model)
+            response = picked.generate_content(
                 parts,
                 generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
             )
             answer = response.text
-            model_used = "gemini"
+            model_used = chosen_model
         else:
             if not claude_client:
                 raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized.")
@@ -2092,13 +2232,13 @@ async def ai_ask(
             messages = [{"role": t['role'], "content": t['content']} for t in turns]
             messages.append({"role": "user", "content": content})
             response = claude_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model=chosen_model,
                 max_tokens=max_tokens,
                 system=ASK_SYSTEM_PROMPT,
                 messages=messages,
             )
             answer = response.content[0].text
-            model_used = "claude"
+            model_used = chosen_model
 
         return {
             "ai_response": answer,
