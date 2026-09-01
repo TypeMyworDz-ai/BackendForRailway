@@ -190,8 +190,21 @@ else:
 
 
 def is_paid_ai_user(user_plan: str) -> bool:
-    paid_plans_for_ai = ['Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
+    paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
     return user_plan in paid_plans_for_ai
+
+
+def is_ai_allowed(user_plan: str, user_email: str = "") -> bool:
+    """May this caller use the AI features?
+
+    Yes if they are on a paid plan, or if they are one of the two admin
+    accounts. Admins keep plan "free" in the database and are recognised by
+    email everywhere else in the app, so the AI endpoints must do the same or
+    the admins are locked out of their own tools.
+    """
+    if user_email and user_email.strip().lower() in [e.lower() for e in ADMIN_EMAILS]:
+        return True
+    return is_paid_ai_user(user_plan)
 
 def is_admin_user(user_email: str) -> bool:
     """Check if user is an admin based on email address"""
@@ -1810,11 +1823,12 @@ async def ai_user_query(
     user_prompt: str = Form(...),
     model: str = Form("claude-haiku-4-5-20251001"),
     max_tokens: int = Form(1000),
-    user_plan: str = Form("free")
+    user_plan: str = Form("free"),
+    user_email: str = Form("")
 ):
     logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
 
-    if not is_paid_ai_user(user_plan):
+    if not is_ai_allowed(user_plan, user_email):
         raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not claude_client:
@@ -1869,7 +1883,8 @@ async def ai_user_query_gemini(
     user_prompt: str = Form(...),
     model: str = Form("models/gemini-pro-latest"),
     max_tokens: int = Form(1000),
-    user_plan: str = Form("free")
+    user_plan: str = Form("free"),
+    user_email: str = Form("")
 ):
     """Same job as /ai/user-query, but answered by Gemini instead of Claude.
 
@@ -1878,7 +1893,7 @@ async def ai_user_query_gemini(
     """
     logger.info(f"Gemini user query endpoint called. Model: {model}, User Plan: {user_plan}")
 
-    if not is_paid_ai_user(user_plan):
+    if not is_ai_allowed(user_plan, user_email):
         raise HTTPException(status_code=403, detail="AI Assistant features are only available on a paid plan. Please choose a plan to continue.")
 
     if not gemini_client:
@@ -1912,11 +1927,12 @@ async def ai_admin_format(
     formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
     model: str = Form("claude-haiku-4-5-20251001"),
     max_tokens: int = Form(4000),
-    user_plan: str = Form("free")
+    user_plan: str = Form("free"),
+    user_email: str = Form("")
 ):
     logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
-    if not is_paid_ai_user(user_plan):
+    if not is_ai_allowed(user_plan, user_email):
         raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not claude_client:
@@ -1970,11 +1986,12 @@ async def ai_admin_format_gemini(
     formatting_instructions: str = Form("Correct all grammar, ensure a formal tone, break into paragraphs with subheadings for each major topic, and highlight action items in bold."),
     model: str = Form("models/gemini-pro-latest"),
     max_tokens: int = Form(4000),
-    user_plan: str = Form("free")
+    user_plan: str = Form("free"),
+    user_email: str = Form("")
 ):
     logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
-    if not is_paid_ai_user(user_plan):
+    if not is_ai_allowed(user_plan, user_email):
         raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not gemini_client:
