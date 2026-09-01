@@ -2118,6 +2118,12 @@ ASK_SYSTEM_PROMPT = (
     "Answer clearly and directly, in plain language, without padding or flattery. "
     "When you are given a transcript, base your answer on it and say so if the "
     "answer is not in it rather than guessing. Do not use emoji. "
+    "Attachments: when the client attaches a document, its full text is placed "
+    "into the message between '--- Attached file: NAME ---' and "
+    "'--- end of NAME ---' markers, and images are attached directly. Anything "
+    "arriving that way is genuinely attached, so read it and answer from it. "
+    "Never tell the client you cannot see or access an attached file, and never "
+    "ask them to paste its contents. "
     "Never describe your own situation or setup to the user. In particular, do "
     "not begin with phrases such as 'Based on general knowledge', 'As no "
     "transcript was provided', 'Here is', or any other preamble about what you "
@@ -2379,7 +2385,10 @@ async def ai_ask(
         if item['kind'] == 'image':
             images.append(item)
         elif item['kind'] == 'text':
-            doc_texts.append(f"--- Attached file: {item['name']} ---\n{item['text']}")
+            doc_texts.append(
+                f"--- Attached file: {item['name']} ---\n{item['text']}"
+                f"\n--- end of {item['name']} ---"
+            )
         else:
             problems.append(f"{item['name']}: {item['message']}")
 
@@ -2388,7 +2397,16 @@ async def ai_ask(
     if transcript and transcript.strip():
         pieces.append(f"Here is the transcript being discussed:\n{transcript.strip()[:200000]}")
     if doc_texts:
-        pieces.append("\n\n".join(doc_texts))
+        # Without this framing the text just looks like part of the question, and
+        # weaker models reply "I cannot see an attached file" even though the
+        # whole document is sitting right there in front of them. Measured: Claude
+        # Haiku denied a PDF it had been given until this wrapper was added.
+        count = len(doc_texts)
+        pieces.append(
+            f"The client attached {count} file{'' if count == 1 else 's'} to this "
+            "message. The full contents are included below, so treat them as "
+            "genuinely attached.\n\n" + "\n\n".join(doc_texts)
+        )
     pieces.append((user_prompt or "Please look at what I have attached.").strip())
     question = "\n\n".join(pieces)
 
