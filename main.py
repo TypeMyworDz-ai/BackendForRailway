@@ -95,6 +95,7 @@ PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
 OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64")
 DEEPGRAM_SERVICE_RAILWAY_URL = os.environ.get("DEEPGRAM_SERVICE_RAILWAY_URL")
 
@@ -201,40 +202,61 @@ else:
 # ---------------------------------------------------------------------------
 
 ASK_MODEL_CATALOGUE = [
+    # -- standard: included with any paid plan ------------------------------
+    {
+        "id": "gpt-5.6-luna",
+        "provider": "openai",
+        "label": "ChatGPT 5.6 Luna",
+        "blurb": "Fast, sharp, and reads very long transcripts. The best all-round choice.",
+        "tier": "standard",
+        "credits": 1,
+        "transcript_only": False,
+    },
+    {
+        "id": "mistral-small-latest",
+        "provider": "mistral",
+        "label": "Mistral Small 4",
+        "blurb": "A capable European model. Good for summaries and everyday questions.",
+        "tier": "standard",
+        "credits": 1,
+        "transcript_only": False,
+    },
     {
         "id": "claude-haiku-4-5-20251001",
         "provider": "claude",
         "label": "Claude Haiku 4.5",
-        "blurb": "Quick and sharp. The best choice for most questions.",
+        "blurb": "Claude's quick model. Strong at careful reading and quoting.",
         "tier": "standard",
+        "credits": 2,
+        "transcript_only": False,
     },
     {
-        "id": "claude-sonnet-4-6",
-        "provider": "claude",
-        "label": "Claude Sonnet 4.6",
-        "blurb": "Thinks harder. Good for long or complicated material.",
-        "tier": "standard",
-    },
-    {
-        "id": "gemini-3.6-flash",
+        "id": "gemini-3.1-flash-lite",
         "provider": "gemini",
-        "label": "Gemini 3.6 Flash",
-        "blurb": "Google's quick model. Strong at reading images.",
+        "label": "Gemini 3.1 Flash-Lite",
+        "blurb": "Google's quick model. Available when you are working on a transcript.",
         "tier": "standard",
+        "credits": 1,
+        "transcript_only": True,
     },
+    # -- premium: what the Monthly and Yearly plans are for -----------------
     {
-        "id": "gemini-pro-latest",
-        "provider": "gemini",
-        "label": "Gemini Pro",
-        "blurb": "Google's deeper model for harder questions.",
-        "tier": "standard",
+        "id": "gpt-5.6-terra",
+        "provider": "openai",
+        "label": "ChatGPT 5.6 Terra",
+        "blurb": "A step up in reasoning. Good for long or complicated material.",
+        "tier": "premium",
+        "credits": 8,
+        "transcript_only": False,
     },
     {
         "id": "claude-sonnet-5",
         "provider": "claude",
         "label": "Claude Sonnet 5",
-        "blurb": "The newest Sonnet. An excellent all-rounder.",
+        "blurb": "An excellent all-rounder. Careful, thorough answers.",
         "tier": "premium",
+        "credits": 8,
+        "transcript_only": False,
     },
     {
         "id": "claude-opus-4-6",
@@ -242,27 +264,54 @@ ASK_MODEL_CATALOGUE = [
         "label": "Claude Opus 4.6",
         "blurb": "The most capable Claude. Slower, best for difficult work.",
         "tier": "premium",
+        "credits": 20,
+        "transcript_only": False,
     },
     {
-        "id": "gemini-3.1-pro-preview",
-        "provider": "gemini",
-        "label": "Gemini 3.1 Pro",
-        "blurb": "Google's most capable model.",
+        "id": "gpt-5.6-sol",
+        "provider": "openai",
+        "label": "ChatGPT 5.6 Sol",
+        "blurb": "OpenAI's most capable model. For the hardest questions.",
         "tier": "premium",
+        "credits": 20,
+        "transcript_only": False,
+    },
+    {
+        "id": "gemini-3.6-flash",
+        "provider": "gemini",
+        "label": "Gemini 3.6 Flash",
+        "blurb": "Google's deeper model. Available when you are working on a transcript.",
+        "tier": "premium",
+        "credits": 8,
+        "transcript_only": True,
     },
 ]
 
-ASK_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+ASK_DEFAULT_MODEL = "gpt-5.6-luna"
+
+# A safe fallback for each provider, used if the default is somehow missing.
+ASK_FALLBACK_MODEL = "claude-haiku-4-5-20251001"
 
 # Plans that also get the premium models.
 PREMIUM_AI_PLANS = ['Monthly Plan', 'Yearly Plan']
 
+# Gemini's 3.x models spend part of their output budget "thinking", and those
+# thinking tokens are billed and counted against max_output_tokens. With a
+# small budget the visible answer gets cut off mid-sentence, which is exactly
+# what clients were seeing. Give Gemini plenty of room, and switch thinking
+# off on the models that allow it.
+GEMINI_MIN_OUTPUT_TOKENS = 8000
+GEMINI_THINKING_OFF = {"gemini-3.1-flash-lite"}
 
-def ask_models_for(user_plan: str, user_email: str = ""):
+
+def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = True):
     """Which models may this caller choose from?
 
     Admins get everything. Monthly and Yearly get the premium models on top of
     the standard ones. Every other paid plan gets the standard set.
+
+    Some models are marked transcript_only. Those are offered when the question
+    is about a transcript, but not on the standalone research page.
     """
     if not is_ai_allowed(user_plan, user_email):
         return []
@@ -270,35 +319,48 @@ def ask_models_for(user_plan: str, user_email: str = ""):
         is_admin_user(user_email)
         or (user_plan in PREMIUM_AI_PLANS)
     )
-    return [
-        m for m in ASK_MODEL_CATALOGUE
-        if m["tier"] == "standard" or premium_ok
-    ]
+    out = []
+    for m in ASK_MODEL_CATALOGUE:
+        if m["tier"] != "standard" and not premium_ok:
+            continue
+        if m.get("transcript_only") and not has_transcript:
+            continue
+        out.append(m)
+    return out
 
 
-def resolve_ask_model(requested: str, user_plan: str, user_email: str = ""):
+def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_transcript: bool = True):
     """Turn a requested model id into (model_id, provider), safely.
 
     An unknown id, or one the caller's plan does not include, quietly falls
     back to the default rather than failing. A client should never see an
     error because they had a stale model saved in their settings.
     """
-    allowed = ask_models_for(user_plan, user_email)
+    allowed = ask_models_for(user_plan, user_email, has_transcript)
     if not allowed:
-        return ASK_DEFAULT_MODEL, "claude"
+        return ASK_DEFAULT_MODEL, "openai"
     wanted = (requested or "").strip()
     for m in allowed:
         if m["id"] == wanted:
             return m["id"], m["provider"]
-    # Older versions of the page sent "claude" or "gemini" rather than an id.
-    if wanted in ("claude", "gemini"):
+    # Older versions of the page sent a provider name rather than an id.
+    if wanted in ("claude", "gemini", "openai", "mistral"):
         for m in allowed:
             if m["provider"] == wanted:
                 return m["id"], m["provider"]
-    for m in allowed:
-        if m["id"] == ASK_DEFAULT_MODEL:
-            return m["id"], m["provider"]
+    for want in (ASK_DEFAULT_MODEL, ASK_FALLBACK_MODEL):
+        for m in allowed:
+            if m["id"] == want:
+                return m["id"], m["provider"]
     return allowed[0]["id"], allowed[0]["provider"]
+
+
+def ask_credit_cost(model_id: str) -> int:
+    """How many credits one question on this model costs."""
+    for m in ASK_MODEL_CATALOGUE:
+        if m["id"] == model_id:
+            return int(m.get("credits", 1))
+    return 1
 
 
 def is_paid_ai_user(user_plan: str) -> bool:
@@ -2127,18 +2189,149 @@ async def ai_user_query(
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @app.get("/ai/models")
-async def ai_models(user_plan: str = "free", user_email: str = ""):
+async def ai_models(user_plan: str = "free", user_email: str = "", has_transcript: str = "true"):
     """The models this caller is allowed to pick from.
 
     The Settings page calls this so that the list a client sees always matches
     what the server will actually accept.
     """
-    allowed = ask_models_for(user_plan, user_email)
+    want_transcript_models = str(has_transcript).strip().lower() not in ("false", "0", "no")
+    allowed = ask_models_for(user_plan, user_email, want_transcript_models)
+    resolved_default = None
+    if allowed:
+        resolved_default, _ = resolve_ask_model("", user_plan, user_email, want_transcript_models)
     return {
         "models": allowed,
-        "default": ASK_DEFAULT_MODEL if allowed else None,
+        "default": resolved_default,
         "premium_included": any(m["tier"] == "premium" for m in allowed),
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Talking to the model providers.
+#
+# OpenAI and Mistral both speak the OpenAI chat format, so one function covers
+# both. Gemini is called over plain HTTP rather than through the SDK, because
+# the installed SDK cannot switch thinking off or report when an answer was
+# cut short, and both of those matter here.
+# ---------------------------------------------------------------------------
+
+OPENAI_FORMAT_ENDPOINTS = {
+    "openai": ("https://api.openai.com/v1/chat/completions", lambda: OPENAI_API_KEY),
+    "mistral": ("https://api.mistral.ai/v1/chat/completions", lambda: MISTRAL_API_KEY),
+}
+
+
+def _ask_openai_format(provider, model_id, system_prompt, turns, question, images, max_tokens):
+    """Call OpenAI or Mistral and return the answer text."""
+    url, get_key = OPENAI_FORMAT_ENDPOINTS[provider]
+    key = get_key()
+    if not key:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} is not connected to that model right now.")
+
+    content = []
+    for img in images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"},
+        })
+    content.append({"type": "text", "text": question})
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for turn in turns:
+        messages.append({"role": turn["role"], "content": turn["content"]})
+    messages.append({"role": "user", "content": content})
+
+    payload = {"model": model_id, "messages": messages}
+    if provider == "openai":
+        # These models count reasoning tokens against the output budget, so
+        # keep reasoning light for chat and give the answer room to finish.
+        payload["max_completion_tokens"] = max(max_tokens, 4000)
+        payload["reasoning_effort"] = "low"
+    else:
+        payload["max_tokens"] = max(max_tokens, 4000)
+
+    r = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=180,
+    )
+    if r.status_code != 200:
+        logger.error(f"{provider} returned {r.status_code}: {r.text[:400]}")
+        raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    text = ((choice.get("message") or {}).get("content") or "").strip()
+    if choice.get("finish_reason") == "length" and text:
+        text += "\n\n[The answer was cut short because it reached its length limit. Ask me to continue and I will pick up where I stopped.]"
+    return text
+
+
+def _ask_gemini(model_id, system_prompt, turns, question, images, max_tokens):
+    """Call Gemini over HTTP and return the answer text."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} is not connected to that model right now.")
+
+    convo = [system_prompt]
+    for turn in turns:
+        convo.append(("You: " if turn["role"] == "user" else "Assistant: ") + turn["content"])
+    convo.append("You: " + question)
+
+    parts = [{"text": "\n\n".join(convo)}]
+    for img in images:
+        parts.append({"inline_data": {"mime_type": img["media_type"], "data": img["data"]}})
+
+    gen = {"maxOutputTokens": max(max_tokens, GEMINI_MIN_OUTPUT_TOKENS)}
+    if model_id in GEMINI_THINKING_OFF:
+        gen["thinkingConfig"] = {"thinkingBudget": 0}
+
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
+        json={"contents": [{"parts": parts}], "generationConfig": gen},
+        timeout=180,
+    )
+    if r.status_code != 200:
+        logger.error(f"gemini returned {r.status_code}: {r.text[:400]}")
+        raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
+    data = r.json()
+    cand = (data.get("candidates") or [{}])[0]
+    text = "".join(
+        p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or [])
+    ).strip()
+    if cand.get("finishReason") == "MAX_TOKENS" and text:
+        text += "\n\n[The answer was cut short because it reached its length limit. Ask me to continue and I will pick up where I stopped.]"
+    if not text:
+        raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} did not get an answer back. Please try again.")
+    return text
+
+
+def _ask_claude(model_id, system_prompt, turns, question, images, max_tokens):
+    """Call Claude and return the answer text."""
+    if not claude_client:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized.")
+    content = []
+    for img in images:
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": img["media_type"], "data": img["data"]},
+        })
+    content.append({"type": "text", "text": question})
+    messages = [{"role": t["role"], "content": t["content"]} for t in turns]
+    messages.append({"role": "user", "content": content})
+    response = claude_client.messages.create(
+        model=model_id,
+        max_tokens=max(max_tokens, 4000),
+        system=system_prompt,
+        messages=messages,
+    )
+    text = response.content[0].text
+    if getattr(response, "stop_reason", None) == "max_tokens" and text:
+        text += "\n\n[The answer was cut short because it reached its length limit. Ask me to continue and I will pick up where I stopped.]"
+    return text
 
 
 @app.post("/ai/ask")
@@ -2199,50 +2392,32 @@ async def ai_ask(
 
     # The client asks; the server decides. An id the plan does not include
     # falls back to the default rather than raising.
-    chosen_model, chosen_provider = resolve_ask_model(model or provider, user_plan, user_email)
+    has_transcript = bool(transcript and transcript.strip())
+    chosen_model, chosen_provider = resolve_ask_model(
+        model or provider, user_plan, user_email, has_transcript
+    )
 
     try:
-        if chosen_provider == "gemini":
-            if not gemini_client:
-                raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} Gemini service is not initialized.")
-            convo = [ASK_SYSTEM_PROMPT]
-            for turn in turns:
-                convo.append(("You: " if turn['role'] == 'user' else "Assistant: ") + turn['content'])
-            convo.append("You: " + question)
-            parts = ["\n\n".join(convo)]
-            for img in images:
-                parts.append({"mime_type": img['media_type'], "data": base64.b64decode(img['data'])})
-            picked = genai.GenerativeModel(chosen_model)
-            response = picked.generate_content(
-                parts,
-                generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
+        if chosen_provider in OPENAI_FORMAT_ENDPOINTS:
+            answer = _ask_openai_format(
+                chosen_provider, chosen_model, ASK_SYSTEM_PROMPT, turns, question, images, max_tokens
             )
-            answer = response.text
+            model_used = chosen_model
+        elif chosen_provider == "gemini":
+            answer = _ask_gemini(
+                chosen_model, ASK_SYSTEM_PROMPT, turns, question, images, max_tokens
+            )
             model_used = chosen_model
         else:
-            if not claude_client:
-                raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized.")
-            content = []
-            for img in images:
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": img['media_type'], "data": img['data']},
-                })
-            content.append({"type": "text", "text": question})
-            messages = [{"role": t['role'], "content": t['content']} for t in turns]
-            messages.append({"role": "user", "content": content})
-            response = claude_client.messages.create(
-                model=chosen_model,
-                max_tokens=max_tokens,
-                system=ASK_SYSTEM_PROMPT,
-                messages=messages,
+            answer = _ask_claude(
+                chosen_model, ASK_SYSTEM_PROMPT, turns, question, images, max_tokens
             )
-            answer = response.content[0].text
             model_used = chosen_model
 
         return {
             "ai_response": answer,
             "model_used": model_used,
+            "credits_used": ask_credit_cost(chosen_model),
             "attachments_read": len(images) + len(doc_texts),
             "attachment_problems": problems,
         }
@@ -2252,6 +2427,8 @@ async def ai_ask(
     except Exception as e:
         logger.error(f"Ask endpoint failed: {e}")
         raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+
+
 
 
 @app.post("/ai/user-query-gemini")
