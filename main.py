@@ -49,15 +49,32 @@ DEEPGRAM_NAME = "Deepgram" # Deepgram
 TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google Gemini
 
 # Admin email addresses
-# Only these two accounts are admins. Admins are never asked to subscribe
-# and are never limited by plan or free-trial rules.
-ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordztest.com']
+# There is exactly ONE admin account. Admins are never asked to subscribe, are
+# never limited by plan or free-trial rules, and can reach the admin tools.
+# Complimentary accounts (below) also skip payment, but are NOT admins and get
+# none of the admin tooling.
+ADMIN_EMAILS = ['typemywordz@gmail.com']
 # Dedicated AssemblyAI Tester
 ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com'
 # Dedicated Deepgram test account. Like the AssemblyAI tester above, this one
 # always goes to Deepgram and never falls back, so that a Deepgram failure is
 # visible in testing instead of being quietly masked by another provider.
 DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
+
+# Complimentary accounts. These skip payment for transcription and for Ask
+# TypeMyworDz, but they are deliberately NOT admins: no admin dashboard, no
+# admin-only models, no elevated data access. Keeping the two lists separate is
+# the whole point, so that "does not pay" never silently means "can see
+# everything".
+COMP_ACCESS_EMAILS = [DEEPGRAM_TESTER_EMAIL]
+
+
+def is_comp_access_user(user_email: str) -> bool:
+    """Free to use the app, but not an admin."""
+    if not user_email:
+        return False
+    return user_email.strip().lower() in [e.lower() for e in COMP_ACCESS_EMAILS]
+
 
 # Outgoing email (Resend). The API key lives only in the environment, never in
 # the repository. If it is missing the app still works: welcome emails are
@@ -371,12 +388,14 @@ def is_paid_ai_user(user_plan: str) -> bool:
 def is_ai_allowed(user_plan: str, user_email: str = "") -> bool:
     """May this caller use the AI features?
 
-    Yes if they are on a paid plan, or if they are one of the two admin
-    accounts. Admins keep plan "free" in the database and are recognised by
-    email everywhere else in the app, so the AI endpoints must do the same or
-    the admins are locked out of their own tools.
+    Yes if they are on a paid plan, if they are the admin, or if they are a
+    complimentary account. The admin and complimentary accounts keep plan
+    "free" in the database and are recognised by email everywhere else in the
+    app, so the AI endpoints must do the same or they are locked out.
     """
-    if user_email and user_email.strip().lower() in [e.lower() for e in ADMIN_EMAILS]:
+    if is_admin_user(user_email):
+        return True
+    if is_comp_access_user(user_email):
         return True
     return is_paid_ai_user(user_plan)
 
