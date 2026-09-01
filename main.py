@@ -601,6 +601,75 @@ def grant_free_trial(profile, now=None):
 # --- end of credit ledger ---
 
 
+# --- one-off conversion of the old hours system into credits ---
+#
+# Before credits, a plan included a number of transcription hours and the app
+# counted minutes used. Those clients are mid-plan and must not lose anything,
+# so their remaining minutes become credits one for one, and they are never
+# given less than the new plan's own allowance. Eight hours left therefore
+# becomes 480 credits rather than the 320 a fresh Three-Day plan grants.
+#
+# This runs once per account and records that it has run, so a client calling
+# it twice does not get paid twice.
+
+LEGACY_PLAN_MINUTES = {
+    'One-Day Plan':   4 * 60,
+    'Three-Day Plan': 8 * 60,
+    'One-Week Plan':  15 * 60,
+    'Monthly Plan':   25 * 60,
+    'Yearly Plan':    25 * 60,
+}
+
+
+def backfill_credits(profile, now=None):
+    """Turn a pre-credits profile into a credit balance. Pure; returns writes.
+
+    Returns (updates, detail). An empty updates dict means there was nothing
+    to do, which is the normal answer for everyone after the first call.
+    """
+    now = now or datetime.now()
+    profile = profile or {}
+
+    if profile.get('creditsBackfilledAt'):
+        return {}, {'skipped': 'already done'}
+    # An account that already has a live credit purse came in after credits
+    # existed, so there is nothing to convert.
+    if _as_dt(profile.get('planCreditsExpireAt')) is not None:
+        return {'creditsBackfilledAt': now}, {'skipped': 'already on credits'}
+
+    plan = profile.get('plan')
+    spec = PLAN_CREDITS.get(plan)
+    expires = _as_dt(profile.get('expiresAt'))
+
+    if spec and expires is not None and expires > now:
+        allowance = LEGACY_PLAN_MINUTES.get(plan, 0)
+        used = _int(profile.get('totalMinutesUsed'))
+        remaining = max(0, allowance - used)
+        credits = max(remaining, spec['credits'])
+        updates = {
+            'planCredits': credits,
+            'planCreditsExpireAt': expires,
+            'planCreditsRefillAt': (now + timedelta(days=REFILL_DAYS)
+                                    if spec['monthly_refill'] else None),
+            'creditsBackfilledAt': now,
+        }
+        return updates, {'granted': credits, 'plan': plan,
+                         'remainingMinutes': remaining, 'reason': 'paid plan converted'}
+
+    # Free account that has not used its trial yet: give it the trial in
+    # credits. One that has already used it gets nothing, which matches what
+    # it had before.
+    if not profile.get('hasReceivedInitialFreeMinutes'):
+        updates = dict(grant_free_trial(profile, now))
+        updates['creditsBackfilledAt'] = now
+        return updates, {'granted': FREE_TRIAL_CREDITS, 'reason': 'free trial'}
+
+    return {'creditsBackfilledAt': now}, {'granted': 0, 'reason': 'trial already used'}
+
+
+# --- end of backfill ---
+
+
 def is_paid_ai_user(user_plan: str) -> bool:
     paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
     return user_plan in paid_plans_for_ai
@@ -2721,6 +2790,34 @@ async def credits_quote(seconds: float = 0, user_id: str = "", user_email: str =
         "short_by": max(0, cost - bal["total"]),
         "exempt": False,
     }
+
+
+@app.post("/credits/backfill")
+async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
+    """Convert one account from the old hours system to credits.
+
+    Safe to call as often as the app likes: after the first time it does
+    nothing. Clients who are mid-plan keep every minute they had left.
+    """
+    if credits_exempt(user_email):
+        return {"exempt": True, "granted": 0}
+
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    profile = await _load_profile(user_id) if user_id else None
+    if profile is None:
+        raise HTTPException(status_code=404, detail="We could not find that account.")
+
+    updates, detail = backfill_credits(profile)
+    if updates:
+        await _save_credit_updates(user_id, updates)
+        logger.info(f"Credit backfill for {user_id}: {detail}")
+
+    bal = read_balance({**profile, **updates})
+    return {"exempt": False, "detail": detail,
+            "planCredits": bal["planCredits"],
+            "topUpCredits": bal["topUpCredits"],
+            "total": bal["total"]}
 
 
 @app.post("/credits/topup")
