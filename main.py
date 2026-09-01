@@ -2339,7 +2339,11 @@ async def ai_ask(
     user_prompt: str = Form(...),
     history: str = Form(""),
     transcript: str = Form(""),
-    provider: str = Form("claude"),
+    # No default here on purpose. This used to default to "claude", which made
+    # "the client did not choose a model" look identical to "the client asked
+    # for Claude", so everyone silently got Claude Haiku instead of the
+    # cheaper default the Settings page advertises.
+    provider: str = Form(""),
     model: str = Form(""),
     max_tokens: int = Form(2000),
     user_plan: str = Form("free"),
