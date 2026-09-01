@@ -227,7 +227,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "Claude Haiku 4.5",
         "blurb": "Claude's quick model. Strong at careful reading and quoting.",
         "tier": "standard",
-        "credits": 2,
+        "credits": 5,
         "transcript_only": False,
     },
     {
@@ -236,7 +236,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "Gemini 3.1 Flash-Lite",
         "blurb": "Google's quick model. Available when you are working on a transcript.",
         "tier": "standard",
-        "credits": 1,
+        "credits": 2,
         "transcript_only": True,
     },
     # -- premium: what the Monthly and Yearly plans are for -----------------
@@ -246,7 +246,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "ChatGPT 5.6 Terra",
         "blurb": "A step up in reasoning. Good for long or complicated material.",
         "tier": "premium",
-        "credits": 8,
+        "credits": 10,
         "transcript_only": False,
     },
     {
@@ -255,7 +255,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "Claude Sonnet 5",
         "blurb": "An excellent all-rounder. Careful, thorough answers.",
         "tier": "premium",
-        "credits": 8,
+        "credits": 10,
         "transcript_only": False,
     },
     {
@@ -264,7 +264,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "Claude Opus 4.6",
         "blurb": "The most capable Claude. Slower, best for difficult work.",
         "tier": "premium",
-        "credits": 20,
+        "credits": 22,
         "transcript_only": False,
     },
     {
@@ -273,7 +273,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "ChatGPT 5.6 Sol",
         "blurb": "OpenAI's most capable model. For the hardest questions.",
         "tier": "premium",
-        "credits": 20,
+        "credits": 18,
         "transcript_only": False,
     },
     {
@@ -282,7 +282,7 @@ ASK_MODEL_CATALOGUE = [
         "label": "Gemini 3.6 Flash",
         "blurb": "Google's deeper model. Available when you are working on a transcript.",
         "tier": "premium",
-        "credits": 8,
+        "credits": 10,
         "transcript_only": True,
     },
 ]
