@@ -351,13 +351,13 @@ class FormattedWordDownloadRequest(BaseModel):
 class UserAIRequest_Pydantic(BaseModel):
     transcript: str
     user_prompt: str
-    model: str = "claude-3-haiku-20240307"
+    model: str = "claude-haiku-4-5-20251001"
     max_tokens: int = 1000
 
 class AdminAIFormatRequest_Pydantic(BaseModel):
     transcript: str
     formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-3-5-haiku-20241022"
+    model: str = "claude-haiku-4-5-20251001"
     max_tokens: int = 4000
 
 # Pydantic model for Gemini User queries (now available for all paid users)
@@ -1808,7 +1808,7 @@ async def list_gemini_models():
 async def ai_user_query(
     transcript: str = Form(...),
     user_prompt: str = Form(...),
-    model: str = Form("claude-3-haiku-20240307"),
+    model: str = Form("claude-haiku-4-5-20251001"),
     max_tokens: int = Form(1000),
     user_plan: str = Form("free")
 ):
@@ -1824,8 +1824,6 @@ async def ai_user_query(
         if len(transcript) > 100000:
             raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
         
-        if len(user_prompt) > 1000:
-            raise HTTPException(status_code=400, detail="User prompt is too long. Please use a shorter prompt.")
 
         full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
 
@@ -1865,11 +1863,54 @@ async def ai_user_query(
         logger.error(f"Unexpected error processing AI user query: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
+@app.post("/ai/user-query-gemini")
+async def ai_user_query_gemini(
+    transcript: str = Form(...),
+    user_prompt: str = Form(...),
+    model: str = Form("models/gemini-pro-latest"),
+    max_tokens: int = Form(1000),
+    user_plan: str = Form("free")
+):
+    """Same job as /ai/user-query, but answered by Gemini instead of Claude.
+
+    This existed for the admin formatter but never for clients, so the
+    frontend's Gemini option was calling a URL that returned 404.
+    """
+    logger.info(f"Gemini user query endpoint called. Model: {model}, User Plan: {user_plan}")
+
+    if not is_paid_ai_user(user_plan):
+        raise HTTPException(status_code=403, detail="AI Assistant features are only available on a paid plan. Please choose a plan to continue.")
+
+    if not gemini_client:
+        raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} Gemini service is not initialized (API key missing or invalid).")
+
+    try:
+        if len(transcript) > 200000:
+            raise HTTPException(status_code=400, detail="Transcript is too long. Please use a shorter transcript.")
+
+        full_prompt = f"{user_prompt}\n\nHere is the transcript:\n{transcript}"
+
+        chosen = genai.GenerativeModel(model) if model and model != "models/gemini-pro-latest" else gemini_client
+        response = chosen.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
+        )
+        ai_response = response.text
+        logger.info(f"Successfully processed Gemini user query with {model}.")
+        return {"ai_response": ai_response}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Gemini user query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+
+
 @app.post("/ai/admin-format")
 async def ai_admin_format(
     transcript: str = Form(...),
     formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
-    model: str = Form("claude-3-5-haiku-20241022"),
+    model: str = Form("claude-haiku-4-5-20251001"),
     max_tokens: int = Form(4000),
     user_plan: str = Form("free")
 ):
