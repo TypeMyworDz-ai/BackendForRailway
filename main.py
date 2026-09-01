@@ -380,6 +380,227 @@ def ask_credit_cost(model_id: str) -> int:
     return 1
 
 
+# ---------------------------------------------------------------------------
+# Credit ledger
+#
+# One credit = one minute of transcription = one standard question.
+#
+# Every account has two purses:
+#   planCredits   - included with a plan. They die when the plan dies.
+#   topUpCredits  - bought separately. Valid for 12 months from purchase.
+#
+# Plan credits are always spent first, so that the credits with the nearer
+# expiry go first and a client is never left holding plan credits that expire
+# while their bought credits sit unused.
+#
+# The Yearly plan is "1,400 credits a month for a year" rather than 16,800 up
+# front. That is handled by a refill date: whenever the balance is read after
+# the refill date has passed, the monthly allowance is topped back up and the
+# refill date moves on a month. Doing it lazily on read means there is no
+# scheduled job to go wrong.
+# ---------------------------------------------------------------------------
+
+import math
+
+# What each plan includes.
+PLAN_CREDITS = {
+    'One-Day Plan':   {'credits': 150,   'days': 1,   'monthly_refill': False},
+    'Three-Day Plan': {'credits': 320,   'days': 3,   'monthly_refill': False},
+    'One-Week Plan':  {'credits': 600,   'days': 7,   'monthly_refill': False},
+    'Monthly Plan':   {'credits': 1400,  'days': 30,  'monthly_refill': False},
+    'Yearly Plan':    {'credits': 1400,  'days': 365, 'monthly_refill': True},
+}
+
+FREE_TRIAL_CREDITS = 10          # once per account
+TOPUP_VALID_DAYS = 365           # bought credits last a year
+REFILL_DAYS = 30                 # yearly plan tops up every 30 days
+
+# Top-up bundles. Prices are set on the pricing page; the server only needs to
+# know how many credits each bundle id is worth, so that a client cannot ask
+# for a bundle and be given someone else's credit count.
+TOPUP_BUNDLES = {
+    'topup-300':  300,
+    'topup-800':  800,
+    'topup-2000': 2000,
+}
+
+
+def _as_dt(value):
+    """Firestore hands back several date shapes. Normalise or give up safely."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    for attr in ('to_datetime', 'ToDatetime'):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return fn().replace(tzinfo=None)
+            except Exception:
+                return None
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '')).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _int(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def minutes_to_credits(seconds):
+    """Transcription is charged by the minute, rounded up, minimum one."""
+    try:
+        s = float(seconds or 0)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s <= 0:
+        return 1
+    return max(1, int(math.ceil(s / 60.0)))
+
+
+def read_balance(profile, now=None):
+    """What can this account actually spend right now?
+
+    Pure: it reads a profile and returns numbers plus any writes that ought to
+    be made (a yearly refill, or clearing an expired purse). It never writes.
+    """
+    now = now or datetime.now()
+    profile = profile or {}
+    updates = {}
+
+    plan = profile.get('plan')
+    plan_credits = _int(profile.get('planCredits'))
+    plan_expires = _as_dt(profile.get('planCreditsExpireAt'))
+    refill_at = _as_dt(profile.get('planCreditsRefillAt'))
+
+    # Plan credits die with the plan.
+    if plan_expires is not None and now >= plan_expires:
+        if plan_credits:
+            updates['planCredits'] = 0
+        plan_credits = 0
+    else:
+        # Yearly plan: top the monthly allowance back up, catching up if the
+        # client has been away for several months.
+        spec = PLAN_CREDITS.get(plan)
+        if spec and spec['monthly_refill'] and refill_at is not None:
+            moved = False
+            guard = 0
+            while now >= refill_at and guard < 24:
+                plan_credits = spec['credits']
+                refill_at = refill_at + timedelta(days=REFILL_DAYS)
+                moved = True
+                guard += 1
+            if moved:
+                updates['planCredits'] = plan_credits
+                updates['planCreditsRefillAt'] = refill_at
+
+    topup_credits = _int(profile.get('topUpCredits'))
+    topup_expires = _as_dt(profile.get('topUpCreditsExpireAt'))
+    if topup_expires is not None and now >= topup_expires:
+        if topup_credits:
+            updates['topUpCredits'] = 0
+        topup_credits = 0
+
+    return {
+        'planCredits': plan_credits,
+        'topUpCredits': topup_credits,
+        'total': plan_credits + topup_credits,
+        'planCreditsExpireAt': plan_expires,
+        'topUpCreditsExpireAt': topup_expires,
+        'updates': updates,
+    }
+
+
+def plan_spend(profile, amount, now=None):
+    """Work out how to take `amount` credits, plan purse first.
+
+    Returns (ok, updates, detail). Does not write anything.
+    """
+    amount = _int(amount)
+    bal = read_balance(profile, now)
+    updates = dict(bal['updates'])
+
+    if amount <= 0:
+        return True, updates, {'charged': 0, 'from_plan': 0, 'from_topup': 0,
+                               'remaining': bal['total']}
+
+    if bal['total'] < amount:
+        return False, updates, {'needed': amount, 'available': bal['total'],
+                                'short_by': amount - bal['total']}
+
+    from_plan = min(bal['planCredits'], amount)
+    from_topup = amount - from_plan
+
+    if from_plan:
+        updates['planCredits'] = bal['planCredits'] - from_plan
+    if from_topup:
+        updates['topUpCredits'] = bal['topUpCredits'] - from_topup
+
+    return True, updates, {
+        'charged': amount,
+        'from_plan': from_plan,
+        'from_topup': from_topup,
+        'remaining': bal['total'] - amount,
+    }
+
+
+def grant_plan_credits(plan, now=None):
+    """The writes that turn a successful payment into plan credits."""
+    now = now or datetime.now()
+    spec = PLAN_CREDITS.get(plan)
+    if not spec:
+        return {}
+    out = {
+        'planCredits': spec['credits'],
+        'planCreditsExpireAt': now + timedelta(days=spec['days']),
+    }
+    out['planCreditsRefillAt'] = (
+        now + timedelta(days=REFILL_DAYS) if spec['monthly_refill'] else None
+    )
+    return out
+
+
+def grant_topup_credits(profile, bundle_id, now=None):
+    """Add a bought bundle. Bought credits stack and the clock restarts.
+
+    Restarting the 12 months on every purchase is deliberately generous: it is
+    easier to explain than several piles with different expiry dates, and it
+    means a regular client's credits never quietly expire.
+    """
+    now = now or datetime.now()
+    credits = TOPUP_BUNDLES.get(bundle_id)
+    if not credits:
+        return None
+    bal = read_balance(profile, now)
+    updates = dict(bal['updates'])
+    updates['topUpCredits'] = bal['topUpCredits'] + credits
+    updates['topUpCreditsExpireAt'] = now + timedelta(days=TOPUP_VALID_DAYS)
+    return {'updates': updates, 'added': credits,
+            'newTotal': bal['planCredits'] + updates['topUpCredits']}
+
+
+def grant_free_trial(profile, now=None):
+    """Ten credits, once, for a brand new account."""
+    profile = profile or {}
+    if profile.get('hasReceivedInitialFreeMinutes'):
+        return {}
+    now = now or datetime.now()
+    return {
+        'planCredits': FREE_TRIAL_CREDITS,
+        'planCreditsExpireAt': now + timedelta(days=30),
+        'planCreditsRefillAt': None,
+        'hasReceivedInitialFreeMinutes': True,
+    }
+
+
+# --- end of credit ledger ---
+
+
 def is_paid_ai_user(user_plan: str) -> bool:
     paid_plans_for_ai = ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']
     return user_plan in paid_plans_for_ai
@@ -398,6 +619,66 @@ def is_ai_allowed(user_plan: str, user_email: str = "") -> bool:
     if is_comp_access_user(user_email):
         return True
     return is_paid_ai_user(user_plan)
+
+def credits_exempt(user_email: str) -> bool:
+    """Accounts that use the app without spending credits.
+
+    The admin and any complimentary account. Everyone else pays their way.
+    """
+    return is_admin_user(user_email) or is_comp_access_user(user_email)
+
+
+async def _load_profile(user_id: str):
+    if not db or not user_id:
+        return None
+    try:
+        snap = await asyncio.to_thread(db.collection('users').document(user_id).get)
+        return snap.to_dict() if snap.exists else None
+    except Exception as e:
+        logger.error(f"Could not read profile {user_id} for credits: {e}")
+        return None
+
+
+async def _save_credit_updates(user_id: str, updates: dict):
+    if not db or not user_id or not updates:
+        return False
+    try:
+        await asyncio.to_thread(db.collection('users').document(user_id).update, updates)
+        return True
+    except Exception as e:
+        logger.error(f"Could not write credits for {user_id}: {e}")
+        return False
+
+
+async def charge_credits(user_id: str, user_email: str, amount: int, what: str):
+    """Take credits for something the client has just received.
+
+    Deliberately forgiving. If the ledger cannot be reached we log it and let
+    the client keep what they have already been given, because silently losing
+    a finished transcript over a database hiccup is far worse than missing one
+    charge. The balance check that guards the paywall happens before the work
+    starts, not here.
+    """
+    if credits_exempt(user_email):
+        return {'charged': 0, 'exempt': True}
+    # Transcription jobs are tracked by email, the assistant by id. Accept
+    # either, and look the id up when only the email is to hand.
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    if not user_id:
+        return {'charged': 0, 'error': 'account not identified'}
+    profile = await _load_profile(user_id)
+    if profile is None:
+        return {'charged': 0, 'error': 'profile unavailable'}
+    ok, updates, detail = plan_spend(profile, amount)
+    if updates:
+        await _save_credit_updates(user_id, updates)
+    if ok:
+        logger.info(f"Charged {detail.get('charged')} credits to {user_id} for {what}; {detail.get('remaining')} left")
+    else:
+        logger.warning(f"Could not charge {amount} credits to {user_id} for {what}: {detail}")
+    return detail
+
 
 def is_admin_user(user_email: str) -> bool:
     """Check if user is an admin based on email address"""
@@ -601,6 +882,10 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         'hasReceivedInitialFreeMinutes': True,
         'totalMinutesUsed': 0
     }
+
+    # Buying a plan refills the plan purse. Bought top-up credits are left
+    # alone deliberately: a client who paid for them keeps them.
+    updates.update(grant_plan_credits(new_plan))
 
     plan_duration_days = 0
     if new_plan == 'Three-Day Plan':
@@ -1628,6 +1913,17 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 "timings_source": transcription_result.get("timings_source")
             })
 
+            # Charge for the audio we actually transcribed, by the minute,
+            # rounded up. Charged on success only: a failed job is free.
+            billed_seconds = (transcription_result.get("duration")
+                              or (duration_minutes or 0) * 60)
+            cost = minutes_to_credits(billed_seconds)
+            charge = await charge_credits(
+                job_data.get("user_id") or "", user_email, cost, f"transcription {job_id}"
+            )
+            job_data["credits_charged"] = charge.get("charged", 0)
+            job_data["credits_remaining"] = charge.get("remaining")
+
     except asyncio.CancelledError:
         logger.info(f"Transcription job {job_id} was cancelled")
         if job_data.get("status") != "cancelled":
@@ -2359,6 +2655,112 @@ def _ask_claude(model_id, system_prompt, turns, question, images, max_tokens):
     return text
 
 
+@app.get("/credits/balance")
+async def credits_balance(user_id: str = "", user_email: str = ""):
+    """What this account can spend, and what each thing costs.
+
+    The client shows this; it never decides it. Any refill or expiry noticed
+    while reading is written back here, so the number a client sees is the
+    number the server will actually honour.
+    """
+    if credits_exempt(user_email):
+        return {"exempt": True, "unlimited": True, "planCredits": None,
+                "topUpCredits": None, "total": None,
+                "costs": {"transcription_per_minute": 1},
+                "bundles": TOPUP_BUNDLES}
+
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    profile = await _load_profile(user_id) if user_id else None
+    if profile is None:
+        raise HTTPException(status_code=404, detail="We could not find that account.")
+
+    bal = read_balance(profile)
+    if bal["updates"]:
+        await _save_credit_updates(user_id, bal["updates"])
+
+    return {
+        "exempt": False,
+        "unlimited": False,
+        "planCredits": bal["planCredits"],
+        "topUpCredits": bal["topUpCredits"],
+        "total": bal["total"],
+        "planCreditsExpireAt": bal["planCreditsExpireAt"].isoformat() if bal["planCreditsExpireAt"] else None,
+        "topUpCreditsExpireAt": bal["topUpCreditsExpireAt"].isoformat() if bal["topUpCreditsExpireAt"] else None,
+        "costs": {
+            "transcription_per_minute": 1,
+            "ask": {m["id"]: m.get("credits", 1) for m in ASK_MODEL_CATALOGUE},
+        },
+        "bundles": TOPUP_BUNDLES,
+    }
+
+
+@app.get("/credits/quote")
+async def credits_quote(seconds: float = 0, user_id: str = "", user_email: str = ""):
+    """Can this account afford a file of this length?
+
+    Asked before an upload starts, so that a client is told up front rather
+    than after waiting for a transcript they cannot have.
+    """
+    cost = minutes_to_credits(seconds)
+    if credits_exempt(user_email):
+        return {"cost": 0, "affordable": True, "exempt": True, "balance": None}
+
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    profile = await _load_profile(user_id) if user_id else None
+    if profile is None:
+        return {"cost": cost, "affordable": False, "exempt": False,
+                "balance": 0, "short_by": cost}
+
+    bal = read_balance(profile)
+    return {
+        "cost": cost,
+        "balance": bal["total"],
+        "affordable": bal["total"] >= cost,
+        "short_by": max(0, cost - bal["total"]),
+        "exempt": False,
+    }
+
+
+@app.post("/credits/topup")
+async def credits_topup(
+    bundle_id: str = Form(...),
+    user_id: str = Form(""),
+    user_email: str = Form(""),
+    reference_id: str = Form(""),
+):
+    """Add a bought bundle of credits.
+
+    The client sends only which bundle was bought. How many credits that is
+    worth is decided here, from the server's own table, so that a client
+    cannot ask for the small bundle and be given the large one.
+    """
+    if bundle_id not in TOPUP_BUNDLES:
+        raise HTTPException(status_code=400, detail="That is not a top-up we sell.")
+
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    profile = await _load_profile(user_id) if user_id else None
+    if profile is None:
+        raise HTTPException(status_code=404, detail="We could not find that account.")
+
+    result = grant_topup_credits(profile, bundle_id)
+    if not result:
+        raise HTTPException(status_code=400, detail="That is not a top-up we sell.")
+
+    updates = dict(result["updates"])
+    if reference_id:
+        updates["lastTopUpReference"] = reference_id
+    updates["lastTopUpAt"] = firestore.SERVER_TIMESTAMP
+
+    if not await _save_credit_updates(user_id, updates):
+        raise HTTPException(status_code=500, detail="The credits could not be added. Please contact support.")
+
+    logger.info(f"Top-up {bundle_id} ({result['added']} credits) added for {user_id}")
+    return {"success": True, "added": result["added"], "total": result["newTotal"]}
+
+
 @app.post("/ai/ask")
 async def ai_ask(
     user_prompt: str = Form(...),
@@ -2373,6 +2775,7 @@ async def ai_ask(
     max_tokens: int = Form(2000),
     user_plan: str = Form("free"),
     user_email: str = Form(""),
+    user_id: str = Form(""),
     files: List[UploadFile] = File(default=[]),
 ):
     """Ask TypeMyworDz.
@@ -2455,10 +2858,16 @@ async def ai_ask(
             )
             model_used = chosen_model
 
+        cost = ask_credit_cost(chosen_model)
+        charge = await charge_credits(
+            user_id or "", user_email, cost, f"ask {chosen_model}"
+        )
+
         return {
             "ai_response": answer,
             "model_used": model_used,
-            "credits_used": ask_credit_cost(chosen_model),
+            "credits_used": charge.get("charged", cost),
+            "credits_remaining": charge.get("remaining"),
             "attachments_read": len(images) + len(doc_texts),
             "attachment_problems": problems,
         }
