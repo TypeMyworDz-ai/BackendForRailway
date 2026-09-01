@@ -212,15 +212,15 @@ ASK_MODEL_CATALOGUE = [
         "credits": 1,
         "transcript_only": False,
     },
-    {
-        "id": "mistral-small-latest",
-        "provider": "mistral",
-        "label": "Mistral Small 4",
-        "blurb": "A capable European model. Good for summaries and everyday questions.",
-        "tier": "standard",
-        "credits": 1,
-        "transcript_only": False,
-    },
+    # Mistral is wired up and working, but their free tier rejects calls from
+    # this server's address with "Invalid API Key" even though the same key
+    # succeeds elsewhere. Until a payment method is added to the Mistral
+    # account, the entry stays out of the catalogue so no client is offered a
+    # model that cannot answer. To switch it back on, restore this block:
+    #   {"id": "mistral-small-latest", "provider": "mistral",
+    #    "label": "Mistral Small 4",
+    #    "blurb": "A capable European model. Good for summaries and everyday questions.",
+    #    "tier": "standard", "credits": 1, "transcript_only": False},
     {
         "id": "claude-haiku-4-5-20251001",
         "provider": "claude",
