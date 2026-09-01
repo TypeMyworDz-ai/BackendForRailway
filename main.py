@@ -1779,6 +1779,7 @@ async def paystack_status():
             "transcribe": "/transcribe",
             "ai_user_query": "/ai/user-query",
             "ai_user_query_gemini": "/ai/user-query-gemini",
+            "ai_ask": "/ai/ask",
             "ai_admin_format": "/ai/admin-format",
             "ai_admin_format_gemini": "/ai/admin-format-gemini",
         },
@@ -1816,6 +1817,135 @@ async def list_gemini_models():
     except Exception as e:
         logger.error(f"Error listing Gemini models: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list Gemini models: {str(e)}")
+
+
+# ===================== Ask TypeMyworDz: reading attachments ================
+# Clients can attach images, PDFs and Word documents to a question. The models
+# cannot open a .docx or a .pdf, so anything that is not an image is turned
+# into plain text here first. Images are passed through as base64 for the
+# model's vision input.
+
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+MAX_TEXT_CHARS_PER_FILE = 200000
+MAX_ATTACHMENTS = 8
+IMAGE_TYPES = {
+    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+    'gif': 'image/gif', 'webp': 'image/webp',
+}
+
+
+def _file_ext(name: str) -> str:
+    return (name or '').rsplit('.', 1)[-1].lower() if '.' in (name or '') else ''
+
+
+def read_attachment(filename: str, raw: bytes):
+    """Turn one uploaded file into something a model can read.
+
+    Returns {'kind': 'text'|'image'|'error', ...}. Errors carry a plain-English
+    message that is shown to the client rather than swallowed, so that an
+    unreadable file never looks like the assistant simply ignored it.
+    """
+    name = filename or 'file'
+    ext = _file_ext(name)
+
+    if not raw:
+        return {'kind': 'error', 'name': name, 'message': 'the file was empty'}
+    if len(raw) > MAX_ATTACHMENT_BYTES:
+        return {'kind': 'error', 'name': name, 'message': 'the file is larger than 20 MB'}
+
+    if ext in IMAGE_TYPES:
+        return {'kind': 'image', 'name': name, 'media_type': IMAGE_TYPES[ext],
+                'data': base64.b64encode(raw).decode('ascii')}
+
+    if ext == 'pdf':
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(BytesIO(raw))
+            if getattr(reader, 'is_encrypted', False):
+                try:
+                    reader.decrypt('')
+                except Exception:
+                    return {'kind': 'error', 'name': name, 'message': 'the PDF is password protected'}
+            pages = []
+            for page in reader.pages:
+                try:
+                    pages.append(page.extract_text() or '')
+                except Exception:
+                    pages.append('')
+            text = '\n\n'.join(p for p in pages if p.strip())
+            if not text.strip():
+                return {'kind': 'error', 'name': name,
+                        'message': 'this PDF has no text in it, it looks like a scan. Try attaching it as an image instead'}
+            return {'kind': 'text', 'name': name, 'text': text[:MAX_TEXT_CHARS_PER_FILE]}
+        except Exception as e:
+            return {'kind': 'error', 'name': name, 'message': f'the PDF could not be read ({e})'}
+
+    if ext in ('docx', 'doc'):
+        try:
+            doc = Document(BytesIO(raw))
+            parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+                    if cells:
+                        parts.append(' | '.join(cells))
+            text = '\n'.join(parts)
+            if not text.strip():
+                return {'kind': 'error', 'name': name, 'message': 'the document had no text in it'}
+            return {'kind': 'text', 'name': name, 'text': text[:MAX_TEXT_CHARS_PER_FILE]}
+        except Exception:
+            return {'kind': 'error', 'name': name,
+                    'message': 'the document could not be read. If it is an older .doc file, save it as .docx and try again'}
+
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode('latin-1')
+        except Exception:
+            return {'kind': 'error', 'name': name, 'message': 'this file type is not supported'}
+    if '\x00' in text[:2000]:
+        return {'kind': 'error', 'name': name, 'message': 'this file type is not supported'}
+    return {'kind': 'text', 'name': name, 'text': text[:MAX_TEXT_CHARS_PER_FILE]}
+
+
+def parse_history(raw_history: str):
+    """Prior turns of the conversation, sent by the browser as JSON.
+
+    Anything malformed is ignored rather than failing the request: losing the
+    earlier context is a far better outcome than losing the question.
+    """
+    if not raw_history:
+        return []
+    try:
+        data = json.loads(raw_history)
+    except Exception:
+        logger.warning("Ask: history was not valid JSON, continuing without it.")
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for turn in data[-40:]:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get('role')
+        content = turn.get('content')
+        if role in ('user', 'assistant') and isinstance(content, str) and content.strip():
+            out.append({'role': role, 'content': content.strip()})
+    # A conversation has to start with the client and alternate; drop any
+    # leading assistant turns that would make the API reject the request.
+    while out and out[0]['role'] != 'user':
+        out.pop(0)
+    return out
+
+
+ASK_SYSTEM_PROMPT = (
+    "You are TypeMyworDz Assistant, the assistant inside a transcription service. "
+    "Answer clearly and directly, in plain language, without padding or flattery. "
+    "When you are given a transcript, base your answer on it and say so if the "
+    "answer is not in it rather than guessing. Do not use emoji."
+)
+
 
 @app.post("/ai/user-query")
 async def ai_user_query(
@@ -1876,6 +2006,113 @@ async def ai_user_query(
     except Exception as e:
         logger.error(f"Unexpected error processing AI user query: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@app.post("/ai/ask")
+async def ai_ask(
+    user_prompt: str = Form(...),
+    history: str = Form(""),
+    transcript: str = Form(""),
+    provider: str = Form("claude"),
+    max_tokens: int = Form(2000),
+    user_plan: str = Form("free"),
+    user_email: str = Form(""),
+    files: List[UploadFile] = File(default=[]),
+):
+    """Ask TypeMyworDz.
+
+    One endpoint behind both places the assistant appears: the standalone page,
+    and the panel beside a finished transcript. It keeps the conversation going
+    via the history field, accepts attachments, and puts no limit on the length
+    of the question.
+    """
+    logger.info(f"Ask endpoint called. provider={provider}, plan={user_plan}, files={len(files or [])}")
+
+    if not is_ai_allowed(user_plan, user_email):
+        raise HTTPException(status_code=403, detail="Ask TypeMyworDz is available on any paid plan. Choose a plan to switch it on.")
+
+    if not (user_prompt or "").strip() and not files:
+        raise HTTPException(status_code=400, detail="Please type a question.")
+
+    # ---- attachments -----------------------------------------------------
+    images = []
+    doc_texts = []
+    problems = []
+    for uf in (files or [])[:MAX_ATTACHMENTS]:
+        try:
+            raw = await uf.read()
+        except Exception:
+            problems.append(f"{uf.filename}: it could not be uploaded")
+            continue
+        item = read_attachment(uf.filename, raw)
+        if item['kind'] == 'image':
+            images.append(item)
+        elif item['kind'] == 'text':
+            doc_texts.append(f"--- Attached file: {item['name']} ---\n{item['text']}")
+        else:
+            problems.append(f"{item['name']}: {item['message']}")
+
+    # ---- build the question ----------------------------------------------
+    pieces = []
+    if transcript and transcript.strip():
+        pieces.append(f"Here is the transcript being discussed:\n{transcript.strip()[:200000]}")
+    if doc_texts:
+        pieces.append("\n\n".join(doc_texts))
+    pieces.append((user_prompt or "Please look at what I have attached.").strip())
+    question = "\n\n".join(pieces)
+
+    turns = parse_history(history)
+
+    try:
+        if provider == "gemini":
+            if not gemini_client:
+                raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} Gemini service is not initialized.")
+            convo = [ASK_SYSTEM_PROMPT]
+            for turn in turns:
+                convo.append(("You: " if turn['role'] == 'user' else "Assistant: ") + turn['content'])
+            convo.append("You: " + question)
+            parts = ["\n\n".join(convo)]
+            for img in images:
+                parts.append({"mime_type": img['media_type'], "data": base64.b64decode(img['data'])})
+            response = gemini_client.generate_content(
+                parts,
+                generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
+            )
+            answer = response.text
+            model_used = "gemini"
+        else:
+            if not claude_client:
+                raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} service is not initialized.")
+            content = []
+            for img in images:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": img['media_type'], "data": img['data']},
+                })
+            content.append({"type": "text", "text": question})
+            messages = [{"role": t['role'], "content": t['content']} for t in turns]
+            messages.append({"role": "user", "content": content})
+            response = claude_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=max_tokens,
+                system=ASK_SYSTEM_PROMPT,
+                messages=messages,
+            )
+            answer = response.content[0].text
+            model_used = "claude"
+
+        return {
+            "ai_response": answer,
+            "model_used": model_used,
+            "attachments_read": len(images) + len(doc_texts),
+            "attachment_problems": problems,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ask endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=f"AI service error: {str(e)}")
+
 
 @app.post("/ai/user-query-gemini")
 async def ai_user_query_gemini(
@@ -2504,6 +2741,7 @@ logger.info("Available API endpoints:")
 logger.info("  POST /transcribe - Main transcription endpoint with smart service selection")
 logger.info("  POST /ai/user-query - Process user-driven AI queries (summarize, Q&A, bullet points) with Claude")
 logger.info("  POST /ai/user-query-gemini - Process user-driven AI queries with Gemini (NOW FOR ALL PAID USERS)")
+logger.info("  POST /ai/ask - Ask TypeMyworDz: conversation with attachments, no length limit")
 logger.info("  POST /ai/admin-format - Process admin-driven AI formatting requests (Anthropic)")
 logger.info("  POST /ai/admin-format-gemini - Process admin-driven AI formatting requests (Google Gemini - NOW FOR ALL PAID USERS)")
 logger.info("  POST /api/initialize-paystack-payment - Initialize Paystack payment")
