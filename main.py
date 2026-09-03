@@ -506,10 +506,20 @@ def read_balance(profile, now=None):
             updates['topUpCredits'] = 0
         topup_credits = 0
 
+    # Credits only work while a plan is running. Bought credits are never
+    # taken away and are always shown, but they sit frozen until the client
+    # has a live plan again. Without this an account could buy top-ups
+    # forever and never subscribe.
+    plan_active = plan_expires is not None and now < plan_expires
+    spendable = plan_credits + (topup_credits if plan_active else 0)
+
     return {
         'planCredits': plan_credits,
         'topUpCredits': topup_credits,
         'total': plan_credits + topup_credits,
+        'planActive': plan_active,
+        'spendable': spendable,
+        'frozen': 0 if plan_active else topup_credits,
         'planCreditsExpireAt': plan_expires,
         'topUpCreditsExpireAt': topup_expires,
         'updates': updates,
@@ -527,11 +537,15 @@ def plan_spend(profile, amount, now=None):
 
     if amount <= 0:
         return True, updates, {'charged': 0, 'from_plan': 0, 'from_topup': 0,
-                               'remaining': bal['total']}
+                               'remaining': bal['spendable']}
 
-    if bal['total'] < amount:
-        return False, updates, {'needed': amount, 'available': bal['total'],
-                                'short_by': amount - bal['total']}
+    if bal['spendable'] < amount:
+        return False, updates, {'needed': amount, 'available': bal['spendable'],
+                                'short_by': amount - bal['spendable'],
+                                'frozen': bal['frozen'],
+                                'planActive': bal['planActive'],
+                                'reason': ('no active plan' if not bal['planActive']
+                                           else 'not enough credits')}
 
     from_plan = min(bal['planCredits'], amount)
     from_topup = amount - from_plan
@@ -545,7 +559,7 @@ def plan_spend(profile, amount, now=None):
         'charged': amount,
         'from_plan': from_plan,
         'from_topup': from_topup,
-        'remaining': bal['total'] - amount,
+        'remaining': bal['spendable'] - amount,
     }
 
 
@@ -2754,6 +2768,9 @@ async def credits_balance(user_id: str = "", user_email: str = ""):
         "planCredits": bal["planCredits"],
         "topUpCredits": bal["topUpCredits"],
         "total": bal["total"],
+        "spendable": bal["spendable"],
+        "frozen": bal["frozen"],
+        "planActive": bal["planActive"],
         "planCreditsExpireAt": bal["planCreditsExpireAt"].isoformat() if bal["planCreditsExpireAt"] else None,
         "topUpCreditsExpireAt": bal["topUpCreditsExpireAt"].isoformat() if bal["topUpCreditsExpireAt"] else None,
         "costs": {
@@ -2786,8 +2803,11 @@ async def credits_quote(seconds: float = 0, user_id: str = "", user_email: str =
     return {
         "cost": cost,
         "balance": bal["total"],
-        "affordable": bal["total"] >= cost,
-        "short_by": max(0, cost - bal["total"]),
+        "spendable": bal["spendable"],
+        "frozen": bal["frozen"],
+        "planActive": bal["planActive"],
+        "affordable": bal["spendable"] >= cost,
+        "short_by": max(0, cost - bal["spendable"]),
         "exempt": False,
     }
 
@@ -2817,7 +2837,10 @@ async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
     return {"exempt": False, "detail": detail,
             "planCredits": bal["planCredits"],
             "topUpCredits": bal["topUpCredits"],
-            "total": bal["total"]}
+            "total": bal["total"],
+            "spendable": bal["spendable"],
+            "frozen": bal["frozen"],
+            "planActive": bal["planActive"]}
 
 
 @app.post("/credits/topup")
