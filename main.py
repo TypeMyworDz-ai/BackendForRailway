@@ -2511,25 +2511,51 @@ def parse_history(raw_history: str):
     return out
 
 
-ASK_SYSTEM_PROMPT = (
-    "You are TypeMyworDz Assistant, the assistant inside a transcription service. "
-    "Answer clearly and directly, in plain language, without padding or flattery. "
-    "When you are given a transcript, base your answer on it and say so if the "
-    "answer is not in it rather than guessing. Do not use emoji. "
+# The assistant is used in two completely different places and must not
+# confuse them. Beside a transcript it is a transcript assistant. On the
+# standalone Ask page it is a general assistant that happens to be ours, and
+# must never mention transcripts, offer to transcribe anything, or ask which
+# transcript the client means. Sending one prompt for both was making the
+# research page answer as though a transcript were sitting in front of it.
+
+_ASK_SHARED = (
+    "Answer clearly and directly, in plain language, without padding or "
+    "flattery. Do not use emoji. "
     "Attachments: when the client attaches a document, its full text is placed "
     "into the message between '--- Attached file: NAME ---' and "
     "'--- end of NAME ---' markers, and images are attached directly. Anything "
     "arriving that way is genuinely attached, so read it and answer from it. "
     "Never tell the client you cannot see or access an attached file, and never "
     "ask them to paste its contents. "
-    "Never describe your own situation or setup to the user. In particular, do "
-    "not begin with phrases such as 'Based on general knowledge', 'As no "
-    "transcript was provided', 'Here is', or any other preamble about what you "
-    "were or were not given. Simply answer the question. "
+    "Never describe your own situation or setup to the user. Do not begin with "
+    "preamble about what you were or were not given, such as 'Based on general "
+    "knowledge' or 'Here is'. Simply answer the question. "
     "Formatting: you may use **bold**, bullet lines beginning with '- ', and "
     "numbered lines beginning with '1. '. Do not use tables, headings marked "
     "with '#', code fences, or single asterisks for emphasis."
 )
+
+ASK_SYSTEM_PROMPT_TRANSCRIPT = (
+    "You are TypeMyworDz Assistant, helping a client work with a transcript "
+    "they have just had made. Base your answer on the transcript you have been "
+    "given, and say plainly when something is not in it rather than guessing. "
+    + _ASK_SHARED
+)
+
+ASK_SYSTEM_PROMPT_GENERAL = (
+    "You are TypeMyworDz Assistant, a general assistant that helps with "
+    "whatever the client is working on: research, writing, planning, analysis, "
+    "code, study, and everyday questions. "
+    "There is no transcript in this conversation and none is expected. Never "
+    "mention transcripts, never offer to transcribe or caption anything, and "
+    "never ask the client which transcript or recording they mean. If a "
+    "question is too vague to answer, ask what they would like you to look at, "
+    "without assuming it is a transcript. "
+    + _ASK_SHARED
+)
+
+# Kept so that anything still referring to the old single prompt keeps working.
+ASK_SYSTEM_PROMPT = ASK_SYSTEM_PROMPT_GENERAL
 
 
 @app.post("/ai/user-query")
@@ -2957,6 +2983,9 @@ async def ai_ask(
     # The client asks; the server decides. An id the plan does not include
     # falls back to the default rather than raising.
     has_transcript = bool(transcript and transcript.strip())
+    ask_system_prompt = (
+        ASK_SYSTEM_PROMPT_TRANSCRIPT if has_transcript else ASK_SYSTEM_PROMPT_GENERAL
+    )
     chosen_model, chosen_provider = resolve_ask_model(
         model or provider, user_plan, user_email, has_transcript
     )
@@ -2964,17 +2993,17 @@ async def ai_ask(
     try:
         if chosen_provider in OPENAI_FORMAT_ENDPOINTS:
             answer = _ask_openai_format(
-                chosen_provider, chosen_model, ASK_SYSTEM_PROMPT, turns, question, images, max_tokens
+                chosen_provider, chosen_model, ask_system_prompt, turns, question, images, max_tokens
             )
             model_used = chosen_model
         elif chosen_provider == "gemini":
             answer = _ask_gemini(
-                chosen_model, ASK_SYSTEM_PROMPT, turns, question, images, max_tokens
+                chosen_model, ask_system_prompt, turns, question, images, max_tokens
             )
             model_used = chosen_model
         else:
             answer = _ask_claude(
-                chosen_model, ASK_SYSTEM_PROMPT, turns, question, images, max_tokens
+                chosen_model, ask_system_prompt, turns, question, images, max_tokens
             )
             model_used = chosen_model
 
