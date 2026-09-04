@@ -498,6 +498,48 @@ TOPUP_BUNDLES = {
     'topup-2000': 2000,
 }
 
+# What everything costs, in US dollars, decided here and nowhere else.
+#
+# There are two price lists. Which one a client is offered depends on where
+# they are paying from. The pricing page never announces this; it simply shows
+# one set of prices, and the client's browser cannot change them. The browser
+# says which plan or bundle it wants and the price is looked up here, so a
+# tampered request cannot buy a Yearly plan for a dollar.
+PRICES = {
+    'africa': {
+        'One-Day Plan':    1.50,
+        'Three-Day Plan':  3.00,
+        'One-Week Plan':   5.00,
+        'Monthly Plan':    9.00,
+        'Yearly Plan':    90.00,
+        'topup-300':       3.00,
+        'topup-800':       6.50,
+        'topup-2000':     15.00,
+    },
+    'global': {
+        'One-Day Plan':    2.00,
+        'Three-Day Plan':  4.00,
+        'One-Week Plan':   7.00,
+        'Monthly Plan':   14.00,
+        'Yearly Plan':   140.00,
+        'topup-300':       4.00,
+        'topup-800':       9.00,
+        'topup-2000':     20.00,
+    },
+}
+
+AFRICA_PAYMENT_CODES = {'KE', 'NG', 'GH', 'ZA', 'OTHER_AFRICA'}
+
+
+def price_region(country_code):
+    """Which price list applies. Anything not recognised pays the global list."""
+    return 'africa' if (country_code or '').upper() in AFRICA_PAYMENT_CODES else 'global'
+
+
+def price_for(item, country_code):
+    """The dollar price of a plan or top-up bundle, or None if we do not sell it."""
+    return PRICES[price_region(country_code)].get(item)
+
 
 def _as_dt(value):
     """Firestore hands back several date shapes. Normalise or give up safely."""
@@ -1474,7 +1516,7 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
 
-async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None):
+async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None, reference: Optional[str] = None):
     """
     Update user credits/plan in Firestore.
     The real-time revenue counter logic is now handled purely on the frontend.
@@ -1492,7 +1534,33 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             logger.error(f"User with email {email} not found in Firestore. Cannot update plan.")
             return {'success': False, 'error': f"User {email} not found in Firestore."}
 
-        # 2. Update user's plan in Firestore
+        # 2a. A top-up is not a plan. Buying credits adds them to the bought
+        # purse and leaves the plan, the free-trial flag and everything else
+        # exactly as it was. Both the callback and the webhook can arrive for
+        # the same payment, so the reference is remembered and a repeat is
+        # ignored rather than granting the credits twice.
+        if plan_name in TOPUP_BUNDLES:
+            profile = await _load_profile(user_id) or {}
+            if reference and profile.get('lastTopUpReference') == reference:
+                logger.info(f"Top-up {reference} for {email} already applied; ignoring the repeat.")
+                return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount,
+                        'currency': currency, 'already_applied': True}
+            result = grant_topup_credits(profile, plan_name)
+            if not result:
+                return {'success': False, 'error': 'Unknown top-up bundle'}
+            topup_updates = dict(result['updates'])
+            topup_updates['lastAccessed'] = firestore.SERVER_TIMESTAMP
+            topup_updates['lastTopUpAt'] = firestore.SERVER_TIMESTAMP
+            if reference:
+                topup_updates['lastTopUpReference'] = reference
+            await asyncio.to_thread(db.collection('users').document(user_id).update, topup_updates)
+            if update_admin_revenue:
+                await update_monthly_revenue_firestore(amount)
+            logger.info(f"Added {result['added']} bought credits to {email}.")
+            return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount,
+                    'currency': currency, 'credits_added': result['added']}
+
+        # 2b. Update user's plan in Firestore
         await asyncio.to_thread(db.collection('users').document(user_id).update, {
             'plan': plan_name,
             'lastAccessed': firestore.SERVER_TIMESTAMP,
@@ -2230,8 +2298,13 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
         raise HTTPException(status_code=500, detail="Paystack configuration missing")
     
     try:
-        # Determine local amount and currency, now Monthly Plan does NOT force USD
-        local_amount, local_currency = get_local_amount_and_currency(request.amount, request.country_code, request.plan_name)
+        # The price comes from the server's own table. Whatever amount the
+        # browser sent is ignored, so the price cannot be edited on the way in.
+        base_usd = price_for(request.plan_name, request.country_code)
+        if base_usd is None:
+            raise HTTPException(status_code=400, detail="That is not something we sell.")
+
+        local_amount, local_currency = get_local_amount_and_currency(base_usd, request.country_code, request.plan_name)
         payment_channels = get_payment_channels(request.country_code, request.plan_name)
 
         amount_kobo = int(local_amount * 100)
@@ -2249,7 +2322,7 @@ async def initialize_paystack_payment(request: PaystackInitializationRequest):
             'channels': payment_channels,
             'metadata': {
                 'plan': request.plan_name,
-                'base_usd_amount': request.amount,
+                'base_usd_amount': base_usd,
                 'country_code': request.country_code,
                 'custom_fields': [
                     {
@@ -2319,7 +2392,7 @@ async def verify_payment(request: PaystackVerificationRequest):
             update_admin_revenue_flag = verification_result['raw_data'].get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
 
             # Pass base_usd_amount, country_code, and update_admin_revenue_flag
-            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code) 
+            credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code, reference) 
             
             if credit_result['success']:
                 logger.info(f"✅ Payment verified and credits updated for {email}")
@@ -2411,7 +2484,7 @@ async def paystack_webhook(request: Request):
             logger.info(f"🔔 Webhook: Payment successful - {customer_email} paid {amount} {currency} for {plan_name}. Base USD: {base_usd_amount}, Country: {country_code}, Update Revenue: {update_admin_revenue_flag}")
             
             if customer_email:
-                credit_result = await update_user_credits_paystack(customer_email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code)
+                credit_result = await update_user_credits_paystack(customer_email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code, reference)
                 if credit_result['success']:
                     logger.info(f"✅ Webhook: Credits updated automatically for {customer_email} in Firestore.")
                 else:
@@ -2991,6 +3064,48 @@ async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
             "planActive": bal["planActive"]}
 
 
+@app.get("/pricing")
+async def pricing(country_code: str = "GLOBAL"):
+    """What we sell and what it costs, for one client.
+
+    The page that shows this must not have to know that more than one price
+    list exists. It asks, it is told one set of prices, and it displays them.
+    """
+    region = price_region(country_code)
+    table = PRICES[region]
+
+    plans = []
+    for name in ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Monthly Plan', 'Yearly Plan']:
+        spec = PLAN_CREDITS.get(name)
+        if not spec or name not in table:
+            continue
+        plans.append({
+            'id': name,
+            'price': table[name],
+            'credits': spec['credits'],
+            'days': spec['days'],
+            'monthly_refill': spec['monthly_refill'],
+            'premium_ai': name in PREMIUM_AI_PLANS,
+        })
+
+    topups = []
+    for bundle_id in ['topup-300', 'topup-800', 'topup-2000']:
+        if bundle_id in table:
+            topups.append({
+                'id': bundle_id,
+                'price': table[bundle_id],
+                'credits': TOPUP_BUNDLES[bundle_id],
+            })
+
+    return {
+        'currency': 'USD',
+        'plans': plans,
+        'topups': topups,
+        'topup_valid_days': TOPUP_VALID_DAYS,
+        'free_trial_credits': FREE_TRIAL_CREDITS,
+    }
+
+
 @app.post("/credits/topup")
 async def credits_topup(
     bundle_id: str = Form(...),
@@ -3006,6 +3121,21 @@ async def credits_topup(
     """
     if bundle_id not in TOPUP_BUNDLES:
         raise HTTPException(status_code=400, detail="That is not a top-up we sell.")
+
+    # Credits are money. This endpoint will only add them against a payment
+    # that Paystack itself confirms was made, for this exact bundle. Without
+    # that check anyone who found the address could help themselves. An admin
+    # may still add credits by hand, for support and goodwill.
+    if not is_admin_user(user_email):
+        if not reference_id:
+            raise HTTPException(status_code=400, detail="A payment reference is required.")
+        check = await verify_paystack_payment(reference_id)
+        if check.get('status') != 'success':
+            raise HTTPException(status_code=402, detail="That payment could not be confirmed.")
+        if check.get('plan') != bundle_id:
+            raise HTTPException(status_code=400, detail="That payment was not for this top-up.")
+        if user_email and check.get('email') and check['email'].lower() != user_email.lower():
+            raise HTTPException(status_code=403, detail="That payment belongs to another account.")
 
     if not user_id and user_email:
         user_id = await get_user_profile_by_email_firestore(user_email)
