@@ -13,6 +13,16 @@ import uuid
 from datetime import datetime, timedelta
 import requests
 from pydub import AudioSegment
+
+# Audio written for clients must open in ordinary playback software, not just
+# in a browser. MP3 has three variants and the encoder picks one from the
+# sample rate: 32 kHz and above gives MPEG-1, which everything plays; 16 to
+# 24 kHz gives MPEG-2; and 8 to 12 kHz gives MPEG-2.5, a non-standard
+# extension that transcription software such as ExpressScribe will not open.
+# Staying at 44,100 Hz keeps every file we produce in the variant that works
+# everywhere. Mono at 64 kbps is what keeps it small.
+PLAYABLE_SAMPLE_RATE = 44100
+PLAYABLE_BITRATE = "64k"
 from pydantic import BaseModel
 from typing import Optional, List
 import httpx
@@ -1091,9 +1101,15 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             audio = audio.set_channels(1)
             logger.info("Converted to mono audio")
         
-        target_sample_rate = 16000
+        # 44,100 Hz is deliberate, not wasteful. Below 32,000 Hz the MP3
+        # encoder switches to the MPEG-2 and MPEG-2.5 variants, and MPEG-2.5
+        # in particular is a non-standard extension that professional
+        # playback software such as ExpressScribe refuses to open. Clients
+        # were having to convert every recording by hand. Mono at 64 kbps
+        # keeps the file small; the sample rate is what buys compatibility.
+        target_sample_rate = PLAYABLE_SAMPLE_RATE
         audio = audio.set_frame_rate(target_sample_rate)
-        logger.info(f"Reduced sample rate to {target_sample_rate} Hz")
+        logger.info(f"Set sample rate to {target_sample_rate} Hz for playback compatibility")
         
         if job_id and cancellation_flags.get(job_id, False):
             logger.info(f"Job {job_id} cancelled during sample rate conversion")
@@ -1107,12 +1123,15 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
             logger.info(f"Job {job_id} cancelled before export")
             raise asyncio.CancelledError(f"Job {job_id} was cancelled")
         
+        # No -q:a here. Passing a quality setting alongside a bitrate makes
+        # the encoder ignore the bitrate entirely: "-q:a 9" was turning a
+        # requested 64 kbps into roughly 10 kbps, which is why recordings
+        # came back sounding poor.
         audio.export(
-            output_path, 
+            output_path,
             format="mp3",
-            bitrate="64k",
+            bitrate=PLAYABLE_BITRATE,
             parameters=[
-                "-q:a", "9",
                 "-ac", "1",
                 "-ar", str(target_sample_rate)
             ]
@@ -1160,8 +1179,8 @@ def compress_audio_for_transcription(input_path: str, output_path: str = None, j
                 
             audio = AudioSegment.from_file(input_path)
             audio = audio.set_channels(1)
-            audio = audio.set_frame_rate(16000)
-            audio.export(output_path, format="mp3", bitrate="64k")
+            audio = audio.set_frame_rate(PLAYABLE_SAMPLE_RATE)
+            audio.export(output_path, format="mp3", bitrate=PLAYABLE_BITRATE)
             
             output_size = os.path.getsize(output_path) / (1024 * 1024)
             size_difference = input_size - output_size
@@ -1198,17 +1217,20 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
         
         audio = AudioSegment.from_file(input_path)
         
+        # Every quality now stays at 44,100 Hz. Only the bitrate changes.
+        # Dropping the sample rate saves very little and costs compatibility,
+        # because anything under 32,000 Hz leaves standard MPEG-1 audio.
         if quality == "high":
             bitrate = "128k"
-            sample_rate = 44100
+            sample_rate = PLAYABLE_SAMPLE_RATE
             channels = 2 if audio.channels > 1 else 1
         elif quality == "medium":
             bitrate = "96k"
-            sample_rate = 22050
+            sample_rate = PLAYABLE_SAMPLE_RATE
             channels = 1
         else:
-            bitrate = "64k"
-            sample_rate = 16000
+            bitrate = PLAYABLE_BITRATE
+            sample_rate = PLAYABLE_SAMPLE_RATE
             channels = 1
         
         if audio.channels != channels:
@@ -1216,12 +1238,12 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
         if audio.frame_rate != sample_rate:
             audio = audio.set_frame_rate(sample_rate)
         
+        # Again no -q:a, so the chosen bitrate is the bitrate we actually get.
         audio.export(
             output_path,
             format="mp3",
             bitrate=bitrate,
             parameters=[
-                "-q:a", "2" if quality == "high" else "5",
                 "-ac", str(channels),
                 "-ar", str(sample_rate)
             ]
