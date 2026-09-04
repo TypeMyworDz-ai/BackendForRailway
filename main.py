@@ -393,22 +393,26 @@ def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: 
     """Which models are being withheld from this caller purely because of plan?
 
     The Settings page shows these dimmed with a lock, rather than hiding them,
-    so a client can see what a better plan would give them. Models hidden for
-    any other reason (no assistant access at all, or transcript-only models on
-    the research page) are NOT listed here, because showing them would only
-    confuse. This never affects what the server will accept.
+    so a client can see what a better plan would give them.
+
+    Someone with no assistant access at all sees the WHOLE catalogue locked,
+    because they are exactly the person a plan would help. Only the
+    transcript-only models are left out on the research page, since a plan
+    would not make those appear there either. This never affects what the
+    server will accept.
     """
-    if not is_ai_allowed(user_plan, user_email):
-        return []
+    ai_ok = is_ai_allowed(user_plan, user_email)
     premium_ok = (
         is_admin_user(user_email)
         or (user_plan in PREMIUM_AI_PLANS)
     )
-    if premium_ok:
+    if ai_ok and premium_ok:
         return []
     out = []
     for m in ASK_MODEL_CATALOGUE:
-        if m["tier"] == "standard":
+        # With no assistant access, everything is locked. With access but no
+        # premium plan, only the premium ones are.
+        if ai_ok and m["tier"] == "standard":
             continue
         if m.get("transcript_only") and not has_transcript:
             continue
