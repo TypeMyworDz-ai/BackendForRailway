@@ -364,7 +364,7 @@ GEMINI_MIN_OUTPUT_TOKENS = 8000
 GEMINI_THINKING_OFF = {"gemini-3.1-flash-lite"}
 
 
-def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = True):
+def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = True, has_credits: bool = False):
     """Which models may this caller choose from?
 
     Admins get everything. Monthly and Yearly get the premium models on top of
@@ -373,7 +373,7 @@ def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = 
     Some models are marked transcript_only. Those are offered when the question
     is about a transcript, but not on the standalone research page.
     """
-    if not is_ai_allowed(user_plan, user_email):
+    if not is_ai_allowed(user_plan, user_email, has_credits):
         return []
     premium_ok = (
         is_admin_user(user_email)
@@ -389,7 +389,7 @@ def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = 
     return out
 
 
-def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: bool = True):
+def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: bool = True, has_credits: bool = False):
     """Which models are being withheld from this caller purely because of plan?
 
     The Settings page shows these dimmed with a lock, rather than hiding them,
@@ -401,7 +401,7 @@ def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: 
     would not make those appear there either. This never affects what the
     server will accept.
     """
-    ai_ok = is_ai_allowed(user_plan, user_email)
+    ai_ok = is_ai_allowed(user_plan, user_email, has_credits)
     premium_ok = (
         is_admin_user(user_email)
         or (user_plan in PREMIUM_AI_PLANS)
@@ -420,14 +420,14 @@ def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: 
     return out
 
 
-def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_transcript: bool = True):
+def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_transcript: bool = True, has_credits: bool = False):
     """Turn a requested model id into (model_id, provider), safely.
 
     An unknown id, or one the caller's plan does not include, quietly falls
     back to the default rather than failing. A client should never see an
     error because they had a stale model saved in their settings.
     """
-    allowed = ask_models_for(user_plan, user_email, has_transcript)
+    allowed = ask_models_for(user_plan, user_email, has_transcript, has_credits)
     if not allowed:
         return ASK_DEFAULT_MODEL, "openai"
     wanted = (requested or "").strip()
@@ -485,7 +485,7 @@ PLAN_CREDITS = {
     'Yearly Plan':    {'credits': 1400,  'days': 365, 'monthly_refill': True},
 }
 
-FREE_TRIAL_CREDITS = 10          # once per account
+FREE_TRIAL_CREDITS = 30          # once per account
 TOPUP_VALID_DAYS = 365           # bought credits last a year
 REFILL_DAYS = 30                 # yearly plan tops up every 30 days
 
@@ -593,6 +593,30 @@ def read_balance(profile, now=None):
     plan_credits = _int(profile.get('planCredits'))
     plan_expires = _as_dt(profile.get('planCreditsExpireAt'))
     refill_at = _as_dt(profile.get('planCreditsRefillAt'))
+
+    # Repair: a plan that was paid for but never filled the purse.
+    #
+    # Credits are meant to be granted at the moment a payment clears. For a
+    # period they were not: the plan was written to the account and the purse
+    # was left untouched, so a paying client saw a live plan and zero credits.
+    #
+    # Those accounts are recognisable because the plan purse has no expiry
+    # date at all. That is genuinely different from a client who simply spent
+    # everything, whose purse has a date and a zero against it, so this cannot
+    # refill someone who has legitimately run out. The grant is made once, and
+    # only for what is left of the plan they already paid for, so it can never
+    # hand out more than was bought or extend the plan.
+    if plan_expires is None:
+        spec = PLAN_CREDITS.get(plan)
+        plan_ends = _as_dt(profile.get('expiresAt'))
+        if spec and plan_ends is not None and now < plan_ends:
+            plan_credits = spec['credits']
+            plan_expires = plan_ends
+            updates['planCredits'] = plan_credits
+            updates['planCreditsExpireAt'] = plan_ends
+            if spec['monthly_refill']:
+                refill_at = now + timedelta(days=REFILL_DAYS)
+                updates['planCreditsRefillAt'] = refill_at
 
     # Plan credits die with the plan.
     if plan_expires is not None and now >= plan_expires:
@@ -826,17 +850,24 @@ def is_paid_ai_user(user_plan: str) -> bool:
     return user_plan in paid_plans_for_ai
 
 
-def is_ai_allowed(user_plan: str, user_email: str = "") -> bool:
+def is_ai_allowed(user_plan: str, user_email: str = "", has_credits: bool = False) -> bool:
     """May this caller use the AI features?
 
-    Yes if they are on a paid plan, if they are the admin, or if they are a
-    complimentary account. The admin and complimentary accounts keep plan
+    Yes if they are on a paid plan, if they hold credits they can spend, if
+    they are the admin, or if they are a complimentary account.
+
+    Credits count exactly as a plan does. A client who buys credits has paid
+    us the same money as a subscriber and must get the same features; being
+    sold credits and then told the assistant is for subscribers only would be
+    taking money for nothing. The admin and complimentary accounts keep plan
     "free" in the database and are recognised by email everywhere else in the
     app, so the AI endpoints must do the same or they are locked out.
     """
     if is_admin_user(user_email):
         return True
     if is_comp_access_user(user_email):
+        return True
+    if has_credits:
         return True
     return is_paid_ai_user(user_plan)
 
@@ -857,6 +888,28 @@ async def _load_profile(user_id: str):
     except Exception as e:
         logger.error(f"Could not read profile {user_id} for credits: {e}")
         return None
+
+
+async def account_has_usable_credits(user_id: str = "", user_email: str = "") -> bool:
+    """Does this account hold credits it can spend right now?
+
+    Credits open the same doors a plan does, so every gate that used to ask
+    only "are they subscribed?" has to ask this as well. A failure to read the
+    account answers no, which is the safe direction: the client is told to buy
+    something rather than being given something free.
+    """
+    try:
+        if not user_id and user_email:
+            user_id = await get_user_profile_by_email_firestore(user_email)
+        if not user_id:
+            return False
+        profile = await _load_profile(user_id)
+        if not profile:
+            return False
+        return read_balance(profile)['spendable'] > 0
+    except Exception as e:
+        logger.warning(f"Could not check credits for {user_email or user_id}: {e}")
+        return False
 
 
 async def _save_credit_updates(user_id: str, updates: dict):
@@ -1108,7 +1161,9 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
     updates.update(grant_plan_credits(new_plan))
 
     plan_duration_days = 0
-    if new_plan == 'Three-Day Plan':
+    if new_plan == 'One-Day Plan':
+        plan_duration_days = 1
+    elif new_plan == 'Three-Day Plan':
         plan_duration_days = 3
     elif new_plan == 'One-Week Plan':
         plan_duration_days = 7
@@ -1560,14 +1615,16 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount,
                     'currency': currency, 'credits_added': result['added']}
 
-        # 2b. Update user's plan in Firestore
-        await asyncio.to_thread(db.collection('users').document(user_id).update, {
-            'plan': plan_name,
-            'lastAccessed': firestore.SERVER_TIMESTAMP,
-            'paystackReferenceId': None, 
-            'hasReceivedInitialFreeMinutes': True,
-            'totalMinutesUsed': 0
-        })
+        # 2b. Set the plan AND fill the credit purse that comes with it.
+        #
+        # This used to write the plan by hand here and never grant a single
+        # credit, while the routine that does grant them sat unused. The
+        # result was a client who had paid, held a valid plan, and could not
+        # transcribe a thing. One routine now does both, so the two can never
+        # drift apart again.
+        plan_result = await update_user_plan_firestore(user_id, plan_name, reference, amount)
+        if not plan_result.get('success'):
+            return {'success': False, 'error': plan_result.get('error', 'Could not update the plan.')}
 
         # 3. Update monthly revenue if flag is True
         if update_admin_revenue:
@@ -2749,7 +2806,8 @@ async def ai_user_query(
 ):
     logger.info(f"AI user query endpoint called. Model: {model}, Prompt: '{user_prompt}', User Plan: {user_plan}")
 
-    if not is_ai_allowed(user_plan, user_email):
+    has_credits = await account_has_usable_credits(user_email=user_email)
+    if not is_ai_allowed(user_plan, user_email, has_credits):
         raise HTTPException(status_code=403, detail="AI Assistant features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not claude_client:
@@ -2811,11 +2869,12 @@ async def ai_models(user_plan: str = "free", user_email: str = "", has_transcrip
     what the server will actually accept.
     """
     want_transcript_models = str(has_transcript).strip().lower() not in ("false", "0", "no")
-    allowed = ask_models_for(user_plan, user_email, want_transcript_models)
-    locked = ask_models_locked_for(user_plan, user_email, want_transcript_models)
+    has_credits = await account_has_usable_credits(user_email=user_email)
+    allowed = ask_models_for(user_plan, user_email, want_transcript_models, has_credits)
+    locked = ask_models_locked_for(user_plan, user_email, want_transcript_models, has_credits)
     resolved_default = None
     if allowed:
-        resolved_default, _ = resolve_ask_model("", user_plan, user_email, want_transcript_models)
+        resolved_default, _ = resolve_ask_model("", user_plan, user_email, want_transcript_models, has_credits)
     return {
         "models": allowed,
         "locked": locked,
@@ -3185,7 +3244,8 @@ async def ai_ask(
     """
     logger.info(f"Ask endpoint called. model={model or provider}, plan={user_plan}, files={len(files or [])}")
 
-    if not is_ai_allowed(user_plan, user_email):
+    has_credits = await account_has_usable_credits(user_email=user_email)
+    if not is_ai_allowed(user_plan, user_email, has_credits):
         raise HTTPException(status_code=403, detail="Ask TypeMyworDz is available on any paid plan. Choose a plan to switch it on.")
 
     if not (user_prompt or "").strip() and not files:
@@ -3298,7 +3358,8 @@ async def ai_user_query_gemini(
     """
     logger.info(f"Gemini user query endpoint called. Model: {model}, User Plan: {user_plan}")
 
-    if not is_ai_allowed(user_plan, user_email):
+    has_credits = await account_has_usable_credits(user_email=user_email)
+    if not is_ai_allowed(user_plan, user_email, has_credits):
         raise HTTPException(status_code=403, detail="AI Assistant features are only available on a paid plan. Please choose a plan to continue.")
 
     if not gemini_client:
@@ -3337,7 +3398,8 @@ async def ai_admin_format(
 ):
     logger.info(f"AI admin format endpoint (Anthropic) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
-    if not is_ai_allowed(user_plan, user_email):
+    has_credits = await account_has_usable_credits(user_email=user_email)
+    if not is_ai_allowed(user_plan, user_email, has_credits):
         raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not claude_client:
@@ -3396,7 +3458,8 @@ async def ai_admin_format_gemini(
 ):
     logger.info(f"AI admin format endpoint (Gemini) called. Model: {model}, Instructions: '{formatting_instructions}', User Plan: {user_plan}")
 
-    if not is_ai_allowed(user_plan, user_email):
+    has_credits = await account_has_usable_credits(user_email=user_email)
+    if not is_ai_allowed(user_plan, user_email, has_credits):
         raise HTTPException(status_code=403, detail="AI Admin formatting features are only available for paid AI users (Three-Day, One-Week, Monthly Plan, Yearly Plan plans). Please upgrade your plan.")
 
     if not gemini_client:
