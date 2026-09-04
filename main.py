@@ -1402,7 +1402,18 @@ def compress_audio_for_download(input_path: str, output_path: str = None, qualit
         # Every quality now stays at 44,100 Hz. Only the bitrate changes.
         # Dropping the sample rate saves very little and costs compatibility,
         # because anything under 32,000 Hz leaves standard MPEG-1 audio.
-        if quality == "high":
+        # "voice" is what the app's own recordings use. They are captured as
+        # 32 kbps mono Opus, so re-encoding them to 128 kbps stereo made the
+        # file roughly four times larger than the original while adding no
+        # quality at all -- you cannot put back detail that was never
+        # recorded. 48 kbps mono at 44,100 Hz is transparent against that
+        # source, stays standard MPEG-1 so playback software still opens it,
+        # and is about two and a half times smaller than the old setting.
+        if quality == "voice":
+            bitrate = "48k"
+            sample_rate = PLAYABLE_SAMPLE_RATE
+            channels = 1
+        elif quality == "high":
             bitrate = "128k"
             sample_rate = PLAYABLE_SAMPLE_RATE
             channels = 2 if audio.channels > 1 else 1
