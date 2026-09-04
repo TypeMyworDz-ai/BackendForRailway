@@ -92,8 +92,13 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # Complimentary accounts (below) also skip payment, but are NOT admins and get
 # none of the admin tooling.
 ADMIN_EMAILS = ['typemywordz@gmail.com']
-# Dedicated AssemblyAI Tester
-ASSEMBLYAI_TESTER_EMAIL = 'njokigituku@gmail.com'
+# Dedicated OpenAI Whisper tester. This account used to be the AssemblyAI
+# tester; the owner moved it to OpenAI so OpenAI can be exercised on its own.
+# Like the Deepgram tester it never falls back, so an OpenAI failure shows up
+# in testing instead of being quietly masked by another provider. It is
+# deliberately NOT a complimentary account: it must hold a plan or credits
+# like any paying client, so it exercises the real billing path too.
+OPENAI_TESTER_EMAIL = 'njokigituku@gmail.com'
 # Dedicated Deepgram test account. Like the AssemblyAI tester above, this one
 # always goes to Deepgram and never falls back, so that a Deepgram failure is
 # visible in testing instead of being quietly masked by another provider.
@@ -166,7 +171,7 @@ logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}")
 logger.info(f"DEBUG: DEEPGRAM_SERVICE_RAILWAY_URL loaded value: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"DEBUG: AssemblyAI Tester email: {ASSEMBLYAI_TESTER_EMAIL}")
+logger.info(f"DEBUG: OpenAI Tester email: {OPENAI_TESTER_EMAIL}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -544,12 +549,23 @@ def read_balance(profile, now=None):
             updates['topUpCredits'] = 0
         topup_credits = 0
 
-    # Credits only work while a plan is running. Bought credits are never
-    # taken away and are always shown, but they sit frozen until the client
-    # has a live plan again. Without this an account could buy top-ups
-    # forever and never subscribe.
+    # Two different purses, two different rules.
+    #
+    # Plan credits come WITH a plan, so they stop when the plan stops. That is
+    # what the client bought and what the dates on the plan say.
+    #
+    # Top-up credits were paid for separately, in cash, on top of a plan. The
+    # owner's decision is that this money stays spendable even after a plan
+    # lapses, because freezing money somebody has already handed over is the
+    # fastest way to earn a complaint.
+    #
+    # This is not a loophole. Measured against the real price list, a client
+    # living on top-ups alone always pays MORE per credit than a subscriber:
+    # the cheapest top-up works out at about 0.0070 per credit against 0.0049
+    # on the cheapest plan, and every bundle clears cost with at least a 42
+    # percent margin. Avoiding a subscription costs the client more, not less.
     plan_active = plan_expires is not None and now < plan_expires
-    spendable = plan_credits + (topup_credits if plan_active else 0)
+    spendable = (plan_credits if plan_active else 0) + topup_credits
 
     return {
         'planCredits': plan_credits,
@@ -557,7 +573,13 @@ def read_balance(profile, now=None):
         'total': plan_credits + topup_credits,
         'planActive': plan_active,
         'spendable': spendable,
-        'frozen': 0 if plan_active else topup_credits,
+        # Nothing is frozen any more, and this is deliberate rather than an
+        # oversight. Plan credits are already set to zero a few lines above
+        # when the plan expires, because they belong to the plan. Bought
+        # credits are now always spendable. That leaves nothing in between,
+        # so this is always 0. The key is kept because the client reads it,
+        # and keeping it means an older client build cannot break.
+        'frozen': 0,
         'planCreditsExpireAt': plan_expires,
         'topUpCreditsExpireAt': topup_expires,
         'updates': updates,
@@ -582,10 +604,14 @@ def plan_spend(profile, amount, now=None):
                                 'short_by': amount - bal['spendable'],
                                 'frozen': bal['frozen'],
                                 'planActive': bal['planActive'],
-                                'reason': ('no active plan' if not bal['planActive']
+                                'reason': ('no active plan'
+                                           if (not bal['planActive'] and bal['frozen'])
                                            else 'not enough credits')}
 
-    from_plan = min(bal['planCredits'], amount)
+    # Spend the plan purse first, because it dies with the plan while bought
+    # credits last a year. Only what is actually spendable counts.
+    usable_plan = bal['planCredits'] if bal['planActive'] else 0
+    from_plan = min(usable_plan, amount)
     from_topup = amount - from_plan
 
     if from_plan:
@@ -813,12 +839,12 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     - OpenAI: First option for weekly subscribers, yearly, and Admins (Admins gets this logic no matter what plans they have subscribed to). Fallback is Assembly > Deepgram.
     - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
     - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
-    - njokigituku@gmail.com will now be using AssemblyAI, which means for them there is no fallback if Assembly fails.
+    - njokigituku@gmail.com is the dedicated OpenAI tester: OpenAI only, no fallback, and it pays like any client.
     - info@typemywordztest.com is the equivalent dedicated Deepgram tester: Deepgram only, no fallback.
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
-    is_assemblyai_tester = (user_email and user_email.lower().strip() == ASSEMBLYAI_TESTER_EMAIL.lower())
+    is_openai_tester = (user_email and user_email.lower().strip() == OPENAI_TESTER_EMAIL.lower())
     is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
 
     # --- Initialize tiers ---
@@ -827,16 +853,16 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     tier_3 = None
     reason = "default_logic"
 
-    # --- Dedicated AssemblyAI Tester Logic ---
-    if is_assemblyai_tester:
-        tier_1 = "assemblyai" 
-        reason = "dedicated_assemblyai_tester"
-        # No fallbacks for the dedicated tester as per requirement
+    # --- Dedicated OpenAI Tester Logic ---
+    # Placed before the speaker-label override on purpose: this account exists
+    # to exercise OpenAI and nothing else, so even a speaker-tag request stays
+    # on it rather than being handed to AssemblyAI.
+    if is_openai_tester:
         return {
-            "tier_1": tier_1,
+            "tier_1": "openai",
             "tier_2": None,
             "tier_3": None,
-            "reason": reason
+            "reason": "dedicated_openai_tester"
         }
 
     # --- Dedicated Deepgram Tester Logic ---
@@ -2144,7 +2170,7 @@ async def root():
             "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
-            "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
+            "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
             "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
             "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
@@ -2155,7 +2181,7 @@ async def root():
             "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
             "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
             "admin_emails": ADMIN_EMAILS,
-            "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+            "openai_tester_email": OPENAI_TESTER_EMAIL,
             "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
         },
         "stats": {
@@ -2390,7 +2416,7 @@ async def paystack_status():
         "google_gemini_configured": bool(GEMINI_API_KEY),
         "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL),
         "admin_emails": ADMIN_EMAILS,
-        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+        "openai_tester_email": OPENAI_TESTER_EMAIL,
         "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "endpoints": {
@@ -3495,7 +3521,7 @@ async def list_jobs():
         "cancellation_flags": len(cancellation_flags),
         "jobs": job_summary,
         "admin_emails": ADMIN_EMAILS,
-        "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+        "openai_tester_email": OPENAI_TESTER_EMAIL,
         "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL,
         "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
         "system_stats": {
@@ -3672,7 +3698,7 @@ async def health_check():
                 "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
-                "assemblyai_tester_transcription": f"Always use {TYPEMYWORDZ1_NAME} (no fallback for {ASSEMBLYAI_TESTER_EMAIL})",
+                "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
                 "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
                 "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
                 "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
@@ -3683,7 +3709,7 @@ async def health_check():
                 "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
                 "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
                 "admin_emails": ADMIN_EMAILS,
-                "assemblyai_tester_email": ASSEMBLYAI_TESTER_EMAIL,
+                "openai_tester_email": OPENAI_TESTER_EMAIL,
                 "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
             }
         }
@@ -3710,7 +3736,7 @@ logger.info(f"Google Gemini API Key configured: {bool(GEMINI_API_KEY)}")
 logger.info(f"Paystack Secret Key configured: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"Firebase Admin SDK configured: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64) and bool(db)}")
 logger.info(f"Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"AssemblyAI Tester email configured: {ASSEMBLYAI_TESTER_EMAIL}")
+logger.info(f"OpenAI Tester email configured: {OPENAI_TESTER_EMAIL}")
 logger.info(f"UPDATED: Google Gemini now available for ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)")
 logger.info(f"Job tracking systems initialized:")
 logger.info(f"  - Main jobs dictionary: {len(jobs)} jobs")
@@ -3770,7 +3796,7 @@ if __name__ == "__main__":
     logger.info(f"  - Monthly Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
-    logger.info(f"  - Dedicated AssemblyAI Tester ({ASSEMBLYAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ1_NAME} (no fallback)")
+    logger.info(f"  - Dedicated OpenAI Tester ({OPENAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ2_NAME} (no fallback)")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
     logger.info(f"  - {TYPEMYWORDZ1_NAME}: AssemblyAI")
