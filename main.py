@@ -389,6 +389,33 @@ def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = 
     return out
 
 
+def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: bool = True):
+    """Which models are being withheld from this caller purely because of plan?
+
+    The Settings page shows these dimmed with a lock, rather than hiding them,
+    so a client can see what a better plan would give them. Models hidden for
+    any other reason (no assistant access at all, or transcript-only models on
+    the research page) are NOT listed here, because showing them would only
+    confuse. This never affects what the server will accept.
+    """
+    if not is_ai_allowed(user_plan, user_email):
+        return []
+    premium_ok = (
+        is_admin_user(user_email)
+        or (user_plan in PREMIUM_AI_PLANS)
+    )
+    if premium_ok:
+        return []
+    out = []
+    for m in ASK_MODEL_CATALOGUE:
+        if m["tier"] == "standard":
+            continue
+        if m.get("transcript_only") and not has_transcript:
+            continue
+        out.append(m)
+    return out
+
+
 def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_transcript: bool = True):
     """Turn a requested model id into (model_id, provider), safely.
 
@@ -2708,11 +2735,13 @@ async def ai_models(user_plan: str = "free", user_email: str = "", has_transcrip
     """
     want_transcript_models = str(has_transcript).strip().lower() not in ("false", "0", "no")
     allowed = ask_models_for(user_plan, user_email, want_transcript_models)
+    locked = ask_models_locked_for(user_plan, user_email, want_transcript_models)
     resolved_default = None
     if allowed:
         resolved_default, _ = resolve_ask_model("", user_plan, user_email, want_transcript_models)
     return {
         "models": allowed,
+        "locked": locked,
         "default": resolved_default,
         "premium_included": any(m["tier"] == "premium" for m in allowed),
     }
