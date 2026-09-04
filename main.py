@@ -32,6 +32,34 @@ from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re
 import anthropic
+
+def claude_text(message) -> str:
+    """Pull the answer text out of a Claude reply.
+
+    Claude does not always put the answer in the first block. When a model
+    reasons before answering, the first block is a thinking block, which has
+    no .text at all, and reading it blindly raised
+    "'ThinkingBlock' object has no attribute 'text'" in the client's face.
+    Newer models can also return tool or citation blocks. So walk every
+    block, keep the ones that actually carry text, and join them.
+    """
+    blocks = getattr(message, "content", None) or []
+    parts = []
+    for block in blocks:
+        # Skip the reasoning; clients asked a question, not for the workings.
+        if getattr(block, "type", None) in ("thinking", "redacted_thinking"):
+            continue
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+    if parts:
+        return "\n\n".join(parts).strip()
+    logger.warning(
+        "Claude reply carried no text blocks; types were %s",
+        [getattr(b, "type", "?") for b in blocks],
+    )
+    return ""
+
 import openai
 
 import google.generativeai as genai
@@ -2612,7 +2640,12 @@ async def ai_user_query(
                 {"role": "user", "content": full_prompt}
             ]
         )
-        ai_response = message.content[0].text
+        ai_response = claude_text(message)
+        if not ai_response:
+            ai_response = (
+                "That answer came back empty, which is a hiccup on the model's "
+                "side rather than anything you did. Please ask again."
+            )
         logger.info(f"Successfully processed AI user query with {model}.")
         return {"ai_response": ai_response}
 
@@ -2780,7 +2813,15 @@ def _ask_claude(model_id, system_prompt, turns, question, images, max_tokens):
         system=system_prompt,
         messages=messages,
     )
-    text = response.content[0].text
+    text = claude_text(response)
+    if not text:
+        # The model returned nothing usable. Better to say so than to show
+        # the client an empty answer bubble and leave them guessing.
+        text = (
+            "That answer came back empty, which is a hiccup on the model's side "
+            "rather than anything you did. Ask again, or pick a different model "
+            "in Settings."
+        )
     if getattr(response, "stop_reason", None) == "max_tokens" and text:
         text += "\n\n[The answer was cut short because it reached its length limit. Ask me to continue and I will pick up where I stopped.]"
     return text
@@ -3127,7 +3168,7 @@ async def ai_admin_format(
                 {"role": "user", "content": full_prompt}
             ]
         )
-        ai_response = message.content[0].text
+        ai_response = claude_text(message)
         logger.info(f"Successfully processed AI admin format request with {model}.")
         return {"formatted_transcript": ai_response}
 
