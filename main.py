@@ -985,7 +985,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     # on it rather than being handed to AssemblyAI.
     if is_openai_tester:
         return {
-            "tier_1": "openai",
+            "tier_1": "openai_whisper",
             "tier_2": None,
             "tier_3": None,
             "reason": "dedicated_openai_tester"
@@ -2052,6 +2052,13 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
         
+        elif tier_1_service is not None and tier_1_service not in ("assemblyai", "openai_whisper", "deepgram"):
+            # Belt and braces. If the router ever names a service the runner
+            # does not know, say so loudly instead of falling through every
+            # branch and reporting a failure that looks like bad audio.
+            logger.error(f"Unknown tier 1 service '{tier_1_service}' for job {job_id}")
+            job_data["tier_1_error"] = f"Unknown service '{tier_1_service}'"
+
         elif tier_1_service == "deepgram":
             if not DEEPGRAM_SERVICE_RAILWAY_URL:
                 logger.error(f"{DEEPGRAM_NAME} Service URL not configured, skipping Tier 1 for job {job_id}")
