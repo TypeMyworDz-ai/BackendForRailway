@@ -1013,11 +1013,15 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         }
 
     # --- Speaker Labels Logic (Global Override) ---
-    # As per request: "All instances of speaker tags requests: First option Assembly, fallback Deepgram."
+    # AssemblyAI first, because it diarizes well. OpenAI sits second and Deepgram
+    # last. OpenAI does not return speaker tags, so a job that falls through to it
+    # comes back as continuous text rather than empty: measured against a real
+    # 8 kHz meeting recording, Deepgram returned 8 characters where AssemblyAI
+    # returned 7,343, so it is no longer trusted as the first fallback.
     if speaker_labels_enabled:
         tier_1 = "assemblyai"
-        tier_2 = "deepgram"
-        tier_3 = None  # No OpenAI for speaker tags as per request for this flow
+        tier_2 = "openai_whisper"
+        tier_3 = "deepgram"
         reason = "speaker_labels_requested_prioritizing_assemblyai"
 
     # --- Plan-based logic ---
@@ -1050,8 +1054,8 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     # is the most accurate one we can produce.
     elif user_plan == 'free':
         tier_1 = "assemblyai"
-        tier_2 = "deepgram"
-        tier_3 = None
+        tier_2 = "openai_whisper"
+        tier_3 = "deepgram"
         reason = "free_trial_prioritizing_assemblyai"
     
     # --- Dynamic adjustment based on service availability ---
