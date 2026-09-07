@@ -2351,13 +2351,13 @@ async def root():
             "Google Gemini integration for AI queries - NOW AVAILABLE FOR ALL PAID USERS"
         ],
         "logic": {
-            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+            "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "three_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "one_week_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "monthly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
             "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+            "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
             "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
             "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
@@ -3949,13 +3949,13 @@ async def health_check():
                 "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL)
             },
             "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "three_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "one_week_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "monthly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None",
+                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
                 "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
                 "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
@@ -4048,12 +4048,12 @@ if __name__ == "__main__":
     logger.info("  🆕 UPDATED: Google Gemini now accessible to ALL paid AI users, not just admins")
     
     logger.info("🔧 NEW TRANSCRIPTION LOGIC:")
-    logger.info(f"  - Free trial: Primary={TYPEMYWORDZ1_NAME} → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
+    logger.info(f"  - Free trial: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Three-Day Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - One-Week Plan: Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Monthly Plan: Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Yearly Plan & Admins ({', '.join(ADMIN_EMAILS)}): Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
-    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME} → Fallback2=None")
+    logger.info(f"  - Speaker Labels requested: Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}")
     logger.info(f"  - Dedicated OpenAI Tester ({OPENAI_TESTER_EMAIL}): Primary={TYPEMYWORDZ2_NAME} (no fallback)")
     logger.info(f"  - Free users: {TYPEMYWORDZ1_NAME} nano model")
     logger.info(f"  - Paid users: {TYPEMYWORDZ1_NAME} best model")
