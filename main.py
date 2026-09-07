@@ -3795,16 +3795,18 @@ class WelcomeEmailRequest(BaseModel):
     name: Optional[str] = ""
 
 
-def build_welcome_email(name: str, free_minutes: int = 5):
+def build_welcome_email(name: str, free_credits: int = None):
     """Build the subject and HTML body of the welcome email.
 
     Kept as a plain function with no network access so it can be unit tested.
     House style: no emoji, green only for things the client can act on,
     neutral greys for everything else.
     """
+    if free_credits is None:
+        free_credits = FREE_TRIAL_CREDITS
     first = (name or "").strip().split(" ")[0] if (name or "").strip() else ""
     greeting = "Welcome, %s" % first if first else "Welcome to TypeMyworDz"
-    subject = "Welcome to TypeMyworDz"
+    subject = "Welcome to TypeMyworDz AI"
 
     html = """<!doctype html>
 <html>
@@ -3819,16 +3821,22 @@ def build_welcome_email(name: str, free_minutes: int = 5):
               <span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
             </td></tr>
             <tr><td style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#858a95;padding-bottom:24px;">
-              You Talk, We Type
+              Your everyday AI companion
             </td></tr>
             <tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">GREETING</td></tr>
             <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">
-              Your account is ready. You have MINUTES minutes of free transcription to try it out,
-              so you can judge the quality on your own audio before you decide anything.
+              Your account is ready, with CREDITS free credits on it. One credit is one minute of
+              audio, so that is CREDITS minutes of transcription to judge the quality on your own
+              recordings before you decide anything.
+            </td></tr>
+            <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">
+              Upload a recording, and when it is done you can proofread it against the audio,
+              add speaker labels, copy it in one click, or export it as a Word or text file.
             </td></tr>
             <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:24px;">
-              Upload a recording, and when it is done you can proofread it against the audio,
-              copy it in one click, or export it as a Word or text file.
+              The same credits also cover Ask TypeMyworDz, which answers questions about your
+              transcripts and anything else you need writing, researching or tidying up. You are
+              never paying twice for the two halves.
             </td></tr>
             <tr><td style="padding-bottom:28px;">
               <a href="APPURL" style="display:inline-block;background:#28a745;color:#ffffff;text-decoration:none;
@@ -3853,18 +3861,20 @@ def build_welcome_email(name: str, free_minutes: int = 5):
 </html>"""
 
     html = html.replace("GREETING", greeting)
-    html = html.replace("MINUTES", str(free_minutes))
+    html = html.replace("CREDITS", str(free_credits))
     html = html.replace("APPURL", APP_URL)
     html = html.replace("SUPPORT", SUPPORT_EMAIL)
 
     text = (
         "%s\n\n"
-        "Your account is ready. You have %d minutes of free transcription to try it out.\n\n"
+        "Your account is ready, with %d free credits on it. One credit is one minute of audio.\n\n"
+        "The same credits also cover Ask TypeMyworDz, which answers questions about your "
+        "transcripts and anything else you need writing, researching or tidying up.\n\n"
         "Start here: %s\n\n"
         "One thing worth knowing: we keep your transcripts, but we delete the audio as soon as it "
         "has been transcribed. Keep your own copy of any recording you may want to proofread against later.\n\n"
         "Any questions, write to %s. A real person answers.\n"
-    ) % (greeting, free_minutes, APP_URL, SUPPORT_EMAIL)
+    ) % (greeting, free_credits, APP_URL, SUPPORT_EMAIL)
 
     return subject, html, text
 
