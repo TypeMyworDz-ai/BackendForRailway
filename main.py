@@ -517,7 +517,17 @@ PRICES = {
         'topup-2000':     15.00,
     },
     'global': {
-        'One-Day Plan':    2.00,
+        # No One-Day Plan on the global list.
+        #
+        # Our card processor for the rest of the world charges 5% plus a flat
+        # 50 cents per transaction. On a $2.00 sale the flat fee alone is 25%
+        # of the price, and after compute the plan cleared about 44 cents --
+        # one support email or one refund wiped out several of them. The
+        # cheapest global entry point is now the 300-credit bundle at $4.00,
+        # which has no expiry pressure and clears about $2.10.
+        #
+        # African clients keep the $1.50 One-Day Plan, where the local
+        # processor's fee structure makes it work.
         'Three-Day Plan':  4.00,
         'One-Week Plan':   7.00,
         'Monthly Plan':   14.00,
