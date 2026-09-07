@@ -1,5 +1,21 @@
-# Use an official Python runtime as a parent image
-FROM python:3.10-slim-bullseye
+# Use an official Python runtime as a parent image.
+#
+# This was python:3.10-slim-bullseye, and that turned out to be the real cause
+# of the 7 September 2026 deploy failures rather than bad luck with a mirror.
+# Bullseye is Debian 11, which is now oldstable: that image had not been
+# rebuilt since July 2025, and old releases have their package pool pruned as
+# versions are superseded. So the package index inside the image pointed at
+# .deb files that no longer exist on the mirror, which is exactly the
+# "404 Not Found" we saw. Retrying could never fix that, and did not: the
+# hardened install below tried five times with a fresh index each time and
+# failed identically every time, which is what proved it was not transient.
+#
+# Bookworm is Debian 12, the current stable, rebuilt within the last week, so
+# its index and its pool actually agree with each other. Same Python 3.10, so
+# nothing about our own code or dependency versions changes. The retry loop
+# below is kept anyway, because a genuinely flaky download is still possible
+# and a deploy should not fail for that.
+FROM python:3.10-slim-bookworm
 
 # Set the working directory in the container
 WORKDIR /app
