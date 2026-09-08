@@ -5,6 +5,7 @@ import subprocess
 import os
 import json
 import base64
+from html import escape
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,7 +66,7 @@ import openai
 import google.generativeai as genai
 
 import firebase_admin
-from firebase_admin import credentials, firestore, initialize_app
+from firebase_admin import auth as firebase_auth, credentials, firestore, initialize_app
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 
@@ -226,6 +227,44 @@ if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
         logger.error(f"Error initializing Firebase Admin SDK: {e}")
 else:
     logger.warning("Firebase Admin SDK config is missing, Firestore operations will not be available.")
+
+
+def _bearer_token(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return ""
+    return header.split(" ", 1)[1].strip()
+
+
+def _verified_user(request: Request) -> dict:
+    token = _bearer_token(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Sign-in is required.")
+    try:
+        return firebase_auth.verify_id_token(token)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Your sign-in session has expired.")
+
+
+def _require_admin(request: Request) -> dict:
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    if email not in {item.lower() for item in ADMIN_EMAILS}:
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    return decoded
+
+
+def _delete_matching_documents(collection_name: str, field_name: str, value: str) -> int:
+    if not db:
+        return 0
+    query_ref = db.collection(collection_name).where(
+        filter=FieldFilter(field_name, "==", value)
+    )
+    snapshots = list(query_ref.stream())
+    for snapshot in snapshots:
+        snapshot.reference.delete()
+    return len(snapshots)
+
 
 claude_client = None
 if ANTHROPIC_API_KEY:
@@ -3793,6 +3832,113 @@ async def list_jobs():
 class WelcomeEmailRequest(BaseModel):
     email: str
     name: Optional[str] = ""
+
+
+class AdminDeleteUserRequest(BaseModel):
+    email: str
+    uid: Optional[str] = None
+
+
+class FeedbackNotificationRequest(BaseModel):
+    name: Optional[str] = ""
+    email: str
+    feedback: str
+
+
+@app.post("/api/admin/delete-user")
+async def admin_delete_user(payload: AdminDeleteUserRequest, request: Request):
+    """Delete an account and its owned app data from the admin dashboard."""
+    _require_admin(request)
+    email = (payload.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email address is required.")
+    if email in {item.lower() for item in ADMIN_EMAILS}:
+        raise HTTPException(status_code=400, detail="Admin accounts cannot be deleted here.")
+
+    auth_uid = payload.uid or ""
+    if not auth_uid:
+        try:
+            record = await asyncio.to_thread(firebase_auth.get_user_by_email, email)
+            auth_uid = record.uid
+        except firebase_auth.UserNotFoundError:
+            auth_uid = ""
+        except Exception as exc:
+            logger.error("Could not look up auth account %s: %s", email, exc)
+
+    deleted = {"auth": False, "profiles": 0, "transcriptions": 0, "chats": 0, "feedback": 0}
+    if auth_uid:
+        try:
+            await asyncio.to_thread(firebase_auth.delete_user, auth_uid)
+            deleted["auth"] = True
+        except firebase_auth.UserNotFoundError:
+            pass
+
+    if db:
+        if auth_uid:
+            await asyncio.to_thread(db.collection("users").document(auth_uid).delete)
+            deleted["profiles"] += 1
+            deleted["transcriptions"] = await asyncio.to_thread(
+                _delete_matching_documents, "transcriptions", "userId", auth_uid
+            )
+            deleted["chats"] = await asyncio.to_thread(
+                _delete_matching_documents, "askChats", "userId", auth_uid
+            )
+        deleted["profiles"] += await asyncio.to_thread(
+            _delete_matching_documents, "users", "email", email
+        )
+        deleted["feedback"] = await asyncio.to_thread(
+            _delete_matching_documents, "feedback", "email", email
+        )
+
+    logger.warning("Admin deleted account %s: %s", email, deleted)
+    return {"success": True, "email": email, "deleted": deleted}
+
+
+@app.post("/api/feedback-notification")
+async def feedback_notification(payload: FeedbackNotificationRequest, request: Request):
+    """Email the support mailbox after authenticated in-app feedback is saved."""
+    decoded = _verified_user(request)
+    signed_in_email = (decoded.get("email") or "").strip().lower()
+    sender_email = (payload.email or "").strip().lower()
+    if not sender_email or sender_email != signed_in_email:
+        raise HTTPException(status_code=403, detail="Feedback email does not match the signed-in account.")
+    if not payload.feedback.strip():
+        raise HTTPException(status_code=400, detail="Feedback cannot be empty.")
+    if not RESEND_API_KEY:
+        return {"sent": False, "reason": "not_configured"}
+
+    clean_name = escape(payload.name or "Anonymous")
+    clean_email = escape(sender_email)
+    clean_feedback = escape(payload.feedback.strip()).replace("\n", "<br>")
+    subject = "New TypeMyworDz feedback from %s" % sender_email
+    html = (
+        "<div style=\"font-family:Arial,sans-serif;color:#14161a;max-width:640px\">"
+        "<h2>New TypeMyworDz feedback</h2>"
+        "<p><b>From:</b> %s &lt;%s&gt;</p><p style=\"white-space:pre-wrap\">%s</p>"
+        "</div>"
+    ) % (clean_name, clean_email, clean_feedback)
+    text = "New TypeMyworDz feedback\n\nFrom: %s <%s>\n\n%s" % (payload.name or "Anonymous", sender_email, payload.feedback.strip())
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                RESEND_ENDPOINT,
+                headers={"Authorization": "Bearer %s" % RESEND_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "from": EMAIL_FROM,
+                    "to": [SUPPORT_EMAIL],
+                    "reply_to": sender_email,
+                    "subject": subject,
+                    "html": html,
+                    "text": text,
+                },
+            )
+        if response.status_code >= 400:
+            logger.error("Feedback notification rejected: %s %s", response.status_code, response.text[:300])
+            return {"sent": False, "reason": "provider_error"}
+        return {"sent": True}
+    except Exception as exc:
+        logger.error("Feedback notification failed: %s", exc)
+        return {"sent": False, "reason": "exception"}
 
 
 def build_welcome_email(name: str, free_credits: int = None):
