@@ -254,6 +254,37 @@ def _require_admin(request: Request) -> dict:
     return decoded
 
 
+def _read_admin_users_snapshot():
+    if not db:
+        return []
+    profiles = []
+    by_uid = {}
+    for document in db.collection("users").stream():
+        data = document.to_dict() or {}
+        uid = data.get("uid") or document.id
+        data["id"] = document.id
+        data["uid"] = uid
+        data["totalMinutesTranscribedByUser"] = 0
+        data["totalTranscriptsByUser"] = 0
+        profiles.append(data)
+        by_uid[uid] = data
+
+    for document in db.collection("transcriptions").stream():
+        data = document.to_dict() or {}
+        uid = data.get("userId")
+        if not uid or uid not in by_uid:
+            continue
+        seconds = data.get("duration")
+        try:
+            seconds = float(seconds)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds == seconds and seconds > 0 and seconds != float("inf") and seconds != float("-inf"):
+            by_uid[uid]["totalMinutesTranscribedByUser"] += int((seconds + 59) // 60)
+        by_uid[uid]["totalTranscriptsByUser"] += 1
+    return profiles
+
+
 def _delete_matching_documents(collection_name: str, field_name: str, value: str) -> int:
     if not db:
         return 0
@@ -3843,6 +3874,15 @@ class FeedbackNotificationRequest(BaseModel):
     name: Optional[str] = ""
     email: str
     feedback: str
+
+
+@app.get("/api/admin/users")
+async def admin_users(request: Request):
+    """Return the admin account snapshot from Firebase Admin SDK."""
+    _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The admin data service is not available.")
+    return {"users": await asyncio.to_thread(_read_admin_users_snapshot)}
 
 
 @app.post("/api/admin/delete-user")
