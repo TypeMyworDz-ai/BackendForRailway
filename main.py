@@ -3876,6 +3876,52 @@ class FeedbackNotificationRequest(BaseModel):
     feedback: str
 
 
+class TrafficEventRequest(BaseModel):
+    visitorId: str
+    page: str
+    source: Optional[str] = "Direct"
+    locale: Optional[str] = "unknown"
+    timezone: Optional[str] = "unknown"
+
+
+@app.post("/api/traffic-event")
+async def traffic_event(payload: TrafficEventRequest):
+    """Record anonymous page telemetry through the trusted backend."""
+    if not db:
+        return {"recorded": False, "reason": "not_configured"}
+    event = {
+        "visitorId": payload.visitorId[:120],
+        "page": payload.page[:180],
+        "source": (payload.source or "Direct")[:120],
+        "locale": (payload.locale or "unknown")[:30],
+        "timezone": (payload.timezone or "unknown")[:80],
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("trafficEvents").add, event)
+    return {"recorded": True}
+
+
+@app.get("/api/admin/traffic")
+async def admin_traffic(request: Request):
+    """Return recent traffic telemetry for the protected admin dashboard."""
+    _require_admin(request)
+    if not db:
+        return {"events": []}
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    events = []
+    query = db.collection("trafficEvents").where(
+        filter=FieldFilter("createdAt", ">=", cutoff)
+    )
+    for document in await asyncio.to_thread(lambda: list(query.stream())):
+        data = document.to_dict() or {}
+        created_at = data.get("createdAt")
+        if hasattr(created_at, "isoformat"):
+            data["createdAt"] = created_at.isoformat()
+        data["id"] = document.id
+        events.append(data)
+    return {"events": events}
+
+
 @app.get("/api/admin/users")
 async def admin_users(request: Request):
     """Return the admin account snapshot from Firebase Admin SDK."""
