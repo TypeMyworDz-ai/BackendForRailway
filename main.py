@@ -5,6 +5,8 @@ import subprocess
 import os
 import json
 import base64
+import hashlib
+import hmac
 from html import escape
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
@@ -154,6 +156,14 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+PADDLE_CLIENT_TOKEN = os.environ.get("PADDLE_CLIENT_TOKEN", "")
+PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY", "")
+PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "")
+try:
+    PADDLE_PRICE_IDS = json.loads(os.environ.get("PADDLE_PRICE_IDS_JSON", "{}"))
+except json.JSONDecodeError:
+    PADDLE_PRICE_IDS = {}
+PADDLE_PRICE_TO_ITEM = {str(price_id): str(item_id) for item_id, price_id in PADDLE_PRICE_IDS.items()}
 OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAILWAY_URL")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
@@ -167,6 +177,10 @@ logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPEN
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
+logger.info(f"DEBUG: PADDLE_CLIENT_TOKEN loaded value: {bool(PADDLE_CLIENT_TOKEN)}")
+logger.info(f"DEBUG: PADDLE_API_KEY loaded value: {bool(PADDLE_API_KEY)}")
+logger.info(f"DEBUG: PADDLE_WEBHOOK_SECRET loaded value: {bool(PADDLE_WEBHOOK_SECRET)}")
+logger.info(f"DEBUG: PADDLE_PRICE_IDS loaded count: {len(PADDLE_PRICE_IDS)}")
 logger.info(f"DEBUG: OPENAI_WHISPER_SERVICE_RAILWAY_URL loaded value: {bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}")
@@ -211,6 +225,13 @@ if PAYSTACK_SECRET_KEY:
     logger.info("Paystack configuration found - payment verification enabled")
 else:
     logger.warning("Paystack configuration missing - payment verification disabled")
+
+if PADDLE_CLIENT_TOKEN and PADDLE_PRICE_IDS:
+    logger.info("Paddle checkout configuration found")
+else:
+    logger.warning("Paddle checkout configuration incomplete - global checkout disabled")
+if not PADDLE_WEBHOOK_SECRET:
+    logger.warning("PADDLE_WEBHOOK_SECRET not set - Paddle fulfillment webhook disabled")
 
 logger.info("Environment variables loaded successfully")
 
@@ -1232,10 +1253,20 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         return {'success': False, 'error': 'Firestore not initialized'}
 
     user_ref = db.collection('users').document(user_id)
+    if reference_id:
+        try:
+            existing_snapshot = await asyncio.to_thread(user_ref.get)
+            existing_data = existing_snapshot.to_dict() if existing_snapshot.exists else {}
+            if existing_data.get('paystackReferenceId') == reference_id or existing_data.get('paymentReferenceId') == reference_id:
+                logger.info(f"Payment {reference_id} already applied for user {user_id}; ignoring duplicate.")
+                return {'success': True, 'already_applied': True}
+        except Exception as e:
+            logger.warning(f"Could not check duplicate payment reference {reference_id}: {e}")
     updates = {
         'plan': new_plan,
         'lastAccessed': firestore.SERVER_TIMESTAMP,
         'paystackReferenceId': reference_id,
+        'paymentReferenceId': reference_id,
         'hasReceivedInitialFreeMinutes': True,
         'totalMinutesUsed': 0
     }
@@ -3223,6 +3254,130 @@ async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
             "spendable": bal["spendable"],
             "frozen": bal["frozen"],
             "planActive": bal["planActive"]}
+
+
+@app.get("/paddle-config")
+async def paddle_config():
+    """Return only the public Paddle checkout configuration.
+
+    The client-side token and price IDs are safe to expose in the browser. The
+    API key and webhook secret never leave the server.
+    """
+    if not PADDLE_CLIENT_TOKEN or not PADDLE_PRICE_IDS:
+        raise HTTPException(status_code=503, detail="Paddle checkout is not configured yet.")
+    return {
+        "environment": "sandbox" if PADDLE_CLIENT_TOKEN.startswith("test_") else "live",
+        "client_token": PADDLE_CLIENT_TOKEN,
+        "price_ids": PADDLE_PRICE_IDS,
+    }
+
+
+def _paddle_signature_is_valid(raw_body: bytes, signature: str) -> bool:
+    if not PADDLE_WEBHOOK_SECRET or not signature:
+        return False
+    parts = {}
+    for piece in signature.split(";"):
+        if "=" in piece:
+            key, value = piece.split("=", 1)
+            parts[key.strip()] = value.strip()
+    timestamp = parts.get("ts")
+    received = parts.get("h1")
+    if not timestamp or not received:
+        return False
+    signed_payload = f"{timestamp}:".encode("utf-8") + raw_body
+    expected = hmac.new(
+        PADDLE_WEBHOOK_SECRET.encode("utf-8"), signed_payload, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, received)
+
+
+@app.post("/paddle-webhook")
+async def paddle_webhook(request: Request):
+    """Fulfil a verified Paddle transaction exactly once per event."""
+    raw_body = await request.body()
+    signature = request.headers.get("Paddle-Signature", "")
+    if not _paddle_signature_is_valid(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid Paddle signature.")
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid Paddle event body.")
+
+    event_type = payload.get("event_type", "")
+    if event_type not in {"transaction.completed", "transaction.paid"}:
+        return {"status": "ignored", "event_type": event_type}
+
+    data = payload.get("data") or {}
+    event_id = payload.get("event_id") or payload.get("notification_id") or data.get("id")
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Paddle event has no identifier.")
+
+    # Paddle can retry a notification. A stored event makes retries harmless;
+    # top-ups also carry their own last-reference guard as a second safety net.
+    if db:
+        existing = await asyncio.to_thread(db.collection("paddleEvents").document(str(event_id)).get)
+        if existing.exists:
+            return {"status": "already_processed", "event_id": event_id}
+
+    items = data.get("items") or []
+    first_item = items[0] if items else {}
+    price = first_item.get("price") or {}
+    price_id = price.get("id") or first_item.get("price_id")
+    item_id = PADDLE_PRICE_TO_ITEM.get(str(price_id))
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Unknown Paddle price.")
+
+    custom_data = data.get("custom_data") or {}
+    if isinstance(custom_data, str):
+        try:
+            custom_data = json.loads(custom_data)
+        except json.JSONDecodeError:
+            custom_data = {}
+
+    email = custom_data.get("email")
+    customer = data.get("customer") or {}
+    if not isinstance(customer, dict):
+        customer = {}
+    if not email:
+        email = customer.get("email")
+    if not email and custom_data.get("user_id"):
+        try:
+            email = (await asyncio.to_thread(firebase_auth.get_user, custom_data["user_id"])).email
+        except Exception:
+            email = None
+    if not email:
+        raise HTTPException(status_code=400, detail="Paddle transaction has no customer email.")
+
+    totals = ((data.get("details") or {}).get("totals") or {})
+    grand_total = totals.get("grand_total") or data.get("grand_total") or "0"
+    try:
+        amount = round(float(grand_total) / 100, 2)
+    except (TypeError, ValueError):
+        amount = 0.0
+    currency = data.get("currency_code") or "USD"
+    reference = data.get("id") or str(event_id)
+    country_code = custom_data.get("country_code") or "GLOBAL"
+
+    result = await update_user_credits_paystack(
+        email=email,
+        plan_name=item_id,
+        amount=amount,
+        currency=currency,
+        update_admin_revenue=True,
+        country_code=country_code,
+        reference=reference,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=500, detail=result.get("error", "Could not fulfil Paddle payment."))
+
+    if db:
+        await asyncio.to_thread(
+            db.collection("paddleEvents").document(str(event_id)).set,
+            {"eventType": event_type, "transactionId": reference, "email": email,
+             "itemId": item_id, "processedAt": firestore.SERVER_TIMESTAMP},
+        )
+    return {"status": "processed", "event_id": event_id, "item_id": item_id}
 
 
 @app.get("/pricing")
