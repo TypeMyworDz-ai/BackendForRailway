@@ -669,6 +669,48 @@ def _int(value):
     return n if n > 0 else 0
 
 
+
+# TMWD_HUMAN_QUOTE_V1
+# Human transcription is priced separately from AI transcription.
+# One human job minute is deliberately not one AI credit: the credit bundles
+# are priced for machine transcription, while a human transcriber is paid per
+# completed audio minute. These values are the first explicit internal rule for
+# the bridge and can be changed in one place before production charging starts.
+HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
+HUMAN_RUSH_CREDITS_PER_MINUTE = 55
+HUMAN_STANDARD_PAYOUT_KES = 40
+HUMAN_RUSH_PAYOUT_KES = 50
+
+
+def human_credit_quote(seconds, turnaround="standard", difficulty="standard"):
+    """Return a server-owned human-transcription quote.
+
+    Rush or difficult work uses the higher rate. The client can request a
+    quote, but only a later confirmation endpoint will reserve or deduct it.
+    """
+    try:
+        duration = float(seconds or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("Audio duration must be a finite, non-negative number.")
+
+    rush = str(turnaround or "").strip().lower() == "rush"
+    difficult = str(difficulty or "").strip().lower() == "difficult"
+    premium = rush or difficult
+    minutes = max(1, int(math.ceil(duration / 60.0)))
+    rate = HUMAN_RUSH_CREDITS_PER_MINUTE if premium else HUMAN_STANDARD_CREDITS_PER_MINUTE
+    payout = HUMAN_RUSH_PAYOUT_KES if premium else HUMAN_STANDARD_PAYOUT_KES
+    return {
+        "minutes": minutes,
+        "credits": minutes * rate,
+        "credits_per_minute": rate,
+        "transcriber_payout_kes_per_minute": payout,
+        "pricing_tier": "rush_or_difficult" if premium else "standard",
+        "formula_version": "human-v1",
+    }
+
+
 def minutes_to_credits(seconds):
     """Transcription is charged by the minute, rounded up, minimum one."""
     try:
@@ -3222,6 +3264,61 @@ async def credits_quote(seconds: float = 0, user_id: str = "", user_email: str =
         "affordable": bal["spendable"] >= cost,
         "short_by": max(0, cost - bal["spendable"]),
         "exempt": False,
+    }
+
+
+
+@app.post("/human-transcription/quote")
+async def human_transcription_quote(
+    request: Request,
+    seconds: float = Form(0),
+    turnaround: str = Form("standard"),
+    difficulty: str = Form("standard"),
+):
+    """Quote a human transcription using the signed-in AI account.
+
+    This endpoint is intentionally quote-only. It does not accept a browser
+    supplied credit amount, upload a file, create a job, reserve credits, or
+    deduct anything. Confirmation and idempotent reservation come later.
+    """
+    decoded = _verified_user(request)
+    user_id = decoded.get("uid") or ""
+    user_email = (decoded.get("email") or "").strip().lower()
+    if not user_id or not user_email:
+        raise HTTPException(status_code=401, detail="Your account could not be verified.")
+
+    try:
+        quote = human_credit_quote(seconds, turnaround, difficulty)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if credits_exempt(user_email):
+        return {
+            **quote,
+            "cost": 0,
+            "spendable": None,
+            "affordable": True,
+            "exempt": True,
+            "reservation": "not_created",
+        }
+
+    profile = await _load_profile(user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="We could not find that account.")
+
+    balance = read_balance(profile)
+    if balance["updates"]:
+        await _save_credit_updates(user_id, balance["updates"])
+
+    cost = quote["credits"]
+    return {
+        **quote,
+        "cost": cost,
+        "spendable": balance["spendable"],
+        "affordable": balance["spendable"] >= cost,
+        "short_by": max(0, cost - balance["spendable"]),
+        "exempt": False,
+        "reservation": "not_created",
     }
 
 
