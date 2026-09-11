@@ -468,6 +468,7 @@ def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = 
         return []
     premium_ok = (
         is_admin_user(user_email)
+        or is_comp_access_user(user_email)
         or (user_plan in PREMIUM_AI_PLANS)
     )
     out = []
@@ -495,6 +496,7 @@ def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: 
     ai_ok = is_ai_allowed(user_plan, user_email, has_credits)
     premium_ok = (
         is_admin_user(user_email)
+        or is_comp_access_user(user_email)
         or (user_plan in PREMIUM_AI_PLANS)
     )
     if ai_ok and premium_ok:
