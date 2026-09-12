@@ -5730,8 +5730,13 @@ async def user_chat_send(other_uid: str, request: Request, attachment: UploadFil
     }
     msg_ref = db.collection("user_chats").document(thread_id).collection("messages").document()
     await asyncio.to_thread(msg_ref.set, item)
-    item["id"] = msg_ref.id
-    return {"message": _human_public(item), "user": target, "thread_id": thread_id}
+    # Firestore resolves SERVER_TIMESTAMP only after the write. Read the saved
+    # document back before returning it so the browser receives a real,
+    # JSON-serializable timestamp instead of the sentinel object.
+    saved_snapshot = await asyncio.to_thread(msg_ref.get)
+    saved_item = saved_snapshot.to_dict() or item
+    saved_item["id"] = msg_ref.id
+    return {"message": _human_public(saved_item), "user": target, "thread_id": thread_id}
 
 
 @app.get("/api/user-chats/{other_uid}/messages/{message_id}/attachment")
