@@ -595,6 +595,9 @@ TOPUP_BUNDLES = {
     'topup-800':  800,
     'topup-2000': 2000,
 }
+CUSTOM_TOPUP_MIN = 10
+CUSTOM_TOPUP_MAX = 5000
+CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 
 # What everything costs, in US dollars, decided here and nowhere else.
 #
@@ -644,8 +647,26 @@ def price_region(country_code):
     return 'africa' if (country_code or '').upper() in AFRICA_PAYMENT_CODES else 'global'
 
 
+def custom_topup_credits(item):
+    match = re.fullmatch(r'topup-custom-(\d+)', str(item or ''))
+    if not match:
+        return None
+    credits = int(match.group(1))
+    if credits < CUSTOM_TOPUP_MIN or credits > CUSTOM_TOPUP_MAX:
+        return None
+    return credits
+
+
+def custom_topup_price(credits, country_code):
+    region = price_region(country_code)
+    return round(float(credits) * CUSTOM_TOPUP_RATE[region], 2)
+
+
 def price_for(item, country_code):
-    """The dollar price of a plan or top-up bundle, or None if we do not sell it."""
+    """The dollar price of a plan, bundle, or validated custom top-up."""
+    custom = custom_topup_credits(item)
+    if custom is not None:
+        return custom_topup_price(custom, country_code)
     return PRICES[price_region(country_code)].get(item)
 
 
@@ -689,12 +710,8 @@ HUMAN_STANDARD_PAYOUT_KES = 40
 HUMAN_RUSH_PAYOUT_KES = 50
 
 
-def human_credit_quote(seconds, turnaround="standard", difficulty="standard"):
-    """Return a server-owned human-transcription quote.
-
-    Rush or difficult work uses the higher rate. The client can request a
-    quote, but only a later confirmation endpoint will reserve or deduct it.
-    """
+def human_credit_quote(seconds, turnaround="standard", difficulty="standard", service="standard", speakers="1-2", timestamps=True, formatting="standard"):
+    """Return one server-owned quote for both human-work entry points."""
     try:
         duration = float(seconds or 0)
     except (TypeError, ValueError):
@@ -708,13 +725,24 @@ def human_credit_quote(seconds, turnaround="standard", difficulty="standard"):
     minutes = max(1, int(math.ceil(duration / 60.0)))
     rate = HUMAN_RUSH_CREDITS_PER_MINUTE if premium else HUMAN_STANDARD_CREDITS_PER_MINUTE
     payout = HUMAN_RUSH_PAYOUT_KES if premium else HUMAN_STANDARD_PAYOUT_KES
+    multiplier = 1.0
+    if str(service or "").strip().lower() == "proofread": multiplier *= 1.2
+    if str(service or "").strip().lower() == "formatted": multiplier *= 1.3
+    if str(speakers or "").strip().lower() == "3+": multiplier *= 1.1
+    if timestamps is False or str(timestamps).lower() == "false": multiplier *= 0.95
+    if str(formatting or "").strip().lower() == "advanced": multiplier *= 1.1
+    credits = int(math.ceil(minutes * rate * multiplier))
     return {
         "minutes": minutes,
-        "credits": minutes * rate,
+        "credits": credits,
         "credits_per_minute": rate,
         "transcriber_payout_kes_per_minute": payout,
         "pricing_tier": "rush_or_difficult" if premium else "standard",
-        "formula_version": "human-v1",
+        "service": service,
+        "speakers": speakers,
+        "timestamps": bool(timestamps) if not isinstance(timestamps, str) else timestamps.lower() != "false",
+        "formatting": formatting,
+        "formula_version": "human-v2",
     }
 
 
@@ -899,6 +927,8 @@ def grant_topup_credits(profile, bundle_id, now=None):
     """
     now = now or datetime.now()
     credits = TOPUP_BUNDLES.get(bundle_id)
+    if credits is None:
+        credits = custom_topup_credits(bundle_id)
     if not credits:
         return None
     bal = read_balance(profile, now)
@@ -1769,7 +1799,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         # exactly as it was. Both the callback and the webhook can arrive for
         # the same payment, so the reference is remembered and a repeat is
         # ignored rather than granting the credits twice.
-        if plan_name in TOPUP_BUNDLES:
+        if plan_name in TOPUP_BUNDLES or custom_topup_credits(plan_name) is not None:
             profile = await _load_profile(user_id) or {}
             if reference and profile.get('lastTopUpReference') == reference:
                 logger.info(f"Top-up {reference} for {email} already applied; ignoring the repeat.")
@@ -3281,6 +3311,10 @@ async def human_transcription_quote(
     seconds: float = Form(0),
     turnaround: str = Form("standard"),
     difficulty: str = Form("standard"),
+    service: str = Form("standard"),
+    speakers: str = Form("1-2"),
+    timestamps: bool = Form(True),
+    formatting: str = Form("standard"),
 ):
     """Quote a human transcription using the signed-in AI account.
 
@@ -3295,7 +3329,7 @@ async def human_transcription_quote(
         raise HTTPException(status_code=401, detail="Your account could not be verified.")
 
     try:
-        quote = human_credit_quote(seconds, turnaround, difficulty)
+        quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -3521,6 +3555,11 @@ async def pricing(country_code: str = "GLOBAL"):
         'currency': 'USD',
         'plans': plans,
         'topups': topups,
+        'custom_topup': {
+            'min_credits': CUSTOM_TOPUP_MIN,
+            'max_credits': CUSTOM_TOPUP_MAX,
+            'price_per_credit': CUSTOM_TOPUP_RATE[region],
+        },
         'topup_valid_days': TOPUP_VALID_DAYS,
         'free_trial_credits': FREE_TRIAL_CREDITS,
     }
@@ -3539,7 +3578,7 @@ async def credits_topup(
     worth is decided here, from the server's own table, so that a client
     cannot ask for the small bundle and be given the large one.
     """
-    if bundle_id not in TOPUP_BUNDLES:
+    if bundle_id not in TOPUP_BUNDLES and custom_topup_credits(bundle_id) is None:
         raise HTTPException(status_code=400, detail="That is not a top-up we sell.")
 
     # Credits are money. This endpoint will only add them against a payment
@@ -4632,28 +4671,39 @@ async def _human_assert_access(job, actor, allow_admin=True):
 @app.post("/human-transcription/jobs")
 async def human_create_job(
     request: Request,
-    audio: UploadFile = File(...),
+    audio: UploadFile = File(None),
     attachments: List[UploadFile] = File(default=[]),
     seconds: float = Form(0),
     turnaround: str = Form("standard"),
     difficulty: str = Form("standard"),
     timestamps: bool = Form(True),
-    speakers: bool = Form(True),
+    speakers: str = Form("1-2"),
     instructions: str = Form(""),
+    service: str = Form("standard"),
+    formatting: str = Form("standard"),
+    source_type: str = Form("human_transcription"),
+    initial_transcript: str = Form(""),
 ):
     actor = await _human_actor(request)
     if actor["role"] != "client" and actor["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only a client can request human work.")
     if seconds <= 0:
         raise HTTPException(status_code=400, detail="The recording length is required.")
-    quote = human_credit_quote(seconds, turnaround, difficulty)
+    source_type = str(source_type or "human_transcription").strip().lower()
+    if source_type not in {"human_transcription", "ai_proofreading"}:
+        raise HTTPException(status_code=400, detail="That proofreading source is not supported.")
+    if source_type == "human_transcription" and (not audio or not audio.filename):
+        raise HTTPException(status_code=400, detail="An audio or video file is required for a new human transcript.")
+    if source_type == "ai_proofreading" and not str(initial_transcript or "").strip():
+        raise HTTPException(status_code=400, detail="The AI transcript is required for proofreading.")
+    quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting)
     profile = await _load_profile(actor["uid"])
     balance = read_balance(profile or {})
     exempt = credits_exempt(actor["email"])
     if not exempt and balance["spendable"] < quote["credits"]:
         raise HTTPException(status_code=409, detail=f"You need {quote['credits'] - balance['spendable']} more credits before human work can begin.")
     job_id = uuid.uuid4().hex
-    audio_meta = await _human_store_upload(job_id, audio, "audio")
+    audio_meta = await _human_store_upload(job_id, audio, "audio") if audio and audio.filename else None
     attachment_meta = []
     for item in attachments or []:
         attachment_meta.append(await _human_store_upload(job_id, item, "instructions"))
@@ -4668,8 +4718,11 @@ async def human_create_job(
         "minutes": quote["minutes"],
         "turnaround": turnaround,
         "difficulty": difficulty,
+        "service": service,
+        "formatting": formatting,
         "timestamps": bool(timestamps),
-        "speakers": bool(speakers),
+        "speakers": speakers,
+        "source_type": source_type,
         "instructions": (instructions or "").strip()[:12000],
         "audio": audio_meta,
         "instruction_attachments": attachment_meta,
@@ -4678,7 +4731,7 @@ async def human_create_job(
         "worker_uid": None,
         "worker_email": None,
         "worker_name": None,
-        "transcript": "",
+        "transcript": str(initial_transcript or "")[:1000000] if source_type == "ai_proofreading" else "",
         "worker_notes": "",
         "admin_feedback": "",
         "worker_rating": None,
@@ -4894,6 +4947,141 @@ async def human_download(job_id: str, request: Request):
     if not transcript:
         raise HTTPException(status_code=404, detail="No completed transcript is available.")
     return Response(content=transcript, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename=human-{job_id}.txt"})
+
+TRAINING_LEVELS = [
+    {"level": 1, "name": "Clean transcript basics", "description": "Follow the brief, preserve wording, and submit a clean first pass."},
+    {"level": 2, "name": "Speaker and timestamp review", "description": "Handle speaker turns, timestamps, difficult audio, and the shared editor."},
+    {"level": 3, "name": "Client-ready delivery", "description": "Complete a full job, apply feedback, and prepare work for admin approval."},
+]
+
+
+async def _trainee_actor(request: Request):
+    decoded = _verified_user(request)
+    uid = decoded.get("uid") or ""
+    email = (decoded.get("email") or "").strip().lower()
+    profile = await _load_profile(uid) or {}
+    return {"uid": uid, "email": email, "profile": profile}
+
+
+@app.get("/human-transcription/trainee/status")
+async def trainee_status(request: Request):
+    actor = await _trainee_actor(request)
+    profile = actor["profile"]
+    return {
+        "application": {
+            "status": profile.get("traineeStatus") or "not_started",
+            "payment_status": profile.get("trainingPaymentStatus") or "not_submitted",
+            "name": profile.get("name") or profile.get("full_name") or "",
+            "country": profile.get("country") or "",
+            "notes": profile.get("traineeNotes") or "",
+            "submitted_at": _human_iso(profile.get("traineeAppliedAt")),
+        },
+        "training": {
+            "level": int(profile.get("trainingLevel") or 0),
+            "status": profile.get("trainingStatus") or "not_started",
+            "submissions": profile.get("trainingSubmissions") or {},
+        },
+        "levels": TRAINING_LEVELS,
+        "is_worker": bool(profile.get("workerApproved") or str(profile.get("role") or "").lower() == "worker"),
+    }
+
+
+@app.post("/human-transcription/trainee/apply")
+async def trainee_apply(request: Request):
+    actor = await _trainee_actor(request)
+    payload = await request.json()
+    name = str(payload.get("name") or "").strip()
+    country = str(payload.get("country") or "").strip()
+    payment_reference = str(payload.get("payment_reference") or "").strip()
+    notes = str(payload.get("notes") or "").strip()
+    if len(name) < 2 or not country:
+        raise HTTPException(status_code=400, detail="Enter your name and country before applying.")
+    if not payment_reference:
+        raise HTTPException(status_code=400, detail="Enter the training payment reference so admin can verify it.")
+    updates = {
+        "name": name,
+        "country": country,
+        "traineeNotes": notes[:12000],
+        "traineeStatus": "applied",
+        "trainingPaymentStatus": "pending_verification",
+        "trainingPaymentReference": payment_reference[:200],
+        "traineeAppliedAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
+    return {"status": "applied", "payment_status": "pending_verification"}
+
+
+@app.get("/api/admin/trainees")
+async def admin_trainees(request: Request):
+    _require_admin(request)
+    if not db:
+        return {"trainees": []}
+    rows = []
+    for snap in await asyncio.to_thread(lambda: list(db.collection("users").stream())):
+        data = snap.to_dict() or {}
+        status = str(data.get("traineeStatus") or "").lower()
+        role = str(data.get("role") or data.get("user_type") or "").lower()
+        if not status and role not in {"trainee", "worker"}:
+            continue
+        data["uid"] = data.get("uid") or snap.id
+        data["id"] = snap.id
+        data["email"] = data.get("email") or ""
+        data["name"] = data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed applicant"
+        rows.append(_human_public(data))
+    rows.sort(key=lambda item: str(item.get("traineeAppliedAt") or ""), reverse=True)
+    return {"trainees": rows}
+
+
+@app.post("/api/admin/trainees/{uid}/decision")
+async def admin_trainee_decision(uid: str, request: Request):
+    _require_admin(request)
+    payload = await request.json()
+    decision = str(payload.get("decision") or "").strip().lower()
+    payment_status = str(payload.get("payment_status") or "").strip().lower()
+    if decision not in {"approve", "reject", "promote_worker", "approve_level"}:
+        raise HTTPException(status_code=400, detail="That trainee decision is not supported.")
+    profile = await _load_profile(uid)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="That trainee account was not found.")
+    updates = {"updatedAt": firestore.SERVER_TIMESTAMP}
+    if payment_status in {"verified", "rejected", "pending_verification"}:
+        updates["trainingPaymentStatus"] = payment_status
+    if decision == "approve":
+        updates.update({"role": "trainee", "traineeStatus": "approved", "trainingStatus": "active", "trainingLevel": max(1, int(profile.get("trainingLevel") or 1)), "workerApproved": False})
+    elif decision == "reject":
+        updates.update({"role": "client", "traineeStatus": "rejected", "trainingStatus": "rejected", "workerApproved": False})
+    elif decision == "approve_level":
+        current = max(1, int(profile.get("trainingLevel") or 1))
+        updates.update({"role": "trainee", "traineeStatus": "approved", "trainingStatus": "active", "trainingLevel": min(3, current + 1)})
+    elif decision == "promote_worker":
+        updates.update({"role": "worker", "traineeStatus": "approved", "trainingStatus": "completed", "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP})
+    await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
+    return {"status": "updated", "uid": uid, "decision": decision}
+
+
+@app.post("/human-transcription/trainee/training/{level}/submit")
+async def trainee_submit_training(level: int, request: Request):
+    actor = await _trainee_actor(request)
+    profile = actor["profile"]
+    role = str(profile.get("role") or profile.get("user_type") or "").lower()
+    if role not in {"trainee", "worker"} and not profile.get("workerApproved"):
+        raise HTTPException(status_code=403, detail="Trainee access is required.")
+    if level < 1 or level > len(TRAINING_LEVELS):
+        raise HTTPException(status_code=400, detail="That training level does not exist.")
+    payload = await request.json()
+    transcript = str(payload.get("transcript") or "").strip()
+    notes = str(payload.get("notes") or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Submit the completed training transcript first.")
+    submission = {"level": level, "transcript": transcript[:1000000], "notes": notes[:12000], "status": "submitted", "createdAt": firestore.SERVER_TIMESTAMP, "uid": actor["uid"], "email": actor["email"]}
+    await asyncio.to_thread(db.collection("training_submissions").document(f"{actor['uid']}-{level}").set, submission, merge=True)
+    updates = {"trainingSubmissions": {**(profile.get("trainingSubmissions") or {}), str(level): "submitted"}, "trainingStatus": "review", "updatedAt": firestore.SERVER_TIMESTAMP}
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
+    return {"status": "submitted", "level": level}
+
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
