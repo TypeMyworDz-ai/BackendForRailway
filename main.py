@@ -5116,6 +5116,7 @@ async def human_create_job(
     formatting: str = Form("standard"),
     source_type: str = Form("human_transcription"),
     initial_transcript: str = Form(""),
+    client_request_id: str = Form(""),
 ):
     actor = await _human_actor(request)
     if actor["role"] != "client" and actor["role"] != "admin":
@@ -5129,6 +5130,21 @@ async def human_create_job(
         raise HTTPException(status_code=400, detail="An audio or video file is required for a new human transcript.")
     if source_type == "ai_proofreading" and not str(initial_transcript or "").strip():
         raise HTTPException(status_code=400, detail="The AI transcript is required for proofreading.")
+    client_request_id = str(client_request_id or "").strip()[:120]
+    # A timed-out browser request can still finish creating the job. Reusing
+    # the same client request id makes a retry return that job instead of
+    # creating a duplicate order.
+    if client_request_id and db is not None:
+        existing_snapshots = await asyncio.to_thread(
+            lambda: list(db.collection(HUMAN_JOB_COLLECTION)
+                         .where(filter=FieldFilter("client_uid", "==", actor["uid"]))
+                         .limit(100).stream())
+        )
+        for existing_snapshot in existing_snapshots:
+            existing_job = existing_snapshot.to_dict() or {}
+            if str(existing_job.get("client_request_id") or "") == client_request_id:
+                existing_job["id"] = existing_snapshot.id
+                return {"job": _human_public(existing_job), "reservation": "not_created", "credits_deducted": 0, "already_created": True}
     quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting)
     profile = await _load_profile(actor["uid"])
     balance = read_balance(profile or {})
@@ -5144,6 +5160,7 @@ async def human_create_job(
     job = {
         "client_uid": actor["uid"],
         "client_email": actor["email"],
+        "client_request_id": client_request_id,
         "status": "pending_admin",
         "createdAt": now,
         "updatedAt": now,
@@ -5174,9 +5191,14 @@ async def human_create_job(
     }
     if db is None:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, job)
-    job["id"] = job_id
-    return {"job": _human_public(job), "reservation": "not_created", "credits_deducted": 0}
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    await asyncio.to_thread(job_ref.set, job)
+    # Resolve Firestore server timestamps before returning the created job.
+    # Otherwise a successful upload can look like a failed request in the browser.
+    saved_snapshot = await asyncio.to_thread(job_ref.get)
+    saved_job = saved_snapshot.to_dict() or job
+    saved_job["id"] = job_id
+    return {"job": _human_public(saved_job), "reservation": "not_created", "credits_deducted": 0}
 
 
 @app.get("/human-transcription/jobs")
@@ -5351,8 +5373,10 @@ async def human_send_message(job_id: str, request: Request, attachment: UploadFi
     item = {"sender_uid": actor["uid"], "sender_email": actor["email"], "sender_role": actor["role"], "message": text[:12000], "attachment": attachment_meta, "createdAt": firestore.SERVER_TIMESTAMP}
     msg_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages").document()
     await asyncio.to_thread(msg_ref.set, item)
-    item["id"] = msg_ref.id
-    return {"message": _human_public(item)}
+    saved_snapshot = await asyncio.to_thread(msg_ref.get)
+    saved_item = saved_snapshot.to_dict() or item
+    saved_item["id"] = msg_ref.id
+    return {"message": _human_public(saved_item)}
 
 
 @app.get("/human-transcription/jobs/{job_id}/messages/{message_id}/attachment")
@@ -5701,12 +5725,39 @@ async def user_chat_messages(other_uid: str, request: Request):
     thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
     ref = db.collection("user_chats").document(thread_id).collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
+    unread_refs = []
     messages = []
     for snap in snapshots:
         data = snap.to_dict() or {}
+        if data.get("recipient_uid") == actor["uid"] and not data.get("readAt"):
+            unread_refs.append(snap.reference)
         data["id"] = snap.id
         messages.append(_human_public(data))
+    if unread_refs:
+        batch = db.batch()
+        for message_ref in unread_refs:
+            batch.update(message_ref, {"readAt": firestore.SERVER_TIMESTAMP})
+        await asyncio.to_thread(batch.commit)
     return {"thread_id": thread_id, "user": target, "messages": messages}
+
+
+@app.get("/api/messaging/unread-count")
+async def messaging_unread_count(request: Request):
+    """Count unread direct messages addressed to the signed-in account."""
+    actor = await _user_chat_actor(request)
+    if not db:
+        return {"count": 0}
+    thread_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
+    unread = 0
+    for thread_snapshot in thread_snapshots:
+        message_ref = thread_snapshot.reference.collection("messages")
+        messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
+        unread += sum(
+            1 for message in messages
+            if (message.to_dict() or {}).get("recipient_uid") == actor["uid"]
+            and not (message.to_dict() or {}).get("readAt")
+        )
+    return {"count": unread}
 
 
 @app.post("/api/user-chats/{other_uid}/messages")
