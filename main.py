@@ -168,6 +168,10 @@ OPENAI_WHISPER_SERVICE_RAILWAY_URL = os.environ.get("OPENAI_WHISPER_SERVICE_RAIL
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY")
 FIREBASE_ADMIN_SDK_CONFIG_BASE64 = os.environ.get("FIREBASE_ADMIN_SDK_CONFIG_BASE64")
+# Railway stores the Firebase Storage bucket under GCS_BUCKET_NAME. Accept both
+# names so human-workflow uploads use the same configured bucket as the rest of
+# the application.
+FIREBASE_STORAGE_BUCKET = (os.environ.get("FIREBASE_STORAGE_BUCKET") or os.environ.get("GCS_BUCKET_NAME") or "").strip()
 DEEPGRAM_SERVICE_RAILWAY_URL = os.environ.get("DEEPGRAM_SERVICE_RAILWAY_URL")
 
 logger.info(f"DEBUG: --- Environment Variable Check (main.py) ---")
@@ -241,7 +245,8 @@ if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
     try:
         service_account_info = json.loads(base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8'))
         cred = credentials.Certificate(service_account_info)
-        initialize_app(cred)
+        firebase_options = {"storageBucket": FIREBASE_STORAGE_BUCKET} if FIREBASE_STORAGE_BUCKET else {}
+        initialize_app(cred, firebase_options)
         db = firestore.client()
         logger.info("Firebase Admin SDK initialized successfully.")
     except Exception as e:
@@ -4560,7 +4565,7 @@ def _human_bucket():
     if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
         return None
     try:
-        configured = os.getenv("FIREBASE_STORAGE_BUCKET", "").strip()
+        configured = (os.getenv("FIREBASE_STORAGE_BUCKET") or os.getenv("GCS_BUCKET_NAME") or "").strip()
         return firebase_storage.bucket(configured) if configured else firebase_storage.bucket()
     except Exception as exc:
         logger.warning("Human workflow storage is unavailable: %s", exc)
