@@ -2655,7 +2655,7 @@ async def cancel_pending_trainee(request: Request):
         payload = {}
     if profile.get("trainingPaymentStatus") == "paid" or profile.get("trainingRoomAccess"):
         raise HTTPException(status_code=409, detail="A paid trainee account cannot be cancelled this way.")
-    delete_auth = bool(profile.get("traineeAccountPendingDeletion") or payload.get("created_for_trainee"))
+    delete_auth = bool(profile.get("traineeAccountPendingDeletion") or payload.get("created_for_trainee") or payload.get("force_pending_cleanup"))
     deleted = {"auth": False, "profile": False}
     if delete_auth:
         try:
@@ -2682,6 +2682,96 @@ async def cancel_pending_trainee(request: Request):
         deleted["profile"] = True
     logger.info("Removed unpaid trainee enrollment for %s (auth_deleted=%s)", actor["email"], delete_auth)
     return {"success": True, "deleted": deleted}
+
+
+@app.post("/api/initialize-trainee-payment")
+async def initialize_trainee_payment(request: Request):
+    """Start trainee checkout before Firebase signup; no account exists yet."""
+    payload = await request.json()
+    email = str(payload.get("email") or "").strip().lower()
+    official_name = str(payload.get("official_name") or "").strip()
+    country_code = str(payload.get("country_code") or "").strip().upper()
+    provider = str(payload.get("provider") or "paystack").strip().lower()
+    callback_url = str(payload.get("callback_url") or f"{APP_URL}/trainee-signup?payment=success&trainee=1")
+    if "@" not in email or len(official_name) < 2:
+        raise HTTPException(status_code=400, detail="A valid email and official ID name are required.")
+    if country_code != TRAINEE_COUNTRY:
+        raise HTTPException(status_code=400, detail="Training enrollment is currently limited to Kenya.")
+    if provider not in {"paystack", "kora"}:
+        raise HTTPException(status_code=400, detail="That payment option is not available.")
+    if provider == "paystack" and not PAYSTACK_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Paystack checkout is not configured yet.")
+    if provider == "kora" and not KORA_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Kora checkout is not configured yet.")
+
+    local_amount, local_currency = get_local_amount_and_currency(TRAINEE_PRICE_USD, TRAINEE_COUNTRY, TRAINEE_PRODUCT)
+    reference = ("tmw-trainee-" if provider == "kora" else "tmw-") + uuid.uuid4().hex
+    metadata = {
+        "product": TRAINEE_PRODUCT,
+        "official_name": official_name,
+        "country_code": TRAINEE_COUNTRY,
+        "trainee_signup": "true",
+    }
+    if provider == "paystack":
+        response = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            headers={"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}", "Content-Type": "application/json"},
+            json={
+                "email": email,
+                "amount": int(round(local_amount * 100)),
+                "currency": local_currency,
+                "reference": reference,
+                "callback_url": callback_url,
+                "channels": get_payment_channels(TRAINEE_COUNTRY, TRAINEE_PRODUCT),
+                "metadata": metadata,
+            },
+            timeout=15,
+        )
+        data = response.json()
+        if response.status_code >= 400 or not data.get("status"):
+            raise HTTPException(status_code=502, detail=data.get("message") or "Paystack checkout could not be started.")
+        checkout_url = (data.get("data") or {}).get("authorization_url")
+    else:
+        redirect_url = callback_url
+        separator = "&" if "?" in redirect_url else "?"
+        redirect_url = f"{redirect_url}{separator}reference={reference}&kora=success&trainee=1"
+        response = requests.post(
+            "https://api.korapay.com/merchant/api/v1/charges/initialize",
+            headers={"Authorization": f"Bearer {KORA_SECRET_KEY}", "Content-Type": "application/json"},
+            json={
+                "amount": int(round(local_amount)),
+                "currency": local_currency,
+                "reference": reference,
+                "redirect_url": redirect_url,
+                "notification_url": KORA_NOTIFICATION_URL or f"{BACKEND_PUBLIC_URL}/api/kora-webhook",
+                "narration": "TypeMyworDz Training Room enrollment",
+                "channels": ["mobile_money", "card"],
+                "customer": {"email": email, "name": official_name},
+                "metadata": metadata,
+            },
+            timeout=15,
+        )
+        data = response.json()
+        if response.status_code >= 400 or not data.get("status"):
+            raise HTTPException(status_code=502, detail=data.get("message") or "Kora checkout could not be started.")
+        checkout_url = (data.get("data") or {}).get("checkout_url")
+    if not checkout_url:
+        raise HTTPException(status_code=502, detail="The payment provider did not return a checkout link.")
+    if db:
+        await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
+            "uid": None,
+            "email": email,
+            "product": TRAINEE_PRODUCT,
+            "provider": provider,
+            "countryCode": TRAINEE_COUNTRY,
+            "officialName": official_name,
+            "amountUsd": TRAINEE_PRICE_USD,
+            "amountLocal": local_amount,
+            "currency": local_currency,
+            "status": "pending",
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        })
+    return {"status": True, "authorization_url": checkout_url, "checkout_url": checkout_url, "reference": reference, "local_amount": local_amount, "local_currency": local_currency}
 
 @app.post("/api/initialize-kora-trainee-payment")
 async def initialize_kora_trainee_payment(request: Request):
@@ -2757,6 +2847,12 @@ async def verify_kora_and_enroll(reference: str):
     currency = str(charge.get("currency") or intent.get("currency") or "KES")
     amount_usd = float(intent.get("amountUsd") or price_for(product, country_code) or 0)
     if product == TRAINEE_PRODUCT:
+        if not await get_user_profile_by_email_firestore(email):
+            await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
+                "status": "paid", "paidAt": firestore.SERVER_TIMESTAMP,
+                "amountUsd": TRAINEE_PRICE_USD, "currency": currency,
+            }, merge=True)
+            return {"success": True, "requires_account": True, "email": email, "trainee_enrolled": False, "plan": product}
         result = await enroll_paid_trainee(email, reference, TRAINEE_PRICE_USD, currency, country_code, "kora")
     else:
         result = await update_user_credits_paystack(
@@ -2972,6 +3068,20 @@ async def verify_payment(request: PaystackVerificationRequest):
             base_usd_amount = verification_result['raw_data'].get('metadata', {}).get('base_usd_amount')
             country_code = verification_result['raw_data'].get('metadata', {}).get('country_code')
             update_admin_revenue_flag = verification_result['raw_data'].get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
+
+            # Trainee checkout is payment-first. If the account does not exist
+            # yet, record the paid intent and let the browser create the account
+            # only after Paystack has confirmed success.
+            if plan_name == TRAINEE_PRODUCT and not await get_user_profile_by_email_firestore(email):
+                if db:
+                    await asyncio.to_thread(db.collection('payment_intents').document(reference).set, {
+                        'email': email, 'product': TRAINEE_PRODUCT, 'provider': 'paystack',
+                        'countryCode': country_code or TRAINEE_COUNTRY,
+                        'officialName': verification_result['raw_data'].get('metadata', {}).get('official_name') or '',
+                        'amountUsd': TRAINEE_PRICE_USD, 'currency': currency,
+                        'status': 'paid', 'paidAt': firestore.SERVER_TIMESTAMP,
+                    }, merge=True)
+                return {"status": "success", "message": "Payment verified. Create the trainee account to continue.", "data": {"amount": amount, "currency": currency, "email": email, "plan": plan_name, "reference": reference, "trainee_pending_account": True}}
 
             # Pass base_usd_amount, country_code, and update_admin_revenue_flag
             credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code, reference) 
@@ -5339,6 +5449,29 @@ async def _trainee_actor(request: Request):
     profile = await _load_profile(uid) or {}
     return {"uid": uid, "email": email, "profile": profile}
 
+
+
+@app.post("/api/trainee/complete-signup")
+async def complete_trainee_signup(request: Request):
+    actor = await _trainee_actor(request)
+    payload = await request.json()
+    reference = str(payload.get("reference") or "").strip()
+    official_name = str(payload.get("official_name") or "").strip()
+    if not reference or len(official_name) < 2:
+        raise HTTPException(status_code=400, detail="The paid enrollment and official name are required.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The enrollment database is unavailable.")
+    snap = await asyncio.to_thread(db.collection("payment_intents").document(reference).get)
+    intent = snap.to_dict() if snap.exists else {}
+    if intent.get("product") != TRAINEE_PRODUCT or intent.get("status") != "paid":
+        raise HTTPException(status_code=409, detail="Payment has not been confirmed for this enrollment.")
+    if str(intent.get("email") or "").strip().lower() != actor["email"]:
+        raise HTTPException(status_code=403, detail="This payment belongs to a different email address.")
+    result = await enroll_paid_trainee(actor["email"], reference, TRAINEE_PRICE_USD, str(intent.get("currency") or "KES"), TRAINEE_COUNTRY, str(intent.get("provider") or "paystack"))
+    if not result.get("success"):
+        raise HTTPException(status_code=409, detail=result.get("error") or "The trainee account could not be completed.")
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {"name": official_name, "officialIdName": official_name}, merge=True)
+    return {"success": True, "training_room": True}
 
 @app.get("/human-transcription/trainee/status")
 async def trainee_status(request: Request):
