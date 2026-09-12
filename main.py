@@ -603,7 +603,8 @@ CUSTOM_TOPUP_MIN = 10
 CUSTOM_TOPUP_MAX = 5000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
-TRAINEE_PRICE_USD = 30.00
+# Temporary checkout-test price. Restore to 30.00 after payment testing.
+TRAINEE_PRICE_USD = 1.50
 TRAINEE_COUNTRY = 'KE'
 
 # What everything costs, in US dollars, decided here and nowhere else.
