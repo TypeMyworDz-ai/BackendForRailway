@@ -4926,7 +4926,9 @@ async def _human_actor(request: Request):
     profile = await _load_profile(uid)
     profile = profile or {}
     profile_role = str(profile.get("role") or profile.get("user_type") or "").strip().lower()
-    if profile_role in {"worker", "trainee", "transcriber"} or profile.get("workerApproved"):
+    # A trainee belongs in the private Training Room until an admin explicitly
+    # promotes them.  Only approved workers may see assigned human jobs.
+    if profile.get("workerApproved") or profile_role in {"worker", "transcriber"}:
         role = "worker"
     return {"uid": uid, "email": email, "role": role, "profile": profile}
 
@@ -4949,6 +4951,7 @@ async def human_create_job(
     difficulty: str = Form("standard"),
     timestamps: bool = Form(True),
     speakers: str = Form("1-2"),
+    speaker_labels: bool = Form(True),
     instructions: str = Form(""),
     service: str = Form("standard"),
     formatting: str = Form("standard"),
@@ -4993,6 +4996,7 @@ async def human_create_job(
         "formatting": formatting,
         "timestamps": bool(timestamps),
         "speakers": speakers,
+        "speaker_labels": bool(speaker_labels),
         "source_type": source_type,
         "instructions": (instructions or "").strip()[:12000],
         "audio": audio_meta,
@@ -5046,7 +5050,9 @@ async def human_list_workers(request: Request):
     for snap in await asyncio.to_thread(lambda: list(db.collection("users").stream())):
         data = snap.to_dict() or {}
         role = str(data.get("role") or data.get("user_type") or "").strip().lower()
-        if role not in {"worker", "trainee", "transcriber"} and not data.get("workerApproved"):
+        # Paid trainees stay in Training Room; only explicitly approved
+        # workers should appear in the assignment list.
+        if not data.get("workerApproved") and role not in {"worker", "transcriber"}:
             continue
         workers.append({
             "uid": data.get("uid") or snap.id,
@@ -5190,6 +5196,63 @@ async def human_send_message(job_id: str, request: Request, attachment: UploadFi
     return {"message": _human_public(item)}
 
 
+@app.get("/human-transcription/jobs/{job_id}/messages/{message_id}/attachment")
+async def human_message_attachment(job_id: str, message_id: str, request: Request):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    message_snapshot = await asyncio.to_thread(
+        db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages").document(message_id).get
+    )
+    if not message_snapshot.exists:
+        raise HTTPException(status_code=404, detail="That attachment was not found.")
+    message = message_snapshot.to_dict() or {}
+    meta = message.get("attachment") or {}
+    path = meta.get("storage_path")
+    bucket = _human_bucket()
+    if not path or bucket is None:
+        raise HTTPException(status_code=404, detail="That attachment is not available.")
+    if not str(path).startswith(f"human-workflow/{job_id}/chat/"):
+        raise HTTPException(status_code=403, detail="That attachment does not belong to this job.")
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="That attachment is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "attachment")) or "attachment"
+    return Response(
+        content=raw,
+        media_type=meta.get("content_type") or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/human-transcription/jobs/{job_id}/instruction/{attachment_index}")
+async def human_instruction_attachment(job_id: str, attachment_index: int, request: Request):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    attachments = job.get("instruction_attachments") or []
+    if attachment_index < 0 or attachment_index >= len(attachments):
+        raise HTTPException(status_code=404, detail="That reference file was not found.")
+    meta = attachments[attachment_index] or {}
+    path = meta.get("storage_path")
+    bucket = _human_bucket()
+    if not path or bucket is None:
+        raise HTTPException(status_code=404, detail="That reference file is not available.")
+    if not str(path).startswith(f"human-workflow/{job_id}/instructions/"):
+        raise HTTPException(status_code=403, detail="That reference file does not belong to this job.")
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="That reference file is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "reference-file")) or "reference-file"
+    return Response(
+        content=raw,
+        media_type=meta.get("content_type") or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/human-transcription/jobs/{job_id}/audio")
 async def human_audio(job_id: str, request: Request):
     actor = await _human_actor(request)
@@ -5260,6 +5323,7 @@ async def trainee_status(request: Request):
 @app.post("/human-transcription/trainee/apply")
 async def trainee_apply(request: Request):
     actor = await _trainee_actor(request)
+    profile = actor["profile"]
     payload = await request.json()
     name = str(payload.get("name") or "").strip()
     country = str(payload.get("country") or "").strip()
