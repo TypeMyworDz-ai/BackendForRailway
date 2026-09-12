@@ -1818,6 +1818,7 @@ async def enroll_paid_trainee(email: str, reference: str, amount: float, currenc
         "trainingPaymentCurrency": currency,
         "trainingRoomAccess": True,
         "workerApproved": False,
+        "traineeAccountPendingDeletion": False,
         "trainingPaidAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
@@ -2634,12 +2635,53 @@ async def register_trainee(request: Request):
         "trainingPaymentStatus": "pending",
         "trainingRoomAccess": False,
         "workerApproved": False,
+        "traineeAccountPendingDeletion": bool(payload.get("created_for_trainee")),
         "traineeAppliedAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
     return {"status": "payment_pending", "country": "Kenya", "fee_usd": TRAINEE_PRICE_USD}
 
+
+
+@app.post("/api/trainee/cancel-pending")
+async def cancel_pending_trainee(request: Request):
+    """Remove a trainee auth/profile created for a checkout that did not pay."""
+    actor = await _trainee_actor(request)
+    profile = actor["profile"]
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if profile.get("trainingPaymentStatus") == "paid" or profile.get("trainingRoomAccess"):
+        raise HTTPException(status_code=409, detail="A paid trainee account cannot be cancelled this way.")
+    delete_auth = bool(profile.get("traineeAccountPendingDeletion") or payload.get("created_for_trainee"))
+    deleted = {"auth": False, "profile": False}
+    if delete_auth:
+        try:
+            await asyncio.to_thread(firebase_auth.delete_user, actor["uid"])
+            deleted["auth"] = True
+        except firebase_auth.UserNotFoundError:
+            deleted["auth"] = True
+        except Exception as exc:
+            logger.warning("Could not delete pending trainee auth account %s: %s", actor["uid"], exc)
+        if db:
+            await asyncio.to_thread(db.collection("users").document(actor["uid"]).delete)
+            deleted["profile"] = True
+    elif db:
+        # An existing client account may have started trainee enrollment. Keep
+        # that normal account, but remove every pending-trainee marker so a
+        # failed checkout cannot change its access or trap it in Training Room.
+        await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {
+            "traineeStatus": "not_started",
+            "trainingPaymentStatus": "not_submitted",
+            "trainingRoomAccess": False,
+            "traineeAccountPendingDeletion": False,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        deleted["profile"] = True
+    logger.info("Removed unpaid trainee enrollment for %s (auth_deleted=%s)", actor["email"], delete_auth)
+    return {"success": True, "deleted": deleted}
 
 @app.post("/api/initialize-kora-trainee-payment")
 async def initialize_kora_trainee_payment(request: Request):
@@ -5415,6 +5457,121 @@ async def trainee_submit_training(level: int, request: Request):
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
     return {"status": "submitted", "level": level}
 
+
+
+# ===================== Direct user conversations ============================
+# A job conversation belongs to a human-work job. This separate collection is
+# for a conversation between two accounts, so admins can contact a client,
+# worker, trainee, or another admin without inventing a job just to send a note.
+def _user_chat_thread_id(first_uid: str, second_uid: str) -> str:
+    return "--".join(sorted([str(first_uid), str(second_uid)]))
+
+
+async def _user_chat_target(other_uid: str):
+    other_uid = str(other_uid or "").strip()
+    if not other_uid:
+        raise HTTPException(status_code=400, detail="A recipient is required.")
+    snapshot = await asyncio.to_thread(db.collection("users").document(other_uid).get)
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="That user could not be found.")
+    data = snapshot.to_dict() or {}
+    return {
+        "uid": other_uid,
+        "email": data.get("email") or "",
+        "name": data.get("name") or data.get("full_name") or data.get("displayName") or data.get("email") or "User",
+        "role": data.get("role") or data.get("user_type") or "client",
+    }
+
+
+async def _user_chat_actor(request: Request):
+    decoded = _verified_user(request)
+    uid = decoded.get("uid") or ""
+    email = (decoded.get("email") or "").strip().lower()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Your account could not be verified.")
+    return {"uid": uid, "email": email, "role": "admin" if is_admin_user(email) else "user"}
+
+
+async def _user_chat_file(thread_id: str, upload: UploadFile):
+    if not upload or not upload.filename:
+        return None
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="The attached file is empty.")
+    if len(raw) > 25 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Attachments must be 25 MB or smaller.")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(upload.filename))[:180] or "attachment"
+    path = f"user-chats/{thread_id}/{uuid.uuid4().hex}-{safe_name}"
+    bucket = _human_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="File storage is not ready yet. Please try again shortly.")
+    blob = bucket.blob(path)
+    blob.upload_from_string(raw, content_type=upload.content_type or "application/octet-stream")
+    return {"name": upload.filename, "storage_path": path, "content_type": upload.content_type or "application/octet-stream", "size": len(raw)}
+
+
+@app.get("/api/user-chats/{other_uid}/messages")
+async def user_chat_messages(other_uid: str, request: Request):
+    actor = await _user_chat_actor(request)
+    target = await _user_chat_target(other_uid)
+    if target["uid"] == actor["uid"]:
+        raise HTTPException(status_code=400, detail="You cannot start a conversation with yourself.")
+    thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
+    ref = db.collection("user_chats").document(thread_id).collection("messages")
+    snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
+    messages = []
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        data["id"] = snap.id
+        messages.append(_human_public(data))
+    return {"thread_id": thread_id, "user": target, "messages": messages}
+
+
+@app.post("/api/user-chats/{other_uid}/messages")
+async def user_chat_send(other_uid: str, request: Request, attachment: UploadFile = File(None), message: str = Form("")):
+    actor = await _user_chat_actor(request)
+    target = await _user_chat_target(other_uid)
+    if target["uid"] == actor["uid"]:
+        raise HTTPException(status_code=400, detail="You cannot message yourself.")
+    text = (message or "").strip()
+    thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
+    attachment_meta = await _user_chat_file(thread_id, attachment) if attachment else None
+    if not text and not attachment_meta:
+        raise HTTPException(status_code=400, detail="Write a message or attach a file.")
+    item = {
+        "sender_uid": actor["uid"],
+        "sender_email": actor["email"],
+        "recipient_uid": target["uid"],
+        "message": text[:12000],
+        "attachment": attachment_meta,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    }
+    msg_ref = db.collection("user_chats").document(thread_id).collection("messages").document()
+    await asyncio.to_thread(msg_ref.set, item)
+    item["id"] = msg_ref.id
+    return {"message": _human_public(item), "user": target, "thread_id": thread_id}
+
+
+@app.get("/api/user-chats/{other_uid}/messages/{message_id}/attachment")
+async def user_chat_attachment(other_uid: str, message_id: str, request: Request):
+    actor = await _user_chat_actor(request)
+    target = await _user_chat_target(other_uid)
+    thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
+    snapshot = await asyncio.to_thread(db.collection("user_chats").document(thread_id).collection("messages").document(message_id).get)
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="That attachment was not found.")
+    data = snapshot.to_dict() or {}
+    meta = data.get("attachment") or {}
+    path = meta.get("storage_path")
+    if not path or not str(path).startswith(f"user-chats/{thread_id}/"):
+        raise HTTPException(status_code=403, detail="That attachment does not belong to this conversation.")
+    bucket = _human_bucket()
+    blob = bucket.blob(path) if bucket else None
+    if blob is None or not blob.exists():
+        raise HTTPException(status_code=404, detail="That attachment is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "attachment")) or "attachment"
+    return Response(content=raw, media_type=meta.get("content_type") or "application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
