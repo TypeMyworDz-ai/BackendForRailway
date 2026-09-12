@@ -2686,9 +2686,14 @@ async def initialize_kora_trainee_payment(request: Request):
 
 
 async def verify_kora_and_enroll(reference: str):
+    """Verify a live Kora charge and fulfil either a trainee, plan, or top-up intent."""
     if not KORA_SECRET_KEY:
         return {"success": False, "error": "Kora configuration missing"}
-    response = requests.get(f"https://api.korapay.com/merchant/api/v1/charges/{reference}", headers={"Authorization": f"Bearer {KORA_SECRET_KEY}"}, timeout=15)
+    response = requests.get(
+        f"https://api.korapay.com/merchant/api/v1/charges/{reference}",
+        headers={"Authorization": f"Bearer {KORA_SECRET_KEY}"},
+        timeout=15,
+    )
     data = response.json()
     charge = data.get("data") or {}
     if response.status_code >= 400 or not data.get("status") or str(charge.get("status") or "").lower() != "success":
@@ -2697,12 +2702,110 @@ async def verify_kora_and_enroll(reference: str):
         return {"success": False, "error": "Firestore not initialized"}
     intent_snap = await asyncio.to_thread(db.collection("payment_intents").document(reference).get)
     intent = intent_snap.to_dict() if intent_snap.exists else {}
-    if not intent or intent.get("product") != TRAINEE_PRODUCT:
+    product = str(intent.get("product") or "")
+    if not intent or not product:
         return {"success": False, "error": "Unknown Kora payment reference"}
-    result = await enroll_paid_trainee(intent.get("email"), reference, TRAINEE_PRICE_USD, str(charge.get("currency") or intent.get("currency") or "KES"), TRAINEE_COUNTRY, "kora")
+
+    if intent.get("status") == "paid":
+        return {"success": True, "already_applied": True, "plan": product, "trainee_enrolled": product == TRAINEE_PRODUCT}
+
+    email = intent.get("email")
+    country_code = str(intent.get("countryCode") or "").upper()
+    currency = str(charge.get("currency") or intent.get("currency") or "KES")
+    amount_usd = float(intent.get("amountUsd") or price_for(product, country_code) or 0)
+    if product == TRAINEE_PRODUCT:
+        result = await enroll_paid_trainee(email, reference, TRAINEE_PRICE_USD, currency, country_code, "kora")
+    else:
+        result = await update_user_credits_paystack(
+            email=email,
+            plan_name=product,
+            amount=amount_usd,
+            currency=currency,
+            update_admin_revenue=bool(intent.get("updateAdminRevenue")),
+            country_code=country_code,
+            reference=reference,
+        )
     if result.get("success"):
-        await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {"status": "paid", "verifiedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        result["plan"] = product
+        await asyncio.to_thread(
+            db.collection("payment_intents").document(reference).set,
+            {"status": "paid", "verifiedAt": firestore.SERVER_TIMESTAMP},
+            merge=True,
+        )
     return result
+
+
+@app.post("/api/initialize-kora-payment")
+async def initialize_kora_payment(request: PaystackInitializationRequest):
+    """Initialize a Kora checkout for an African plan or credit top-up."""
+    if not KORA_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Kora checkout is not configured yet.")
+    if not request.email or not request.user_id:
+        raise HTTPException(status_code=400, detail="A signed-in account is required.")
+    base_usd = price_for(request.plan_name, request.country_code)
+    if base_usd is None:
+        raise HTTPException(status_code=400, detail="That is not something we sell.")
+    local_amount, local_currency = get_local_amount_and_currency(base_usd, request.country_code, request.plan_name)
+    reference = "tmw-" + uuid.uuid4().hex
+    redirect_url = str(request.callback_url or f"{APP_URL}/?kora=success")
+    separator = "&" if "?" in redirect_url else "?"
+    redirect_url = f"{redirect_url}{separator}reference={reference}"
+    notification_url = KORA_NOTIFICATION_URL or f"{BACKEND_PUBLIC_URL}/api/kora-webhook"
+    kora_payload = {
+        "amount": int(round(local_amount)),
+        "currency": local_currency,
+        "reference": reference,
+        "redirect_url": redirect_url,
+        "notification_url": notification_url,
+        "narration": f"TypeMyworDz {request.plan_name}",
+        "channels": ["mobile_money", "card"],
+        "customer": {"email": request.email},
+        "metadata": {
+            "product": request.plan_name,
+            "user-id": request.user_id,
+            "country": request.country_code,
+        },
+    }
+    headers = {"Authorization": f"Bearer {KORA_SECRET_KEY}", "Content-Type": "application/json"}
+    try:
+        response = requests.post(
+            "https://api.korapay.com/merchant/api/v1/charges/initialize",
+            headers=headers,
+            json=kora_payload,
+            timeout=15,
+        )
+        data = response.json()
+        if response.status_code >= 400 or not data.get("status"):
+            raise HTTPException(status_code=502, detail=data.get("message") or "Kora checkout could not be started.")
+        if db:
+            await asyncio.to_thread(
+                db.collection("payment_intents").document(reference).set,
+                {
+                    "uid": request.user_id,
+                    "email": request.email,
+                    "product": request.plan_name,
+                    "provider": "kora",
+                    "countryCode": request.country_code,
+                    "amountUsd": base_usd,
+                    "amountLocal": local_amount,
+                    "currency": local_currency,
+                    "updateAdminRevenue": bool(request.update_admin_revenue),
+                    "status": "pending",
+                    "createdAt": firestore.SERVER_TIMESTAMP,
+                },
+            )
+        return {
+            "status": True,
+            "checkout_url": data.get("data", {}).get("checkout_url"),
+            "reference": reference,
+            "local_amount": local_amount,
+            "local_currency": local_currency,
+        }
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        logger.exception("Kora initialization failed")
+        raise HTTPException(status_code=502, detail="Kora checkout could not be reached.") from exc
 
 
 @app.post("/api/verify-kora-payment")
@@ -2710,7 +2813,7 @@ async def verify_kora_payment(request: KoraVerificationRequest):
     result = await verify_kora_and_enroll(request.reference)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error", "Kora payment verification failed."))
-    return {"status": "success", "data": {"plan": TRAINEE_PRODUCT, "reference": request.reference, "training_room": True}}
+    return {"status": "success", "data": {"plan": result.get("plan", ""), "reference": request.reference, "training_room": bool(result.get("trainee_enrolled"))}}
 
 
 @app.post("/api/kora-webhook")
