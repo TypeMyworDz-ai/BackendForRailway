@@ -68,7 +68,7 @@ import openai
 import google.generativeai as genai
 
 import firebase_admin
-from firebase_admin import auth as firebase_auth, credentials, firestore, initialize_app
+from firebase_admin import auth as firebase_auth, credentials, firestore, initialize_app, storage as firebase_storage
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 
@@ -94,7 +94,7 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # plan or free-trial rules, and can reach the admin tools.
 # Complimentary accounts (below) also skip payment, but are NOT admins and get
 # none of the admin tooling.
-ADMIN_EMAILS = ['typemywordz@gmail.com', 'mutheepatriciah3@gmail.com']
+ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordztest.com']
 # Dedicated OpenAI Whisper tester. This account used to be the AssemblyAI
 # tester; the owner moved it to OpenAI so OpenAI can be exercised on its own.
 # Like the Deepgram tester it never falls back, so an OpenAI failure shows up
@@ -4516,6 +4516,379 @@ logger.info("  GET /jobs - List all jobs")
 logger.info("  GET /health - System health check")
 logger.info("  DELETE /cleanup - Clean up old jobs")
 logger.info("  GET / - Root endpoint with service info")
+
+
+# ===================== Human workflow =====================
+# The human service is deliberately a state machine.  A quote never charges
+# credits; the client cannot download the finished work until the admin has
+# released it after the client's approval.
+HUMAN_JOB_COLLECTION = "human_jobs"
+HUMAN_JOB_STATUSES = {
+    "pending_admin",
+    "approved",
+    "assigned",
+    "in_progress",
+    "submitted",
+    "client_review",
+    "client_approved",
+    "released",
+    "cancelled",
+}
+
+
+def _human_iso(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def _human_public(data):
+    out = dict(data or {})
+    for key, value in list(out.items()):
+        if isinstance(value, dict):
+            out[key] = _human_public(value)
+        elif isinstance(value, list):
+            out[key] = [_human_public(item) if isinstance(item, dict) else _human_iso(item) for item in value]
+        else:
+            out[key] = _human_iso(value)
+    return out
+
+
+def _human_bucket():
+    if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
+        return None
+    try:
+        configured = os.getenv("FIREBASE_STORAGE_BUCKET", "").strip()
+        return firebase_storage.bucket(configured) if configured else firebase_storage.bucket()
+    except Exception as exc:
+        logger.warning("Human workflow storage is unavailable: %s", exc)
+        return None
+
+
+async def _human_store_upload(job_id: str, upload: UploadFile, folder: str):
+    if not upload or not upload.filename:
+        return None
+    raw = await upload.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"{upload.filename} is empty.")
+    if len(raw) > 500 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"{upload.filename} is larger than 500 MB.")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(upload.filename))[:180] or "attachment"
+    path = f"human-workflow/{job_id}/{folder}/{uuid.uuid4().hex}-{safe_name}"
+    bucket = _human_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="File storage is not ready yet. Please try again shortly.")
+    blob = bucket.blob(path)
+    blob.upload_from_string(raw, content_type=upload.content_type or "application/octet-stream")
+    return {
+        "name": upload.filename,
+        "storage_path": path,
+        "content_type": upload.content_type or "application/octet-stream",
+        "size": len(raw),
+    }
+
+
+async def _human_job(job_id: str):
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    snapshot = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="That human-transcription job was not found.")
+    data = snapshot.to_dict() or {}
+    data["id"] = snapshot.id
+    return data
+
+
+async def _human_actor(request: Request):
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    uid = decoded.get("uid") or ""
+    if not uid:
+        raise HTTPException(status_code=401, detail="Your account could not be verified.")
+    role = "admin" if is_admin_user(email) else "client"
+    profile = await _load_profile(uid)
+    profile = profile or {}
+    profile_role = str(profile.get("role") or profile.get("user_type") or "").strip().lower()
+    if profile_role in {"worker", "trainee", "transcriber"} or profile.get("workerApproved"):
+        role = "worker"
+    return {"uid": uid, "email": email, "role": role, "profile": profile}
+
+
+async def _human_assert_access(job, actor, allow_admin=True):
+    if actor["role"] == "admin" and allow_admin:
+        return
+    if job.get("client_uid") == actor["uid"] or job.get("worker_uid") == actor["uid"]:
+        return
+    raise HTTPException(status_code=403, detail="You do not have access to this job.")
+
+
+@app.post("/human-transcription/jobs")
+async def human_create_job(
+    request: Request,
+    audio: UploadFile = File(...),
+    attachments: List[UploadFile] = File(default=[]),
+    seconds: float = Form(0),
+    turnaround: str = Form("standard"),
+    difficulty: str = Form("standard"),
+    timestamps: bool = Form(True),
+    speakers: bool = Form(True),
+    instructions: str = Form(""),
+):
+    actor = await _human_actor(request)
+    if actor["role"] != "client" and actor["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only a client can request human work.")
+    if seconds <= 0:
+        raise HTTPException(status_code=400, detail="The recording length is required.")
+    quote = human_credit_quote(seconds, turnaround, difficulty)
+    profile = await _load_profile(actor["uid"])
+    balance = read_balance(profile or {})
+    exempt = credits_exempt(actor["email"])
+    if not exempt and balance["spendable"] < quote["credits"]:
+        raise HTTPException(status_code=409, detail=f"You need {quote['credits'] - balance['spendable']} more credits before human work can begin.")
+    job_id = uuid.uuid4().hex
+    audio_meta = await _human_store_upload(job_id, audio, "audio")
+    attachment_meta = []
+    for item in attachments or []:
+        attachment_meta.append(await _human_store_upload(job_id, item, "instructions"))
+    now = firestore.SERVER_TIMESTAMP
+    job = {
+        "client_uid": actor["uid"],
+        "client_email": actor["email"],
+        "status": "pending_admin",
+        "createdAt": now,
+        "updatedAt": now,
+        "seconds": float(seconds),
+        "minutes": quote["minutes"],
+        "turnaround": turnaround,
+        "difficulty": difficulty,
+        "timestamps": bool(timestamps),
+        "speakers": bool(speakers),
+        "instructions": (instructions or "").strip()[:12000],
+        "audio": audio_meta,
+        "instruction_attachments": attachment_meta,
+        "quote_credits": int(quote["credits"]),
+        "quote": quote,
+        "worker_uid": None,
+        "worker_email": None,
+        "worker_name": None,
+        "transcript": "",
+        "worker_notes": "",
+        "admin_feedback": "",
+        "worker_rating": None,
+        "credits_charged": 0,
+        "releasedAt": None,
+    }
+    if db is None:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, job)
+    job["id"] = job_id
+    return {"job": _human_public(job), "reservation": "not_created", "credits_deducted": 0}
+
+
+@app.get("/human-transcription/jobs")
+async def human_list_jobs(request: Request, scope: str = "mine"):
+    actor = await _human_actor(request)
+    if not db:
+        return {"jobs": []}
+    ref = db.collection(HUMAN_JOB_COLLECTION)
+    if actor["role"] == "admin" or scope == "admin":
+        snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream()))
+    elif actor["role"] == "worker" or scope == "assigned":
+        snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
+    else:
+        snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("client_uid", "==", actor["uid"])).stream()))
+    jobs = []
+    for snap in snapshots:
+        item = snap.to_dict() or {}
+        item["id"] = snap.id
+        jobs.append(_human_public(item))
+    jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+    return {"jobs": jobs}
+
+
+@app.get("/human-transcription/workers")
+async def human_list_workers(request: Request):
+    _require_admin(request)
+    if not db:
+        return {"workers": []}
+    workers = []
+    for snap in await asyncio.to_thread(lambda: list(db.collection("users").stream())):
+        data = snap.to_dict() or {}
+        role = str(data.get("role") or data.get("user_type") or "").strip().lower()
+        if role not in {"worker", "trainee", "transcriber"} and not data.get("workerApproved"):
+            continue
+        workers.append({
+            "uid": data.get("uid") or snap.id,
+            "email": data.get("email") or "",
+            "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
+            "role": role or "worker",
+            "approved": bool(data.get("workerApproved") or role == "worker"),
+            "available": data.get("is_available", True),
+        })
+    return {"workers": workers}
+
+
+@app.post("/human-transcription/jobs/{job_id}/approve")
+async def human_admin_approve(job_id: str, request: Request):
+    _require_admin(request)
+    job = await _human_job(job_id)
+    if job.get("status") != "pending_admin":
+        raise HTTPException(status_code=409, detail="This job is not waiting for admin approval.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "approved", "updatedAt": firestore.SERVER_TIMESTAMP})
+    return {"status": "approved", "job_id": job_id}
+
+
+@app.post("/human-transcription/jobs/{job_id}/assign")
+async def human_admin_assign(job_id: str, request: Request):
+    _require_admin(request)
+    payload = await request.json()
+    worker_uid = str(payload.get("worker_uid") or "").strip()
+    worker_email = str(payload.get("worker_email") or "").strip().lower()
+    worker_name = str(payload.get("worker_name") or "").strip()
+    if not worker_uid:
+        raise HTTPException(status_code=400, detail="Choose an approved worker first.")
+    job = await _human_job(job_id)
+    if job.get("status") not in {"approved", "assigned"}:
+        raise HTTPException(status_code=409, detail="Approve the job before assigning it.")
+    updates = {"status": "assigned", "worker_uid": worker_uid, "worker_email": worker_email, "worker_name": worker_name, "updatedAt": firestore.SERVER_TIMESTAMP}
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    return {"status": "assigned", "job_id": job_id, "worker_uid": worker_uid}
+
+
+@app.post("/human-transcription/jobs/{job_id}/start")
+async def human_worker_start(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor, allow_admin=False)
+    if job.get("status") not in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="This job is not ready to start.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+    return {"status": "in_progress", "job_id": job_id}
+
+
+@app.post("/human-transcription/jobs/{job_id}/submit")
+async def human_worker_submit(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor, allow_admin=False)
+    payload = await request.json()
+    transcript = str(payload.get("transcript") or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Add the completed transcript before submitting.")
+    updates = {"status": "submitted", "transcript": transcript[:1000000], "worker_notes": str(payload.get("notes") or "")[:12000], "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    return {"status": "submitted", "job_id": job_id}
+
+
+@app.post("/human-transcription/jobs/{job_id}/review")
+async def human_admin_review(job_id: str, request: Request):
+    _require_admin(request)
+    job = await _human_job(job_id)
+    if job.get("status") not in {"submitted", "client_review"}:
+        raise HTTPException(status_code=409, detail="This job is not ready for admin review.")
+    payload = await request.json()
+    rating = payload.get("rating")
+    try:
+        rating = max(1, min(5, int(rating))) if rating is not None else None
+    except (TypeError, ValueError):
+        rating = None
+    updates = {"status": "client_review", "admin_feedback": str(payload.get("feedback") or "")[:12000], "worker_rating": rating, "reviewedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    return {"status": "client_review", "job_id": job_id}
+
+
+@app.post("/human-transcription/jobs/{job_id}/client-approve")
+async def human_client_approve(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "client":
+        raise HTTPException(status_code=403, detail="Client access is required.")
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor, allow_admin=False)
+    if job.get("status") != "client_review":
+        raise HTTPException(status_code=409, detail="The job is not waiting for your approval.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "client_approved", "clientApprovedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP})
+    return {"status": "client_approved", "job_id": job_id, "credits_deducted": 0}
+
+
+@app.post("/human-transcription/jobs/{job_id}/release")
+async def human_admin_release(job_id: str, request: Request):
+    _require_admin(request)
+    job = await _human_job(job_id)
+    if job.get("status") != "client_approved":
+        raise HTTPException(status_code=409, detail="Client approval is required before releasing the work.")
+    charge = await charge_credits(job.get("client_uid") or "", job.get("client_email") or "", int(job.get("quote_credits") or 0), f"human transcription {job_id}")
+    if charge.get("error") or charge.get("needed"):
+        raise HTTPException(status_code=409, detail="The client's credits no longer cover this job. The work remains locked.")
+    updates = {"status": "released", "credits_charged": int(job.get("quote_credits") or 0), "releasedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    return {"status": "released", "job_id": job_id, "credits_deducted": int(job.get("quote_credits") or 0)}
+
+
+@app.get("/human-transcription/jobs/{job_id}/messages")
+async def human_messages(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
+    snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
+    messages = []
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        data["id"] = snap.id
+        messages.append(_human_public(data))
+    return {"messages": messages}
+
+
+@app.post("/human-transcription/jobs/{job_id}/messages")
+async def human_send_message(job_id: str, request: Request, attachment: UploadFile = File(None), message: str = Form("")):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    text = (message or "").strip()
+    attachment_meta = await _human_store_upload(job_id, attachment, "chat") if attachment else None
+    if not text and not attachment_meta:
+        raise HTTPException(status_code=400, detail="Write a message or attach a file.")
+    item = {"sender_uid": actor["uid"], "sender_email": actor["email"], "sender_role": actor["role"], "message": text[:12000], "attachment": attachment_meta, "createdAt": firestore.SERVER_TIMESTAMP}
+    msg_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages").document()
+    await asyncio.to_thread(msg_ref.set, item)
+    item["id"] = msg_ref.id
+    return {"message": _human_public(item)}
+
+
+@app.get("/human-transcription/jobs/{job_id}/audio")
+async def human_audio(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    meta = job.get("audio") or {}
+    path = meta.get("storage_path")
+    bucket = _human_bucket()
+    if not path or bucket is None:
+        raise HTTPException(status_code=404, detail="The source audio is not available.")
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="The source audio is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    return Response(content=raw, media_type=meta.get("content_type") or "application/octet-stream", headers={"Content-Disposition": f"inline; filename={meta.get('name') or 'source-audio'}"})
+
+
+@app.get("/human-transcription/jobs/{job_id}/download")
+async def human_download(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    if job.get("status") != "released" and actor["role"] == "client":
+        raise HTTPException(status_code=403, detail="The completed work will be downloadable after admin releases it.")
+    transcript = str(job.get("transcript") or "")
+    if not transcript:
+        raise HTTPException(status_code=404, detail="No completed transcript is available.")
+    return Response(content=transcript, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename=human-{job_id}.txt"})
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")
