@@ -1793,11 +1793,17 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
 
-async def enroll_paid_trainee(email: str, reference: str, amount: float, currency: str, country_code: str, payment_provider: str = "paystack"):
-    """Unlock Training Room only after the payment provider confirms success."""
+async def enroll_paid_trainee(email: str, reference: str, amount: float, currency: str, country_code: str, payment_provider: str = "paystack", user_id: Optional[str] = None):
+    """Unlock Training Room only after the payment provider confirms success.
+
+    When the account was just created, the Firebase auth event and the profile
+    document can arrive at different times.  A signed-in finalization request
+    supplies the verified UID directly so enrollment never depends on a
+    profile lookup racing the auth callback.
+    """
     if not db:
         return {"success": False, "error": "Firestore not initialized"}
-    user_id = await get_user_profile_by_email_firestore(email)
+    user_id = user_id or await get_user_profile_by_email_firestore(email)
     if not user_id:
         return {"success": False, "error": f"User {email} not found in Firestore."}
     profile = await _load_profile(user_id) or {}
@@ -5467,7 +5473,7 @@ async def complete_trainee_signup(request: Request):
         raise HTTPException(status_code=409, detail="Payment has not been confirmed for this enrollment.")
     if str(intent.get("email") or "").strip().lower() != actor["email"]:
         raise HTTPException(status_code=403, detail="This payment belongs to a different email address.")
-    result = await enroll_paid_trainee(actor["email"], reference, TRAINEE_PRICE_USD, str(intent.get("currency") or "KES"), TRAINEE_COUNTRY, str(intent.get("provider") or "paystack"))
+    result = await enroll_paid_trainee(actor["email"], reference, TRAINEE_PRICE_USD, str(intent.get("currency") or "KES"), TRAINEE_COUNTRY, str(intent.get("provider") or "paystack"), user_id=actor["uid"])
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error") or "The trainee account could not be completed.")
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {"name": official_name, "officialIdName": official_name}, merge=True)
