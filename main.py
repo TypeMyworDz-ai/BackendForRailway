@@ -5441,10 +5441,24 @@ async def human_download(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="No completed transcript is available.")
     return Response(content=transcript, media_type="text/plain", headers={"Content-Disposition": f"attachment; filename=human-{job_id}.txt"})
 
+TRAINING_GUIDELINES = {
+    "title": "TypeMyworDz human-work guidelines",
+    "summary": "These standards apply to training exercises and future human-work assignments.",
+    "sections": [
+        {"title": "Accuracy before speed", "body": "Preserve the speaker's meaning and wording. Remove only clear fillers, stutters, duplicated words, false starts, and explicit self-corrections."},
+        {"title": "Names and research", "body": "Keep names, places, organisations, and technical terms consistent. Research distinctive proper nouns when the assignment requires it, but do not rewrite the speaker's meaning."},
+        {"title": "Speakers and timestamps", "body": "Keep speaker changes clear, use the supplied timestamp convention, and check the audio when a word or identity is uncertain."},
+        {"title": "Client-ready delivery", "body": "Follow the client's template and instructions, check the complete document, and submit only work that has been reviewed from beginning to end."},
+    ],
+}
+
 TRAINING_LEVELS = [
-    {"level": 1, "name": "Clean transcript basics", "description": "Follow the brief, preserve wording, and submit a clean first pass."},
-    {"level": 2, "name": "Speaker and timestamp review", "description": "Handle speaker turns, timestamps, difficult audio, and the shared editor."},
-    {"level": 3, "name": "Client-ready delivery", "description": "Complete a full job, apply feedback, and prepare work for admin approval."},
+    {"level": 1, "name": "Orientation and standards", "kind": "study", "description": "Read the programme, understand the workflow, and begin the first conversation with the admin."},
+    {"level": 2, "name": "TypeMyworDz guidelines", "kind": "study", "description": "Study the human-work guidelines, ask questions, and discuss examples with the admin.", "guidelines": True},
+    {"level": 3, "name": "Tools, privacy and review habits", "kind": "study", "description": "Learn the editor, timestamp checks, file handling, privacy expectations, and quality-control routine."},
+    {"level": 4, "name": "Practical: clean transcript", "kind": "practical", "description": "Complete a short clean-transcript exercise using the required brief and formatting rules."},
+    {"level": 5, "name": "Practical: speakers and timestamps", "kind": "practical", "description": "Complete a timestamp and speaker-review exercise, checking difficult audio carefully."},
+    {"level": 6, "name": "Practical: client-ready delivery", "kind": "practical", "description": "Complete a full client-ready exercise and respond to admin feedback."},
 ]
 
 
@@ -5498,6 +5512,7 @@ async def trainee_status(request: Request):
             "submissions": profile.get("trainingSubmissions") or {},
         },
         "levels": TRAINING_LEVELS,
+        "guidelines": TRAINING_GUIDELINES,
         "is_worker": bool(profile.get("workerApproved") or str(profile.get("role") or "").lower() == "worker"),
     }
 
@@ -5569,7 +5584,7 @@ async def admin_trainee_decision(uid: str, request: Request):
         updates.update({"role": "client", "traineeStatus": "rejected", "trainingStatus": "rejected", "workerApproved": False})
     elif decision == "approve_level":
         current = max(1, int(profile.get("trainingLevel") or 1))
-        updates.update({"role": "trainee", "traineeStatus": "enrolled", "trainingStatus": "active", "trainingRoomAccess": True, "trainingLevel": min(3, current + 1), "workerApproved": False})
+        updates.update({"role": "trainee", "traineeStatus": "enrolled", "trainingStatus": "active", "trainingRoomAccess": True, "trainingLevel": min(len(TRAINING_LEVELS), current + 1), "workerApproved": False})
     elif decision == "promote_worker":
         updates.update({"role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed", "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP})
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
@@ -5585,17 +5600,45 @@ async def trainee_submit_training(level: int, request: Request):
         raise HTTPException(status_code=403, detail="Trainee access is required.")
     if level < 1 or level > len(TRAINING_LEVELS):
         raise HTTPException(status_code=400, detail="That training level does not exist.")
+    current_level = max(1, int(profile.get("trainingLevel") or 1))
+    if level > current_level:
+        raise HTTPException(status_code=403, detail="Complete the current module and wait for admin approval before opening that module.")
     payload = await request.json()
     transcript = str(payload.get("transcript") or "").strip()
     notes = str(payload.get("notes") or "").strip()
-    if not transcript:
-        raise HTTPException(status_code=400, detail="Submit the completed training transcript first.")
+    if level >= 4 and not transcript:
+        raise HTTPException(status_code=400, detail="Submit the completed practical transcript first.")
     submission = {"level": level, "transcript": transcript[:1000000], "notes": notes[:12000], "status": "submitted", "createdAt": firestore.SERVER_TIMESTAMP, "uid": actor["uid"], "email": actor["email"]}
     await asyncio.to_thread(db.collection("training_submissions").document(f"{actor['uid']}-{level}").set, submission, merge=True)
     updates = {"trainingSubmissions": {**(profile.get("trainingSubmissions") or {}), str(level): "submitted"}, "trainingStatus": "review", "updatedAt": firestore.SERVER_TIMESTAMP}
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
     return {"status": "submitted", "level": level}
 
+
+
+@app.get("/api/messaging/contacts")
+async def messaging_contacts(request: Request):
+    """Return safe direct-message recipients for the signed-in dashboard."""
+    actor = await _user_chat_actor(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Messaging is not available yet.")
+    rows = []
+    if actor["role"] == "admin":
+        rows = await asyncio.to_thread(_read_admin_users_snapshot)
+    else:
+        for email in ADMIN_EMAILS:
+            try:
+                record = await asyncio.to_thread(firebase_auth.get_user_by_email, email)
+                profile = await _load_profile(record.uid) or {}
+                rows.append({
+                    "uid": record.uid,
+                    "email": email,
+                    "name": profile.get("name") or profile.get("displayName") or email,
+                    "role": "admin",
+                })
+            except Exception:
+                continue
+    return {"contacts": [item for item in rows if item.get("uid") != actor["uid"]]}
 
 
 # ===================== Direct user conversations ============================
