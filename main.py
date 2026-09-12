@@ -156,6 +156,9 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY")
 PAYSTACK_WEBHOOK_SECRET = os.environ.get("PAYSTACK_WEBHOOK_SECRET")
+KORA_SECRET_KEY = os.environ.get("KORA_SECRET_KEY", "")
+KORA_NOTIFICATION_URL = os.environ.get("KORA_NOTIFICATION_URL", "")
+BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "https://backendforrailway-production-7128.up.railway.app")
 PADDLE_CLIENT_TOKEN = os.environ.get("PADDLE_CLIENT_TOKEN", "")
 PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY", "")
 PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "")
@@ -181,6 +184,7 @@ logger.info(f"DEBUG: OPENAI_API_KEY (for GPT if direct) loaded value: {bool(OPEN
 logger.info(f"DEBUG: PAYSTACK_SECRET_KEY loaded value: {bool(PAYSTACK_SECRET_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_PUBLIC_KEY loaded value: {bool(PAYSTACK_PUBLIC_KEY)}")
 logger.info(f"DEBUG: PAYSTACK_WEBHOOK_SECRET loaded value: {bool(PAYSTACK_WEBHOOK_SECRET)}")
+logger.info(f"DEBUG: KORA_SECRET_KEY loaded value: {bool(KORA_SECRET_KEY)}")
 logger.info(f"DEBUG: PADDLE_CLIENT_TOKEN loaded value: {bool(PADDLE_CLIENT_TOKEN)}")
 logger.info(f"DEBUG: PADDLE_API_KEY loaded value: {bool(PADDLE_API_KEY)}")
 logger.info(f"DEBUG: PADDLE_WEBHOOK_SECRET loaded value: {bool(PADDLE_WEBHOOK_SECRET)}")
@@ -598,6 +602,9 @@ TOPUP_BUNDLES = {
 CUSTOM_TOPUP_MIN = 10
 CUSTOM_TOPUP_MAX = 5000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
+TRAINEE_PRODUCT = 'trainee-training'
+TRAINEE_PRICE_USD = 30.00
+TRAINEE_COUNTRY = 'KE'
 
 # What everything costs, in US dollars, decided here and nowhere else.
 #
@@ -663,7 +670,9 @@ def custom_topup_price(credits, country_code):
 
 
 def price_for(item, country_code):
-    """The dollar price of a plan, bundle, or validated custom top-up."""
+    """The dollar price of a plan, bundle, custom top-up, or trainee enrollment."""
+    if item == TRAINEE_PRODUCT:
+        return TRAINEE_PRICE_USD if (country_code or '').upper() == TRAINEE_COUNTRY else None
     custom = custom_topup_credits(item)
     if custom is not None:
         return custom_topup_price(custom, country_code)
@@ -1280,6 +1289,13 @@ class PaystackWebhookRequest(BaseModel):
     event: str
     data: dict
 
+class TraineeRegistrationRequest(BaseModel):
+    official_name: str
+    country_code: str
+
+class KoraVerificationRequest(BaseModel):
+    reference: str
+
 class CreditUpdateRequest(BaseModel):
     email: str
     plan_name: str
@@ -1776,6 +1792,39 @@ async def verify_paystack_payment(reference: str) -> dict:
             'details': str(e)
         }
 
+async def enroll_paid_trainee(email: str, reference: str, amount: float, currency: str, country_code: str, payment_provider: str = "paystack"):
+    """Unlock Training Room only after the payment provider confirms success."""
+    if not db:
+        return {"success": False, "error": "Firestore not initialized"}
+    user_id = await get_user_profile_by_email_firestore(email)
+    if not user_id:
+        return {"success": False, "error": f"User {email} not found in Firestore."}
+    profile = await _load_profile(user_id) or {}
+    if profile.get("lastTrainingPaymentReference") == reference:
+        return {"success": True, "already_applied": True, "trainee_enrolled": True}
+    if str(country_code or "").upper() != TRAINEE_COUNTRY:
+        return {"success": False, "error": "Training enrollment is currently limited to Kenya."}
+    updates = {
+        "role": "trainee",
+        "traineeStatus": "enrolled",
+        "trainingStatus": "active",
+        "trainingLevel": max(1, int(profile.get("trainingLevel") or 1)),
+        "trainingPaymentStatus": "paid",
+        "trainingPaymentReference": reference,
+        "lastTrainingPaymentReference": reference,
+        "trainingPaymentProvider": payment_provider,
+        "trainingPaymentAmountUsd": TRAINEE_PRICE_USD,
+        "trainingPaymentCurrency": currency,
+        "trainingRoomAccess": True,
+        "workerApproved": False,
+        "trainingPaidAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("users").document(user_id).set, updates, merge=True)
+    logger.info("Paid trainee enrolled in Training Room: %s", email)
+    return {"success": True, "trainee_enrolled": True, "email": email, "reference": reference}
+
+
 async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None, reference: Optional[str] = None):
     """
     Update user credits/plan in Firestore.
@@ -1794,7 +1843,11 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             logger.error(f"User with email {email} not found in Firestore. Cannot update plan.")
             return {'success': False, 'error': f"User {email} not found in Firestore."}
 
-        # 2a. A top-up is not a plan. Buying credits adds them to the bought
+        # 2a. Trainee enrollment is a product, not an AI plan or credit top-up.
+        if plan_name == TRAINEE_PRODUCT:
+            return await enroll_paid_trainee(email, reference or "", amount, currency, country_code or "", "paystack")
+
+        # 2b. A top-up is not a plan. Buying credits adds them to the bought
         # purse and leaves the plan, the free-trial flag and everything else
         # exactly as it was. Both the callback and the webhook can arrive for
         # the same payment, so the reference is remembered and a repeat is
@@ -2559,6 +2612,120 @@ async def root():
         }
     }
 
+@app.post("/api/trainee/register")
+async def register_trainee(request: Request):
+    actor = await _trainee_actor(request)
+    payload = await request.json()
+    official_name = str(payload.get("official_name") or "").strip()
+    country_code = str(payload.get("country_code") or "").strip().upper()
+    if len(official_name) < 2:
+        raise HTTPException(status_code=400, detail="Enter your official ID name.")
+    if country_code != TRAINEE_COUNTRY:
+        raise HTTPException(status_code=400, detail="Training enrollment is currently limited to Kenya.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    updates = {
+        "name": official_name,
+        "officialIdName": official_name,
+        "country": "Kenya",
+        "countryCode": TRAINEE_COUNTRY,
+        "traineeStatus": "payment_pending",
+        "trainingPaymentStatus": "pending",
+        "trainingRoomAccess": False,
+        "workerApproved": False,
+        "traineeAppliedAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
+    return {"status": "payment_pending", "country": "Kenya", "fee_usd": TRAINEE_PRICE_USD}
+
+
+@app.post("/api/initialize-kora-trainee-payment")
+async def initialize_kora_trainee_payment(request: Request):
+    actor = await _trainee_actor(request)
+    payload = await request.json()
+    official_name = str(payload.get("official_name") or actor["profile"].get("officialIdName") or actor["profile"].get("name") or "").strip()
+    country_code = str(payload.get("country_code") or actor["profile"].get("countryCode") or "").upper()
+    if country_code != TRAINEE_COUNTRY:
+        raise HTTPException(status_code=400, detail="Training enrollment is currently limited to Kenya.")
+    if not KORA_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Kora checkout is not configured yet.")
+    local_amount, local_currency = get_local_amount_and_currency(TRAINEE_PRICE_USD, TRAINEE_COUNTRY, "trainee-training")
+    reference = "tmw-trainee-" + uuid.uuid4().hex
+    notification_url = KORA_NOTIFICATION_URL or f"{BACKEND_PUBLIC_URL}/api/kora-webhook"
+    redirect_url = str(payload.get("redirect_url") or f"{APP_URL}/?kora=success")
+    kora_payload = {
+        "amount": int(round(local_amount)),
+        "currency": local_currency,
+        "reference": reference,
+        "redirect_url": redirect_url,
+        "notification_url": notification_url,
+        "narration": "TypeMyworDz Training Room enrollment",
+        "channels": ["mobile_money", "card"],
+        "customer": {"email": actor["email"], "name": official_name},
+        "metadata": {"product": TRAINEE_PRODUCT, "user-id": actor["uid"], "country": TRAINEE_COUNTRY},
+    }
+    headers = {"Authorization": f"Bearer {KORA_SECRET_KEY}", "Content-Type": "application/json"}
+    try:
+        response = requests.post("https://api.korapay.com/merchant/api/v1/charges/initialize", headers=headers, json=kora_payload, timeout=15)
+        data = response.json()
+        if response.status_code >= 400 or not data.get("status"):
+            raise HTTPException(status_code=502, detail=data.get("message") or "Kora checkout could not be started.")
+        if db:
+            await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
+                "uid": actor["uid"], "email": actor["email"], "product": TRAINEE_PRODUCT, "provider": "kora",
+                "countryCode": TRAINEE_COUNTRY, "amountUsd": TRAINEE_PRICE_USD, "amountLocal": local_amount,
+                "currency": local_currency, "status": "pending", "createdAt": firestore.SERVER_TIMESTAMP,
+            })
+        return {"status": True, "checkout_url": data.get("data", {}).get("checkout_url"), "reference": reference, "local_amount": local_amount, "local_currency": local_currency}
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        logger.exception("Kora initialization failed")
+        raise HTTPException(status_code=502, detail="Kora checkout could not be reached.") from exc
+
+
+async def verify_kora_and_enroll(reference: str):
+    if not KORA_SECRET_KEY:
+        return {"success": False, "error": "Kora configuration missing"}
+    response = requests.get(f"https://api.korapay.com/merchant/api/v1/charges/{reference}", headers={"Authorization": f"Bearer {KORA_SECRET_KEY}"}, timeout=15)
+    data = response.json()
+    charge = data.get("data") or {}
+    if response.status_code >= 400 or not data.get("status") or str(charge.get("status") or "").lower() != "success":
+        return {"success": False, "error": data.get("message") or "Kora payment is not successful yet."}
+    if not db:
+        return {"success": False, "error": "Firestore not initialized"}
+    intent_snap = await asyncio.to_thread(db.collection("payment_intents").document(reference).get)
+    intent = intent_snap.to_dict() if intent_snap.exists else {}
+    if not intent or intent.get("product") != TRAINEE_PRODUCT:
+        return {"success": False, "error": "Unknown Kora payment reference"}
+    result = await enroll_paid_trainee(intent.get("email"), reference, TRAINEE_PRICE_USD, str(charge.get("currency") or intent.get("currency") or "KES"), TRAINEE_COUNTRY, "kora")
+    if result.get("success"):
+        await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {"status": "paid", "verifiedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return result
+
+
+@app.post("/api/verify-kora-payment")
+async def verify_kora_payment(request: KoraVerificationRequest):
+    result = await verify_kora_and_enroll(request.reference)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Kora payment verification failed."))
+    return {"status": "success", "data": {"plan": TRAINEE_PRODUCT, "reference": request.reference, "training_room": True}}
+
+
+@app.post("/api/kora-webhook")
+async def kora_webhook(request: Request):
+    payload = await request.json()
+    if payload.get("event") not in (None, "charge.success"):
+        return {"status": "received"}
+    reference = str((payload.get("data") or {}).get("reference") or "").strip()
+    if reference:
+        result = await verify_kora_and_enroll(reference)
+        if not result.get("success"):
+            logger.warning("Kora webhook received but verification was not successful: %s", result.get("error"))
+    return {"status": "received"}
+
+
 @app.post("/api/initialize-paystack-payment")
 async def initialize_paystack_payment(request: PaystackInitializationRequest):
     logger.info(f"Initializing Paystack payment for {request.email} in {request.country_code}: Base USD {request.amount}")
@@ -2780,6 +2947,7 @@ async def paystack_webhook(request: Request):
 async def paystack_status():
     return {
         "paystack_configured": bool(PAYSTACK_SECRET_KEY),
+        "kora_configured": bool(KORA_SECRET_KEY),
         "public_key_configured": bool(PAYSTACK_PUBLIC_KEY),
         "webhook_secret_configured": bool(PAYSTACK_WEBHOOK_SECRET),
         "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
@@ -4992,26 +5160,25 @@ async def trainee_apply(request: Request):
     payload = await request.json()
     name = str(payload.get("name") or "").strip()
     country = str(payload.get("country") or "").strip()
-    payment_reference = str(payload.get("payment_reference") or "").strip()
     notes = str(payload.get("notes") or "").strip()
-    if len(name) < 2 or not country:
-        raise HTTPException(status_code=400, detail="Enter your name and country before applying.")
-    if not payment_reference:
-        raise HTTPException(status_code=400, detail="Enter the training payment reference so admin can verify it.")
+    if len(name) < 2 or country.upper() != "KE":
+        raise HTTPException(status_code=400, detail="Enter your official ID name. Training enrollment is currently limited to Kenya.")
     updates = {
         "name": name,
-        "country": country,
+        "officialIdName": name,
+        "country": "Kenya",
+        "countryCode": "KE",
         "traineeNotes": notes[:12000],
-        "traineeStatus": "applied",
-        "trainingPaymentStatus": "pending_verification",
-        "trainingPaymentReference": payment_reference[:200],
+        "traineeStatus": profile.get("traineeStatus") or "payment_pending",
+        "trainingPaymentStatus": profile.get("trainingPaymentStatus") or "pending",
+        "trainingRoomAccess": bool(profile.get("trainingRoomAccess")),
         "traineeAppliedAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
-    return {"status": "applied", "payment_status": "pending_verification"}
+    return {"status": updates["traineeStatus"], "payment_status": updates["trainingPaymentStatus"], "training_room": bool(updates["trainingRoomAccess"])}
 
 
 @app.get("/api/admin/trainees")
@@ -5041,7 +5208,7 @@ async def admin_trainee_decision(uid: str, request: Request):
     payload = await request.json()
     decision = str(payload.get("decision") or "").strip().lower()
     payment_status = str(payload.get("payment_status") or "").strip().lower()
-    if decision not in {"approve", "reject", "promote_worker", "approve_level"}:
+    if decision not in {"reject", "promote_worker", "approve_level"}:
         raise HTTPException(status_code=400, detail="That trainee decision is not supported.")
     profile = await _load_profile(uid)
     if profile is None:
@@ -5049,15 +5216,13 @@ async def admin_trainee_decision(uid: str, request: Request):
     updates = {"updatedAt": firestore.SERVER_TIMESTAMP}
     if payment_status in {"verified", "rejected", "pending_verification"}:
         updates["trainingPaymentStatus"] = payment_status
-    if decision == "approve":
-        updates.update({"role": "trainee", "traineeStatus": "approved", "trainingStatus": "active", "trainingLevel": max(1, int(profile.get("trainingLevel") or 1)), "workerApproved": False})
-    elif decision == "reject":
+    if decision == "reject":
         updates.update({"role": "client", "traineeStatus": "rejected", "trainingStatus": "rejected", "workerApproved": False})
     elif decision == "approve_level":
         current = max(1, int(profile.get("trainingLevel") or 1))
-        updates.update({"role": "trainee", "traineeStatus": "approved", "trainingStatus": "active", "trainingLevel": min(3, current + 1)})
+        updates.update({"role": "trainee", "traineeStatus": "enrolled", "trainingStatus": "active", "trainingRoomAccess": True, "trainingLevel": min(3, current + 1), "workerApproved": False})
     elif decision == "promote_worker":
-        updates.update({"role": "worker", "traineeStatus": "approved", "trainingStatus": "completed", "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP})
+        updates.update({"role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed", "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP})
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     return {"status": "updated", "uid": uid, "decision": decision}
 
