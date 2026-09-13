@@ -5354,10 +5354,19 @@ async def human_messages(job_id: str, request: Request):
     ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
     messages = []
+    unread_refs = []
     for snap in snapshots:
         data = snap.to_dict() or {}
+        read_by = data.get("readBy") or []
+        if data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
+            unread_refs.append(snap.reference)
         data["id"] = snap.id
         messages.append(_human_public(data))
+    if unread_refs:
+        batch = db.batch()
+        for message_ref in unread_refs:
+            batch.update(message_ref, {"readBy": firestore.ArrayUnion([actor["uid"]])})
+        await asyncio.to_thread(batch.commit)
     return {"messages": messages}
 
 
@@ -5743,12 +5752,12 @@ async def user_chat_messages(other_uid: str, request: Request):
 
 @app.get("/api/messaging/unread-count")
 async def messaging_unread_count(request: Request):
-    """Count unread direct messages addressed to the signed-in account."""
-    actor = await _user_chat_actor(request)
+    """Count unread direct and job-specific messages for the signed-in account."""
+    actor = await _human_actor(request)
     if not db:
         return {"count": 0}
-    thread_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
     unread = 0
+    thread_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
     for thread_snapshot in thread_snapshots:
         message_ref = thread_snapshot.reference.collection("messages")
         messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
@@ -5756,6 +5765,20 @@ async def messaging_unread_count(request: Request):
             1 for message in messages
             if (message.to_dict() or {}).get("recipient_uid") == actor["uid"]
             and not (message.to_dict() or {}).get("readAt")
+        )
+
+    job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
+    for job_snapshot in job_snapshots:
+        job = job_snapshot.to_dict() or {}
+        has_access = actor["role"] == "admin" or job.get("client_uid") == actor["uid"] or job.get("worker_uid") == actor["uid"]
+        if not has_access:
+            continue
+        message_ref = job_snapshot.reference.collection("messages")
+        messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
+        unread += sum(
+            1 for message in messages
+            if (message.to_dict() or {}).get("sender_uid") != actor["uid"]
+            and actor["uid"] not in ((message.to_dict() or {}).get("readBy") or [])
         )
     return {"count": unread}
 
