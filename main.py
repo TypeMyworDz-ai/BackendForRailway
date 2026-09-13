@@ -5030,6 +5030,25 @@ def _human_public(data):
     return out
 
 
+# Workers must never see who the client is, and clients must never see who
+# the worker is: every human job goes through admin, and admin is the only
+# party allowed to see both sides. This strips the other side's identity off
+# a job dict before it goes out, on top of the ordinary timestamp cleanup.
+_HUMAN_CLIENT_IDENTITY_FIELDS = ("client_uid", "client_email", "client_name")
+_HUMAN_WORKER_IDENTITY_FIELDS = ("worker_uid", "worker_email", "worker_name")
+
+
+def _human_public_for(data, actor_role):
+    out = _human_public(data)
+    if actor_role == "worker":
+        for key in _HUMAN_CLIENT_IDENTITY_FIELDS:
+            out.pop(key, None)
+    elif actor_role == "client":
+        for key in _HUMAN_WORKER_IDENTITY_FIELDS:
+            out.pop(key, None)
+    return out
+
+
 def _human_bucket():
     if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
         return None
@@ -5217,7 +5236,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     for snap in snapshots:
         item = snap.to_dict() or {}
         item["id"] = snap.id
-        jobs.append(_human_public(item))
+        jobs.append(_human_public_for(item, actor["role"]))
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     return {"jobs": jobs}
 
@@ -5346,46 +5365,76 @@ async def human_admin_release(job_id: str, request: Request):
     return {"status": "released", "job_id": job_id, "credits_deducted": int(job.get("quote_credits") or 0)}
 
 
+def _human_thread_for(actor, requested_thread=""):
+    """Which conversation is this request allowed to touch?
+
+    A worker is never in contact with the client and a client is never in
+    contact with the worker; every human job routes through admin instead.
+    So there are two separate conversations per job, "client" and "worker",
+    and admin is the only actor allowed to choose which one to open. A
+    client or worker cannot pick a thread; the server picks it for them from
+    their role, which is what actually keeps the two sides apart even if the
+    browser were tricked into asking for the wrong one.
+    """
+    if actor["role"] == "client":
+        return "client"
+    if actor["role"] == "worker":
+        return "worker"
+    thread = (requested_thread or "").strip().lower()
+    if thread not in ("client", "worker"):
+        raise HTTPException(status_code=400, detail="Choose whether this message is to the client or the worker.")
+    return thread
+
+
 @app.get("/human-transcription/jobs/{job_id}/messages")
-async def human_messages(job_id: str, request: Request):
+async def human_messages(job_id: str, request: Request, thread: str = ""):
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
+    target_thread = _human_thread_for(actor, thread)
     ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
     messages = []
     unread_refs = []
     for snap in snapshots:
         data = snap.to_dict() or {}
+        # Messages saved before conversations were split have no thread on
+        # them at all. Those were every one of them client<->admin, so that
+        # is where they stay; they must never appear in a worker's thread.
+        if (data.get("thread") or "client") != target_thread:
+            continue
         read_by = data.get("readBy") or []
         if data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
             unread_refs.append(snap.reference)
         data["id"] = snap.id
-        messages.append(_human_public(data))
+        messages.append(_human_public_for(data, actor["role"]))
     if unread_refs:
         batch = db.batch()
         for message_ref in unread_refs:
             batch.update(message_ref, {"readBy": firestore.ArrayUnion([actor["uid"]])})
         await asyncio.to_thread(batch.commit)
-    return {"messages": messages}
+    return {"messages": messages, "thread": target_thread}
 
 
 @app.post("/human-transcription/jobs/{job_id}/messages")
-async def human_send_message(job_id: str, request: Request, attachment: UploadFile = File(None), message: str = Form("")):
+async def human_send_message(job_id: str, request: Request, attachment: UploadFile = File(None), message: str = Form(""), thread: str = Form("")):
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
+    target_thread = _human_thread_for(actor, thread)
+    if target_thread == "worker" and not job.get("worker_uid"):
+        raise HTTPException(status_code=409, detail="This job has no worker assigned yet.")
     text = (message or "").strip()
     attachment_meta = await _human_store_upload(job_id, attachment, "chat") if attachment else None
     if not text and not attachment_meta:
         raise HTTPException(status_code=400, detail="Write a message or attach a file.")
-    item = {"sender_uid": actor["uid"], "sender_email": actor["email"], "sender_role": actor["role"], "message": text[:12000], "attachment": attachment_meta, "createdAt": firestore.SERVER_TIMESTAMP}
+    item = {"sender_uid": actor["uid"], "sender_email": actor["email"], "sender_role": actor["role"], "message": text[:12000], "attachment": attachment_meta, "thread": target_thread, "createdAt": firestore.SERVER_TIMESTAMP}
     msg_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages").document()
     await asyncio.to_thread(msg_ref.set, item)
     saved_snapshot = await asyncio.to_thread(msg_ref.get)
     saved_item = saved_snapshot.to_dict() or item
     saved_item["id"] = msg_ref.id
-    return {"message": _human_public(saved_item)}
+    return {"message": _human_public_for(saved_item, actor["role"])}
 
 
 @app.get("/human-transcription/jobs/{job_id}/messages/{message_id}/attachment")
@@ -5399,6 +5448,8 @@ async def human_message_attachment(job_id: str, message_id: str, request: Reques
     if not message_snapshot.exists:
         raise HTTPException(status_code=404, detail="That attachment was not found.")
     message = message_snapshot.to_dict() or {}
+    if actor["role"] in ("client", "worker") and (message.get("thread") or "client") != actor["role"]:
+        raise HTTPException(status_code=403, detail="You do not have access to this attachment.")
     meta = message.get("attachment") or {}
     path = meta.get("storage_path")
     bucket = _human_bucket()
