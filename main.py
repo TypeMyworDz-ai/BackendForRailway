@@ -5750,6 +5750,105 @@ async def user_chat_messages(other_uid: str, request: Request):
     return {"thread_id": thread_id, "user": target, "messages": messages}
 
 
+@app.get("/api/messaging/inbox")
+async def messaging_inbox(request: Request):
+    """Return one inbox row per direct person or human-work job."""
+    actor = await _human_actor(request)
+    if not db:
+        return {"threads": []}
+
+    threads = []
+    user_chat_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
+    for thread_snapshot in user_chat_snapshots:
+        message_snapshots = await asyncio.to_thread(
+            lambda ref=thread_snapshot.reference.collection("messages"): list(ref.order_by("createdAt").stream())
+        )
+        if not message_snapshots:
+            continue
+        other_uid = ""
+        messages = []
+        unread_count = 0
+        for message_snapshot in message_snapshots:
+            data = message_snapshot.to_dict() or {}
+            sender_uid = str(data.get("sender_uid") or "")
+            recipient_uid = str(data.get("recipient_uid") or "")
+            if sender_uid != actor["uid"]:
+                other_uid = sender_uid
+            elif recipient_uid != actor["uid"]:
+                other_uid = recipient_uid
+            if recipient_uid == actor["uid"] and not data.get("readAt"):
+                unread_count += 1
+            data["id"] = message_snapshot.id
+            messages.append(_human_public(data))
+        if not other_uid:
+            continue
+        try:
+            contact = await _user_chat_target(other_uid)
+        except HTTPException:
+            contact = {"uid": other_uid, "name": "Contact", "email": "", "role": "client"}
+        latest = messages[-1]
+        latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else contact.get("name") or contact.get("email") or "Contact"
+        threads.append({
+            "id": f"user:{other_uid}",
+            "kind": "user",
+            "user": contact,
+            "title": contact.get("name") or contact.get("email") or "Contact",
+            "role": contact.get("role") or "client",
+            "job": None,
+            "latest": {"id": latest.get("id"), "senderName": latest_sender, "preview": latest.get("message") or "Attachment", "createdAt": latest.get("createdAt")},
+            "latestAt": latest.get("createdAt"),
+            "unreadCount": unread_count,
+        })
+
+    job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
+    for job_snapshot in job_snapshots:
+        job = job_snapshot.to_dict() or {}
+        job_id = job_snapshot.id
+        has_access = actor["role"] == "admin" or job.get("client_uid") == actor["uid"] or job.get("worker_uid") == actor["uid"]
+        if not has_access:
+            continue
+        message_snapshots = await asyncio.to_thread(
+            lambda ref=job_snapshot.reference.collection("messages"): list(ref.order_by("createdAt").stream())
+        )
+        if not message_snapshots:
+            continue
+        messages = []
+        unread_count = 0
+        for message_snapshot in message_snapshots:
+            data = message_snapshot.to_dict() or {}
+            read_by = data.get("readBy") or []
+            if data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
+                unread_count += 1
+            data["id"] = message_snapshot.id
+            messages.append(_human_public(data))
+        latest = messages[-1]
+        source = str(job.get("source_type") or "human_transcription").replace("_", " ").title()
+        job_title = job.get("title") or job.get("name") or f"{source} · {job_id[:8]}"
+        participant_uid = job.get("client_uid") if actor["role"] == "admin" else (job.get("worker_uid") or "")
+        participant = None
+        if participant_uid:
+            try:
+                participant = await _user_chat_target(participant_uid)
+            except HTTPException:
+                participant = None
+        latest_role = str(latest.get("sender_role") or "client").lower()
+        latest_sender = "TypeMyworDz admin" if latest_role == "admin" else (latest.get("sender_email") or latest_role.title())
+        threads.append({
+            "id": f"job:{job_id}",
+            "kind": "job",
+            "user": participant or {"uid": participant_uid, "name": latest_sender, "email": latest.get("sender_email") or "", "role": latest_role},
+            "title": participant.get("name") if participant else latest_sender,
+            "role": participant.get("role") if participant else latest_role,
+            "job": {"id": job_id, "title": job_title, "status": job.get("status") or "pending"},
+            "latest": {"id": latest.get("id"), "senderName": latest_sender, "preview": latest.get("message") or "Attachment", "createdAt": latest.get("createdAt")},
+            "latestAt": latest.get("createdAt"),
+            "unreadCount": unread_count,
+        })
+
+    threads.sort(key=lambda item: str(item.get("latestAt") or ""), reverse=True)
+    return {"threads": threads}
+
+
 @app.get("/api/messaging/unread-count")
 async def messaging_unread_count(request: Request):
     """Count unread direct and job-specific messages for the signed-in account."""
