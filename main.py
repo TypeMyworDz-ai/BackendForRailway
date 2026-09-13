@@ -603,8 +603,8 @@ CUSTOM_TOPUP_MIN = 10
 CUSTOM_TOPUP_MAX = 5000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
-# Temporary checkout-test price. Restore to 30.00 after payment testing.
-TRAINEE_PRICE_USD = 1.50
+# Training enrollment test price; keep checkout and displayed pricing aligned.
+TRAINEE_PRICE_USD = 0.50
 TRAINEE_COUNTRY = 'KE'
 
 # What everything costs, in US dollars, decided here and nowhere else.
@@ -5476,12 +5476,18 @@ async def human_download(job_id: str, request: Request):
 
 TRAINING_GUIDELINES = {
     "title": "TypeMyworDz human-work guidelines",
-    "summary": "These standards apply to training exercises and future human-work assignments.",
+    "summary": "TypeMyworDz trainees learn to produce accurate, faithful, readable transcripts. These standards apply to training exercises and to future human-work assignments unless a client brief says otherwise.",
     "sections": [
-        {"title": "Accuracy before speed", "body": "Preserve the speaker's meaning and wording. Remove only clear fillers, stutters, duplicated words, false starts, and explicit self-corrections."},
-        {"title": "Names and research", "body": "Keep names, places, organisations, and technical terms consistent. Research distinctive proper nouns when the assignment requires it, but do not rewrite the speaker's meaning."},
-        {"title": "Speakers and timestamps", "body": "Keep speaker changes clear, use the supplied timestamp convention, and check the audio when a word or identity is uncertain."},
-        {"title": "Client-ready delivery", "body": "Follow the client's template and instructions, check the complete document, and submit only work that has been reviewed from beginning to end."},
+        {"title": "1. The TypeMyworDz standard", "body": "A transcript is a written record of spoken audio, not a summary or a rewrite. Preserve the speaker's meaning, wording, order, tone, and uncertainty. Do not silently paraphrase, repair grammar, add explanations, or invent words. Accuracy comes before speed, and every submission must receive a complete review before delivery."},
+        {"title": "2. Full verbatim and clean verbatim", "body": "Full verbatim includes speech errors, false starts, fillers, slang, stutters, repetitions, and unfinished wording. Clean verbatim removes clear fillers, stutters, speech errors, false starts, unnecessary repetitions, and explicit self-corrections while preserving meaning. Do not change an intact sentence simply because it sounds informal. Follow the client brief when it specifies the style."},
+        {"title": "3. Do not paraphrase or correct the speaker", "body": "Do not reconstruct a sentence into better English, change a speaker's grammar, or replace spoken wording with a more professional alternative unless the applicable client brief expressly requires it. Preserve contractions as spoken. Curse words are transcribed as spoken. Direct quotations use straight double quotation marks."},
+        {"title": "4. Inaudible, unintelligible, and timestamps", "body": "Use [inaudible 00:00:00] when the sound cannot be heard. Use [unintelligible 00:00:00] when speech can be heard but cannot be understood. Use timestamps in [00:00:00] format. Do not use parentheses in place of square brackets. Check the audio before marking a passage and place the notation as close as possible to the uncertain words."},
+        {"title": "5. Paragraphs, punctuation, and capitalization", "body": "Split long speeches into readable paragraphs without changing the speaker's order. Normally end every sentence with punctuation and capitalize the beginning of every sentence. Do not use exclamation marks in transcripts. Preserve question marks when the speaker asks a question. Never add punctuation that changes the intended meaning."},
+        {"title": "6. Speaker labels and changes", "body": "Use descriptive speaker labels when the assignment requires labels. Labels should be bold, followed by a colon and one space, for example, Interviewer: and Participant: . Separate speaker changes as accurately as possible. When identity is uncertain, replay the exchange and flag the uncertainty instead of guessing."},
+        {"title": "7. Sound events and interruptions", "body": "Use concise, lower-case bracketed notes for relevant sound events, such as [laughs], [background noise], [crosstalk], [silence], and [sound cut]. Use a double dash for a false start, speech error, or unfinished sentence. Use a single dash for an interruption where the speaker continues. Do not over-describe ordinary room sounds."},
+        {"title": "8. Numbers, dates, and times", "body": "Generally spell out single-digit numbers and use numerals for larger numbers. Use numerals for money, years, ages, percentages, measurements, equations, dates, times, telephone numbers, and mixed-number sentences when the context calls for them. Write percent in transcript text unless a client brief says otherwise. Use capitalized AM and PM for times. Formal series remain capitalized, such as Grade 8, Section B, Chapter 1, and Article VI."},
+        {"title": "9. Names, research, and consistency", "body": "Research distinctive proper nouns, organisations, places, technical terms, and titles when appropriate. Research verifies spelling and context; it does not authorize changing the speaker's wording or adding information. Keep confirmed spellings consistent throughout the transcript and ask the admin when two possible identities cannot be resolved."},
+        {"title": "10. Privacy, review, and delivery", "body": "Treat every recording, transcript, name, and client instruction as confidential. Use approved tools and do not share files casually. Before delivery, check the brief, completeness, speaker turns, timestamps, uncertain passages, names, numbers, punctuation, and formatting from beginning to end. Submit work only when another person can use it without needing to reconstruct what you meant."},
     ],
 }
 
