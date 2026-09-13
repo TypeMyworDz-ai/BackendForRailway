@@ -5763,7 +5763,15 @@ async def user_chat_messages(other_uid: str, request: Request):
     if target["uid"] == actor["uid"]:
         raise HTTPException(status_code=400, detail="You cannot start a conversation with yourself.")
     thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
-    ref = db.collection("user_chats").document(thread_id).collection("messages")
+    thread_ref = db.collection("user_chats").document(thread_id)
+    # Repair older conversations whose messages were written before the
+    # parent-thread materialization fix.
+    await asyncio.to_thread(thread_ref.set, {
+        "participants": [actor["uid"], target["uid"]],
+        "participant_emails": [actor["email"], target["email"]],
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    ref = thread_ref.collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
     unread_refs = []
     messages = []
@@ -5790,9 +5798,24 @@ async def messaging_inbox(request: Request):
 
     threads = []
     user_chat_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
-    for thread_snapshot in user_chat_snapshots:
+    user_chat_entries = [(snapshot.id, snapshot.reference) for snapshot in user_chat_snapshots]
+    known_thread_ids = {thread_id for thread_id, _ in user_chat_entries}
+    # Older releases wrote only the messages subcollection. Include those
+    # orphaned threads in the inbox until a normal read/send repairs them.
+    try:
+        orphan_messages = await asyncio.to_thread(lambda: list(db.collection_group("messages").stream()))
+    except Exception:
+        orphan_messages = []
+    for message_snapshot in orphan_messages:
+        path_parts = message_snapshot.reference.path.split("/")
+        if len(path_parts) == 4 and path_parts[0] == "user_chats" and path_parts[2] == "messages":
+            thread_id = path_parts[1]
+            if thread_id not in known_thread_ids:
+                user_chat_entries.append((thread_id, db.collection("user_chats").document(thread_id)))
+                known_thread_ids.add(thread_id)
+    for thread_id, thread_ref in user_chat_entries:
         message_snapshots = await asyncio.to_thread(
-            lambda ref=thread_snapshot.reference.collection("messages"): list(ref.order_by("createdAt").stream())
+            lambda ref=thread_ref.collection("messages"): list(ref.order_by("createdAt").stream())
         )
         if not message_snapshots:
             continue
@@ -5924,6 +5947,16 @@ async def user_chat_send(other_uid: str, request: Request, attachment: UploadFil
     attachment_meta = await _user_chat_file(thread_id, attachment) if attachment else None
     if not text and not attachment_meta:
         raise HTTPException(status_code=400, detail="Write a message or attach a file.")
+    # Materialize the parent thread before writing its first message. Without
+    # this document Firestore only shows a phantom path created by the
+    # subcollection, and inbox queries over user_chats cannot discover it.
+    thread_ref = db.collection("user_chats").document(thread_id)
+    await asyncio.to_thread(thread_ref.set, {
+        "participants": [actor["uid"], target["uid"]],
+        "participant_emails": [actor["email"], target["email"]],
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "lastMessageAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
     item = {
         "sender_uid": actor["uid"],
         "sender_email": actor["email"],
@@ -5932,7 +5965,7 @@ async def user_chat_send(other_uid: str, request: Request, attachment: UploadFil
         "attachment": attachment_meta,
         "createdAt": firestore.SERVER_TIMESTAMP,
     }
-    msg_ref = db.collection("user_chats").document(thread_id).collection("messages").document()
+    msg_ref = thread_ref.collection("messages").document()
     await asyncio.to_thread(msg_ref.set, item)
     # Firestore resolves SERVER_TIMESTAMP only after the write. Read the saved
     # document back before returning it so the browser receives a real,
