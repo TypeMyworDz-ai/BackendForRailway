@@ -5516,8 +5516,33 @@ async def complete_trainee_signup(request: Request):
         raise HTTPException(status_code=503, detail="The enrollment database is unavailable.")
     snap = await asyncio.to_thread(db.collection("payment_intents").document(reference).get)
     intent = snap.to_dict() if snap.exists else {}
-    if intent.get("product") != TRAINEE_PRODUCT or intent.get("status") != "paid":
-        raise HTTPException(status_code=409, detail="Payment has not been confirmed for this enrollment.")
+    if intent.get("product") != TRAINEE_PRODUCT:
+        raise HTTPException(status_code=409, detail="This payment is not a trainee enrollment.")
+
+    # A browser can reach account creation before the provider webhook has
+    # updated Firestore. Re-check the provider here instead of creating a
+    # normal client account and leaving the paid trainee half-enrolled.
+    if intent.get("status") != "paid":
+        provider = str(intent.get("provider") or "paystack").strip().lower()
+        if provider == "kora":
+            await verify_kora_and_enroll(reference)
+        elif provider == "paystack":
+            verification = await verify_paystack_payment(reference)
+            if verification.get("status") == "success":
+                await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
+                    "status": "paid",
+                    "paidAt": firestore.SERVER_TIMESTAMP,
+                    "email": verification.get("email") or intent.get("email"),
+                    "product": TRAINEE_PRODUCT,
+                    "provider": "paystack",
+                    "countryCode": intent.get("countryCode") or TRAINEE_COUNTRY,
+                    "currency": verification.get("currency") or intent.get("currency") or "KES",
+                }, merge=True)
+        snap = await asyncio.to_thread(db.collection("payment_intents").document(reference).get)
+        intent = snap.to_dict() if snap.exists else {}
+
+    if intent.get("status") != "paid":
+        raise HTTPException(status_code=409, detail="Payment has not been confirmed for this enrollment yet. Please wait a moment and try again.")
     if str(intent.get("email") or "").strip().lower() != actor["email"]:
         raise HTTPException(status_code=403, detail="This payment belongs to a different email address.")
     result = await enroll_paid_trainee(actor["email"], reference, TRAINEE_PRICE_USD, str(intent.get("currency") or "KES"), TRAINEE_COUNTRY, str(intent.get("provider") or "paystack"), user_id=actor["uid"])
