@@ -95,7 +95,7 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # plan or free-trial rules, and can reach the admin tools.
 # Complimentary accounts (below) also skip payment, but are NOT admins and get
 # none of the admin tooling.
-ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordztest.com']
+ADMIN_EMAILS = ['typemywordz@gmail.com']
 # Dedicated OpenAI Whisper tester. This account used to be the AssemblyAI
 # tester; the owner moved it to OpenAI so OpenAI can be exercised on its own.
 # Like the Deepgram tester it never falls back, so an OpenAI failure shows up
@@ -103,17 +103,15 @@ ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordztest.com']
 # deliberately NOT a complimentary account: it must hold a plan or credits
 # like any paying client, so it exercises the real billing path too.
 OPENAI_TESTER_EMAIL = 'njokigituku@gmail.com'
-# Dedicated Deepgram test account. Like the AssemblyAI tester above, this one
-# always goes to Deepgram and never falls back, so that a Deepgram failure is
-# visible in testing instead of being quietly masked by another provider.
+# Dedicated Deepgram test account. It pays through the normal plan/credit
+# path, starts on Deepgram, and falls back to OpenAI so both services can be
+# tested without changing the experience for ordinary paying clients.
 DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
 
-# Complimentary accounts. These skip payment for transcription and for Ask
-# TypeMyworDz, but they are deliberately NOT admins: no admin dashboard, no
-# admin-only models, no elevated data access. Keeping the two lists separate is
-# the whole point, so that "does not pay" never silently means "can see
-# everything".
-COMP_ACCESS_EMAILS = [DEEPGRAM_TESTER_EMAIL]
+# Complimentary accounts. Keep this list empty unless an account is explicitly
+# approved for free access. The Deepgram tester is intentionally a normal
+# paying account so it exercises the real billing and paywall path.
+COMP_ACCESS_EMAILS = []
 
 
 def is_comp_access_user(user_email: str) -> bool:
@@ -1203,7 +1201,8 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
     - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
     - njokigituku@gmail.com is the dedicated OpenAI tester: OpenAI only, no fallback, and it pays like any client.
-    - info@typemywordztest.com is the equivalent dedicated Deepgram tester: Deepgram only, no fallback.
+    - info@typemywordztest.com is the dedicated Deepgram tester: Deepgram first,
+      OpenAI fallback, and normal plan/credit requirements.
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
@@ -1230,13 +1229,14 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
 
     # --- Dedicated Deepgram Tester Logic ---
     # Placed before the speaker-label override on purpose: this account exists to
-    # exercise Deepgram and nothing else, so even a speaker-tag request stays on it.
+    # exercise Deepgram first, while still exposing the configured OpenAI
+    # fallback if Deepgram is unavailable. It is not payment-exempt.
     if is_deepgram_tester:
         return {
             "tier_1": "deepgram",
-            "tier_2": None,
+            "tier_2": "openai_whisper",
             "tier_3": None,
-            "reason": "dedicated_deepgram_tester"
+            "reason": "dedicated_deepgram_tester_with_openai_fallback"
         }
 
     # --- Speaker Labels Logic (Global Override) ---
