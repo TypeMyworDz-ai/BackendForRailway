@@ -13,6 +13,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, R
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
+import secrets
 from datetime import datetime, timedelta
 import requests
 from pydub import AudioSegment
@@ -1033,6 +1034,52 @@ def backfill_credits(profile, now=None):
 
 
 # --- end of backfill ---
+
+
+# --- referrals: give credits, get credits ---
+#
+# Every account gets a short code. Sharing it and having someone sign up
+# tops up both people by the same amount, once per new account. This reuses
+# the existing top-up ledger rather than inventing a new balance, so a
+# referral bonus behaves exactly like a bought bundle: it stacks, and it
+# lasts a year.
+
+REFERRAL_BONUS_CREDITS = 100
+REFERRAL_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I
+
+
+def _new_referral_code() -> str:
+    return "".join(secrets.choice(REFERRAL_CODE_ALPHABET) for _ in range(7))
+
+
+async def _ensure_referral_code(user_id: str, profile: dict) -> str:
+    """Return this account's referral code, creating one the first time."""
+    existing = (profile or {}).get("referralCode")
+    if existing:
+        return existing
+    for _ in range(5):
+        code = _new_referral_code()
+        doc_ref = db.collection("referral_codes").document(code)
+        snap = await asyncio.to_thread(doc_ref.get)
+        if snap.exists:
+            continue
+        await asyncio.to_thread(doc_ref.set, {"uid": user_id, "createdAt": datetime.now()})
+        await asyncio.to_thread(db.collection("users").document(user_id).update, {"referralCode": code})
+        return code
+    raise HTTPException(status_code=500, detail="Could not generate a referral code right now. Try again shortly.")
+
+
+def _grant_referral_bonus(profile: dict, now=None) -> dict:
+    """Same shape as a bought top-up: add credits, extend the expiry."""
+    now = now or datetime.now()
+    bal = read_balance(profile or {}, now)
+    updates = dict(bal["updates"])
+    updates["topUpCredits"] = bal["topUpCredits"] + REFERRAL_BONUS_CREDITS
+    updates["topUpCreditsExpireAt"] = now + timedelta(days=TOPUP_VALID_DAYS)
+    return updates
+
+
+# --- end of referrals ---
 
 
 def is_paid_ai_user(user_plan: str) -> bool:
@@ -3822,6 +3869,74 @@ async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
             "spendable": bal["spendable"],
             "frozen": bal["frozen"],
             "planActive": bal["planActive"]}
+
+
+@app.get("/referrals/code")
+async def referrals_code(user_id: str = "", user_email: str = ""):
+    """This account's own referral code and running total, creating the code
+    the first time it is asked for."""
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    profile = await _load_profile(user_id) if user_id else None
+    if profile is None:
+        raise HTTPException(status_code=404, detail="We could not find that account.")
+
+    code = await _ensure_referral_code(user_id, profile)
+    completed = profile.get("referralsCompleted") or []
+    return {
+        "code": code,
+        "share_url": f"https://typemywordz.ai/?ref={code}",
+        "referral_bonus_credits": REFERRAL_BONUS_CREDITS,
+        "referrals_completed": len(completed),
+        "credits_earned": len(completed) * REFERRAL_BONUS_CREDITS,
+    }
+
+
+@app.post("/referrals/apply")
+async def referrals_apply(user_id: str = Form(""), user_email: str = Form(""), code: str = Form("")):
+    """A brand-new account redeems someone else's referral code.
+
+    One-time per account, no self-referrals, and a bad or unknown code is
+    reported quietly rather than as an error - a friend mistyping a code
+    should never block someone from finishing signup.
+    """
+    code = (code or "").strip().upper()
+    if not code:
+        return {"applied": False, "reason": "no code given"}
+
+    if not user_id and user_email:
+        user_id = await get_user_profile_by_email_firestore(user_email)
+    profile = await _load_profile(user_id) if user_id else None
+    if profile is None:
+        raise HTTPException(status_code=404, detail="We could not find that account.")
+
+    if profile.get("referredByUid") or profile.get("referralAppliedAt"):
+        return {"applied": False, "reason": "already applied"}
+
+    code_snap = await asyncio.to_thread(db.collection("referral_codes").document(code).get)
+    if not code_snap.exists:
+        return {"applied": False, "reason": "unknown code"}
+    referrer_uid = (code_snap.to_dict() or {}).get("uid")
+    if not referrer_uid or referrer_uid == user_id:
+        return {"applied": False, "reason": "invalid code"}
+
+    referrer_profile = await _load_profile(referrer_uid)
+    if referrer_profile is None:
+        return {"applied": False, "reason": "referrer no longer exists"}
+
+    now = datetime.now()
+
+    referee_updates = _grant_referral_bonus(profile, now)
+    referee_updates["referredByUid"] = referrer_uid
+    referee_updates["referralAppliedAt"] = now
+    await _save_credit_updates(user_id, referee_updates)
+
+    referrer_updates = _grant_referral_bonus(referrer_profile, now)
+    referrer_updates["referralsCompleted"] = firestore.ArrayUnion([user_id])
+    await _save_credit_updates(referrer_uid, referrer_updates)
+
+    logger.info(f"Referral applied: {user_id} referred by {referrer_uid} via {code}")
+    return {"applied": True, "bonus_credits": REFERRAL_BONUS_CREDITS}
 
 
 @app.get("/paddle-config")
