@@ -5280,7 +5280,7 @@ def _human_public_for(data, actor_role):
             out.pop(key, None)
         # Worker pay is handled separately; never expose client pricing or
         # credit accounting in a worker room response.
-        for key in ("quote_credits", "credits_charged", "credits_deducted", "credit_cost", "price", "amount", "currency"):
+        for key in ("quote_credits", "credits_charged", "credits_deducted", "credit_cost", "price", "amount", "currency", "quote"):
             out.pop(key, None)
     elif actor_role == "client":
         for key in _HUMAN_WORKER_IDENTITY_FIELDS:
