@@ -599,7 +599,7 @@ TOPUP_BUNDLES = {
     'topup-2000': 2000,
 }
 CUSTOM_TOPUP_MIN = 10
-CUSTOM_TOPUP_MAX = 5000
+CUSTOM_TOPUP_MAX = 50000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
 # Training enrollment test price; keep checkout and displayed pricing aligned.
