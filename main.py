@@ -5163,13 +5163,13 @@ logger.info("  GET / - Root endpoint with service info")
 
 
 @app.get("/credits/ledger")
-async def credits_ledger(request: Request, limit: int = 50, user_id: str = ""):
+async def credits_ledger(request: Request, limit: int = 50, user_id: str = "", email: str = ""):
     """Return the signed-in client's auditable credit history."""
     decoded = _verified_user(request)
     actor_uid = decoded.get("uid") or ""
     actor_email = (decoded.get("email") or "").strip().lower()
-    if is_admin_user(actor_email) and user_id:
-        target_uid = user_id
+    if is_admin_user(actor_email) and (user_id or email):
+        target_uid = user_id or await get_user_profile_by_email_firestore(email.strip().lower())
     else:
         target_uid = actor_uid
     if not target_uid or not db:
@@ -5485,6 +5485,44 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         jobs.append(_human_public_for(item, actor["role"]))
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     return {"jobs": jobs}
+
+
+@app.get("/human-transcription/worker/payment-history")
+async def human_worker_payment_history(request: Request):
+    """Show a worker's private KES earnings without exposing client details."""
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    if not db:
+        return {"paid": [], "upcoming": [], "totals": {"paid_kes": 0, "upcoming_kes": 0}}
+    snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
+    finished = {"submitted", "client_review", "client_approved", "released"}
+    paid, upcoming = [], []
+    for snap in snapshots:
+        job = snap.to_dict() or {}
+        if job.get("status") not in finished:
+            continue
+        quote = job.get("quote") or {}
+        minutes = int(job.get("minutes") or quote.get("minutes") or 0)
+        rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+        amount = max(0, minutes * rate)
+        row = {
+            "job_id": snap.id,
+            "status": "paid" if job.get("workerPaymentStatus") == "paid" or job.get("workerPaidAt") else "upcoming",
+            "job_status": job.get("status"),
+            "minutes": minutes,
+            "amount_kes": amount,
+            "rate_kes_per_minute": rate,
+            "completed_at": _human_iso(job.get("releasedAt") or job.get("submittedAt") or job.get("updatedAt")),
+            "paid_at": _human_iso(job.get("workerPaidAt")),
+        }
+        (paid if row["status"] == "paid" else upcoming).append(row)
+    paid.sort(key=lambda item: str(item.get("paid_at") or item.get("completed_at") or ""), reverse=True)
+    upcoming.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
+    return {"paid": paid, "upcoming": upcoming, "totals": {
+        "paid_kes": sum(item["amount_kes"] for item in paid),
+        "upcoming_kes": sum(item["amount_kes"] for item in upcoming),
+    }}
 
 
 @app.get("/human-transcription/workers")
