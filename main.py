@@ -598,7 +598,7 @@ TOPUP_BUNDLES = {
     'topup-800':  800,
     'topup-2000': 2000,
 }
-CUSTOM_TOPUP_MIN = 10
+CUSTOM_TOPUP_MIN = 50
 CUSTOM_TOPUP_MAX = 50000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
@@ -5697,7 +5697,15 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
-    target_thread = _human_thread_for(actor, thread)
+    requested_thread = (thread or "").strip().lower()
+    # The admin Messages inbox represents the whole job, not one of the two
+    # internal job threads. When it opens a job without an explicit thread,
+    # show the client thread by default and clear unread messages in both the
+    # client and worker threads. The dedicated HumanJobWorkspace still passes
+    # thread=client or thread=worker when the admin wants to read only one.
+    inbox_open = actor["role"] == "admin" and not requested_thread
+    target_thread = "client" if inbox_open else _human_thread_for(actor, requested_thread)
+    threads_to_mark_read = {"client", "worker"} if inbox_open else {target_thread}
     ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
     messages = []
@@ -5707,11 +5715,12 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
         # Messages saved before conversations were split have no thread on
         # them at all. Those were every one of them client<->admin, so that
         # is where they stay; they must never appear in a worker's thread.
-        if (data.get("thread") or "client") != target_thread:
-            continue
+        message_thread = data.get("thread") or "client"
         read_by = data.get("readBy") or []
-        if data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
+        if message_thread in threads_to_mark_read and data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
             unread_refs.append(snap.reference)
+        if message_thread != target_thread:
+            continue
         data["id"] = snap.id
         messages.append(_human_public_for(data, actor["role"]))
     if unread_refs:
