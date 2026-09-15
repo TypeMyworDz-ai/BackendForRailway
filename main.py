@@ -161,6 +161,11 @@ BACKEND_PUBLIC_URL = os.environ.get("BACKEND_PUBLIC_URL", "https://backendforrai
 PADDLE_CLIENT_TOKEN = os.environ.get("PADDLE_CLIENT_TOKEN", "")
 PADDLE_API_KEY = os.environ.get("PADDLE_API_KEY", "")
 PADDLE_WEBHOOK_SECRET = os.environ.get("PADDLE_WEBHOOK_SECRET", "")
+# Catalog product used for Paddle's server-created custom-price transactions.
+# The product ID is public; the API key remains server-side.
+PADDLE_CUSTOM_TOPUP_PRODUCT_ID = os.environ.get(
+    "PADDLE_CUSTOM_TOPUP_PRODUCT_ID", "pro_01m2j2k9f0wrqz53j52z5rhr97"
+)
 try:
     PADDLE_PRICE_IDS = json.loads(os.environ.get("PADDLE_PRICE_IDS_JSON", "{}"))
 except json.JSONDecodeError:
@@ -598,7 +603,8 @@ TOPUP_BUNDLES = {
     'topup-800':  800,
     'topup-2000': 2000,
 }
-CUSTOM_TOPUP_MIN = 50
+CUSTOM_TOPUP_MIN_AFRICA = 50
+CUSTOM_TOPUP_MIN_GLOBAL = 100
 CUSTOM_TOPUP_MAX = 50000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
@@ -654,12 +660,16 @@ def price_region(country_code):
     return 'africa' if (country_code or '').upper() in AFRICA_PAYMENT_CODES else 'global'
 
 
-def custom_topup_credits(item):
+def custom_topup_min(country_code='KE'):
+    return CUSTOM_TOPUP_MIN_GLOBAL if price_region(country_code) == 'global' else CUSTOM_TOPUP_MIN_AFRICA
+
+
+def custom_topup_credits(item, country_code='KE'):
     match = re.fullmatch(r'topup-custom-(\d+)', str(item or ''))
     if not match:
         return None
     credits = int(match.group(1))
-    if credits < CUSTOM_TOPUP_MIN or credits > CUSTOM_TOPUP_MAX:
+    if credits < custom_topup_min(country_code) or credits > CUSTOM_TOPUP_MAX:
         return None
     return credits
 
@@ -673,7 +683,7 @@ def price_for(item, country_code):
     """The dollar price of a plan, bundle, custom top-up, or trainee enrollment."""
     if item == TRAINEE_PRODUCT:
         return TRAINEE_PRICE_USD if (country_code or '').upper() == TRAINEE_COUNTRY else None
-    custom = custom_topup_credits(item)
+    custom = custom_topup_credits(item, country_code)
     if custom is not None:
         return custom_topup_price(custom, country_code)
     return PRICES[price_region(country_code)].get(item)
@@ -927,7 +937,7 @@ def grant_plan_credits(plan, now=None):
     return out
 
 
-def grant_topup_credits(profile, bundle_id, now=None):
+def grant_topup_credits(profile, bundle_id, country_code='KE', now=None):
     """Add a bought bundle. Bought credits stack and the clock restarts.
 
     Restarting the 12 months on every purchase is deliberately generous: it is
@@ -937,7 +947,7 @@ def grant_topup_credits(profile, bundle_id, now=None):
     now = now or datetime.now()
     credits = TOPUP_BUNDLES.get(bundle_id)
     if credits is None:
-        credits = custom_topup_credits(bundle_id)
+        credits = custom_topup_credits(bundle_id, country_code)
     if not credits:
         return None
     bal = read_balance(profile, now)
@@ -1957,13 +1967,13 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         # exactly as it was. Both the callback and the webhook can arrive for
         # the same payment, so the reference is remembered and a repeat is
         # ignored rather than granting the credits twice.
-        if plan_name in TOPUP_BUNDLES or custom_topup_credits(plan_name) is not None:
+        if plan_name in TOPUP_BUNDLES or custom_topup_credits(plan_name, country_code or 'KE') is not None:
             profile = await _load_profile(user_id) or {}
             if reference and profile.get('lastTopUpReference') == reference:
                 logger.info(f"Top-up {reference} for {email} already applied; ignoring the repeat.")
                 return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount,
                         'currency': currency, 'already_applied': True}
-            result = grant_topup_credits(profile, plan_name)
+            result = grant_topup_credits(profile, plan_name, country_code=country_code or 'KE')
             if not result:
                 return {'success': False, 'error': 'Unknown top-up bundle'}
             topup_updates = dict(result['updates'])
@@ -3994,6 +4004,78 @@ async def referrals_apply(user_id: str = Form(""), user_email: str = Form(""), c
     return {"applied": True, "bonus_credits": REFERRAL_BONUS_CREDITS}
 
 
+@app.post("/paddle-custom-topup")
+async def paddle_custom_topup(request: Request):
+    """Create a Paddle checkout transaction for an exact global credit amount."""
+    decoded = _verified_user(request)
+    user_id = decoded.get("uid") or ""
+    email = (decoded.get("email") or "").strip().lower()
+    if not user_id or not email:
+        raise HTTPException(status_code=401, detail="Your account could not be verified.")
+    if not PADDLE_API_KEY or not PADDLE_CUSTOM_TOPUP_PRODUCT_ID:
+        raise HTTPException(status_code=503, detail="International custom top-ups are not configured yet.")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="The custom credit amount was not received.")
+    try:
+        credits = int(body.get("credits") or 0)
+    except (TypeError, ValueError):
+        credits = 0
+    if custom_topup_credits(f"topup-custom-{credits}", "GLOBAL") is None:
+        raise HTTPException(status_code=400, detail="International custom top-ups require at least 100 credits.")
+
+    amount = custom_topup_price(credits, "GLOBAL")
+    amount_minor = str(int(round(amount * 100)))
+    item_id = f"topup-custom-{credits}"
+    payload = {
+        "items": [{
+            "quantity": 1,
+            "price": {
+                "description": f"TypeMyworDz AI custom credit top-up: {credits} credits",
+                "name": f"Custom top-up — {credits} credits",
+                "product_id": PADDLE_CUSTOM_TOPUP_PRODUCT_ID,
+                "unit_price": {"amount": amount_minor, "currency_code": "USD"},
+            },
+        }],
+        "custom_data": {
+            "user_id": user_id,
+            "email": email,
+            "item_id": item_id,
+            "country_code": "GLOBAL",
+        },
+    }
+    try:
+        response = await asyncio.to_thread(
+            requests.post,
+            "https://api.paddle.com/transactions",
+            headers={
+                "Authorization": f"Bearer {PADDLE_API_KEY}",
+                "Content-Type": "application/json",
+                "Paddle-Version": "1",
+            },
+            json=payload,
+            timeout=30,
+        )
+        data = response.json()
+    except Exception as exc:
+        logger.exception("Paddle custom top-up transaction creation failed")
+        raise HTTPException(status_code=502, detail="Paddle checkout could not be reached.") from exc
+    if not response.ok or not data.get("data"):
+        logger.error("Paddle custom top-up rejected: %s", data)
+        detail = (data.get("error") or {}).get("detail") if isinstance(data, dict) else None
+        raise HTTPException(status_code=502, detail=detail or "Paddle could not create this checkout.")
+    transaction = data["data"]
+    return {
+        "transaction_id": transaction.get("id"),
+        "checkout_url": (transaction.get("checkout") or {}).get("url"),
+        "credits": credits,
+        "amount": amount,
+        "currency": "USD",
+    }
+
+
 @app.get("/paddle-config")
 async def paddle_config():
     """Return only the public Paddle checkout configuration.
@@ -4062,9 +4144,7 @@ async def paddle_webhook(request: Request):
     first_item = items[0] if items else {}
     price = first_item.get("price") or {}
     price_id = price.get("id") or first_item.get("price_id")
-    item_id = PADDLE_PRICE_TO_ITEM.get(str(price_id))
-    if not item_id:
-        raise HTTPException(status_code=400, detail="Unknown Paddle price.")
+    mapped_item_id = PADDLE_PRICE_TO_ITEM.get(str(price_id))
 
     custom_data = data.get("custom_data") or {}
     if isinstance(custom_data, str):
@@ -4072,6 +4152,14 @@ async def paddle_webhook(request: Request):
             custom_data = json.loads(custom_data)
         except json.JSONDecodeError:
             custom_data = {}
+    custom_item_id = custom_data.get("item_id") if isinstance(custom_data, dict) else None
+    if mapped_item_id == "topup-custom" or str(custom_item_id or "").startswith("topup-custom-"):
+        quantity = first_item.get("quantity") or 1
+        item_id = custom_item_id or f"topup-custom-{quantity}"
+    else:
+        item_id = mapped_item_id
+    if not item_id:
+        raise HTTPException(status_code=400, detail="Unknown Paddle price.")
 
     email = custom_data.get("email")
     customer = data.get("customer") or {}
@@ -4156,7 +4244,7 @@ async def pricing(country_code: str = "GLOBAL"):
         'plans': plans,
         'topups': topups,
         'custom_topup': {
-            'min_credits': CUSTOM_TOPUP_MIN,
+            'min_credits': custom_topup_min(country_code),
             'max_credits': CUSTOM_TOPUP_MAX,
             'price_per_credit': CUSTOM_TOPUP_RATE[region],
         },
