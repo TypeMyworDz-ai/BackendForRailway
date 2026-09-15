@@ -4024,7 +4024,7 @@ async def paddle_custom_topup(request: Request):
     except (TypeError, ValueError):
         credits = 0
     if custom_topup_credits(f"topup-custom-{credits}", "GLOBAL") is None:
-        raise HTTPException(status_code=400, detail="International custom top-ups require at least 100 credits.")
+        raise HTTPException(status_code=400, detail="Minimum allowed top up is 100 credits.")
 
     amount = custom_topup_price(credits, "GLOBAL")
     amount_minor = str(int(round(amount * 100)))
