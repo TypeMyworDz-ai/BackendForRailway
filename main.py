@@ -1147,11 +1147,46 @@ async def account_has_usable_credits(user_id: str = "", user_email: str = "") ->
         return False
 
 
-async def _save_credit_updates(user_id: str, updates: dict):
+async def _record_credit_ledger(user_id: str, amount: int, reason: str, context: Optional[dict] = None, balance_after: Optional[int] = None):
+    """Write one immutable audit entry for every credit movement."""
+    if not db or not user_id or not amount:
+        return False
+    payload = {
+        "amount": int(amount),
+        "direction": "added" if amount > 0 else "deducted",
+        "reason": str(reason or "account credit update")[:240],
+        "context": context if isinstance(context, dict) else {"detail": str(context or "")[:500]},
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    }
+    if balance_after is not None:
+        payload["balanceAfter"] = int(balance_after)
+    try:
+        await asyncio.to_thread(
+            db.collection("users").document(user_id).collection("credit_ledger").add,
+            payload,
+        )
+        return True
+    except Exception as e:
+        logger.error("Could not write credit ledger entry for %s: %s", user_id, e)
+        return False
+
+
+async def _save_credit_updates(user_id: str, updates: dict, ledger_reason: str = "account credit update", ledger_context: Optional[dict] = None):
     if not db or not user_id or not updates:
         return False
     try:
-        await asyncio.to_thread(db.collection('users').document(user_id).update, updates)
+        user_ref = db.collection("users").document(user_id)
+        before_snapshot = await asyncio.to_thread(user_ref.get)
+        before = before_snapshot.to_dict() if before_snapshot.exists else {}
+        await asyncio.to_thread(user_ref.update, updates)
+        before_total = _int(before.get("planCredits")) + _int(before.get("topUpCredits"))
+        after_plan = _int(updates.get("planCredits", before.get("planCredits")))
+        after_topup = _int(updates.get("topUpCredits", before.get("topUpCredits")))
+        delta = (after_plan + after_topup) - before_total
+        if delta:
+            await _record_credit_ledger(
+                user_id, delta, ledger_reason, ledger_context, after_plan + after_topup
+            )
         return True
     except Exception as e:
         logger.error(f"Could not write credits for {user_id}: {e}")
@@ -1180,7 +1215,7 @@ async def charge_credits(user_id: str, user_email: str, amount: int, what: str):
         return {'charged': 0, 'error': 'profile unavailable'}
     ok, updates, detail = plan_spend(profile, amount)
     if updates:
-        await _save_credit_updates(user_id, updates)
+        await _save_credit_updates(user_id, updates, ledger_reason=what, ledger_context={"operation": "charge"})
     if ok:
         logger.info(f"Charged {detail.get('charged')} credits to {user_id} for {what}; {detail.get('remaining')} left")
     else:
@@ -1352,6 +1387,14 @@ class CreditUpdateRequest(BaseModel):
     duration_hours: Optional[int] = None
     duration_days: Optional[int] = None
 
+
+class AdminCreditAdjustmentRequest(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    amount: int
+    reason: str
+    context: dict = {}
+
 class FormattedWordDownloadRequest(BaseModel):
     transcription_html: str
     filename: Optional[str] = "transcription.docx"
@@ -1440,7 +1483,14 @@ async def update_user_plan_firestore(user_id: str, new_plan: str, reference_id: 
         updates['subscriptionStartDate'] = None
 
     try:
-        await asyncio.to_thread(user_ref.update, updates) 
+        await asyncio.to_thread(user_ref.update, updates)
+        granted = _int(updates.get("planCredits"))
+        if granted:
+            await _record_credit_ledger(
+                user_id, granted, "plan purchase",
+                {"plan": new_plan, "payment_reference": reference_id, "payment_amount_usd": payment_amount_usd},
+                granted + _int((await asyncio.to_thread(user_ref.get)).to_dict().get("topUpCredits")),
+            )
         logger.info(f"User {user_id} plan updated to {new_plan} in Firestore.")
         return {'success': True}
     except Exception as e:
@@ -1922,6 +1972,11 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             if reference:
                 topup_updates['lastTopUpReference'] = reference
             await asyncio.to_thread(db.collection('users').document(user_id).update, topup_updates)
+            await _record_credit_ledger(
+                user_id, result['added'], "credit top-up purchase",
+                {"item": plan_name, "payment_reference": reference, "amount": amount, "currency": currency},
+                result['newTotal'],
+            )
             if update_admin_revenue:
                 await update_monthly_revenue_firestore(amount)
             logger.info(f"Added {result['added']} bought credits to {email}.")
@@ -3858,7 +3913,7 @@ async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
 
     updates, detail = backfill_credits(profile)
     if updates:
-        await _save_credit_updates(user_id, updates)
+        await _save_credit_updates(user_id, updates, ledger_reason=detail.get("reason", "credit backfill"), ledger_context={"operation": "backfill"})
         logger.info(f"Credit backfill for {user_id}: {detail}")
 
     bal = read_balance({**profile, **updates})
@@ -3929,11 +3984,11 @@ async def referrals_apply(user_id: str = Form(""), user_email: str = Form(""), c
     referee_updates = _grant_referral_bonus(profile, now)
     referee_updates["referredByUid"] = referrer_uid
     referee_updates["referralAppliedAt"] = now
-    await _save_credit_updates(user_id, referee_updates)
+    await _save_credit_updates(user_id, referee_updates, ledger_reason="referral bonus", ledger_context={"role": "referee", "referrer_uid": referrer_uid})
 
     referrer_updates = _grant_referral_bonus(referrer_profile, now)
     referrer_updates["referralsCompleted"] = firestore.ArrayUnion([user_id])
-    await _save_credit_updates(referrer_uid, referrer_updates)
+    await _save_credit_updates(referrer_uid, referrer_updates, ledger_reason="referral bonus", ledger_context={"role": "referrer", "referee_uid": user_id})
 
     logger.info(f"Referral applied: {user_id} referred by {referrer_uid} via {code}")
     return {"applied": True, "bonus_credits": REFERRAL_BONUS_CREDITS}
@@ -4156,7 +4211,7 @@ async def credits_topup(
         updates["lastTopUpReference"] = reference_id
     updates["lastTopUpAt"] = firestore.SERVER_TIMESTAMP
 
-    if not await _save_credit_updates(user_id, updates):
+    if not await _save_credit_updates(user_id, updates, ledger_reason="credit top-up purchase", ledger_context={"item": bundle_id, "payment_reference": reference_id}):
         raise HTTPException(status_code=500, detail="The credits could not be added. Please contact support.")
 
     logger.info(f"Top-up {bundle_id} ({result['added']} credits) added for {user_id}")
@@ -5107,6 +5162,71 @@ logger.info("  DELETE /cleanup - Clean up old jobs")
 logger.info("  GET / - Root endpoint with service info")
 
 
+@app.get("/credits/ledger")
+async def credits_ledger(request: Request, limit: int = 50, user_id: str = ""):
+    """Return the signed-in client's auditable credit history."""
+    decoded = _verified_user(request)
+    actor_uid = decoded.get("uid") or ""
+    actor_email = (decoded.get("email") or "").strip().lower()
+    if is_admin_user(actor_email) and user_id:
+        target_uid = user_id
+    else:
+        target_uid = actor_uid
+    if not target_uid or not db:
+        return {"entries": []}
+    try:
+        snapshots = await asyncio.to_thread(lambda: list(db.collection("users").document(target_uid).collection("credit_ledger").stream()))
+    except Exception as exc:
+        logger.warning("Could not read credit ledger for %s: %s", target_uid, exc)
+        return {"entries": []}
+    entries = []
+    for snap in snapshots:
+        item = snap.to_dict() or {}
+        item["id"] = snap.id
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        entries.append(item)
+    entries.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
+    return {"entries": entries[:max(1, min(int(limit or 50), 100))]}
+
+
+@app.post("/api/admin/credits/adjust")
+async def admin_adjust_credits(payload: AdminCreditAdjustmentRequest, request: Request):
+    """Add or remove credits with an explicit admin reason and audit entry."""
+    admin = _require_admin(request)
+    if not db or not int(payload.amount):
+        raise HTTPException(status_code=400, detail="Enter a non-zero credit adjustment.")
+    target_uid = str(payload.user_id or "").strip()
+    target_email = str(payload.email or "").strip().lower()
+    if not target_uid and target_email:
+        target_uid = await get_user_profile_by_email_firestore(target_email)
+    if not target_uid:
+        raise HTTPException(status_code=404, detail="The client account could not be found.")
+    profile = await _load_profile(target_uid)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="The client account could not be found.")
+    delta = int(payload.amount)
+    context = dict(payload.context or {})
+    context.update({"admin_email": (admin.get("email") or "").lower(), "operation": "admin_adjustment"})
+    if delta > 0:
+        balance = read_balance(profile)
+        updates = dict(balance.get("updates") or {})
+        updates["topUpCredits"] = balance["topUpCredits"] + delta
+        updates["topUpCreditsExpireAt"] = datetime.now() + timedelta(days=TOPUP_VALID_DAYS)
+        if not await _save_credit_updates(target_uid, updates, ledger_reason=payload.reason, ledger_context=context):
+            raise HTTPException(status_code=500, detail="The credit adjustment could not be saved.")
+    else:
+        ok, updates, detail = plan_spend(profile, abs(delta))
+        if not ok:
+            raise HTTPException(status_code=409, detail="The account does not have enough spendable credits to remove that amount.")
+        if not await _save_credit_updates(target_uid, updates, ledger_reason=payload.reason, ledger_context=context):
+            raise HTTPException(status_code=500, detail="The credit adjustment could not be saved.")
+    refreshed = await _load_profile(target_uid) or {}
+    current = read_balance(refreshed)
+    return {"success": True, "user_id": target_uid, "amount": delta, "reason": payload.reason, "balance": current["spendable"]}
+
+
 # ===================== Human workflow =====================
 # The human service is deliberately a state machine.  A quote never charges
 # credits; the client cannot download the finished work until the admin has
@@ -5157,6 +5277,10 @@ def _human_public_for(data, actor_role):
     out = _human_public(data)
     if actor_role == "worker":
         for key in _HUMAN_CLIENT_IDENTITY_FIELDS:
+            out.pop(key, None)
+        # Worker pay is handled separately; never expose client pricing or
+        # credit accounting in a worker room response.
+        for key in ("quote_credits", "credits_charged", "credits_deducted", "credit_cost", "price", "amount", "currency"):
             out.pop(key, None)
     elif actor_role == "client":
         for key in _HUMAN_WORKER_IDENTITY_FIELDS:
@@ -5343,7 +5467,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     ref = db.collection(HUMAN_JOB_COLLECTION)
     if actor["role"] == "admin" or scope == "admin":
         snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream()))
-    elif actor["role"] == "worker" or scope == "assigned":
+    elif actor["role"] == "worker" or scope == "assigned" or scope == "finished":
         snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
     else:
         snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("client_uid", "==", actor["uid"])).stream()))
@@ -5351,6 +5475,13 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     for snap in snapshots:
         item = snap.to_dict() or {}
         item["id"] = snap.id
+        if actor["role"] == "worker" or scope in {"assigned", "finished"}:
+            finished = {"submitted", "client_review", "client_approved", "released"}
+            active = {"assigned", "in_progress"}
+            if scope == "finished" and item.get("status") not in finished:
+                continue
+            if scope != "finished" and item.get("status") not in active:
+                continue
         jobs.append(_human_public_for(item, actor["role"]))
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     return {"jobs": jobs}
@@ -5478,6 +5609,28 @@ async def human_admin_release(job_id: str, request: Request):
     updates = {"status": "released", "credits_charged": int(job.get("quote_credits") or 0), "releasedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     return {"status": "released", "job_id": job_id, "credits_deducted": int(job.get("quote_credits") or 0)}
+
+
+@app.delete("/human-transcription/jobs/{job_id}")
+async def human_admin_delete(job_id: str, request: Request):
+    """Permanently remove a human/proofreading job and its chat records."""
+    _require_admin(request)
+    job = await _human_job(job_id)
+    if not db:
+        raise HTTPException(status_code=503, detail="Database is not ready.")
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    try:
+        message_snapshots = await asyncio.to_thread(lambda: list(job_ref.collection("messages").stream()))
+        if message_snapshots:
+            batch = db.batch()
+            for snap in message_snapshots:
+                batch.delete(snap.reference)
+            await asyncio.to_thread(batch.commit)
+        await asyncio.to_thread(job_ref.delete)
+    except Exception as exc:
+        logger.error("Could not delete human job %s: %s", job_id, exc)
+        raise HTTPException(status_code=500, detail="The human job could not be deleted.")
+    return {"deleted": True, "job_id": job_id, "previous_status": job.get("status")}
 
 
 def _human_thread_for(actor, requested_thread=""):
