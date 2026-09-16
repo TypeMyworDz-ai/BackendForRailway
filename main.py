@@ -4852,7 +4852,7 @@ class WelcomeEmailRequest(BaseModel):
 
 
 class AdminDeleteUserRequest(BaseModel):
-    email: str
+    email: Optional[str] = None
     uid: Optional[str] = None
 
 
@@ -4919,16 +4919,33 @@ async def admin_users(request: Request):
 
 @app.post("/api/admin/delete-user")
 async def admin_delete_user(payload: AdminDeleteUserRequest, request: Request):
-    """Delete an account and its owned app data from the admin dashboard."""
+    """Delete an account and its owned app data from the admin dashboard.
+
+    Most accounts are identified by email, but some Firestore profiles were
+    created without one ever being saved (an incomplete signup, for example).
+    Those still carry a uid, so accept uid-only requests and look the email up
+    from Firebase Auth when we have it, instead of hard-requiring email.
+    """
     _require_admin(request)
     email = (payload.email or "").strip().lower()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="A valid email address is required.")
-    if email in {item.lower() for item in ADMIN_EMAILS}:
+    auth_uid = (payload.uid or "").strip()
+
+    if not email and not auth_uid:
+        raise HTTPException(status_code=400, detail="An email address or account ID is required.")
+
+    if auth_uid and not email:
+        try:
+            record = await asyncio.to_thread(firebase_auth.get_user, auth_uid)
+            email = (record.email or "").strip().lower()
+        except firebase_auth.UserNotFoundError:
+            email = ""
+        except Exception as exc:
+            logger.error("Could not look up auth account %s: %s", auth_uid, exc)
+
+    if email and email in {item.lower() for item in ADMIN_EMAILS}:
         raise HTTPException(status_code=400, detail="Admin accounts cannot be deleted here.")
 
-    auth_uid = payload.uid or ""
-    if not auth_uid:
+    if not auth_uid and email:
         try:
             record = await asyncio.to_thread(firebase_auth.get_user_by_email, email)
             auth_uid = record.uid
@@ -4955,15 +4972,16 @@ async def admin_delete_user(payload: AdminDeleteUserRequest, request: Request):
             deleted["chats"] = await asyncio.to_thread(
                 _delete_matching_documents, "askChats", "userId", auth_uid
             )
-        deleted["profiles"] += await asyncio.to_thread(
-            _delete_matching_documents, "users", "email", email
-        )
-        deleted["feedback"] = await asyncio.to_thread(
-            _delete_matching_documents, "feedback", "email", email
-        )
+        if email:
+            deleted["profiles"] += await asyncio.to_thread(
+                _delete_matching_documents, "users", "email", email
+            )
+            deleted["feedback"] = await asyncio.to_thread(
+                _delete_matching_documents, "feedback", "email", email
+            )
 
-    logger.warning("Admin deleted account %s: %s", email, deleted)
-    return {"success": True, "email": email, "deleted": deleted}
+    logger.warning("Admin deleted account %s (uid=%s): %s", email or "(no email)", auth_uid or "(no uid)", deleted)
+    return {"success": True, "email": email, "uid": auth_uid, "deleted": deleted}
 
 
 @app.post("/api/feedback-notification")
