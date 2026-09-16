@@ -1301,8 +1301,8 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     # and none of these run. Between April and now this was an "if", which
     # quietly overrode the speaker-label rule for admins and yearly users.
 
-    # AssemblyAI first for admins, Three-Day and One-Week plans.
-    elif is_admin or user_plan in ['Three-Day Plan', 'One-Week Plan']:
+    # AssemblyAI first for admins, One-Day, Three-Day and One-Week plans.
+    elif is_admin or user_plan in ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan']:
         tier_1 = "assemblyai"
         tier_2 = "openai_whisper"
         tier_3 = "deepgram"
@@ -1329,7 +1329,19 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         tier_2 = "openai_whisper"
         tier_3 = "deepgram"
         reason = "free_trial_prioritizing_assemblyai"
-    
+
+    # Safety net: any plan name that does not match one of the branches
+    # above (a new plan added on the frontend, a naming mismatch, a
+    # credit-only account with no active plan label, etc.) used to leave
+    # every tier as None, which meant zero services were attempted and the
+    # job failed instantly for a paying client. Never let an unrecognised
+    # plan name produce an empty service list again.
+    else:
+        tier_1 = "openai_whisper"
+        tier_2 = "assemblyai"
+        tier_3 = "deepgram"
+        reason = f"unmatched_plan_fallback_openai ('{user_plan}')"
+
     # --- Dynamic adjustment based on service availability ---
     final_tiers_list = []
     
