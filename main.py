@@ -106,7 +106,7 @@ OPENAI_TESTER_EMAIL = 'njokigituku@gmail.com'
 # Dedicated Deepgram test account. It pays through the normal plan/credit
 # path, starts on Deepgram, and falls back to OpenAI so both services can be
 # tested without changing the experience for ordinary paying clients.
-DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
+DEEPGRAM_TESTER_EMAIL = 'info@typemywordz.ai'
 
 # Complimentary accounts. Keep this list empty unless an account is explicitly
 # approved for free access. The Deepgram tester is intentionally a normal
@@ -1246,7 +1246,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
     - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
     - njokigituku@gmail.com is the dedicated OpenAI tester: OpenAI only, no fallback, and it pays like any client.
-    - info@typemywordztest.com is the dedicated Deepgram tester: Deepgram first,
+    - info@typemywordz.ai is the dedicated Deepgram tester: Deepgram first,
       OpenAI fallback, and normal plan/credit requirements.
     """
     
@@ -2724,7 +2724,7 @@ async def root():
             "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
-            "deepgram_tester_transcription": f"Primary=Deepgram → Fallback1={TYPEMYWORDZ2_NAME} for {DEEPGRAM_TESTER_EMAIL}",
+            "deepgram_tester_transcription": f"Primary=Deepgram → Fallback=OpenAI for {DEEPGRAM_TESTER_EMAIL}",
             "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
             "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
@@ -5254,7 +5254,7 @@ async def health_check():
                 "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
                 "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
-                "deepgram_tester_transcription": f"Always use Deepgram (no fallback for {DEEPGRAM_TESTER_EMAIL})",
+                "deepgram_tester_transcription": f"Primary=Deepgram → Fallback=OpenAI for {DEEPGRAM_TESTER_EMAIL}",
                 "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
                 "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
                 "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
