@@ -609,7 +609,7 @@ CUSTOM_TOPUP_MAX = 50000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
 # Training enrollment test price; keep checkout and displayed pricing aligned.
-TRAINEE_PRICE_USD = 0.50
+TRAINEE_PRICE_USD = 20.00
 TRAINEE_COUNTRY = 'KE'
 
 # What everything costs, in US dollars, decided here and nowhere else.
@@ -5043,6 +5043,78 @@ async def feedback_notification(payload: FeedbackNotificationRequest, request: R
         return {"sent": False, "reason": "exception"}
 
 
+async def _send_resend_message(address: str, subject: str, html: str, text: str, label: str = "email"):
+    """Send a transactional message without making the calling workflow fail."""
+    address = (address or "").strip()
+    if not address or "@" not in address:
+        return {"sent": False, "reason": "invalid_address"}
+    if not RESEND_API_KEY:
+        logger.warning("%s skipped for %s: RESEND_API_KEY is not set", label, address)
+        return {"sent": False, "reason": "not_configured"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                RESEND_ENDPOINT,
+                headers={
+                    "Authorization": "Bearer %s" % RESEND_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": EMAIL_FROM,
+                    "to": [address],
+                    "reply_to": SUPPORT_EMAIL,
+                    "subject": subject,
+                    "html": html,
+                    "text": text,
+                },
+            )
+        if response.status_code >= 400:
+            logger.error("%s rejected for %s: %s %s", label, address, response.status_code, response.text[:300])
+            return {"sent": False, "reason": "provider_error"}
+        logger.info("%s sent to %s", label, address)
+        return {"sent": True}
+    except Exception as exc:
+        logger.error("%s failed for %s: %s", label, address, exc)
+        return {"sent": False, "reason": "exception"}
+
+
+def build_trainee_welcome_email(name: str):
+    """Build the paid trainee welcome message without mentioning client credits."""
+    raw_name = (name or "").strip()
+    first = escape(raw_name.split(" ")[0]) if raw_name else "there"
+    greeting = "Welcome, %s" % first
+    subject = "Your TypeMyworDz training account is ready"
+    html = """<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f8f8f9;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f8f8f9;padding:32px 16px;">
+      <tr><td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border:1px solid #e5e6ea;border-radius:10px;padding:32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+          <tr><td style="font-size:20px;font-weight:700;color:#14161a;padding-bottom:4px;">
+            <span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
+          </td></tr>
+          <tr><td style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#858a95;padding-bottom:24px;">Your everyday AI companion</td></tr>
+          <tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">GREETING</td></tr>
+          <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">Your paid training enrolment is confirmed and your Training Room account is ready.</td></tr>
+          <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">Sign in to review the TypeMyworDz standards, work through the training modules, and submit each exercise for review. Your progress is saved in the Training Room.</td></tr>
+          <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:24px;">Training is a skills programme and does not guarantee employment. If you need help, reply to this email or contact SUPPORT.</td></tr>
+          <tr><td style="padding-bottom:28px;"><a href="APPURL" style="display:inline-block;background:#28a745;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;padding:12px 22px;border-radius:7px;">Open Training Room</a></td></tr>
+          <tr><td style="font-size:12px;color:#858a95;padding-top:20px;border-top:1px solid #e5e6ea;">You are receiving this because a TypeMyworDz training account was created with this address.</td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>"""
+    html = html.replace("GREETING", greeting).replace("SUPPORT", SUPPORT_EMAIL).replace("APPURL", APP_URL)
+    text = (
+        "%s\n\n"
+        "Your paid training enrolment is confirmed and your TypeMyworDz Training Room account is ready.\n\n"
+        "Sign in here: %s\n\n"
+        "Training is a skills programme and does not guarantee employment. For help, contact %s.\n"
+    ) % ("Welcome, %s" % (raw_name.split(" ")[0] if raw_name else "there"), APP_URL, SUPPORT_EMAIL)
+    return subject, html, text
+
+
 def build_welcome_email(name: str, free_credits: int = None):
     """Build the subject and HTML body of the welcome email.
 
@@ -5135,41 +5207,8 @@ async def send_welcome_email(payload: WelcomeEmailRequest):
     email provider is having a bad day, so every problem is logged and reported
     back as sent=false instead of raising.
     """
-    address = (payload.email or "").strip()
-    if not address or "@" not in address:
-        return {"sent": False, "reason": "invalid_address"}
-
-    if not RESEND_API_KEY:
-        logger.warning("Welcome email skipped for %s: RESEND_API_KEY is not set", address)
-        return {"sent": False, "reason": "not_configured"}
-
     subject, html, text = build_welcome_email(payload.name or "")
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(
-                RESEND_ENDPOINT,
-                headers={
-                    "Authorization": "Bearer %s" % RESEND_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": EMAIL_FROM,
-                    "to": [address],
-                    "reply_to": SUPPORT_EMAIL,
-                    "subject": subject,
-                    "html": html,
-                    "text": text,
-                },
-            )
-        if r.status_code >= 400:
-            logger.error("Welcome email rejected for %s: %s %s", address, r.status_code, r.text[:300])
-            return {"sent": False, "reason": "provider_error"}
-        logger.info("Welcome email sent to %s", address)
-        return {"sent": True}
-    except Exception as e:
-        logger.error("Welcome email failed for %s: %s", address, e)
-        return {"sent": False, "reason": "exception"}
+    return await _send_resend_message(payload.email, subject, html, text, "Welcome email")
 
 
 @app.get("/health")
@@ -6039,6 +6078,12 @@ async def complete_trainee_signup(request: Request):
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error") or "The trainee account could not be completed.")
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {"name": official_name, "officialIdName": official_name}, merge=True)
+
+    # Trainees bypass the normal profile-creation path, so send their own
+    # welcome message after payment and enrolment have both succeeded. Email
+    # delivery is deliberately non-blocking for account completion.
+    trainee_subject, trainee_html, trainee_text = build_trainee_welcome_email(official_name)
+    await _send_resend_message(actor["email"], trainee_subject, trainee_html, trainee_text, "Trainee welcome email")
     return {"success": True, "training_room": True}
 
 @app.get("/human-transcription/trainee/status")
