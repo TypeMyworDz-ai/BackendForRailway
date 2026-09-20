@@ -6003,7 +6003,7 @@ async def human_worker_payment_history(request: Request):
 
 @app.get("/human-transcription/workers")
 async def human_list_workers(request: Request):
-    _require_admin(request)
+    _require_human_job_admin(request)
     if not db:
         return {"workers": []}
     workers = []
