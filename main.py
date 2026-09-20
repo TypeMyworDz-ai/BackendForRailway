@@ -726,10 +726,10 @@ def _int(value):
 # the bridge and can be changed in one place before production charging starts.
 HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
-# Transcriber pay rate, updated 2026-09-20 to a flat 30 KES/minute for
-# standard work. Rush pay keeps its prior proportional premium over standard
-# (was 50/40 = 1.25x) so a rush job still pays more than a standard one.
-HUMAN_STANDARD_PAYOUT_KES = 30
+# Transcriber pay rate, temporarily set to 15 KES/minute for standard work.
+# Rush pay remains separately configured so rush jobs still pay more than
+# standard work.
+HUMAN_STANDARD_PAYOUT_KES = 15
 HUMAN_RUSH_PAYOUT_KES = 38
 
 # TMWD_HUMAN_TAT_V1
