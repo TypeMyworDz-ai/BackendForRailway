@@ -3941,7 +3941,7 @@ async def human_transcription_quote(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    if credits_exempt(user_email):
+    if credits_exempt(user_email) or human_job_credits_exempt(user_email):
         return {
             **quote,
             "cost": 0,
