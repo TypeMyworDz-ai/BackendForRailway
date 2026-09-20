@@ -7,6 +7,7 @@ import json
 import base64
 import hashlib
 import hmac
+import calendar
 from html import escape
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
@@ -725,8 +726,18 @@ def _int(value):
 # the bridge and can be changed in one place before production charging starts.
 HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
-HUMAN_STANDARD_PAYOUT_KES = 40
-HUMAN_RUSH_PAYOUT_KES = 50
+# Transcriber pay rate, updated 2026-09-20 to a flat 30 KES/minute for
+# standard work. Rush pay keeps its prior proportional premium over standard
+# (was 50/40 = 1.25x) so a rush job still pays more than a standard one.
+HUMAN_STANDARD_PAYOUT_KES = 30
+HUMAN_RUSH_PAYOUT_KES = 38
+
+# TMWD_HUMAN_TAT_V1
+# A worker gets 3 minutes of turnaround time for every 1 minute of assigned
+# audio (a 10-minute audio job -> a 30-minute deadline). If the worker has
+# not submitted by the deadline, the job is automatically taken back and
+# returned to the admin queue ("approved", unassigned) for reassignment.
+HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE = 3
 
 
 def human_credit_quote(seconds, turnaround="standard", difficulty="standard", service="standard", speakers="1-2", timestamps=True, formatting="standard"):
@@ -2673,9 +2684,14 @@ async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
     health_task = asyncio.create_task(health_monitor())
     logger.info("Health monitor task created")
+    human_expiry_task = asyncio.create_task(human_expiry_monitor())
+    human_payout_task = asyncio.create_task(human_payout_monitor())
+    logger.info("Human worker TAT and payout monitor tasks created")
     yield
     logger.info("Application lifespan shutdown")
     health_task.cancel()
+    human_expiry_task.cancel()
+    human_payout_task.cancel()
     for job_id, task in active_background_tasks.items():
         if not task.done():
             logger.info(f"Cancelling background task for job {job_id}")
@@ -5431,7 +5447,15 @@ _HUMAN_WORKER_IDENTITY_FIELDS = ("worker_uid", "worker_email", "worker_name")
 
 
 def _human_public_for(data, actor_role):
+    # Compute the TAT countdown from the raw (pre-serialisation) deadline
+    # before _human_public turns every timestamp into a plain ISO string.
+    deadline = _as_dt((data or {}).get("deadlineAt"))
+    time_remaining_seconds = None
+    if deadline is not None and (data or {}).get("status") in ("assigned", "in_progress"):
+        time_remaining_seconds = max(0, int((deadline - datetime.now()).total_seconds()))
     out = _human_public(data)
+    if time_remaining_seconds is not None:
+        out["time_remaining_seconds"] = time_remaining_seconds
     if actor_role == "worker":
         for key in _HUMAN_CLIENT_IDENTITY_FIELDS:
             out.pop(key, None)
@@ -5479,6 +5503,49 @@ async def _human_store_upload(job_id: str, upload: UploadFile, folder: str):
     }
 
 
+async def _human_reclaim_expired_job(job_id: str, job: dict):
+    """A worker's TAT deadline passed before they submitted. Take the job
+    back from them and return it to the admin queue as "approved" so it can
+    be reassigned, exactly like a fresh, unassigned approved job."""
+    worker_name = job.get("worker_name") or job.get("worker_email") or "the previous worker"
+    now = datetime.now()
+    updates = {
+        "status": "approved",
+        "worker_uid": None,
+        "worker_email": None,
+        "worker_name": None,
+        "assignedAt": None,
+        "deadlineAt": None,
+        "tat_seconds": None,
+        "auto_reassigned_count": int(job.get("auto_reassigned_count") or 0) + 1,
+        "last_auto_reassigned_at": now,
+        "last_auto_reassigned_worker_name": worker_name,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    try:
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    except Exception as exc:
+        logger.warning("Could not auto-reclaim expired human job %s: %s", job_id, exc)
+        return job
+    job = dict(job)
+    job.update(updates)
+    return job
+
+
+async def _human_check_expiry(job_id: str, job: dict):
+    """Lazily enforce the worker TAT deadline whenever a job is read. If the
+    deadline has passed while the job is still assigned/in progress, it is
+    reclaimed back to the admin queue before being handed to any caller."""
+    if not db or not job:
+        return job
+    if job.get("status") not in ("assigned", "in_progress"):
+        return job
+    deadline = _as_dt(job.get("deadlineAt"))
+    if not deadline or datetime.now() <= deadline:
+        return job
+    return await _human_reclaim_expired_job(job_id, job)
+
+
 async def _human_job(job_id: str):
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
@@ -5487,7 +5554,155 @@ async def _human_job(job_id: str):
         raise HTTPException(status_code=404, detail="That human-transcription job was not found.")
     data = snapshot.to_dict() or {}
     data["id"] = snapshot.id
+    data = await _human_check_expiry(job_id, data)
     return data
+
+
+async def human_expiry_sweep():
+    """Background safety net: reclaim any job whose worker TAT deadline has
+    passed even if nobody happens to load it in the browser right now."""
+    if not db:
+        return
+    try:
+        snapshots = await asyncio.to_thread(
+            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("status", "in", ["assigned", "in_progress"])).stream())
+        )
+    except Exception as exc:
+        logger.warning("Human job expiry sweep could not list jobs: %s", exc)
+        return
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        data["id"] = snap.id
+        await _human_check_expiry(snap.id, data)
+
+
+async def human_expiry_monitor():
+    """Runs for the life of the app, checking worker TAT deadlines every
+    minute so an expired job is returned to the admin queue promptly."""
+    while True:
+        try:
+            await human_expiry_sweep()
+        except Exception as exc:
+            logger.warning("Human job expiry monitor iteration failed: %s", exc)
+        await asyncio.sleep(60)
+
+
+# ===================== Human worker bi-monthly payouts =====================
+# Worker pay accrues across two halves of each calendar month: the 1st-15th
+# and the 16th-end of month. When a half ends, every worker's accrued jobs in
+# that half are rolled into one pending payout invoice, which an admin later
+# marks as paid. The next half starts accruing immediately regardless of
+# whether the previous invoice has been paid yet.
+HUMAN_PAYOUT_COLLECTION = "human_worker_payouts"
+
+
+def _pay_period_bounds(dt):
+    """Which half-month period does this datetime fall in, and when does it
+    start/end? Returns (period_label, start_dt, end_dt_exclusive)."""
+    year, month, day = dt.year, dt.month, dt.day
+    last_day = calendar.monthrange(year, month)[1]
+    if day <= 15:
+        label = f"{year:04d}-{month:02d}-A"
+        start = datetime(year, month, 1)
+        end = datetime(year, month, 15, 23, 59, 59, 999999)
+    else:
+        label = f"{year:04d}-{month:02d}-B"
+        start = datetime(year, month, 16)
+        end = datetime(year, month, last_day, 23, 59, 59, 999999)
+    return label, start, end
+
+
+async def _close_due_pay_periods():
+    """Find completed worker jobs that have not yet been rolled into a
+    payout invoice, group them by worker + half-month period, and for every
+    period that has fully ended, create/update that worker's pending payout.
+    Jobs in a period that has not ended yet are left alone; they keep
+    accruing toward an invoice that will be created once their half ends."""
+    if not db:
+        return
+    now = datetime.now()
+    try:
+        snapshots = await asyncio.to_thread(
+            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("payout_status", "==", "unassigned")).stream())
+        )
+    except Exception as exc:
+        logger.warning("Pay period close could not list unassigned jobs: %s", exc)
+        return
+    groups = {}
+    for snap in snapshots:
+        job = snap.to_dict() or {}
+        completed_at = _as_dt(job.get("workerCompletedAt"))
+        worker_uid = job.get("worker_uid")
+        if not completed_at or not worker_uid:
+            continue
+        label, start, end = _pay_period_bounds(completed_at)
+        if now <= end:
+            continue  # this half has not ended yet; keep accruing
+        key = (worker_uid, label)
+        bucket = groups.setdefault(key, {
+            "worker_uid": worker_uid,
+            "worker_email": job.get("worker_email") or "",
+            "worker_name": job.get("worker_name") or "",
+            "period_label": label,
+            "period_start": start,
+            "period_end": end,
+            "job_ids": [],
+            "total_minutes": 0,
+            "total_amount_kes": 0,
+        })
+        bucket["job_ids"].append(snap.id)
+        bucket["total_minutes"] += int(job.get("worker_minutes") or 0)
+        bucket["total_amount_kes"] += int(job.get("worker_amount_kes") or 0)
+    for (worker_uid, label), bucket in groups.items():
+        payout_id = f"{worker_uid}_{label}"
+        payout_ref = db.collection(HUMAN_PAYOUT_COLLECTION).document(payout_id)
+        existing_snapshot = await asyncio.to_thread(payout_ref.get)
+        if existing_snapshot.exists:
+            existing = existing_snapshot.to_dict() or {}
+            updates = {
+                "job_ids": sorted(set((existing.get("job_ids") or []) + bucket["job_ids"])),
+                "total_minutes": int(existing.get("total_minutes") or 0) + bucket["total_minutes"],
+                "total_amount_kes": int(existing.get("total_amount_kes") or 0) + bucket["total_amount_kes"],
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+            await asyncio.to_thread(payout_ref.set, updates, merge=True)
+        else:
+            await asyncio.to_thread(payout_ref.set, {
+                "worker_uid": worker_uid,
+                "worker_email": bucket["worker_email"],
+                "worker_name": bucket["worker_name"],
+                "period_label": label,
+                "period_start": bucket["period_start"],
+                "period_end": bucket["period_end"],
+                "job_ids": bucket["job_ids"],
+                "total_minutes": bucket["total_minutes"],
+                "total_amount_kes": bucket["total_amount_kes"],
+                "status": "pending",
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "paidAt": None,
+                "paidBy": None,
+            })
+        batch = db.batch()
+        for job_id in bucket["job_ids"]:
+            batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {
+                "payout_status": "invoiced",
+                "payout_period_id": label,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+        await asyncio.to_thread(batch.commit)
+
+
+async def human_payout_monitor():
+    """Runs for the life of the app, closing any half-month pay period that
+    has ended so its invoice is ready for the admin without anyone having to
+    open the dashboard first."""
+    while True:
+        try:
+            await _close_due_pay_periods()
+        except Exception as exc:
+            logger.warning("Human payout monitor iteration failed: %s", exc)
+        await asyncio.sleep(900)
 
 
 async def _human_actor(request: Request):
@@ -5603,6 +5818,21 @@ async def human_create_job(
         "worker_rating": None,
         "credits_charged": 0,
         "releasedAt": None,
+        # TAT/deadline tracking (set when the job is assigned to a worker).
+        "assignedAt": None,
+        "deadlineAt": None,
+        "tat_seconds": None,
+        "auto_reassigned_count": 0,
+        "last_auto_reassigned_at": None,
+        "last_auto_reassigned_worker_name": None,
+        # Worker pay/payout tracking.
+        "workerCompletedAt": None,
+        "worker_minutes": None,
+        "worker_amount_kes": None,
+        "payout_status": None,
+        "payout_period_id": None,
+        "workerPaymentStatus": None,
+        "workerPaidAt": None,
     }
     if db is None:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
@@ -5632,6 +5862,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     for snap in snapshots:
         item = snap.to_dict() or {}
         item["id"] = snap.id
+        item = await _human_check_expiry(snap.id, item)
         if actor["role"] == "worker" or scope in {"assigned", "finished"}:
             finished = {"submitted", "client_review", "client_approved", "released"}
             active = {"assigned", "in_progress"}
@@ -5646,12 +5877,18 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
 
 @app.get("/human-transcription/worker/payment-history")
 async def human_worker_payment_history(request: Request):
-    """Show a worker's private KES earnings without exposing client details."""
+    """Show a worker's private KES earnings without exposing client details.
+
+    Pay accrues in two halves of each month (1st-15th, 16th-end of month).
+    Once a half ends, its jobs are rolled into one pending payout invoice
+    that an admin later marks as paid; the next half keeps accruing
+    regardless of whether that invoice has been paid yet."""
     actor = await _human_actor(request)
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
     if not db:
-        return {"paid": [], "upcoming": [], "totals": {"paid_kes": 0, "upcoming_kes": 0}}
+        return {"paid": [], "upcoming": [], "totals": {"paid_kes": 0, "upcoming_kes": 0}, "current_period": None, "pending_payouts": []}
+    await _close_due_pay_periods()
     snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
     finished = {"submitted", "client_review", "client_approved", "released"}
     paid, upcoming = [], []
@@ -5660,26 +5897,62 @@ async def human_worker_payment_history(request: Request):
         if job.get("status") not in finished:
             continue
         quote = job.get("quote") or {}
-        minutes = int(job.get("minutes") or quote.get("minutes") or 0)
+        minutes = int(job.get("worker_minutes") or job.get("minutes") or quote.get("minutes") or 0)
         rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
-        amount = max(0, minutes * rate)
+        amount = int(job.get("worker_amount_kes") if job.get("worker_amount_kes") is not None else max(0, minutes * rate))
         row = {
             "job_id": snap.id,
-            "status": "paid" if job.get("workerPaymentStatus") == "paid" or job.get("workerPaidAt") else "upcoming",
+            "status": "paid" if job.get("payout_status") == "paid" or job.get("workerPaymentStatus") == "paid" or job.get("workerPaidAt") else "upcoming",
             "job_status": job.get("status"),
+            "payout_status": job.get("payout_status") or "accruing",
+            "payout_period_id": job.get("payout_period_id"),
             "minutes": minutes,
             "amount_kes": amount,
             "rate_kes_per_minute": rate,
-            "completed_at": _human_iso(job.get("releasedAt") or job.get("submittedAt") or job.get("updatedAt")),
+            "completed_at": _human_iso(job.get("workerCompletedAt") or job.get("releasedAt") or job.get("submittedAt") or job.get("updatedAt")),
             "paid_at": _human_iso(job.get("workerPaidAt")),
         }
         (paid if row["status"] == "paid" else upcoming).append(row)
     paid.sort(key=lambda item: str(item.get("paid_at") or item.get("completed_at") or ""), reverse=True)
     upcoming.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
-    return {"paid": paid, "upcoming": upcoming, "totals": {
-        "paid_kes": sum(item["amount_kes"] for item in paid),
-        "upcoming_kes": sum(item["amount_kes"] for item in upcoming),
-    }}
+
+    label, start, end = _pay_period_bounds(datetime.now())
+    current_accrued = [item for item in upcoming if item.get("payout_status") in (None, "accruing", "unassigned") and item.get("payout_period_id") in (None, label)]
+    payout_snapshots = await asyncio.to_thread(
+        lambda: list(db.collection(HUMAN_PAYOUT_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream())
+    )
+    pending_payouts = []
+    for snap in payout_snapshots:
+        payout = snap.to_dict() or {}
+        if payout.get("status") == "paid":
+            continue
+        pending_payouts.append({
+            "payout_id": snap.id,
+            "period_label": payout.get("period_label"),
+            "period_start": _human_iso(payout.get("period_start")),
+            "period_end": _human_iso(payout.get("period_end")),
+            "total_minutes": int(payout.get("total_minutes") or 0),
+            "total_amount_kes": int(payout.get("total_amount_kes") or 0),
+            "status": payout.get("status") or "pending",
+        })
+    pending_payouts.sort(key=lambda item: str(item.get("period_label") or ""), reverse=True)
+
+    return {
+        "paid": paid,
+        "upcoming": upcoming,
+        "totals": {
+            "paid_kes": sum(item["amount_kes"] for item in paid),
+            "upcoming_kes": sum(item["amount_kes"] for item in upcoming),
+        },
+        "current_period": {
+            "label": label,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "accrued_kes": sum(item["amount_kes"] for item in current_accrued),
+            "accrued_minutes": sum(item["minutes"] for item in current_accrued),
+        },
+        "pending_payouts": pending_payouts,
+    }
 
 
 @app.get("/human-transcription/workers")
@@ -5706,6 +5979,148 @@ async def human_list_workers(request: Request):
     return {"workers": workers}
 
 
+@app.get("/api/admin/worker-payments/search")
+async def admin_worker_payments_search(request: Request, worker_uid: str = "", start_date: str = "", end_date: str = "", status: str = "all"):
+    """Flexible search across every worker's completed jobs, for the admin
+    payment dashboard. A day is start_date == end_date; a week is a 7-day
+    range; leaving worker_uid empty searches every worker at once. status
+    is one of: all, accruing (this half, not yet invoiced), invoiced
+    (pending payout awaiting admin approval), paid."""
+    _require_admin(request)
+    if not db:
+        return {"jobs": [], "total_minutes": 0, "total_amount_kes": 0}
+    await _close_due_pay_periods()
+
+    def _parse_day(value, end_of_day=False):
+        if not value:
+            return None
+        try:
+            d = datetime.fromisoformat(value[:10])
+        except Exception:
+            return None
+        return d.replace(hour=23, minute=59, second=59, microsecond=999999) if end_of_day else d
+
+    start_bound = _parse_day(start_date)
+    end_bound = _parse_day(end_date, end_of_day=True)
+    status = (status or "all").strip().lower()
+
+    ref = db.collection(HUMAN_JOB_COLLECTION)
+    if worker_uid:
+        snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", worker_uid)).stream()))
+    else:
+        snapshots = await asyncio.to_thread(lambda: list(ref.stream()))
+
+    finished = {"submitted", "client_review", "client_approved", "released"}
+    rows = []
+    for snap in snapshots:
+        job = snap.to_dict() or {}
+        if job.get("status") not in finished or not job.get("worker_uid"):
+            continue
+        completed_at = _as_dt(job.get("workerCompletedAt") or job.get("submittedAt"))
+        if start_bound and (not completed_at or completed_at < start_bound):
+            continue
+        if end_bound and (not completed_at or completed_at > end_bound):
+            continue
+        job_payout_status = "paid" if job.get("payout_status") == "paid" else (job.get("payout_status") or "accruing")
+        if status != "all" and job_payout_status != status:
+            continue
+        minutes = int(job.get("worker_minutes") or job.get("minutes") or 0)
+        amount = int(job.get("worker_amount_kes") or 0)
+        rows.append({
+            "job_id": snap.id,
+            "worker_uid": job.get("worker_uid"),
+            "worker_email": job.get("worker_email") or "",
+            "worker_name": job.get("worker_name") or "",
+            "minutes": minutes,
+            "amount_kes": amount,
+            "payout_status": job_payout_status,
+            "payout_period_id": job.get("payout_period_id"),
+            "completed_at": _human_iso(completed_at),
+            "job_status": job.get("status"),
+        })
+    rows.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
+    return {
+        "jobs": rows,
+        "total_minutes": sum(item["minutes"] for item in rows),
+        "total_amount_kes": sum(item["amount_kes"] for item in rows),
+        "job_count": len(rows),
+    }
+
+
+@app.get("/api/admin/worker-payouts")
+async def admin_worker_payouts(request: Request, worker_uid: str = "", status: str = "all"):
+    """List bi-monthly payout invoices for the admin dashboard, optionally
+    filtered by worker and/or status (pending/paid)."""
+    _require_admin(request)
+    if not db:
+        return {"payouts": [], "totals": {"pending_kes": 0, "paid_kes": 0}}
+    await _close_due_pay_periods()
+    ref = db.collection(HUMAN_PAYOUT_COLLECTION)
+    if worker_uid:
+        snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", worker_uid)).stream()))
+    else:
+        snapshots = await asyncio.to_thread(lambda: list(ref.stream()))
+    status = (status or "all").strip().lower()
+    payouts = []
+    pending_total, paid_total = 0, 0
+    for snap in snapshots:
+        payout = snap.to_dict() or {}
+        payout_status = payout.get("status") or "pending"
+        amount = int(payout.get("total_amount_kes") or 0)
+        if payout_status == "paid":
+            paid_total += amount
+        else:
+            pending_total += amount
+        if status != "all" and payout_status != status:
+            continue
+        payouts.append({
+            "payout_id": snap.id,
+            "worker_uid": payout.get("worker_uid"),
+            "worker_email": payout.get("worker_email") or "",
+            "worker_name": payout.get("worker_name") or "",
+            "period_label": payout.get("period_label"),
+            "period_start": _human_iso(payout.get("period_start")),
+            "period_end": _human_iso(payout.get("period_end")),
+            "total_minutes": int(payout.get("total_minutes") or 0),
+            "total_amount_kes": amount,
+            "status": payout_status,
+            "job_ids": payout.get("job_ids") or [],
+            "paid_at": _human_iso(payout.get("paidAt")),
+            "paid_by": payout.get("paidBy"),
+        })
+    payouts.sort(key=lambda item: str(item.get("period_label") or ""), reverse=True)
+    return {"payouts": payouts, "totals": {"pending_kes": pending_total, "paid_kes": paid_total}}
+
+
+@app.post("/api/admin/worker-payouts/{payout_id}/mark-paid")
+async def admin_mark_payout_paid(payout_id: str, request: Request):
+    """Admin confirms a half-month invoice has actually been paid out."""
+    admin = _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    payout_ref = db.collection(HUMAN_PAYOUT_COLLECTION).document(payout_id)
+    snapshot = await asyncio.to_thread(payout_ref.get)
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="That payout invoice was not found.")
+    payout = snapshot.to_dict() or {}
+    if payout.get("status") == "paid":
+        raise HTTPException(status_code=409, detail="This payout has already been marked as paid.")
+    now = datetime.now()
+    await asyncio.to_thread(payout_ref.set, {"status": "paid", "paidAt": now, "paidBy": (admin.get("email") or "").lower(), "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    job_ids = payout.get("job_ids") or []
+    if job_ids:
+        batch = db.batch()
+        for job_id in job_ids:
+            batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {
+                "payout_status": "paid",
+                "workerPaymentStatus": "paid",
+                "workerPaidAt": now,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+        await asyncio.to_thread(batch.commit)
+    return {"status": "paid", "payout_id": payout_id, "jobs_marked_paid": len(job_ids)}
+
+
 @app.post("/human-transcription/jobs/{job_id}/approve")
 async def human_admin_approve(job_id: str, request: Request):
     _require_admin(request)
@@ -5728,9 +6143,24 @@ async def human_admin_assign(job_id: str, request: Request):
     job = await _human_job(job_id)
     if job.get("status") not in {"approved", "assigned"}:
         raise HTTPException(status_code=409, detail="Approve the job before assigning it.")
-    updates = {"status": "assigned", "worker_uid": worker_uid, "worker_email": worker_email, "worker_name": worker_name, "updatedAt": firestore.SERVER_TIMESTAMP}
+    # The worker's turnaround clock starts the moment the job is assigned:
+    # 3 minutes of TAT for every 1 minute of assigned audio.
+    minutes = max(1, int(job.get("minutes") or 1))
+    tat_seconds = minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
+    now = datetime.now()
+    deadline = now + timedelta(seconds=tat_seconds)
+    updates = {
+        "status": "assigned",
+        "worker_uid": worker_uid,
+        "worker_email": worker_email,
+        "worker_name": worker_name,
+        "assignedAt": now,
+        "deadlineAt": deadline,
+        "tat_seconds": tat_seconds,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
-    return {"status": "assigned", "job_id": job_id, "worker_uid": worker_uid}
+    return {"status": "assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
 
 
 @app.post("/human-transcription/jobs/{job_id}/start")
@@ -5739,6 +6169,8 @@ async def human_worker_start(job_id: str, request: Request):
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
     job = await _human_job(job_id)
+    if job.get("worker_uid") != actor["uid"] and job.get("status") == "approved":
+        raise HTTPException(status_code=409, detail="The deadline for this job passed and it has been returned to the admin queue for reassignment.")
     await _human_assert_access(job, actor, allow_admin=False)
     if job.get("status") not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="This job is not ready to start.")
@@ -5752,12 +6184,32 @@ async def human_worker_submit(job_id: str, request: Request):
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
     job = await _human_job(job_id)
+    if job.get("worker_uid") != actor["uid"] and job.get("status") == "approved":
+        raise HTTPException(status_code=409, detail="The deadline for this job passed and it has been returned to the admin queue for reassignment.")
     await _human_assert_access(job, actor, allow_admin=False)
     payload = await request.json()
     transcript = str(payload.get("transcript") or "").strip()
     if not transcript:
         raise HTTPException(status_code=400, detail="Add the completed transcript before submitting.")
-    updates = {"status": "submitted", "transcript": transcript[:1000000], "worker_notes": str(payload.get("notes") or "")[:12000], "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+    # Lock in the worker's pay for this job now, at submission time, so a
+    # later change to the per-minute rate never rewrites what was already
+    # earned. This amount is what accrues toward the current half-month
+    # pay period and, once that half ends, into a pending payout invoice.
+    quote = job.get("quote") or {}
+    minutes = int(job.get("minutes") or quote.get("minutes") or 0)
+    rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+    worker_amount_kes = max(0, minutes * rate)
+    updates = {
+        "status": "submitted",
+        "transcript": transcript[:1000000],
+        "worker_notes": str(payload.get("notes") or "")[:12000],
+        "submittedAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "workerCompletedAt": datetime.now(),
+        "worker_minutes": minutes,
+        "worker_amount_kes": worker_amount_kes,
+        "payout_status": "unassigned",
+    }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     return {"status": "submitted", "job_id": job_id}
 
