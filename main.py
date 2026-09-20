@@ -1135,6 +1135,44 @@ def credits_exempt(user_email: str) -> bool:
     return is_admin_user(user_email) or is_comp_access_user(user_email)
 
 
+# Extra accounts that can run the human-transcription pipeline solo: approve a
+# request, assign it straight to a worker, and sign off finished work on a
+# client's behalf, all without a separate client account clicking anything.
+# This is deliberately its own list, kept separate from ADMIN_EMAILS, so it
+# never grants the app-wide admin dashboard, never bypasses the paywall for
+# AI transcription or Ask TypeMyworDz, and never exempts anything except the
+# human-transcription jobs these accounts personally own as the "client".
+HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai']
+
+
+def is_human_job_admin(user_email: str) -> bool:
+    """True for a real admin, or one of the extra accounts above, for the
+    purposes of the human-transcription workflow only."""
+    if not user_email:
+        return False
+    email = user_email.strip().lower()
+    if is_admin_user(email):
+        return True
+    return email in {item.lower() for item in HUMAN_JOB_ADMIN_EMAILS}
+
+
+def human_job_credits_exempt(user_email: str) -> bool:
+    """A human-transcription job is free of charge only when the client on
+    that job is a real admin or one of the extra human-job-admin accounts.
+    Deliberately separate from credits_exempt: it must never leak into AI
+    transcription or Ask TypeMyworDz billing for the same accounts, so those
+    keep exercising the real paywall exactly as before."""
+    return is_human_job_admin(user_email)
+
+
+def _require_human_job_admin(request: Request) -> dict:
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    if not is_human_job_admin(email):
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    return decoded
+
+
 async def _load_profile(user_id: str):
     if not db or not user_id:
         return None
@@ -5711,7 +5749,10 @@ async def _human_actor(request: Request):
     uid = decoded.get("uid") or ""
     if not uid:
         raise HTTPException(status_code=401, detail="Your account could not be verified.")
-    role = "admin" if is_admin_user(email) else "client"
+    # A human-job admin (real admin, or the dedicated info@typemywordz.ai ops
+    # account) gets the "admin" role here even though it is not a full
+    # ADMIN_EMAILS admin elsewhere in the app.
+    role = "admin" if is_human_job_admin(email) else "client"
     profile = await _load_profile(uid)
     profile = profile or {}
     profile_role = str(profile.get("role") or profile.get("user_type") or "").strip().lower()
@@ -5778,7 +5819,11 @@ async def human_create_job(
     quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting)
     profile = await _load_profile(actor["uid"])
     balance = read_balance(profile or {})
-    exempt = credits_exempt(actor["email"])
+    # A real admin, or the dedicated human-job-admin account, never needs
+    # credits for a human-transcription job it owns. Everyone else -- every
+    # ordinary client, including info@typemywordz.ai's own AI-transcription
+    # and Ask TypeMyworDz usage elsewhere in the app -- still pays normally.
+    exempt = credits_exempt(actor["email"]) or human_job_credits_exempt(actor["email"])
     if not exempt and balance["spendable"] < quote["credits"]:
         raise HTTPException(status_code=409, detail=f"You need {quote['credits'] - balance['spendable']} more credits before human work can begin.")
     job_id = uuid.uuid4().hex
@@ -5814,6 +5859,7 @@ async def human_create_job(
         "worker_name": None,
         "transcript": str(initial_transcript or "")[:1000000] if source_type == "ai_proofreading" else "",
         "worker_notes": "",
+        "final_attachment": None,
         "admin_feedback": "",
         "worker_rating": None,
         "credits_charged": 0,
@@ -6123,7 +6169,7 @@ async def admin_mark_payout_paid(payout_id: str, request: Request):
 
 @app.post("/human-transcription/jobs/{job_id}/approve")
 async def human_admin_approve(job_id: str, request: Request):
-    _require_admin(request)
+    _require_human_job_admin(request)
     job = await _human_job(job_id)
     if job.get("status") != "pending_admin":
         raise HTTPException(status_code=409, detail="This job is not waiting for admin approval.")
@@ -6133,7 +6179,7 @@ async def human_admin_approve(job_id: str, request: Request):
 
 @app.post("/human-transcription/jobs/{job_id}/assign")
 async def human_admin_assign(job_id: str, request: Request):
-    _require_admin(request)
+    _require_human_job_admin(request)
     payload = await request.json()
     worker_uid = str(payload.get("worker_uid") or "").strip()
     worker_email = str(payload.get("worker_email") or "").strip().lower()
@@ -6179,7 +6225,13 @@ async def human_worker_start(job_id: str, request: Request):
 
 
 @app.post("/human-transcription/jobs/{job_id}/submit")
-async def human_worker_submit(job_id: str, request: Request):
+async def human_worker_submit(
+    job_id: str,
+    request: Request,
+    transcript: str = Form(""),
+    notes: str = Form(""),
+    attachment: UploadFile = File(None),
+):
     actor = await _human_actor(request)
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
@@ -6187,10 +6239,16 @@ async def human_worker_submit(job_id: str, request: Request):
     if job.get("worker_uid") != actor["uid"] and job.get("status") == "approved":
         raise HTTPException(status_code=409, detail="The deadline for this job passed and it has been returned to the admin queue for reassignment.")
     await _human_assert_access(job, actor, allow_admin=False)
-    payload = await request.json()
-    transcript = str(payload.get("transcript") or "").strip()
-    if not transcript:
-        raise HTTPException(status_code=400, detail="Add the completed transcript before submitting.")
+    transcript_text = str(transcript or "").strip()
+    # Some jobs only need the finished file handed back -- there is nothing
+    # to type into the shared editor. A worker may submit with just that
+    # attachment, as long as there is either real transcript text or a
+    # final file, never neither.
+    final_attachment = job.get("final_attachment")
+    if attachment and attachment.filename:
+        final_attachment = await _human_store_upload(job_id, attachment, "final")
+    if not transcript_text and not final_attachment:
+        raise HTTPException(status_code=400, detail="Add the completed transcript, or attach the finished file, before submitting.")
     # Lock in the worker's pay for this job now, at submission time, so a
     # later change to the per-minute rate never rewrites what was already
     # earned. This amount is what accrues toward the current half-month
@@ -6201,8 +6259,9 @@ async def human_worker_submit(job_id: str, request: Request):
     worker_amount_kes = max(0, minutes * rate)
     updates = {
         "status": "submitted",
-        "transcript": transcript[:1000000],
-        "worker_notes": str(payload.get("notes") or "")[:12000],
+        "transcript": transcript_text[:1000000],
+        "final_attachment": final_attachment,
+        "worker_notes": str(notes or "")[:12000],
         "submittedAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
         "workerCompletedAt": datetime.now(),
@@ -6216,7 +6275,7 @@ async def human_worker_submit(job_id: str, request: Request):
 
 @app.post("/human-transcription/jobs/{job_id}/review")
 async def human_admin_review(job_id: str, request: Request):
-    _require_admin(request)
+    _require_human_job_admin(request)
     job = await _human_job(job_id)
     if job.get("status") not in {"submitted", "client_review"}:
         raise HTTPException(status_code=409, detail="This job is not ready for admin review.")
@@ -6234,26 +6293,41 @@ async def human_admin_review(job_id: str, request: Request):
 @app.post("/human-transcription/jobs/{job_id}/client-approve")
 async def human_client_approve(job_id: str, request: Request):
     actor = await _human_actor(request)
-    if actor["role"] != "client":
-        raise HTTPException(status_code=403, detail="Client access is required.")
     job = await _human_job(job_id)
-    await _human_assert_access(job, actor, allow_admin=False)
+    if actor["role"] == "admin":
+        # Some clients are fully hands-off and trust an admin's review more
+        # than they want to log in and click approve themselves. A real
+        # admin, or the dedicated human-job-admin account, may sign off on
+        # any client's behalf here.
+        pass
+    elif actor["role"] != "client":
+        raise HTTPException(status_code=403, detail="Client access is required.")
+    else:
+        await _human_assert_access(job, actor, allow_admin=False)
     if job.get("status") != "client_review":
         raise HTTPException(status_code=409, detail="The job is not waiting for your approval.")
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "client_approved", "clientApprovedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP})
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "client_approved", "clientApprovedAt": firestore.SERVER_TIMESTAMP, "clientApprovedBy": actor["email"], "updatedAt": firestore.SERVER_TIMESTAMP})
     return {"status": "client_approved", "job_id": job_id, "credits_deducted": 0}
 
 
 @app.post("/human-transcription/jobs/{job_id}/release")
 async def human_admin_release(job_id: str, request: Request):
-    _require_admin(request)
+    _require_human_job_admin(request)
     job = await _human_job(job_id)
     if job.get("status") != "client_approved":
         raise HTTPException(status_code=409, detail="Client approval is required before releasing the work.")
-    charge = await charge_credits(job.get("client_uid") or "", job.get("client_email") or "", int(job.get("quote_credits") or 0), f"human transcription {job_id}")
-    if charge.get("error") or charge.get("needed"):
-        raise HTTPException(status_code=409, detail="The client's credits no longer cover this job. The work remains locked.")
-    updates = {"status": "released", "credits_charged": int(job.get("quote_credits") or 0), "releasedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+    client_email = job.get("client_email") or ""
+    if human_job_credits_exempt(client_email):
+        # This job's "client" is a real admin or the dedicated human-job-admin
+        # account (info@typemywordz.ai). Human-transcription jobs never cost
+        # that account credits, even though it still pays normally for AI
+        # transcription and Ask TypeMyworDz elsewhere in the app.
+        charge = {"charged": 0, "exempt": True}
+    else:
+        charge = await charge_credits(job.get("client_uid") or "", client_email, int(job.get("quote_credits") or 0), f"human transcription {job_id}")
+        if charge.get("error") or charge.get("needed"):
+            raise HTTPException(status_code=409, detail="The client's credits no longer cover this job. The work remains locked.")
+    updates = {"status": "released", "credits_charged": int(charge.get("charged") or 0), "releasedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     return {"status": "released", "job_id": job_id, "credits_deducted": int(job.get("quote_credits") or 0)}
 
@@ -6413,6 +6487,32 @@ async def human_instruction_attachment(job_id: str, attachment_index: int, reque
         raise HTTPException(status_code=404, detail="That reference file is no longer available.")
     raw = await asyncio.to_thread(blob.download_as_bytes)
     filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "reference-file")) or "reference-file"
+    return Response(
+        content=raw,
+        media_type=meta.get("content_type") or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/human-transcription/jobs/{job_id}/final-attachment")
+async def human_final_attachment(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor)
+    meta = job.get("final_attachment") or {}
+    path = meta.get("storage_path")
+    bucket = _human_bucket()
+    if not path or bucket is None:
+        raise HTTPException(status_code=404, detail="No finished file was attached to this job.")
+    if not str(path).startswith(f"human-workflow/{job_id}/final/"):
+        raise HTTPException(status_code=403, detail="That file does not belong to this job.")
+    if job.get("status") not in {"submitted", "client_review", "client_approved", "released"} and actor["role"] == "client":
+        raise HTTPException(status_code=403, detail="The completed work will be downloadable after admin releases it.")
+    blob = bucket.blob(path)
+    if not blob.exists():
+        raise HTTPException(status_code=404, detail="That file is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "final-transcript")) or "final-transcript"
     return Response(
         content=raw,
         media_type=meta.get("content_type") or "application/octet-stream",
