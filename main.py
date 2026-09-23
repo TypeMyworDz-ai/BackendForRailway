@@ -738,6 +738,19 @@ HUMAN_RUSH_PAYOUT_KES = 38
 # submitted by the deadline, the job is returned to the admin queue.
 HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE = 4
 HUMAN_SHORT_AUDIO_TAT_MINUTES = 6
+HUMAN_TAT_EXTENSION_OPTIONS = (5, 10, 15, 20)
+
+
+def human_tat_seconds(audio_seconds):
+    """Return the worker deadline window for one assigned audio segment."""
+    try:
+        seconds = float(audio_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds <= 60:
+        return HUMAN_SHORT_AUDIO_TAT_MINUTES * 60
+    minutes = max(1, int(math.ceil(seconds / 60.0)))
+    return minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
 
 
 def human_credit_quote(seconds, turnaround="standard", difficulty="standard", service="standard", speakers="1-2", timestamps=True, formatting="standard"):
@@ -5448,6 +5461,11 @@ HUMAN_JOB_STATUSES = {
     "approved",
     "assigned",
     "in_progress",
+    "split_assigned",
+    "split_in_progress",
+    "proofreading_available",
+    "proofreading_assigned",
+    "proofreading_in_progress",
     "submitted",
     "client_review",
     "client_approved",
@@ -5484,26 +5502,89 @@ _HUMAN_CLIENT_IDENTITY_FIELDS = ("client_uid", "client_email", "client_name")
 _HUMAN_WORKER_IDENTITY_FIELDS = ("worker_uid", "worker_email", "worker_name")
 
 
-def _human_public_for(data, actor_role):
-    # Compute the TAT countdown from the raw (pre-serialisation) deadline
-    # before _human_public turns every timestamp into a plain ISO string.
-    deadline = _as_dt((data or {}).get("deadlineAt"))
-    time_remaining_seconds = None
-    if deadline is not None and (data or {}).get("status") in ("assigned", "in_progress"):
-        time_remaining_seconds = max(0, int((deadline - datetime.now()).total_seconds()))
+def _human_public_for(data, actor_role, actor_uid=""):
+    """Serialize a human job without leaking the other side's identity.
+
+    Split jobs keep one parent record but expose only the current worker's
+    segment to that worker. Admins see the full assignment map.
+    """
+    data = data or {}
     out = _human_public(data)
-    if time_remaining_seconds is not None:
-        out["time_remaining_seconds"] = time_remaining_seconds
+    segments = data.get("segments") or []
+
+    def remaining(deadline, status):
+        deadline_dt = _as_dt(deadline)
+        if deadline_dt is not None and status in ("assigned", "in_progress"):
+            return max(0, int((deadline_dt - datetime.now()).total_seconds()))
+        return None
+
     if actor_role == "worker":
         for key in _HUMAN_CLIENT_IDENTITY_FIELDS:
             out.pop(key, None)
-        # Worker pay is handled separately; never expose client pricing or
-        # credit accounting in a worker room response.
         for key in ("quote_credits", "credits_charged", "credits_deducted", "credit_cost", "price", "amount", "currency", "quote"):
             out.pop(key, None)
+        assignment = None
+        for item in segments:
+            if (item or {}).get("worker_uid") == actor_uid:
+                assignment = dict(item)
+                assignment["time_remaining_seconds"] = remaining(item.get("deadlineAt"), item.get("status"))
+                assignment["role"] = "transcriber"
+                break
+        if data.get("proofreader_uid") == actor_uid:
+            assignment = {
+                "id": "proofreader",
+                "label": "Final proofreading",
+                "role": "proofreader",
+                "status": data.get("proofreader_status"),
+                "transcript": data.get("transcript") or "\n\n".join(
+                    item.get("transcript", "") for item in segments if item.get("transcript")
+                ),
+                "final_attachment": data.get("final_attachment"),
+                "deadlineAt": data.get("proofreader_deadlineAt"),
+                "time_remaining_seconds": remaining(data.get("proofreader_deadlineAt"), data.get("proofreader_status")),
+                "worker_minutes": data.get("minutes"),
+            }
+        if assignment is not None:
+            assignment = _human_public(assignment)
+            out["worker_assignment"] = assignment
+            out["time_remaining_seconds"] = assignment.get("time_remaining_seconds")
+            out["transcript"] = assignment.get("transcript") or ""
+            out["final_attachment"] = assignment.get("final_attachment")
+        out.pop("segments", None)
+        out.pop("assigned_worker_uids", None)
+        out.pop("proofreader_uid", None)
+        out.pop("proofreader_email", None)
+        out.pop("proofreader_name", None)
+        out.pop("proofreader_status", None)
+        out.pop("proofreader_deadlineAt", None)
+        out.pop("proofreader_tat_seconds", None)
+        out.pop("proofreader_completedAt", None)
+        out.pop("proofreader_minutes", None)
+        out.pop("proofreader_amount_kes", None)
+        out.pop("proofreader_payout_status", None)
+        out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
         for key in _HUMAN_WORKER_IDENTITY_FIELDS:
             out.pop(key, None)
+        for segment in out.get("segments") or []:
+            if isinstance(segment, dict):
+                for key in _HUMAN_WORKER_IDENTITY_FIELDS:
+                    segment.pop(key, None)
+        out.pop("assigned_worker_uids", None)
+        out.pop("segments", None)
+        for key in ("proofreader_uid", "proofreader_email", "proofreader_name"):
+            out.pop(key, None)
+    else:
+        # Admin gets a useful countdown beside each active segment.
+        public_segments = []
+        for item in out.get("segments") or []:
+            if isinstance(item, dict):
+                item["time_remaining_seconds"] = remaining(item.get("deadlineAt"), item.get("status"))
+            public_segments.append(item)
+        out["segments"] = public_segments
+        out["time_remaining_seconds"] = remaining(data.get("deadlineAt"), data.get("status"))
+        if data.get("proofreader_status") in ("assigned", "in_progress"):
+            out["proofreader_time_remaining_seconds"] = remaining(data.get("proofreader_deadlineAt"), data.get("proofreader_status"))
     return out
 
 
@@ -5571,15 +5652,70 @@ async def _human_reclaim_expired_job(job_id: str, job: dict):
 
 
 async def _human_check_expiry(job_id: str, job: dict):
-    """Lazily enforce the worker TAT deadline whenever a job is read. If the
-    deadline has passed while the job is still assigned/in progress, it is
-    reclaimed back to the admin queue before being handed to any caller."""
+    """Return expired work to the admin queue without taking live work away."""
     if not db or not job:
+        return job
+    now = datetime.now()
+    if job.get("split_mode") == "dual":
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        changed = False
+        for item in segments:
+            if item.get("status") not in ("assigned", "in_progress"):
+                continue
+            deadline = _as_dt(item.get("deadlineAt"))
+            if not deadline or now <= deadline:
+                continue
+            previous = item.get("worker_name") or item.get("worker_email") or "the previous worker"
+            item.update({
+                "status": "available",
+                "worker_uid": None,
+                "worker_email": None,
+                "worker_name": None,
+                "assignedAt": None,
+                "deadlineAt": None,
+                "tat_seconds": None,
+                "auto_reassigned_count": int(item.get("auto_reassigned_count") or 0) + 1,
+                "last_auto_reassigned_at": now,
+                "last_auto_reassigned_worker_name": previous,
+            })
+            changed = True
+        proofreader_status = job.get("proofreader_status")
+        proofreader_deadline = _as_dt(job.get("proofreader_deadlineAt"))
+        if proofreader_status in ("assigned", "in_progress") and proofreader_deadline and now > proofreader_deadline:
+            job = dict(job)
+            job.update({"proofreader_status": "available", "proofreader_uid": None, "proofreader_email": None, "proofreader_name": None, "proofreader_deadlineAt": None, "proofreader_tat_seconds": None})
+            changed = True
+        if changed:
+            job = dict(job)
+            job["segments"] = segments
+            job["assigned_worker_uids"] = [item.get("worker_uid") for item in segments if item.get("worker_uid")]
+            if job.get("proofreader_status") in ("assigned", "in_progress"):
+                job["status"] = "proofreading_assigned"
+            elif all(item.get("status") == "submitted" for item in segments):
+                job["status"] = "proofreading_available"
+            else:
+                job["status"] = "split_assigned"
+            job["updatedAt"] = firestore.SERVER_TIMESTAMP
+            try:
+                await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+                    "segments": segments,
+                    "assigned_worker_uids": job["assigned_worker_uids"],
+                    "proofreader_uid": job.get("proofreader_uid"),
+                    "proofreader_email": job.get("proofreader_email"),
+                    "proofreader_name": job.get("proofreader_name"),
+                    "proofreader_status": job.get("proofreader_status"),
+                    "proofreader_deadlineAt": job.get("proofreader_deadlineAt"),
+                    "proofreader_tat_seconds": job.get("proofreader_tat_seconds"),
+                    "status": job["status"],
+                    "updatedAt": firestore.SERVER_TIMESTAMP,
+                })
+            except Exception as exc:
+                logger.warning("Could not update split-job expiry for %s: %s", job_id, exc)
         return job
     if job.get("status") not in ("assigned", "in_progress"):
         return job
     deadline = _as_dt(job.get("deadlineAt"))
-    if not deadline or datetime.now() <= deadline:
+    if not deadline or now <= deadline:
         return job
     return await _human_reclaim_expired_job(job_id, job)
 
@@ -5650,85 +5786,128 @@ def _pay_period_bounds(dt):
     return label, start, end
 
 
+def _human_worker_earning_items(job_id, job):
+    """Yield payout-ready worker work from single jobs, split parts and proofreaders."""
+    quote = job.get("quote") or {}
+    default_rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+    if job.get("worker_uid") and job.get("payout_status") == "unassigned" and job.get("workerCompletedAt"):
+        minutes = int(job.get("worker_minutes") or job.get("minutes") or 0)
+        yield {
+            "source": "job", "job_id": job_id, "worker_uid": job.get("worker_uid"),
+            "worker_email": job.get("worker_email") or "", "worker_name": job.get("worker_name") or "",
+            "completed_at": _as_dt(job.get("workerCompletedAt")), "minutes": minutes,
+            "amount_kes": int(job.get("worker_amount_kes") or max(0, minutes * default_rate)),
+        }
+    for item in (job.get("segments") or []):
+        if item.get("worker_uid") and item.get("payout_status") == "unassigned" and item.get("workerCompletedAt"):
+            minutes = int(item.get("worker_minutes") or item.get("minutes") or 0)
+            yield {
+                "source": "segment", "segment_id": item.get("id"), "job_id": job_id,
+                "worker_uid": item.get("worker_uid"), "worker_email": item.get("worker_email") or "",
+                "worker_name": item.get("worker_name") or "", "completed_at": _as_dt(item.get("workerCompletedAt")),
+                "minutes": minutes, "amount_kes": int(item.get("worker_amount_kes") or max(0, minutes * default_rate)),
+            }
+    if job.get("proofreader_uid") and job.get("proofreader_payout_status") == "unassigned" and job.get("proofreader_completedAt"):
+        minutes = int(job.get("proofreader_minutes") or job.get("minutes") or 0)
+        yield {
+            "source": "proofreader", "job_id": job_id, "worker_uid": job.get("proofreader_uid"),
+            "worker_email": job.get("proofreader_email") or "", "worker_name": job.get("proofreader_name") or "",
+            "completed_at": _as_dt(job.get("proofreader_completedAt")), "minutes": minutes,
+            "amount_kes": int(job.get("proofreader_amount_kes") or max(0, minutes * default_rate)),
+        }
+
+
 async def _close_due_pay_periods():
-    """Find completed worker jobs that have not yet been rolled into a
-    payout invoice, group them by worker + half-month period, and for every
-    period that has fully ended, create/update that worker's pending payout.
-    Jobs in a period that has not ended yet are left alone; they keep
-    accruing toward an invoice that will be created once their half ends."""
+    """Roll completed single jobs, split parts and proofreading into invoices."""
     if not db:
         return
     now = datetime.now()
     try:
-        snapshots = await asyncio.to_thread(
-            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("payout_status", "==", "unassigned")).stream())
-        )
+        snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
     except Exception as exc:
-        logger.warning("Pay period close could not list unassigned jobs: %s", exc)
+        logger.warning("Pay period close could not list human jobs: %s", exc)
         return
     groups = {}
+    sources = {}
     for snap in snapshots:
         job = snap.to_dict() or {}
-        completed_at = _as_dt(job.get("workerCompletedAt"))
-        worker_uid = job.get("worker_uid")
-        if not completed_at or not worker_uid:
-            continue
-        label, start, end = _pay_period_bounds(completed_at)
-        if now <= end:
-            continue  # this half has not ended yet; keep accruing
-        key = (worker_uid, label)
-        bucket = groups.setdefault(key, {
-            "worker_uid": worker_uid,
-            "worker_email": job.get("worker_email") or "",
-            "worker_name": job.get("worker_name") or "",
-            "period_label": label,
-            "period_start": start,
-            "period_end": end,
-            "job_ids": [],
-            "total_minutes": 0,
-            "total_amount_kes": 0,
-        })
-        bucket["job_ids"].append(snap.id)
-        bucket["total_minutes"] += int(job.get("worker_minutes") or 0)
-        bucket["total_amount_kes"] += int(job.get("worker_amount_kes") or 0)
+        for item in _human_worker_earning_items(snap.id, job):
+            completed_at = item.get("completed_at")
+            if not completed_at:
+                continue
+            label, start_dt, end_dt = _pay_period_bounds(completed_at)
+            if now <= end_dt:
+                continue
+            key = (item["worker_uid"], label)
+            bucket = groups.setdefault(key, {
+                "worker_uid": item["worker_uid"], "worker_email": item["worker_email"], "worker_name": item["worker_name"],
+                "period_label": label, "period_start": start_dt, "period_end": end_dt,
+                "job_ids": [], "items": [], "total_minutes": 0, "total_amount_kes": 0,
+            })
+            bucket["job_ids"].append(snap.id)
+            bucket["items"].append(item)
+            bucket["total_minutes"] += item["minutes"]
+            bucket["total_amount_kes"] += item["amount_kes"]
+            sources[(snap.id, item.get("source"), item.get("segment_id"))] = (label, item)
     for (worker_uid, label), bucket in groups.items():
         payout_id = f"{worker_uid}_{label}"
         payout_ref = db.collection(HUMAN_PAYOUT_COLLECTION).document(payout_id)
         existing_snapshot = await asyncio.to_thread(payout_ref.get)
+        new_items = [{"job_id": item["job_id"], "source": item["source"], "segment_id": item.get("segment_id"), "minutes": item["minutes"], "amount_kes": item["amount_kes"]} for item in bucket["items"]]
         if existing_snapshot.exists:
             existing = existing_snapshot.to_dict() or {}
+            existing_items = existing.get("items") or []
+            existing_ids = {(x.get("job_id"), x.get("source"), x.get("segment_id")) for x in existing_items}
+            additions = [x for x in new_items if (x.get("job_id"), x.get("source"), x.get("segment_id")) not in existing_ids]
             updates = {
                 "job_ids": sorted(set((existing.get("job_ids") or []) + bucket["job_ids"])),
-                "total_minutes": int(existing.get("total_minutes") or 0) + bucket["total_minutes"],
-                "total_amount_kes": int(existing.get("total_amount_kes") or 0) + bucket["total_amount_kes"],
+                "items": existing_items + additions,
+                "total_minutes": int(existing.get("total_minutes") or 0) + sum(x["minutes"] for x in additions),
+                "total_amount_kes": int(existing.get("total_amount_kes") or 0) + sum(x["amount_kes"] for x in additions),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             }
             await asyncio.to_thread(payout_ref.set, updates, merge=True)
         else:
             await asyncio.to_thread(payout_ref.set, {
-                "worker_uid": worker_uid,
-                "worker_email": bucket["worker_email"],
-                "worker_name": bucket["worker_name"],
-                "period_label": label,
-                "period_start": bucket["period_start"],
-                "period_end": bucket["period_end"],
-                "job_ids": bucket["job_ids"],
-                "total_minutes": bucket["total_minutes"],
-                "total_amount_kes": bucket["total_amount_kes"],
-                "status": "pending",
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-                "paidAt": None,
-                "paidBy": None,
+                "worker_uid": worker_uid, "worker_email": bucket["worker_email"], "worker_name": bucket["worker_name"],
+                "period_label": bucket["period_label"], "period_start": bucket["period_start"], "period_end": bucket["period_end"],
+                "job_ids": sorted(set(bucket["job_ids"])), "items": new_items,
+                "total_minutes": bucket["total_minutes"], "total_amount_kes": bucket["total_amount_kes"], "status": "pending",
+                "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP, "paidAt": None, "paidBy": None,
             })
-        batch = db.batch()
-        for job_id in bucket["job_ids"]:
-            batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {
-                "payout_status": "invoiced",
-                "payout_period_id": label,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            })
-        await asyncio.to_thread(batch.commit)
+        # Mark only the exact earning item as invoiced.
+        by_job = {}
+        for item in bucket["items"]:
+            by_job.setdefault(item["job_id"], []).append(item)
+        for job_id, items in by_job.items():
+            snap = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+            job = snap.to_dict() or {}
+            segments = [dict(x or {}) for x in (job.get("segments") or [])]
+            changed = False
+            for item in items:
+                if item["source"] == "job":
+                    job["payout_status"] = "invoiced"
+                    job["payout_period_id"] = label
+                    changed = True
+                elif item["source"] == "segment":
+                    for segment in segments:
+                        if segment.get("id") == item.get("segment_id"):
+                            segment["payout_status"] = "invoiced"
+                            segment["payout_period_id"] = label
+                            changed = True
+                elif item["source"] == "proofreader":
+                    job["proofreader_payout_status"] = "invoiced"
+                    job["proofreader_payout_period_id"] = label
+                    changed = True
+            if changed:
+                update = {"updatedAt": firestore.SERVER_TIMESTAMP}
+                if any(item["source"] == "job" for item in items):
+                    update.update({"payout_status": job.get("payout_status"), "payout_period_id": label})
+                if any(item["source"] == "segment" for item in items):
+                    update["segments"] = segments
+                if any(item["source"] == "proofreader" for item in items):
+                    update.update({"proofreader_payout_status": "invoiced", "proofreader_payout_period_id": label})
+                await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, update)
 
 
 async def human_payout_monitor():
@@ -5767,6 +5946,10 @@ async def _human_assert_access(job, actor, allow_admin=True):
     if actor["role"] == "admin" and allow_admin:
         return
     if job.get("client_uid") == actor["uid"] or job.get("worker_uid") == actor["uid"]:
+        return
+    if any((item or {}).get("worker_uid") == actor["uid"] for item in (job.get("segments") or [])):
+        return
+    if job.get("proofreader_uid") == actor["uid"]:
         return
     raise HTTPException(status_code=403, detail="You do not have access to this job.")
 
@@ -5879,6 +6062,22 @@ async def human_create_job(
         "payout_period_id": None,
         "workerPaymentStatus": None,
         "workerPaidAt": None,
+        # Optional two-worker workflow. The parent job remains the client-facing
+        # record; each segment carries its own worker, deadline and submission.
+        "split_mode": "single",
+        "segments": [],
+        "assigned_worker_uids": [],
+        "proofreader_uid": None,
+        "proofreader_email": None,
+        "proofreader_name": None,
+        "proofreader_status": None,
+        "proofreader_deadlineAt": None,
+        "proofreader_tat_seconds": None,
+        "proofreader_completedAt": None,
+        "proofreader_minutes": None,
+        "proofreader_amount_kes": None,
+        "proofreader_payout_status": None,
+        "proofreader_payout_period_id": None,
     }
     if db is None:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
@@ -5900,8 +6099,14 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     ref = db.collection(HUMAN_JOB_COLLECTION)
     if actor["role"] == "admin" or scope == "admin":
         snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream()))
-    elif actor["role"] == "worker" or scope == "assigned" or scope == "finished":
-        snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
+    elif actor["role"] == "worker" or scope in {"assigned", "finished"}:
+        # Keep the original single-worker query and add the split parent query.
+        found = {}
+        for snap in await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream())):
+            found[snap.id] = snap
+        for snap in await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("assigned_worker_uids", "array_contains", actor["uid"])).stream())):
+            found[snap.id] = snap
+        snapshots = list(found.values())
     else:
         snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("client_uid", "==", actor["uid"])).stream()))
     jobs = []
@@ -5910,13 +6115,16 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         item["id"] = snap.id
         item = await _human_check_expiry(snap.id, item)
         if actor["role"] == "worker" or scope in {"assigned", "finished"}:
+            assignment = next((part for part in (item.get("segments") or []) if part.get("worker_uid") == actor["uid"]), None)
+            is_proofreader = item.get("proofreader_uid") == actor["uid"]
+            current_status = assignment.get("status") if assignment else (item.get("proofreader_status") if is_proofreader else item.get("status"))
             finished = {"submitted", "client_review", "client_approved", "released"}
             active = {"assigned", "in_progress"}
-            if scope == "finished" and item.get("status") not in finished:
+            if scope == "finished" and current_status not in finished:
                 continue
-            if scope != "finished" and item.get("status") not in active:
+            if scope != "finished" and current_status not in active:
                 continue
-        jobs.append(_human_public_for(item, actor["role"]))
+        jobs.append(_human_public_for(item, actor["role"], actor.get("uid") or ""))
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     response = {"jobs": jobs}
     if actor["role"] == "worker":
@@ -5938,82 +6146,44 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
 
 @app.get("/human-transcription/worker/payment-history")
 async def human_worker_payment_history(request: Request):
-    """Show a worker's private KES earnings without exposing client details.
-
-    Pay accrues in two halves of each month (1st-15th, 16th-end of month).
-    Once a half ends, its jobs are rolled into one pending payout invoice
-    that an admin later marks as paid; the next half keeps accruing
-    regardless of whether that invoice has been paid yet."""
     actor = await _human_actor(request)
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
     if not db:
         return {"paid": [], "upcoming": [], "totals": {"paid_kes": 0, "upcoming_kes": 0}, "current_period": None, "pending_payouts": []}
     await _close_due_pay_periods()
-    snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
-    finished = {"submitted", "client_review", "client_approved", "released"}
+    found = {}
+    for snap in await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream())):
+        found[snap.id] = snap
+    for snap in await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("assigned_worker_uids", "array_contains", actor["uid"])).stream())):
+        found[snap.id] = snap
     paid, upcoming = [], []
-    for snap in snapshots:
+    for snap in found.values():
         job = snap.to_dict() or {}
-        if job.get("status") not in finished:
-            continue
-        quote = job.get("quote") or {}
-        minutes = int(job.get("worker_minutes") or job.get("minutes") or quote.get("minutes") or 0)
-        rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
-        amount = int(job.get("worker_amount_kes") if job.get("worker_amount_kes") is not None else max(0, minutes * rate))
-        row = {
-            "job_id": snap.id,
-            "status": "paid" if job.get("payout_status") == "paid" or job.get("workerPaymentStatus") == "paid" or job.get("workerPaidAt") else "upcoming",
-            "job_status": job.get("status"),
-            "payout_status": job.get("payout_status") or "accruing",
-            "payout_period_id": job.get("payout_period_id"),
-            "minutes": minutes,
-            "amount_kes": amount,
-            "rate_kes_per_minute": rate,
-            "completed_at": _human_iso(job.get("workerCompletedAt") or job.get("releasedAt") or job.get("submittedAt") or job.get("updatedAt")),
-            "paid_at": _human_iso(job.get("workerPaidAt")),
-        }
-        (paid if row["status"] == "paid" else upcoming).append(row)
+        earnings = []
+        if job.get("worker_uid") == actor["uid"]:
+            earnings.append({"source": "job", "worker_uid": actor["uid"], "status": job.get("status"), "payout_status": job.get("payout_status"), "payout_period_id": job.get("payout_period_id"), "minutes": int(job.get("worker_minutes") or job.get("minutes") or 0), "amount_kes": int(job.get("worker_amount_kes") or 0), "completed_at": job.get("workerCompletedAt"), "paid_at": job.get("workerPaidAt")})
+        for segment in (job.get("segments") or []):
+            if segment.get("worker_uid") == actor["uid"]:
+                earnings.append({"source": segment.get("id"), "worker_uid": actor["uid"], "status": job.get("status"), "payout_status": segment.get("payout_status"), "payout_period_id": segment.get("payout_period_id"), "minutes": int(segment.get("worker_minutes") or segment.get("minutes") or 0), "amount_kes": int(segment.get("worker_amount_kes") or 0), "completed_at": segment.get("workerCompletedAt"), "paid_at": segment.get("workerPaidAt")})
+        if job.get("proofreader_uid") == actor["uid"]:
+            earnings.append({"source": "proofreader", "worker_uid": actor["uid"], "status": job.get("status"), "payout_status": job.get("proofreader_payout_status"), "payout_period_id": job.get("proofreader_payout_period_id"), "minutes": int(job.get("proofreader_minutes") or job.get("minutes") or 0), "amount_kes": int(job.get("proofreader_amount_kes") or 0), "completed_at": job.get("proofreader_completedAt"), "paid_at": job.get("proofreaderPaidAt")})
+        for item in earnings:
+            row = {"job_id": snap.id, "role": "Proofreader" if item["source"] == "proofreader" else ("Part " + str(item["source"]).split("_")[-1] if item["source"].startswith("part_") else "Transcriber"), "status": "paid" if item.get("payout_status") == "paid" or item.get("paid_at") else "upcoming", "job_status": item.get("status"), "payout_status": item.get("payout_status") or "accruing", "payout_period_id": item.get("payout_period_id"), "minutes": item["minutes"], "amount_kes": item["amount_kes"], "rate_kes_per_minute": round(item["amount_kes"] / item["minutes"], 2) if item["minutes"] else 0, "completed_at": _human_iso(item.get("completed_at")), "paid_at": _human_iso(item.get("paid_at"))}
+            (paid if row["status"] == "paid" else upcoming).append(row)
     paid.sort(key=lambda item: str(item.get("paid_at") or item.get("completed_at") or ""), reverse=True)
     upcoming.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
-
-    label, start, end = _pay_period_bounds(datetime.now())
+    label, start_dt, end_dt = _pay_period_bounds(datetime.now())
     current_accrued = [item for item in upcoming if item.get("payout_status") in (None, "accruing", "unassigned") and item.get("payout_period_id") in (None, label)]
-    payout_snapshots = await asyncio.to_thread(
-        lambda: list(db.collection(HUMAN_PAYOUT_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream())
-    )
+    payout_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_PAYOUT_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
     pending_payouts = []
     for snap in payout_snapshots:
         payout = snap.to_dict() or {}
         if payout.get("status") == "paid":
             continue
-        pending_payouts.append({
-            "payout_id": snap.id,
-            "period_label": payout.get("period_label"),
-            "period_start": _human_iso(payout.get("period_start")),
-            "period_end": _human_iso(payout.get("period_end")),
-            "total_minutes": int(payout.get("total_minutes") or 0),
-            "total_amount_kes": int(payout.get("total_amount_kes") or 0),
-            "status": payout.get("status") or "pending",
-        })
+        pending_payouts.append({"payout_id": snap.id, "period_label": payout.get("period_label"), "period_start": _human_iso(payout.get("period_start")), "period_end": _human_iso(payout.get("period_end")), "total_minutes": int(payout.get("total_minutes") or 0), "total_amount_kes": int(payout.get("total_amount_kes") or 0), "status": payout.get("status") or "pending"})
     pending_payouts.sort(key=lambda item: str(item.get("period_label") or ""), reverse=True)
-
-    return {
-        "paid": paid,
-        "upcoming": upcoming,
-        "totals": {
-            "paid_kes": sum(item["amount_kes"] for item in paid),
-            "upcoming_kes": sum(item["amount_kes"] for item in upcoming),
-        },
-        "current_period": {
-            "label": label,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "accrued_kes": sum(item["amount_kes"] for item in current_accrued),
-            "accrued_minutes": sum(item["minutes"] for item in current_accrued),
-        },
-        "pending_payouts": pending_payouts,
-    }
+    return {"paid": paid, "upcoming": upcoming, "totals": {"paid_kes": sum(item["amount_kes"] for item in paid), "upcoming_kes": sum(item["amount_kes"] for item in upcoming)}, "current_period": {"label": label, "start": start_dt.isoformat(), "end": end_dt.isoformat(), "accrued_kes": sum(item["amount_kes"] for item in current_accrued), "accrued_minutes": sum(item["minutes"] for item in current_accrued)}, "pending_payouts": pending_payouts}
 
 
 @app.get("/human-transcription/workers")
@@ -6042,16 +6212,10 @@ async def human_list_workers(request: Request):
 
 @app.get("/api/admin/worker-payments/search")
 async def admin_worker_payments_search(request: Request, worker_uid: str = "", start_date: str = "", end_date: str = "", status: str = "all"):
-    """Flexible search across every worker's completed jobs, for the admin
-    payment dashboard. A day is start_date == end_date; a week is a 7-day
-    range; leaving worker_uid empty searches every worker at once. status
-    is one of: all, accruing (this half, not yet invoiced), invoiced
-    (pending payout awaiting admin approval), paid."""
     _require_admin(request)
     if not db:
         return {"jobs": [], "total_minutes": 0, "total_amount_kes": 0}
     await _close_due_pay_periods()
-
     def _parse_day(value, end_of_day=False):
         if not value:
             return None
@@ -6060,52 +6224,27 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
         except Exception:
             return None
         return d.replace(hour=23, minute=59, second=59, microsecond=999999) if end_of_day else d
-
     start_bound = _parse_day(start_date)
     end_bound = _parse_day(end_date, end_of_day=True)
     status = (status or "all").strip().lower()
-
-    ref = db.collection(HUMAN_JOB_COLLECTION)
-    if worker_uid:
-        snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", worker_uid)).stream()))
-    else:
-        snapshots = await asyncio.to_thread(lambda: list(ref.stream()))
-
-    finished = {"submitted", "client_review", "client_approved", "released"}
     rows = []
-    for snap in snapshots:
+    for snap in await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream())):
         job = snap.to_dict() or {}
-        if job.get("status") not in finished or not job.get("worker_uid"):
-            continue
-        completed_at = _as_dt(job.get("workerCompletedAt") or job.get("submittedAt"))
-        if start_bound and (not completed_at or completed_at < start_bound):
-            continue
-        if end_bound and (not completed_at or completed_at > end_bound):
-            continue
-        job_payout_status = "paid" if job.get("payout_status") == "paid" else (job.get("payout_status") or "accruing")
-        if status != "all" and job_payout_status != status:
-            continue
-        minutes = int(job.get("worker_minutes") or job.get("minutes") or 0)
-        amount = int(job.get("worker_amount_kes") or 0)
-        rows.append({
-            "job_id": snap.id,
-            "worker_uid": job.get("worker_uid"),
-            "worker_email": job.get("worker_email") or "",
-            "worker_name": job.get("worker_name") or "",
-            "minutes": minutes,
-            "amount_kes": amount,
-            "payout_status": job_payout_status,
-            "payout_period_id": job.get("payout_period_id"),
-            "completed_at": _human_iso(completed_at),
-            "job_status": job.get("status"),
-        })
+        for item in _human_worker_earning_items(snap.id, job):
+            if worker_uid and item.get("worker_uid") != worker_uid:
+                continue
+            completed_at = item.get("completed_at")
+            if start_bound and (not completed_at or completed_at < start_bound):
+                continue
+            if end_bound and (not completed_at or completed_at > end_bound):
+                continue
+            payout_status = "paid" if item.get("source") == "job" and job.get("payout_status") == "paid" else (item.get("payout_status") or "accruing")
+            if status != "all" and payout_status != status:
+                continue
+            role = "Proofreader" if item.get("source") == "proofreader" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" else "Transcriber")
+            rows.append({"job_id": snap.id, "role": role, "worker_uid": item.get("worker_uid"), "worker_email": item.get("worker_email") or "", "worker_name": item.get("worker_name") or "", "minutes": item.get("minutes") or 0, "amount_kes": item.get("amount_kes") or 0, "payout_status": payout_status, "payout_period_id": item.get("payout_period_id"), "completed_at": _human_iso(completed_at), "job_status": job.get("status")})
     rows.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
-    return {
-        "jobs": rows,
-        "total_minutes": sum(item["minutes"] for item in rows),
-        "total_amount_kes": sum(item["amount_kes"] for item in rows),
-        "job_count": len(rows),
-    }
+    return {"jobs": rows, "total_minutes": sum(item["minutes"] for item in rows), "total_amount_kes": sum(item["amount_kes"] for item in rows), "job_count": len(rows)}
 
 
 @app.get("/api/admin/worker-payouts")
@@ -6168,18 +6307,34 @@ async def admin_mark_payout_paid(payout_id: str, request: Request):
         raise HTTPException(status_code=409, detail="This payout has already been marked as paid.")
     now = datetime.now()
     await asyncio.to_thread(payout_ref.set, {"status": "paid", "paidAt": now, "paidBy": (admin.get("email") or "").lower(), "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    items = payout.get("items") or []
     job_ids = payout.get("job_ids") or []
-    if job_ids:
+    if items:
+        by_job = {}
+        for item in items:
+            by_job.setdefault(item.get("job_id"), []).append(item)
+        for job_id, job_items in by_job.items():
+            snap = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+            job = snap.to_dict() or {}
+            segments = [dict(x or {}) for x in (job.get("segments") or [])]
+            update = {"updatedAt": firestore.SERVER_TIMESTAMP}
+            for item in job_items:
+                if item.get("source") == "job":
+                    update.update({"payout_status": "paid", "workerPaymentStatus": "paid", "workerPaidAt": now})
+                elif item.get("source") == "segment":
+                    for segment in segments:
+                        if segment.get("id") == item.get("segment_id"):
+                            segment.update({"payout_status": "paid", "workerPaymentStatus": "paid", "workerPaidAt": now})
+                    update["segments"] = segments
+                elif item.get("source") == "proofreader":
+                    update.update({"proofreader_payout_status": "paid", "proofreaderPaidAt": now})
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, update)
+    elif job_ids:
         batch = db.batch()
         for job_id in job_ids:
-            batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {
-                "payout_status": "paid",
-                "workerPaymentStatus": "paid",
-                "workerPaidAt": now,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-            })
+            batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {"payout_status": "paid", "workerPaymentStatus": "paid", "workerPaidAt": now, "updatedAt": firestore.SERVER_TIMESTAMP})
         await asyncio.to_thread(batch.commit)
-    return {"status": "paid", "payout_id": payout_id, "jobs_marked_paid": len(job_ids)}
+    return {"status": "paid", "payout_id": payout_id, "jobs_marked_paid": len(items) or len(job_ids)}
 
 
 @app.post("/human-transcription/jobs/{job_id}/approve")
@@ -6196,40 +6351,210 @@ async def human_admin_approve(job_id: str, request: Request):
 async def human_admin_assign(job_id: str, request: Request):
     _require_human_job_admin(request)
     payload = await request.json()
-    worker_uid = str(payload.get("worker_uid") or "").strip()
-    worker_email = str(payload.get("worker_email") or "").strip().lower()
-    worker_name = str(payload.get("worker_name") or "").strip()
+    job = await _human_job(job_id)
+    assignment_mode = str(payload.get("assignment_mode") or "single").strip().lower()
+    requested_workers = payload.get("workers") if isinstance(payload.get("workers"), list) else []
+    if not requested_workers and payload.get("worker_uid"):
+        requested_workers = [{
+            "worker_uid": payload.get("worker_uid"),
+            "worker_email": payload.get("worker_email"),
+            "worker_name": payload.get("worker_name"),
+        }]
+    requested_workers = [item for item in requested_workers if str(item.get("worker_uid") or "").strip()]
+    if assignment_mode == "dual" or len(requested_workers) == 2:
+        if len(requested_workers) != 2:
+            raise HTTPException(status_code=400, detail="Choose two different approved workers for a split assignment.")
+        worker_uids = [str(item.get("worker_uid")).strip() for item in requested_workers]
+        if len(set(worker_uids)) != 2:
+            raise HTTPException(status_code=400, detail="Choose two different workers for the two parts.")
+        if job.get("status") not in {"approved", "split_assigned", "split_in_progress", "proofreading_available", "proofreading_assigned"}:
+            raise HTTPException(status_code=409, detail="Approve the job before assigning its parts.")
+        try:
+            total_seconds = float(job.get("seconds") or 0)
+        except (TypeError, ValueError):
+            total_seconds = 0
+        midpoint = total_seconds / 2.0
+        total_minutes = max(1, int(job.get("minutes") or math.ceil(total_seconds / 60.0)))
+        first_minutes = max(1, int(math.ceil(total_minutes / 2.0)))
+        second_minutes = max(1, total_minutes - first_minutes)
+        part_seconds = [midpoint, max(1.0, total_seconds - midpoint)]
+        now = datetime.now()
+        segments = []
+        for index, worker in enumerate(requested_workers):
+            tat_seconds = human_tat_seconds(part_seconds[index])
+            segments.append({
+                "id": f"part_{index + 1}",
+                "label": f"Part {index + 1} of 2",
+                "index": index + 1,
+                "start_seconds": 0 if index == 0 else round(midpoint, 2),
+                "end_seconds": round(midpoint, 2) if index == 0 else round(total_seconds, 2),
+                "minutes": first_minutes if index == 0 else second_minutes,
+                "worker_uid": str(worker.get("worker_uid")).strip(),
+                "worker_email": str(worker.get("worker_email") or "").strip().lower(),
+                "worker_name": str(worker.get("worker_name") or "").strip(),
+                "status": "assigned",
+                "assignedAt": now,
+                "deadlineAt": now + timedelta(seconds=tat_seconds),
+                "tat_seconds": tat_seconds,
+                "tat_extension_minutes": 0,
+                "transcript": "",
+                "worker_notes": "",
+                "final_attachment": None,
+                "workerCompletedAt": None,
+                "worker_minutes": None,
+                "worker_amount_kes": None,
+                "payout_status": None,
+                "payout_period_id": None,
+                "auto_reassigned_count": 0,
+                "last_auto_reassigned_at": None,
+                "last_auto_reassigned_worker_name": None,
+            })
+        updates = {
+            "status": "split_assigned",
+            "split_mode": "dual",
+            "segments": segments,
+            "assigned_worker_uids": worker_uids,
+            "worker_uid": None,
+            "worker_email": None,
+            "worker_name": None,
+            "assignedAt": now,
+            "deadlineAt": None,
+            "tat_seconds": None,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+        return {"status": "split_assigned", "job_id": job_id, "segments": [{"id": item["id"], "worker_uid": item["worker_uid"], "tat_seconds": item["tat_seconds"]} for item in segments]}
+
+    if len(requested_workers) != 1:
+        raise HTTPException(status_code=400, detail="Choose an approved worker first.")
+    worker = requested_workers[0]
+    worker_uid = str(worker.get("worker_uid") or "").strip()
     if not worker_uid:
         raise HTTPException(status_code=400, detail="Choose an approved worker first.")
-    job = await _human_job(job_id)
+    if job.get("split_mode") == "dual":
+        segment_id = str(payload.get("segment_id") or "").strip()
+        if not segment_id:
+            raise HTTPException(status_code=400, detail="Choose which unassigned part to give this worker.")
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        target = next((item for item in segments if item.get("id") == segment_id), None)
+        if not target or target.get("status") not in {"available", "approved"}:
+            raise HTTPException(status_code=409, detail="That part is not waiting for reassignment.")
+        tat_seconds = human_tat_seconds(float(target.get("end_seconds") or 0) - float(target.get("start_seconds") or 0))
+        now = datetime.now()
+        target.update({
+            "worker_uid": worker_uid,
+            "worker_email": str(worker.get("worker_email") or "").strip().lower(),
+            "worker_name": str(worker.get("worker_name") or "").strip(),
+            "status": "assigned",
+            "assignedAt": now,
+            "deadlineAt": now + timedelta(seconds=tat_seconds),
+            "tat_seconds": tat_seconds,
+        })
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+            "segments": segments,
+            "assigned_worker_uids": [item.get("worker_uid") for item in segments if item.get("worker_uid")],
+            "status": "split_assigned",
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        return {"status": "split_assigned", "job_id": job_id, "segment_id": segment_id}
+
     if job.get("status") not in {"approved", "assigned"}:
         raise HTTPException(status_code=409, detail="Approve the job before assigning it.")
-    # The worker's turnaround clock starts the moment the job is assigned.
-    # One minute or less gets a practical six-minute minimum; longer jobs get
-    # four minutes for every rounded audio minute.
-    try:
-        audio_seconds = float(job.get("seconds") or 0)
-    except (TypeError, ValueError):
-        audio_seconds = 0
-    if audio_seconds <= 60:
-        tat_seconds = HUMAN_SHORT_AUDIO_TAT_MINUTES * 60
-    else:
-        minutes = max(1, int(math.ceil(audio_seconds / 60.0)))
-        tat_seconds = minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
+    tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
     now = datetime.now()
     deadline = now + timedelta(seconds=tat_seconds)
     updates = {
         "status": "assigned",
         "worker_uid": worker_uid,
-        "worker_email": worker_email,
-        "worker_name": worker_name,
+        "worker_email": str(worker.get("worker_email") or "").strip().lower(),
+        "worker_name": str(worker.get("worker_name") or "").strip(),
         "assignedAt": now,
         "deadlineAt": deadline,
         "tat_seconds": tat_seconds,
+        "tat_extension_minutes": 0,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     return {"status": "assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
+
+
+@app.post("/human-transcription/jobs/{job_id}/assign-proofreader")
+async def human_admin_assign_proofreader(job_id: str, request: Request):
+    _require_human_job_admin(request)
+    payload = await request.json()
+    worker_uid = str(payload.get("worker_uid") or "").strip()
+    if not worker_uid:
+        raise HTTPException(status_code=400, detail="Choose an approved proofreader first.")
+    job = await _human_job(job_id)
+    if job.get("split_mode") != "dual" or not all((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+        raise HTTPException(status_code=409, detail="Both parts must be submitted before assigning the final proofreader.")
+    tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
+    now = datetime.now()
+    assigned = list(job.get("assigned_worker_uids") or [])
+    if worker_uid not in assigned:
+        assigned.append(worker_uid)
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "status": "proofreading_assigned",
+        "proofreader_uid": worker_uid,
+        "proofreader_email": str(payload.get("worker_email") or "").strip().lower(),
+        "proofreader_name": str(payload.get("worker_name") or "").strip(),
+        "proofreader_status": "assigned",
+        "proofreader_assignedAt": now,
+        "proofreader_deadlineAt": now + timedelta(seconds=tat_seconds),
+        "proofreader_tat_seconds": tat_seconds,
+        "proofreader_tat_extension_minutes": 0,
+        "assigned_worker_uids": assigned,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "proofreading_assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
+
+
+@app.post("/human-transcription/jobs/{job_id}/extend-tat")
+async def human_admin_extend_tat(job_id: str, request: Request):
+    _require_human_job_admin(request)
+    payload = await request.json()
+    try:
+        extra_minutes = int(payload.get("minutes"))
+    except (TypeError, ValueError):
+        extra_minutes = 0
+    if extra_minutes not in HUMAN_TAT_EXTENSION_OPTIONS:
+        raise HTTPException(status_code=400, detail="Choose a 5, 10, 15, or 20 minute extension.")
+    job = await _human_job(job_id)
+    now = datetime.now()
+    segment_id = str(payload.get("segment_id") or "").strip()
+    if job.get("split_mode") == "dual":
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        target = next((item for item in segments if item.get("id") == segment_id), None) if segment_id else None
+        if not target:
+            raise HTTPException(status_code=400, detail="Choose the part whose deadline should be extended.")
+        if target.get("status") not in {"assigned", "in_progress"} or not _as_dt(target.get("deadlineAt")) or _as_dt(target.get("deadlineAt")) <= now:
+            raise HTTPException(status_code=409, detail="That part is no longer active, so its deadline cannot be extended.")
+        target["deadlineAt"] = _as_dt(target.get("deadlineAt")) + timedelta(minutes=extra_minutes)
+        target["tat_seconds"] = int(target.get("tat_seconds") or 0) + extra_minutes * 60
+        target["tat_extension_minutes"] = int(target.get("tat_extension_minutes") or 0) + extra_minutes
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "updatedAt": firestore.SERVER_TIMESTAMP})
+        return {"status": "extended", "job_id": job_id, "segment_id": segment_id, "minutes_added": extra_minutes}
+    if job.get("proofreader_uid") and str(payload.get("target") or "") == "proofreader":
+        deadline = _as_dt(job.get("proofreader_deadlineAt"))
+        if job.get("proofreader_status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
+            raise HTTPException(status_code=409, detail="The proofreader deadline is no longer active.")
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+            "proofreader_deadlineAt": deadline + timedelta(minutes=extra_minutes),
+            "proofreader_tat_seconds": int(job.get("proofreader_tat_seconds") or 0) + extra_minutes * 60,
+            "proofreader_tat_extension_minutes": int(job.get("proofreader_tat_extension_minutes") or 0) + extra_minutes,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        return {"status": "extended", "job_id": job_id, "target": "proofreader", "minutes_added": extra_minutes}
+    deadline = _as_dt(job.get("deadlineAt"))
+    if job.get("status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
+        raise HTTPException(status_code=409, detail="This job's deadline is no longer active.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "deadlineAt": deadline + timedelta(minutes=extra_minutes),
+        "tat_seconds": int(job.get("tat_seconds") or 0) + extra_minutes * 60,
+        "tat_extension_minutes": int(job.get("tat_extension_minutes") or 0) + extra_minutes,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "extended", "job_id": job_id, "minutes_added": extra_minutes}
 
 
 @app.post("/human-transcription/jobs/{job_id}/start")
@@ -6238,9 +6563,20 @@ async def human_worker_start(job_id: str, request: Request):
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
     job = await _human_job(job_id)
-    if job.get("worker_uid") != actor["uid"] and job.get("status") == "approved":
-        raise HTTPException(status_code=409, detail="The deadline for this job passed and it has been returned to the admin queue for reassignment.")
     await _human_assert_access(job, actor, allow_admin=False)
+    if job.get("split_mode") == "dual":
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        target = next((item for item in segments if item.get("worker_uid") == actor["uid"]), None)
+        if target and target.get("status") in {"assigned", "in_progress"}:
+            target["status"] = "in_progress"
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": "split_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+            return {"status": "in_progress", "job_id": job_id, "segment_id": target.get("id")}
+        if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"proofreader_status": "in_progress", "status": "proofreading_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+            return {"status": "in_progress", "job_id": job_id, "role": "proofreader"}
+        raise HTTPException(status_code=409, detail="This assignment is not ready to start.")
+    if job.get("worker_uid") != actor["uid"]:
+        raise HTTPException(status_code=403, detail="You do not have access to this job.")
     if job.get("status") not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="This job is not ready to start.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
@@ -6259,23 +6595,73 @@ async def human_worker_submit(
     if actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
     job = await _human_job(job_id)
-    if job.get("worker_uid") != actor["uid"] and job.get("status") == "approved":
-        raise HTTPException(status_code=409, detail="The deadline for this job passed and it has been returned to the admin queue for reassignment.")
     await _human_assert_access(job, actor, allow_admin=False)
     transcript_text = str(transcript or "").strip()
-    # Some jobs only need the finished file handed back -- there is nothing
-    # to type into the shared editor. A worker may submit with just that
-    # attachment, as long as there is either real transcript text or a
-    # final file, never neither.
+
+    if job.get("split_mode") == "dual":
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
+        if target:
+            final_attachment = target.get("final_attachment")
+            if attachment and attachment.filename:
+                final_attachment = await _human_store_upload(job_id, attachment, f"final-{target.get('id')}")
+            if not transcript_text and not final_attachment:
+                raise HTTPException(status_code=400, detail="Add your part of the transcript, or attach the finished file, before submitting.")
+            quote = job.get("quote") or {}
+            minutes = int(target.get("minutes") or 0)
+            rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+            target.update({
+                "status": "submitted",
+                "transcript": transcript_text[:1000000],
+                "final_attachment": final_attachment,
+                "worker_notes": str(notes or "")[:12000],
+                "submittedAt": datetime.now(),
+                "workerCompletedAt": datetime.now(),
+                "worker_minutes": minutes,
+                "worker_amount_kes": max(0, minutes * rate),
+                "payout_status": "unassigned",
+            })
+            both_submitted = all(item.get("status") == "submitted" for item in segments)
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+                "segments": segments,
+                "status": "proofreading_available" if both_submitted else "split_in_progress",
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+            return {"status": "proofreading_available" if both_submitted else "split_in_progress", "job_id": job_id, "segment_id": target.get("id")}
+
+        if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
+            final_attachment = job.get("final_attachment")
+            if attachment and attachment.filename:
+                final_attachment = await _human_store_upload(job_id, attachment, "proofreader-final")
+            combined = transcript_text or "\n\n".join(item.get("transcript", "") for item in segments if item.get("transcript"))
+            if not combined and not final_attachment:
+                raise HTTPException(status_code=400, detail="Review both parts and submit the combined transcript or a finished file.")
+            minutes = int(job.get("minutes") or 0)
+            rate = int((job.get("quote") or {}).get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+                "status": "submitted",
+                "transcript": combined[:1000000],
+                "final_attachment": final_attachment,
+                "worker_notes": str(notes or "")[:12000],
+                "proofreader_status": "submitted",
+                "proofreader_completedAt": datetime.now(),
+                "proofreader_minutes": minutes,
+                "proofreader_amount_kes": max(0, minutes * rate),
+                "proofreader_payout_status": "unassigned",
+                "submittedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+            return {"status": "submitted", "job_id": job_id, "role": "proofreader"}
+        raise HTTPException(status_code=409, detail="This assignment is no longer active.")
+
+    if job.get("worker_uid") != actor["uid"]:
+        raise HTTPException(status_code=403, detail="You do not have access to this job.")
+    transcript_text = str(transcript or "").strip()
     final_attachment = job.get("final_attachment")
     if attachment and attachment.filename:
         final_attachment = await _human_store_upload(job_id, attachment, "final")
     if not transcript_text and not final_attachment:
         raise HTTPException(status_code=400, detail="Add the completed transcript, or attach the finished file, before submitting.")
-    # Lock in the worker's pay for this job now, at submission time, so a
-    # later change to the per-minute rate never rewrites what was already
-    # earned. This amount is what accrues toward the current half-month
-    # pay period and, once that half ends, into a pending payout invoice.
     quote = job.get("quote") or {}
     minutes = int(job.get("minutes") or quote.get("minutes") or 0)
     rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
@@ -6544,7 +6930,7 @@ async def human_final_attachment(job_id: str, request: Request):
 
 
 @app.get("/human-transcription/jobs/{job_id}/audio")
-async def human_audio(job_id: str, request: Request):
+async def human_audio(job_id: str, request: Request, segment_id: str = ""): 
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
@@ -6557,6 +6943,24 @@ async def human_audio(job_id: str, request: Request):
     if not blob.exists():
         raise HTTPException(status_code=404, detail="The source audio is no longer available.")
     raw = await asyncio.to_thread(blob.download_as_bytes)
+    # Split workers receive only their assigned half of the recording. Admins,
+    # clients and proofreaders continue to receive the complete source audio.
+    if segment_id and actor.get("role") == "worker" and job.get("split_mode") == "dual":
+        segment = next((item for item in (job.get("segments") or []) if item.get("id") == segment_id and item.get("worker_uid") == actor.get("uid")), None)
+        if not segment:
+            raise HTTPException(status_code=403, detail="That audio segment is not assigned to you.")
+        try:
+            suffix = str(meta.get("name") or "").rsplit(".", 1)[-1].lower()
+            source = AudioSegment.from_file(BytesIO(raw), format=suffix if suffix in {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac"} else None)
+            start_ms = max(0, int(float(segment.get("start_seconds") or 0) * 1000))
+            end_ms = min(len(source), int(float(segment.get("end_seconds") or len(source) / 1000) * 1000))
+            clipped = source[start_ms:end_ms]
+            output = BytesIO()
+            clipped.export(output, format="mp3", bitrate="64k")
+            raw = output.getvalue()
+            return Response(content=raw, media_type="audio/mpeg", headers={"Content-Disposition": f"inline; filename={segment.get('id') or 'assigned-part'}.mp3"})
+        except Exception as exc:
+            logger.warning("Could not clip split audio %s/%s: %s", job_id, segment_id, exc)
     return Response(content=raw, media_type=meta.get("content_type") or "application/octet-stream", headers={"Content-Disposition": f"inline; filename={meta.get('name') or 'source-audio'}"})
 
 
