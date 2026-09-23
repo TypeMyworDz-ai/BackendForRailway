@@ -732,12 +732,12 @@ HUMAN_RUSH_CREDITS_PER_MINUTE = 55
 HUMAN_STANDARD_PAYOUT_KES = 15
 HUMAN_RUSH_PAYOUT_KES = 38
 
-# TMWD_HUMAN_TAT_V1
-# A worker gets 3 minutes of turnaround time for every 1 minute of assigned
-# audio (a 10-minute audio job -> a 30-minute deadline). If the worker has
-# not submitted by the deadline, the job is automatically taken back and
-# returned to the admin queue ("approved", unassigned) for reassignment.
-HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE = 3
+# TMWD_HUMAN_TAT_V2
+# Jobs of one minute or less receive a six-minute minimum TAT. Longer jobs
+# receive four minutes for every rounded audio minute. If the worker has not
+# submitted by the deadline, the job is returned to the admin queue.
+HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE = 4
+HUMAN_SHORT_AUDIO_TAT_MINUTES = 6
 
 
 def human_credit_quote(seconds, turnaround="standard", difficulty="standard", service="standard", speakers="1-2", timestamps=True, formatting="standard"):
@@ -5918,7 +5918,22 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
                 continue
         jobs.append(_human_public_for(item, actor["role"]))
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
-    return {"jobs": jobs}
+    response = {"jobs": jobs}
+    if actor["role"] == "worker":
+        ratings = []
+        for snapshot in snapshots:
+            raw_rating = (snapshot.to_dict() or {}).get("worker_rating")
+            try:
+                value = float(raw_rating)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and 1 <= value <= 5:
+                ratings.append(value)
+        response["worker_rating_summary"] = {
+            "average": round(sum(ratings) / len(ratings), 2) if ratings else None,
+            "count": len(ratings),
+        }
+    return response
 
 
 @app.get("/human-transcription/worker/payment-history")
@@ -6189,10 +6204,18 @@ async def human_admin_assign(job_id: str, request: Request):
     job = await _human_job(job_id)
     if job.get("status") not in {"approved", "assigned"}:
         raise HTTPException(status_code=409, detail="Approve the job before assigning it.")
-    # The worker's turnaround clock starts the moment the job is assigned:
-    # 3 minutes of TAT for every 1 minute of assigned audio.
-    minutes = max(1, int(job.get("minutes") or 1))
-    tat_seconds = minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
+    # The worker's turnaround clock starts the moment the job is assigned.
+    # One minute or less gets a practical six-minute minimum; longer jobs get
+    # four minutes for every rounded audio minute.
+    try:
+        audio_seconds = float(job.get("seconds") or 0)
+    except (TypeError, ValueError):
+        audio_seconds = 0
+    if audio_seconds <= 60:
+        tat_seconds = HUMAN_SHORT_AUDIO_TAT_MINUTES * 60
+    else:
+        minutes = max(1, int(math.ceil(audio_seconds / 60.0)))
+        tat_seconds = minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
     now = datetime.now()
     deadline = now + timedelta(seconds=tat_seconds)
     updates = {
