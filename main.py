@@ -5524,6 +5524,18 @@ _HUMAN_CLIENT_IDENTITY_FIELDS = ("client_uid", "client_email", "client_name")
 _HUMAN_WORKER_IDENTITY_FIELDS = ("worker_uid", "worker_email", "worker_name")
 
 
+def _human_worker_segment(segments, actor_uid):
+    """Select this worker's active part first, then their most recent part.
+
+    A worker may be assigned a later split part after finishing an earlier
+    one. Choosing the first matching segment would keep exposing the submitted
+    part and hide the new active assignment.
+    """
+    owned = [item for item in (segments or []) if (item or {}).get("worker_uid") == actor_uid]
+    active = next((item for item in owned if item.get("status") in {"assigned", "in_progress"}), None)
+    return active or (owned[-1] if owned else None)
+
+
 def _human_public_for(data, actor_role, actor_uid=""):
     """Serialize a human job without leaking the other side's identity.
 
@@ -5547,19 +5559,17 @@ def _human_public_for(data, actor_role, actor_uid=""):
             out.pop(key, None)
         for key in ("quote_credits", "credits_charged", "credits_deducted", "credit_cost", "price", "amount", "currency", "quote"):
             out.pop(key, None)
-        assignment = None
-        for item in segments:
-            if (item or {}).get("worker_uid") == actor_uid:
-                assignment = dict(item)
-                assignment["time_remaining_seconds"] = remaining(item.get("deadlineAt"), item.get("status"))
-                assignment["role"] = "transcriber"
-                break
+        owned_segment = _human_worker_segment(segments, actor_uid)
+        assignment = dict(owned_segment) if owned_segment else None
+        if assignment is not None:
+            assignment["time_remaining_seconds"] = remaining(assignment.get("deadlineAt"), assignment.get("status"))
+            assignment["role"] = "transcriber"
         if assignment is None and data.get("worker_uid") == actor_uid:
             assignment = {
                 "id": "transcriber", "label": "Full transcript", "role": "transcriber",
                 "status": data.get("status"), "transcript": data.get("transcript") or "",
                 "final_attachment": _human_public(data.get("final_attachment") or {}) if data.get("final_attachment") else None,
-                "deadlineAt": data.get("deadlineAt"),
+                "assignedAt": data.get("assignedAt"), "deadlineAt": data.get("deadlineAt"),
                 "time_remaining_seconds": remaining(data.get("deadlineAt"), data.get("status")),
                 "start_seconds": 0, "end_seconds": data.get("seconds"),
             }
@@ -5572,6 +5582,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
                 "transcript": data.get("transcript") or "\n\n".join(
                     item.get("transcript", "") for item in segments if item.get("transcript")
                 ),
+                "assignedAt": data.get("proofreader_assignedAt"),
                 # The proofreader must start with a clean final-file input;
                 # the earlier segment attachments are presented separately.
                 "final_attachment": None,
@@ -5756,7 +5767,7 @@ async def _human_check_expiry(job_id: str, job: dict):
         if changed:
             job = dict(job)
             job["segments"] = segments
-            job["assigned_worker_uids"] = [item.get("worker_uid") for item in segments if item.get("worker_uid")]
+            job["assigned_worker_uids"] = list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid")))
             if job.get("proofreader_status") in ("assigned", "in_progress"):
                 job["status"] = "proofreading_assigned"
             elif all(item.get("status") == "submitted" for item in segments):
@@ -6232,7 +6243,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         item["id"] = snap.id
         item = await _human_check_expiry(snap.id, item)
         if actor["role"] == "worker" or scope in {"assigned", "finished"}:
-            assignment = next((part for part in (item.get("segments") or []) if part.get("worker_uid") == actor["uid"]), None)
+            assignment = _human_worker_segment(item.get("segments") or [], actor["uid"])
             is_proofreader = item.get("proofreader_uid") == actor["uid"]
             current_status = item.get("proofreader_status") if is_proofreader else (assignment.get("status") if assignment else item.get("status"))
             finished = {"submitted", "client_review", "client_approved", "released"}
@@ -6266,7 +6277,7 @@ async def human_workflow_notifications(request: Request, since: str = ""):
     """Return small, role-filtered human-work events for app-wide alerts."""
     actor = await _human_actor(request)
     if not db:
-        return {"events": [], "server_time": datetime.now().isoformat()}
+        return {"events": [], "server_time": datetime.now().astimezone().isoformat()}
     try:
         since_dt = _as_dt(datetime.fromisoformat(str(since).replace("Z", "+00:00"))) if since else None
     except Exception:
@@ -6338,7 +6349,7 @@ async def human_workflow_notifications(request: Request, since: str = ""):
             if last_message.get("sender_uid") != actor["uid"] and recent(last_message.get("createdAt")):
                 events.append({"type": "message", "job_id": job_id, "job_name": job_name, "sender_role": last_message.get("sender_role"), "thread": message_thread, "message_id": last_message.get("id"), "updated_at": _human_iso(last_message.get("createdAt"))})
     events.sort(key=lambda event: str(event.get("updated_at") or ""))
-    return {"events": events, "server_time": datetime.now().isoformat()}
+    return {"events": events, "server_time": datetime.now().astimezone().isoformat()}
 
 
 @app.get("/human-transcription/worker/payment-history")
@@ -6855,10 +6866,11 @@ async def human_admin_assign(job_id: str, request: Request):
     requested_workers = [item for item in requested_workers if str(item.get("worker_uid") or "").strip()]
     if assignment_mode == "dual" or len(requested_workers) == 2:
         if len(requested_workers) != 2:
-            raise HTTPException(status_code=400, detail="Choose two different approved workers for a split assignment.")
+            raise HTTPException(status_code=400, detail="Choose a worker for each part of the split assignment.")
+        if job.get("split_mode") == "dual" and job.get("segments"):
+            raise HTTPException(status_code=409, detail="This job is already split. Assign or reassign one part at a time so submitted work is preserved.")
         worker_uids = [str(item.get("worker_uid")).strip() for item in requested_workers]
-        if len(set(worker_uids)) != 2:
-            raise HTTPException(status_code=400, detail="Choose two different workers for the two parts.")
+        same_worker_sequential = worker_uids[0] == worker_uids[1]
         if job.get("status") not in {"approved", "split_assigned", "split_in_progress", "proofreading_available", "proofreading_assigned"}:
             raise HTTPException(status_code=409, detail="Approve the job before assigning its parts.")
         try:
@@ -6873,7 +6885,8 @@ async def human_admin_assign(job_id: str, request: Request):
         now = datetime.now()
         segments = []
         for index, worker in enumerate(requested_workers):
-            tat_seconds = human_tat_seconds(part_seconds[index])
+            staged_part = same_worker_sequential and index == 1
+            tat_seconds = human_tat_seconds(part_seconds[index]) if not staged_part else None
             segments.append({
                 "id": f"part_{index + 1}",
                 "label": f"Part {index + 1} of 2",
@@ -6881,12 +6894,12 @@ async def human_admin_assign(job_id: str, request: Request):
                 "start_seconds": 0 if index == 0 else round(midpoint, 2),
                 "end_seconds": round(midpoint, 2) if index == 0 else round(total_seconds, 2),
                 "minutes": first_minutes if index == 0 else second_minutes,
-                "worker_uid": str(worker.get("worker_uid")).strip(),
-                "worker_email": str(worker.get("worker_email") or "").strip().lower(),
-                "worker_name": str(worker.get("worker_name") or "").strip(),
-                "status": "assigned",
-                "assignedAt": now,
-                "deadlineAt": now + timedelta(seconds=tat_seconds),
+                "worker_uid": None if staged_part else str(worker.get("worker_uid")).strip(),
+                "worker_email": "" if staged_part else str(worker.get("worker_email") or "").strip().lower(),
+                "worker_name": "" if staged_part else str(worker.get("worker_name") or "").strip(),
+                "status": "available" if staged_part else "assigned",
+                "assignedAt": None if staged_part else now,
+                "deadlineAt": None if staged_part else now + timedelta(seconds=tat_seconds),
                 "tat_seconds": tat_seconds,
                 "tat_extension_minutes": 0,
                 "transcript": "",
@@ -6905,7 +6918,7 @@ async def human_admin_assign(job_id: str, request: Request):
             "status": "split_assigned",
             "split_mode": "dual",
             "segments": segments,
-            "assigned_worker_uids": worker_uids,
+            "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
             "worker_uid": None,
             "worker_email": None,
             "worker_name": None,
@@ -6915,7 +6928,12 @@ async def human_admin_assign(job_id: str, request: Request):
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
-        return {"status": "split_assigned", "job_id": job_id, "segments": [{"id": item["id"], "worker_uid": item["worker_uid"], "tat_seconds": item["tat_seconds"]} for item in segments]}
+        return {
+            "status": "split_assigned",
+            "job_id": job_id,
+            "same_worker_sequential": same_worker_sequential,
+            "segments": [{"id": item["id"], "worker_uid": item["worker_uid"], "status": item["status"], "tat_seconds": item["tat_seconds"]} for item in segments],
+        }
 
     if len(requested_workers) != 1:
         raise HTTPException(status_code=400, detail="Choose an approved worker first.")
@@ -6926,11 +6944,15 @@ async def human_admin_assign(job_id: str, request: Request):
     if job.get("split_mode") == "dual":
         segment_id = str(payload.get("segment_id") or "").strip()
         if not segment_id:
-            raise HTTPException(status_code=400, detail="Choose which unassigned part to give this worker.")
+            raise HTTPException(status_code=400, detail="Choose a part waiting for assignment.")
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         target = next((item for item in segments if item.get("id") == segment_id), None)
         if not target or target.get("status") not in {"available", "approved"}:
-            raise HTTPException(status_code=409, detail="That part is not waiting for reassignment.")
+            raise HTTPException(status_code=409, detail="That part is not waiting for assignment.")
+        active_part = next((item for item in segments if item.get("id") != target.get("id") and item.get("worker_uid") == worker_uid and item.get("status") in {"assigned", "in_progress"}), None)
+        if active_part:
+            label = active_part.get("label") or "the current part"
+            raise HTTPException(status_code=409, detail=f"Let this worker submit {label} before assigning another part to them.")
         tat_seconds = human_tat_seconds(float(target.get("end_seconds") or 0) - float(target.get("start_seconds") or 0))
         now = datetime.now()
         target.update({
@@ -6944,7 +6966,7 @@ async def human_admin_assign(job_id: str, request: Request):
         })
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
             "segments": segments,
-            "assigned_worker_uids": [item.get("worker_uid") for item in segments if item.get("worker_uid")],
+            "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
             "status": "split_assigned",
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
@@ -7058,8 +7080,8 @@ async def human_worker_start(job_id: str, request: Request):
     await _human_assert_access(job, actor, allow_admin=False)
     if job.get("split_mode") == "dual":
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
-        target = next((item for item in segments if item.get("worker_uid") == actor["uid"]), None)
-        if target and target.get("status") in {"assigned", "in_progress"}:
+        target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
+        if target:
             target["status"] = "in_progress"
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": "split_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
             return {"status": "in_progress", "job_id": job_id, "segment_id": target.get("id")}
