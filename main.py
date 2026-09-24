@@ -7629,6 +7629,27 @@ async def human_final_attachment(job_id: str, request: Request):
     )
 
 
+def _human_worker_split_mp3_bytes(clipped):
+    """Make a small speech-first MP3 without collapsing distinct speaker channels."""
+    channels = clipped.split_to_mono()
+    identical_channels = len(channels) > 1 and all(
+        channel.raw_data == channels[0].raw_data for channel in channels[1:]
+    )
+    if len(channels) == 1 or identical_channels:
+        # 22.05 kHz / 32 kbps mono keeps speech clear while halving the
+        # size of the previous 64 kbps worker clip.
+        speech_audio = channels[0].set_frame_rate(22050)
+        bitrate = "32k"
+    else:
+        # Separate stereo tracks can contain different speakers. Preserve
+        # those channels rather than downmixing them into one another.
+        speech_audio = clipped.set_frame_rate(22050)
+        bitrate = "64k"
+    output = BytesIO()
+    speech_audio.export(output, format="mp3", bitrate=bitrate)
+    return output.getvalue()
+
+
 @app.get("/human-transcription/jobs/{job_id}/audio")
 async def human_audio(job_id: str, request: Request, segment_id: str = ""): 
     actor = await _human_actor(request)
@@ -7655,12 +7676,13 @@ async def human_audio(job_id: str, request: Request, segment_id: str = ""):
             start_ms = max(0, int(float(segment.get("start_seconds") or 0) * 1000))
             end_ms = min(len(source), int(float(segment.get("end_seconds") or len(source) / 1000) * 1000))
             clipped = source[start_ms:end_ms]
-            output = BytesIO()
-            clipped.export(output, format="mp3", bitrate="64k")
-            raw = output.getvalue()
+            raw = _human_worker_split_mp3_bytes(clipped)
             return Response(content=raw, media_type="audio/mpeg", headers={"Content-Disposition": f"inline; filename={segment.get('id') or 'assigned-part'}.mp3"})
         except Exception as exc:
             logger.warning("Could not clip split audio %s/%s: %s", job_id, segment_id, exc)
+            # Never send the full source recording when a worker is authorized
+            # for only one part and segment preparation fails.
+            raise HTTPException(status_code=502, detail="The assigned audio segment could not be prepared. Please try again or contact the admin.")
     return Response(content=raw, media_type=meta.get("content_type") or "application/octet-stream", headers={"Content-Disposition": f"inline; filename={meta.get('name') or 'source-audio'}"})
 
 
