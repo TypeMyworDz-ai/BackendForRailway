@@ -731,6 +731,7 @@ HUMAN_RUSH_CREDITS_PER_MINUTE = 55
 # standard work.
 HUMAN_STANDARD_PAYOUT_KES = 15
 HUMAN_RUSH_PAYOUT_KES = 38
+HUMAN_PROOFREADING_PAYOUT_KES = 10
 
 # TMWD_HUMAN_TAT_V2
 # Jobs of one minute or less receive a six-minute minimum TAT. Longer jobs
@@ -2819,6 +2820,9 @@ async def register_trainee(request: Request):
     country_code = str(payload.get("country_code") or "").strip().upper()
     if len(official_name) < 2:
         raise HTTPException(status_code=400, detail="Enter your official ID name.")
+    registered_name = str((actor.get("profile") or {}).get("officialIdName") or "").strip()
+    if registered_name and registered_name.casefold() != official_name.casefold():
+        raise HTTPException(status_code=409, detail="Your official name is locked from trainee registration. Contact support if it needs correcting.")
     if country_code != TRAINEE_COUNTRY:
         raise HTTPException(status_code=400, detail="Training enrollment is currently limited to Kenya.")
     if not db:
@@ -5739,7 +5743,10 @@ async def human_expiry_sweep():
         return
     try:
         snapshots = await asyncio.to_thread(
-            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("status", "in", ["assigned", "in_progress"])).stream())
+            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("status", "in", [
+                "assigned", "in_progress", "split_assigned", "split_in_progress",
+                "proofreading_assigned", "proofreading_in_progress",
+            ])).stream())
         )
     except Exception as exc:
         logger.warning("Human job expiry sweep could not list jobs: %s", exc)
@@ -5813,7 +5820,7 @@ def _human_worker_earning_items(job_id, job):
             "source": "proofreader", "job_id": job_id, "worker_uid": job.get("proofreader_uid"),
             "worker_email": job.get("proofreader_email") or "", "worker_name": job.get("proofreader_name") or "",
             "completed_at": _as_dt(job.get("proofreader_completedAt")), "minutes": minutes,
-            "amount_kes": int(job.get("proofreader_amount_kes") or max(0, minutes * default_rate)),
+            "amount_kes": int(job.get("proofreader_amount_kes") or max(0, minutes * HUMAN_PROOFREADING_PAYOUT_KES)),
         }
 
 
@@ -6175,15 +6182,66 @@ async def human_worker_payment_history(request: Request):
     upcoming.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
     label, start_dt, end_dt = _pay_period_bounds(datetime.now())
     current_accrued = [item for item in upcoming if item.get("payout_status") in (None, "accruing", "unassigned") and item.get("payout_period_id") in (None, label)]
+    is_proofreading = lambda row: row.get("role") == "Proofreader"
+    def earning_breakdown(rows):
+        transcription_rows = [row for row in rows if not is_proofreading(row)]
+        proofreading_rows = [row for row in rows if is_proofreading(row)]
+        return {
+            "transcription_kes": sum(row["amount_kes"] for row in transcription_rows),
+            "transcription_minutes": sum(row["minutes"] for row in transcription_rows),
+            "proofreading_kes": sum(row["amount_kes"] for row in proofreading_rows),
+            "proofreading_minutes": sum(row["minutes"] for row in proofreading_rows),
+            "total_kes": sum(row["amount_kes"] for row in rows),
+            "total_minutes": sum(row["minutes"] for row in rows),
+        }
+    paid_breakdown = earning_breakdown(paid)
+    upcoming_breakdown = earning_breakdown(upcoming)
+    current_breakdown = earning_breakdown(current_accrued)
     payout_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_PAYOUT_COLLECTION).where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream()))
     pending_payouts = []
     for snap in payout_snapshots:
         payout = snap.to_dict() or {}
         if payout.get("status") == "paid":
             continue
-        pending_payouts.append({"payout_id": snap.id, "period_label": payout.get("period_label"), "period_start": _human_iso(payout.get("period_start")), "period_end": _human_iso(payout.get("period_end")), "total_minutes": int(payout.get("total_minutes") or 0), "total_amount_kes": int(payout.get("total_amount_kes") or 0), "status": payout.get("status") or "pending"})
+        payout_items = payout.get("items") or []
+        transcription_items = [item for item in payout_items if item.get("source") != "proofreader"]
+        proofreading_items = [item for item in payout_items if item.get("source") == "proofreader"]
+        pending_payouts.append({
+            "payout_id": snap.id,
+            "period_label": payout.get("period_label"),
+            "period_start": _human_iso(payout.get("period_start")),
+            "period_end": _human_iso(payout.get("period_end")),
+            "total_minutes": int(payout.get("total_minutes") or 0),
+            "total_amount_kes": int(payout.get("total_amount_kes") or 0),
+            "transcription_amount_kes": sum(int(item.get("amount_kes") or 0) for item in transcription_items),
+            "proofreading_amount_kes": sum(int(item.get("amount_kes") or 0) for item in proofreading_items),
+            "status": payout.get("status") or "pending",
+        })
+        if not payout_items:
+            pending_payouts[-1]["transcription_amount_kes"] = int(payout.get("total_amount_kes") or 0)
     pending_payouts.sort(key=lambda item: str(item.get("period_label") or ""), reverse=True)
-    return {"paid": paid, "upcoming": upcoming, "totals": {"paid_kes": sum(item["amount_kes"] for item in paid), "upcoming_kes": sum(item["amount_kes"] for item in upcoming)}, "current_period": {"label": label, "start": start_dt.isoformat(), "end": end_dt.isoformat(), "accrued_kes": sum(item["amount_kes"] for item in current_accrued), "accrued_minutes": sum(item["minutes"] for item in current_accrued)}, "pending_payouts": pending_payouts}
+    return {
+        "paid": paid,
+        "upcoming": upcoming,
+        "totals": {
+            "paid_kes": paid_breakdown["total_kes"],
+            "upcoming_kes": upcoming_breakdown["total_kes"],
+            "paid_transcription_kes": paid_breakdown["transcription_kes"],
+            "paid_proofreading_kes": paid_breakdown["proofreading_kes"],
+            "upcoming_transcription_kes": upcoming_breakdown["transcription_kes"],
+            "upcoming_proofreading_kes": upcoming_breakdown["proofreading_kes"],
+        },
+        "current_period": {
+            "label": label, "start": start_dt.isoformat(), "end": end_dt.isoformat(),
+            "accrued_kes": current_breakdown["total_kes"],
+            "accrued_minutes": current_breakdown["total_minutes"],
+            "transcription_kes": current_breakdown["transcription_kes"],
+            "transcription_minutes": current_breakdown["transcription_minutes"],
+            "proofreading_kes": current_breakdown["proofreading_kes"],
+            "proofreading_minutes": current_breakdown["proofreading_minutes"],
+        },
+        "pending_payouts": pending_payouts,
+    }
 
 
 @app.get("/human-transcription/workers")
@@ -6210,9 +6268,72 @@ async def human_list_workers(request: Request):
     return {"workers": workers}
 
 
+@app.get("/human-transcription/worker/payment-profile")
+async def human_worker_payment_profile(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    profile = actor.get("profile") or {}
+    return {
+        "official_id_name": profile.get("officialIdName") or profile.get("name") or "",
+        "mpesa_registered_name": profile.get("mpesaRegisteredName") or "",
+        "mpesa_number": profile.get("mpesaNumber") or "",
+        "complete": bool(profile.get("mpesaRegisteredName") and profile.get("mpesaNumber")),
+    }
+
+
+@app.post("/human-transcription/worker/payment-profile")
+async def human_worker_save_payment_profile(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    payload = await request.json()
+    registered_name = re.sub(r"\s+", " ", str(payload.get("mpesa_registered_name") or "").strip())[:120]
+    raw_number = re.sub(r"[\s()+.-]", "", str(payload.get("mpesa_number") or ""))
+    if bool(registered_name) != bool(raw_number):
+        raise HTTPException(status_code=400, detail="Enter both the M-Pesa registered name and number, or clear both fields.")
+    normalized_number = ""
+    if registered_name:
+        if len(registered_name) < 2:
+            raise HTTPException(status_code=400, detail="Enter the M-Pesa account name as it appears in M-Pesa.")
+        if not re.fullmatch(r"(?:254|0)(?:7|1)\d{8}", raw_number):
+            raise HTTPException(status_code=400, detail="Enter a valid Kenyan M-Pesa number, such as 0712 345 678 or 254712345678.")
+        normalized_number = "254" + raw_number[1:] if raw_number.startswith("0") else raw_number
+    updates = {
+        "mpesaRegisteredName": registered_name,
+        "mpesaNumber": normalized_number,
+        "mpesaDetailsUpdatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
+    return {"saved": True, "official_id_name": (actor.get("profile") or {}).get("officialIdName") or (actor.get("profile") or {}).get("name") or "", "mpesa_registered_name": registered_name, "mpesa_number": normalized_number, "complete": bool(registered_name and normalized_number)}
+
+
+@app.get("/human-transcription/admin/workers/{worker_uid}/payment-profile")
+async def human_admin_worker_payment_profile(worker_uid: str, request: Request):
+    admin = _require_human_job_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    profile = await _load_profile(worker_uid)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="The worker account was not found.")
+    role = str(profile.get("role") or profile.get("user_type") or "").strip().lower()
+    if not profile.get("workerApproved") and role not in {"worker", "transcriber"}:
+        raise HTTPException(status_code=404, detail="The approved worker account was not found.")
+    logger.info("Human-work admin %s viewed payout details for worker %s", (admin.get("email") or "").lower(), worker_uid)
+    return {
+        "worker_uid": worker_uid,
+        "worker_name": profile.get("name") or profile.get("displayName") or profile.get("full_name") or "",
+        "worker_email": profile.get("email") or "",
+        "official_id_name": profile.get("officialIdName") or profile.get("name") or "",
+        "mpesa_registered_name": profile.get("mpesaRegisteredName") or "",
+        "mpesa_number": profile.get("mpesaNumber") or "",
+        "complete": bool(profile.get("mpesaRegisteredName") and profile.get("mpesaNumber")),
+    }
+
+
 @app.get("/api/admin/worker-payments/search")
 async def admin_worker_payments_search(request: Request, worker_uid: str = "", start_date: str = "", end_date: str = "", status: str = "all"):
-    _require_admin(request)
+    _require_human_job_admin(request)
     if not db:
         return {"jobs": [], "total_minutes": 0, "total_amount_kes": 0}
     await _close_due_pay_periods()
@@ -6244,14 +6365,25 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
             role = "Proofreader" if item.get("source") == "proofreader" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" else "Transcriber")
             rows.append({"job_id": snap.id, "role": role, "worker_uid": item.get("worker_uid"), "worker_email": item.get("worker_email") or "", "worker_name": item.get("worker_name") or "", "minutes": item.get("minutes") or 0, "amount_kes": item.get("amount_kes") or 0, "payout_status": payout_status, "payout_period_id": item.get("payout_period_id"), "completed_at": _human_iso(completed_at), "job_status": job.get("status")})
     rows.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
-    return {"jobs": rows, "total_minutes": sum(item["minutes"] for item in rows), "total_amount_kes": sum(item["amount_kes"] for item in rows), "job_count": len(rows)}
+    transcription_rows = [item for item in rows if item["role"] != "Proofreader"]
+    proofreading_rows = [item for item in rows if item["role"] == "Proofreader"]
+    return {
+        "jobs": rows,
+        "total_minutes": sum(item["minutes"] for item in rows),
+        "total_amount_kes": sum(item["amount_kes"] for item in rows),
+        "transcription_amount_kes": sum(item["amount_kes"] for item in transcription_rows),
+        "proofreading_amount_kes": sum(item["amount_kes"] for item in proofreading_rows),
+        "transcription_minutes": sum(item["minutes"] for item in transcription_rows),
+        "proofreading_minutes": sum(item["minutes"] for item in proofreading_rows),
+        "job_count": len(rows),
+    }
 
 
 @app.get("/api/admin/worker-payouts")
 async def admin_worker_payouts(request: Request, worker_uid: str = "", status: str = "all"):
-    """List bi-monthly payout invoices for the admin dashboard, optionally
+    """List bi-monthly payout invoices for the human-work admins, optionally
     filtered by worker and/or status (pending/paid)."""
-    _require_admin(request)
+    _require_human_job_admin(request)
     if not db:
         return {"payouts": [], "totals": {"pending_kes": 0, "paid_kes": 0}}
     await _close_due_pay_periods()
@@ -6273,6 +6405,9 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
             pending_total += amount
         if status != "all" and payout_status != status:
             continue
+        invoice_items = payout.get("items") or []
+        transcription_items = [item for item in invoice_items if item.get("source") != "proofreader"]
+        proofreading_items = [item for item in invoice_items if item.get("source") == "proofreader"]
         payouts.append({
             "payout_id": snap.id,
             "worker_uid": payout.get("worker_uid"),
@@ -6283,11 +6418,18 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
             "period_end": _human_iso(payout.get("period_end")),
             "total_minutes": int(payout.get("total_minutes") or 0),
             "total_amount_kes": amount,
+            "transcription_minutes": sum(int(item.get("minutes") or 0) for item in transcription_items),
+            "transcription_amount_kes": sum(int(item.get("amount_kes") or 0) for item in transcription_items),
+            "proofreading_minutes": sum(int(item.get("minutes") or 0) for item in proofreading_items),
+            "proofreading_amount_kes": sum(int(item.get("amount_kes") or 0) for item in proofreading_items),
             "status": payout_status,
             "job_ids": payout.get("job_ids") or [],
             "paid_at": _human_iso(payout.get("paidAt")),
             "paid_by": payout.get("paidBy"),
         })
+        if not invoice_items:
+            payouts[-1]["transcription_minutes"] = int(payout.get("total_minutes") or 0)
+            payouts[-1]["transcription_amount_kes"] = amount
     payouts.sort(key=lambda item: str(item.get("period_label") or ""), reverse=True)
     return {"payouts": payouts, "totals": {"pending_kes": pending_total, "paid_kes": paid_total}}
 
@@ -6295,7 +6437,7 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
 @app.post("/api/admin/worker-payouts/{payout_id}/mark-paid")
 async def admin_mark_payout_paid(payout_id: str, request: Request):
     """Admin confirms a half-month invoice has actually been paid out."""
-    admin = _require_admin(request)
+    admin = _require_human_job_admin(request)
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     payout_ref = db.collection(HUMAN_PAYOUT_COLLECTION).document(payout_id)
@@ -6637,7 +6779,6 @@ async def human_worker_submit(
             if not combined and not final_attachment:
                 raise HTTPException(status_code=400, detail="Review both parts and submit the combined transcript or a finished file.")
             minutes = int(job.get("minutes") or 0)
-            rate = int((job.get("quote") or {}).get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
                 "status": "submitted",
                 "transcript": combined[:1000000],
@@ -6646,7 +6787,7 @@ async def human_worker_submit(
                 "proofreader_status": "submitted",
                 "proofreader_completedAt": datetime.now(),
                 "proofreader_minutes": minutes,
-                "proofreader_amount_kes": max(0, minutes * rate),
+                "proofreader_amount_kes": max(0, minutes * HUMAN_PROOFREADING_PAYOUT_KES),
                 "proofreader_payout_status": "unassigned",
                 "submittedAt": firestore.SERVER_TIMESTAMP,
                 "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -7053,6 +7194,9 @@ async def complete_trainee_signup(request: Request):
         raise HTTPException(status_code=409, detail="Payment has not been confirmed for this enrollment yet. Please wait a moment and try again.")
     if str(intent.get("email") or "").strip().lower() != actor["email"]:
         raise HTTPException(status_code=403, detail="This payment belongs to a different email address.")
+    saved_official_name = str((actor.get("profile") or {}).get("officialIdName") or "").strip()
+    if saved_official_name and saved_official_name.casefold() != official_name.casefold():
+        raise HTTPException(status_code=409, detail="The official name from your trainee registration is locked. Contact support if it needs correcting.")
     result = await enroll_paid_trainee(actor["email"], reference, TRAINEE_PRICE_USD, str(intent.get("currency") or "KES"), TRAINEE_COUNTRY, str(intent.get("provider") or "paystack"), user_id=actor["uid"])
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error") or "The trainee account could not be completed.")
@@ -7099,6 +7243,9 @@ async def trainee_apply(request: Request):
     notes = str(payload.get("notes") or "").strip()
     if len(name) < 2 or country.upper() != "KE":
         raise HTTPException(status_code=400, detail="Enter your official ID name. Training enrollment is currently limited to Kenya.")
+    registered_name = str((profile or {}).get("officialIdName") or "").strip()
+    if registered_name and registered_name.casefold() != name.casefold():
+        raise HTTPException(status_code=409, detail="Your official name is locked from trainee registration. Contact support if it needs correcting.")
     updates = {
         "name": name,
         "officialIdName": name,
