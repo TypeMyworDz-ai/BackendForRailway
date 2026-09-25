@@ -301,6 +301,10 @@ def _read_admin_users_snapshot():
         data["uid"] = uid
         data["totalMinutesTranscribedByUser"] = 0
         data["totalTranscriptsByUser"] = 0
+        data["askTypeMyworDzCreditsUsed"] = _int(data.get("askTypeMyworDzCreditsUsed"))
+        data["askTypeMyworDzQueries"] = _int(data.get("askTypeMyworDzQueries"))
+        data["transcriptAiCreditsUsed"] = _int(data.get("transcriptAiCreditsUsed"))
+        data["transcriptAiQueries"] = _int(data.get("transcriptAiQueries"))
         profiles.append(data)
         by_uid[uid] = data
 
@@ -726,10 +730,9 @@ def _int(value):
 # the bridge and can be changed in one place before production charging starts.
 HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
-# Transcriber pay rate, temporarily set to 15 KES/minute for standard work.
-# Rush pay remains separately configured so rush jobs still pay more than
-# standard work.
-HUMAN_STANDARD_PAYOUT_KES = 15
+# Standard transcription pay is 25 KES per completed audio minute. Rush pay
+# remains separately configured; proofreading stays at 10 KES per minute.
+HUMAN_STANDARD_PAYOUT_KES = 25
 HUMAN_RUSH_PAYOUT_KES = 38
 HUMAN_PROOFREADING_PAYOUT_KES = 10
 
@@ -1284,7 +1287,7 @@ async def _save_credit_updates(user_id: str, updates: dict, ledger_reason: str =
         return False
 
 
-async def charge_credits(user_id: str, user_email: str, amount: int, what: str):
+async def charge_credits(user_id: str, user_email: str, amount: int, what: str, usage_category: str = ""):
     """Take credits for something the client has just received.
 
     Deliberately forgiving. If the ledger cannot be reached we log it and let
@@ -1305,8 +1308,21 @@ async def charge_credits(user_id: str, user_email: str, amount: int, what: str):
     if profile is None:
         return {'charged': 0, 'error': 'profile unavailable'}
     ok, updates, detail = plan_spend(profile, amount)
+    usage_fields = {
+        "standalone_ask": ("askTypeMyworDzCreditsUsed", "askTypeMyworDzQueries"),
+        "transcript_query": ("transcriptAiCreditsUsed", "transcriptAiQueries"),
+    }
+    if ok and usage_category in usage_fields and detail.get("charged", 0) > 0:
+        credits_field, queries_field = usage_fields[usage_category]
+        updates[credits_field] = firestore.Increment(int(detail["charged"]))
+        updates[queries_field] = firestore.Increment(1)
     if updates:
-        await _save_credit_updates(user_id, updates, ledger_reason=what, ledger_context={"operation": "charge"})
+        await _save_credit_updates(
+            user_id,
+            updates,
+            ledger_reason=what,
+            ledger_context={"operation": "charge", "usage_category": usage_category or None},
+        )
     if ok:
         logger.info(f"Charged {detail.get('charged')} credits to {user_id} for {what}; {detail.get('remaining')} left")
     else:
@@ -4509,13 +4525,15 @@ async def ai_ask(
             model_used = chosen_model
 
         cost = ask_credit_cost(chosen_model)
+        usage_category = "transcript_query" if has_transcript else "standalone_ask"
         charge = await charge_credits(
-            user_id or "", user_email, cost, f"ask {chosen_model}"
+            user_id or "", user_email, cost, f"ask {chosen_model}", usage_category=usage_category
         )
 
         return {
             "ai_response": answer,
             "model_used": model_used,
+            "usage_category": usage_category,
             "credits_used": charge.get("charged", cost),
             "credits_remaining": charge.get("remaining"),
             "attachments_read": len(images) + len(doc_texts),
@@ -7438,6 +7456,38 @@ def _human_thread_for(actor, requested_thread=""):
     return thread
 
 
+def _human_message_read_by_role(message, job):
+    """Expose a role label for receipts without exposing participant UIDs."""
+    message = message or {}
+    job = job or {}
+    sender_uid = str(message.get("sender_uid") or "")
+    readers = {str(uid) for uid in (message.get("readBy") or []) if str(uid) and str(uid) != sender_uid}
+    if not readers:
+        return ""
+    thread = str(message.get("thread") or "client").lower()
+    worker_uids = {str(uid) for uid in (job.get("assigned_worker_uids") or []) if uid}
+    worker_uids.update(str((item or {}).get("worker_uid")) for item in (job.get("segments") or []) if (item or {}).get("worker_uid"))
+    for key in ("worker_uid", "proofreader_uid"):
+        if job.get(key):
+            worker_uids.add(str(job[key]))
+    sender_role = str(message.get("sender_role") or "").lower()
+    if not sender_role:
+        if sender_uid == str(job.get("client_uid") or ""):
+            sender_role = "client"
+        elif sender_uid in worker_uids:
+            sender_role = "worker"
+        else:
+            sender_role = "admin"
+    if thread == "client":
+        if sender_role == "admin":
+            return "client" if str(job.get("client_uid") or "") in readers else ""
+        return "admin"
+    worker_readers = readers.intersection(worker_uids)
+    if sender_role == "admin":
+        return "worker" if worker_readers else ""
+    return "worker" if worker_readers else "admin"
+
+
 @app.get("/human-transcription/jobs/{job_id}/messages")
 async def human_messages(job_id: str, request: Request, thread: str = ""):
     actor = await _human_actor(request)
@@ -7462,13 +7512,18 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
         # them at all. Those were every one of them client<->admin, so that
         # is where they stay; they must never appear in a worker's thread.
         message_thread = data.get("thread") or "client"
-        read_by = data.get("readBy") or []
+        read_by = list(data.get("readBy") or [])
         if message_thread in threads_to_mark_read and data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
             unread_refs.append(snap.reference)
+            read_by.append(actor["uid"])
+            data["readBy"] = read_by
         if message_thread != target_thread:
             continue
         data["id"] = snap.id
-        messages.append(_human_public_for(data, actor["role"]))
+        public_message = _human_public_for(data, actor["role"])
+        public_message["read_by_role"] = _human_message_read_by_role(data, job)
+        public_message.pop("readBy", None)
+        messages.append(public_message)
     if unread_refs:
         batch = db.batch()
         for message_ref in unread_refs:
@@ -7510,7 +7565,10 @@ async def human_send_message(job_id: str, request: Request, attachment: UploadFi
     saved_snapshot = await asyncio.to_thread(msg_ref.get)
     saved_item = saved_snapshot.to_dict() or item
     saved_item["id"] = msg_ref.id
-    return {"message": _human_public_for(saved_item, actor["role"])}
+    public_message = _human_public_for(saved_item, actor["role"])
+    public_message["read_by_role"] = ""
+    public_message.pop("readBy", None)
+    return {"message": public_message}
 
 
 @app.get("/human-transcription/jobs/{job_id}/messages/{message_id}/attachment")
@@ -8166,13 +8224,14 @@ async def messaging_unread_count(request: Request):
     """Count unread direct and job-specific messages for the signed-in account."""
     actor = await _human_actor(request)
     if not db:
-        return {"count": 0}
-    unread = 0
+        return {"count": 0, "direct_count": 0, "job_count": 0}
+    direct_unread = 0
+    job_unread = 0
     thread_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
     for thread_snapshot in thread_snapshots:
         message_ref = thread_snapshot.reference.collection("messages")
         messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
-        unread += sum(
+        direct_unread += sum(
             1 for message in messages
             if (message.to_dict() or {}).get("recipient_uid") == actor["uid"]
             and not (message.to_dict() or {}).get("readAt")
@@ -8186,12 +8245,12 @@ async def messaging_unread_count(request: Request):
             continue
         message_ref = job_snapshot.reference.collection("messages")
         messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
-        unread += sum(
+        job_unread += sum(
             1 for message in messages
             if (message.to_dict() or {}).get("sender_uid") != actor["uid"]
             and actor["uid"] not in ((message.to_dict() or {}).get("readBy") or [])
         )
-    return {"count": unread}
+    return {"count": direct_unread + job_unread, "direct_count": direct_unread, "job_count": job_unread}
 
 
 @app.post("/api/user-chats/{other_uid}/messages")
