@@ -1182,6 +1182,137 @@ def credits_exempt(user_email: str) -> bool:
 # AI transcription or Ask TypeMyworDz, and never exempts anything except the
 # human-transcription jobs these accounts personally own as the "client".
 HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai']
+USER_NOTIFICATION_COLLECTION = "user_notifications"
+
+
+def _user_notification_ref(recipient_uid: str, event_key: str):
+    identity = uuid.uuid5(uuid.NAMESPACE_URL, f"typemywordz-notification:{recipient_uid}:{event_key}").hex
+    return identity, db.collection(USER_NOTIFICATION_COLLECTION).document(identity)
+
+
+async def _create_user_notification(
+    recipient_uid: str, event_key: str, kind: str, title: str, body: str,
+    *, route: str, job_id: str = "", thread_id: str = "", target_id: str = "",
+    created_at=None, requires_action: bool = False,
+):
+    """Store a durable, body-free notification for one verified recipient."""
+    if not db or not recipient_uid or not event_key:
+        return ""
+    notification_id, ref = _user_notification_ref(str(recipient_uid), str(event_key))
+    try:
+        existing = await asyncio.to_thread(ref.get)
+        item = {
+            "notification_id": notification_id,
+            "recipient_uid": str(recipient_uid),
+            "event_key": str(event_key)[:500],
+            "kind": str(kind)[:80],
+            "title": str(title)[:180],
+            "body": str(body)[:360],
+            "route": str(route)[:80],
+            "job_id": str(job_id or "")[:180],
+            "thread_id": str(thread_id or "")[:240],
+            "target_id": str(target_id or "")[:240],
+            "requires_action": bool(requires_action),
+        }
+        if not existing.exists:
+            item.update({
+                "createdAt": created_at or firestore.SERVER_TIMESTAMP,
+                "readAt": None,
+                "snoozedUntil": None,
+                "lastRungAt": None,
+                "actionCompletedAt": None,
+            })
+        # Merge without resetting read/snooze fields when an event is retried.
+        await asyncio.to_thread(ref.set, item, merge=True)
+        return notification_id
+    except Exception as exc:
+        logger.warning("Could not create notification for %s: %s", recipient_uid, exc)
+        return ""
+
+
+async def _human_notification_admin_uids(exclude_uids=None):
+    """Resolve only the configured general and Human Work admin accounts."""
+    if not db:
+        return []
+    excluded = {str(uid) for uid in (exclude_uids or []) if uid}
+    recipients = set()
+    emails = {str(email).strip().lower() for email in (ADMIN_EMAILS + HUMAN_JOB_ADMIN_EMAILS) if email}
+    for email in emails:
+        try:
+            record = await asyncio.to_thread(firebase_auth.get_user_by_email, email)
+            if record.uid and record.uid not in excluded:
+                recipients.add(record.uid)
+                continue
+        except Exception:
+            pass
+        try:
+            snapshots = await asyncio.to_thread(
+                lambda email=email: list(db.collection("users").where(filter=FieldFilter("email", "==", email)).limit(1).stream())
+            )
+            if snapshots and snapshots[0].id not in excluded:
+                recipients.add(snapshots[0].id)
+        except Exception as exc:
+            logger.warning("Could not resolve notification admin %s: %s", email, exc)
+    return sorted(recipients)
+
+
+async def _notify_human_admins(event_key: str, kind: str, title: str, body: str, *, route: str, job_id: str, requires_action: bool = False, exclude_uids=None, target_id: str = ""):
+    recipients = await _human_notification_admin_uids(exclude_uids)
+    for uid in recipients:
+        await _create_user_notification(uid, event_key, kind, title, body, route=route, job_id=job_id, target_id=target_id or job_id, requires_action=requires_action)
+
+
+async def _complete_human_admin_notifications(job_id: str, kinds, *, target_id: str = ""):
+    for uid in await _human_notification_admin_uids():
+        await _update_user_notification_states(uid, job_id=job_id, target_id=target_id, kinds=set(kinds or []), read=True, completed=True)
+
+
+async def _notify_worker_assignment(job_id: str, worker_uid: str, label: str, assigned_at, *, segment_id: str = ""):
+    if not worker_uid:
+        return
+    moment = _human_iso(assigned_at) or datetime.now().isoformat()
+    part = f":{segment_id}" if segment_id else ""
+    await _create_user_notification(
+        str(worker_uid), f"human-assignment:{job_id}:{label}{part}:{moment}", "assignment",
+        "New Human Work assigned", f"Open Work Room to start {label}.",
+        route="human_worker", job_id=job_id, target_id=segment_id or job_id, created_at=assigned_at, requires_action=True,
+    )
+
+
+async def _update_user_notification_states(recipient_uid: str, *, job_id: str = "", thread_id: str = "", target_id: str = "", kinds=None, read: bool = False, completed: bool = False):
+    if not db or not recipient_uid:
+        return
+    try:
+        snapshots = await asyncio.to_thread(
+            lambda: list(db.collection(USER_NOTIFICATION_COLLECTION).where(filter=FieldFilter("recipient_uid", "==", recipient_uid)).stream())
+        )
+        now_value = firestore.SERVER_TIMESTAMP
+        allowed_kinds = set(kinds or [])
+        writes = []
+        for snapshot in snapshots:
+            item = snapshot.to_dict() or {}
+            if job_id and str(item.get("job_id") or "") != str(job_id):
+                continue
+            if thread_id and str(item.get("thread_id") or "") != str(thread_id):
+                continue
+            if target_id and str(item.get("target_id") or "") != str(target_id):
+                continue
+            if allowed_kinds and item.get("kind") not in allowed_kinds:
+                continue
+            updates = {}
+            if read:
+                updates["readAt"] = now_value
+            if completed:
+                updates["actionCompletedAt"] = now_value
+            if updates:
+                writes.append((snapshot.reference, updates))
+        for start in range(0, len(writes), 450):
+            batch = db.batch()
+            for ref, updates in writes[start:start + 450]:
+                batch.set(ref, updates, merge=True)
+            await asyncio.to_thread(batch.commit)
+    except Exception as exc:
+        logger.warning("Could not update notification state for %s: %s", recipient_uid, exc)
 
 
 def is_human_job_admin(user_email: str) -> bool:
@@ -5755,6 +5886,19 @@ async def _human_reclaim_expired_job(job_id: str, job: dict):
     except Exception as exc:
         logger.warning("Could not auto-reclaim expired human job %s: %s", job_id, exc)
         return job
+    worker_uid = str(job.get("worker_uid") or "")
+    assignment_token = _human_iso(job.get("assignedAt")) or now.isoformat()
+    if worker_uid:
+        await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+        await _create_user_notification(
+            worker_uid, f"human-expired:{job_id}:main:{assignment_token}", "assignment_taken_back",
+            "A Human Work deadline passed", "This job returned to the queue after its deadline.",
+            route="human_worker", job_id=job_id, target_id=job_id,
+        )
+    await _notify_human_admins(
+        f"human-returned-to-queue:{job_id}:main:{assignment_token}", "returned_to_queue", "A Human Work job returned to the queue",
+        "A worker deadline passed. Review and reassign the job.", route="human_ops", job_id=job_id, requires_action=True,
+    )
     job = dict(job)
     job.update(updates)
     return job
@@ -5765,8 +5909,10 @@ async def _human_check_expiry(job_id: str, job: dict):
     if not db or not job:
         return job
     now = datetime.now()
+    original_job = dict(job)
     if job.get("split_mode") == "dual":
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        expired_assignments = []
         changed = False
         for item in segments:
             if item.get("status") not in ("assigned", "in_progress"):
@@ -5774,6 +5920,8 @@ async def _human_check_expiry(job_id: str, job: dict):
             deadline = _as_dt(item.get("deadlineAt"))
             if not deadline or now <= deadline:
                 continue
+            assignment_token = _human_iso(item.get("assignedAt")) or now.isoformat()
+            expired_assignments.append((str(item.get("worker_uid") or ""), "part", str(item.get("id") or ""), item.get("label") or "job part", assignment_token))
             previous = item.get("worker_name") or item.get("worker_email") or "the previous worker"
             item.update({
                 "status": "available",
@@ -5791,6 +5939,8 @@ async def _human_check_expiry(job_id: str, job: dict):
         proofreader_status = job.get("proofreader_status")
         proofreader_deadline = _as_dt(job.get("proofreader_deadlineAt"))
         if proofreader_status in ("assigned", "in_progress") and proofreader_deadline and now > proofreader_deadline:
+            assignment_token = _human_iso(job.get("proofreader_assignedAt")) or now.isoformat()
+            expired_assignments.append((str(job.get("proofreader_uid") or ""), "proofreader", "proofreader", "proofreading", assignment_token))
             job = dict(job)
             job.update({"proofreader_status": "available", "proofreader_uid": None, "proofreader_email": None, "proofreader_name": None, "proofreader_deadlineAt": None, "proofreader_tat_seconds": None})
             changed = True
@@ -5804,7 +5954,6 @@ async def _human_check_expiry(job_id: str, job: dict):
                 job["status"] = "proofreading_available"
             else:
                 job["status"] = "split_assigned"
-            job["updatedAt"] = firestore.SERVER_TIMESTAMP
             try:
                 await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
                     "segments": segments,
@@ -5820,6 +5969,20 @@ async def _human_check_expiry(job_id: str, job: dict):
                 })
             except Exception as exc:
                 logger.warning("Could not update split-job expiry for %s: %s", job_id, exc)
+                return original_job
+            for worker_uid, role, assignment_id, label, assignment_token in expired_assignments:
+                if worker_uid:
+                    await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+                    await _create_user_notification(
+                        worker_uid, f"human-expired:{job_id}:{role}:{assignment_id}:{assignment_token}", "assignment_taken_back",
+                        "A Human Work deadline passed", f"Your {label} returned to the queue after its deadline.",
+                        route="human_worker", job_id=job_id, target_id=job_id,
+                    )
+                await _notify_human_admins(
+                    f"human-returned-to-queue:{job_id}:{role}:{assignment_id}:{assignment_token}", "returned_to_queue",
+                    "Human Work returned to the queue", f"A {label} deadline passed. Review and reassign this step.",
+                    route="human_ops", job_id=job_id, requires_action=True, target_id=assignment_id,
+                )
         return job
     if job.get("status") not in ("assigned", "in_progress"):
         return job
@@ -6238,6 +6401,10 @@ async def human_create_job(
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
     await asyncio.to_thread(job_ref.set, job)
+    await _notify_human_admins(
+        f"human-new-request:{job_id}", "job_request", "A new Human Work request",
+        "Review the new request in the Human Work queue.", route="human_ops", job_id=job_id, requires_action=True,
+    )
     # Resolve Firestore server timestamps before returning the created job.
     # Otherwise a successful upload can look like a failed request in the browser.
     saved_snapshot = await asyncio.to_thread(job_ref.get)
@@ -6886,6 +7053,16 @@ async def human_admin_approve(job_id: str, request: Request):
     if job.get("status") != "pending_admin":
         raise HTTPException(status_code=409, detail="This job is not waiting for admin approval.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "approved", "updatedAt": firestore.SERVER_TIMESTAMP})
+    await _complete_human_admin_notifications(job_id, {"job_request"})
+    if job.get("client_uid"):
+        await _create_user_notification(
+            str(job["client_uid"]), f"human-approved:{job_id}", "job_approved", "Your Human Work request is approved",
+            "The team is arranging the next step for your job.", route="human_job", job_id=job_id, target_id=job_id,
+        )
+    await _notify_human_admins(
+        f"human-approved-awaiting-assignment:{job_id}", "job_approved", "Human Work ready for assignment",
+        "Choose a transcriber in the Human Work queue.", route="human_ops", job_id=job_id, requires_action=True,
+    )
     return {"status": "approved", "job_id": job_id}
 
 
@@ -6967,6 +7144,11 @@ async def human_admin_assign(job_id: str, request: Request):
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+        await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
+        for segment in segments:
+            if segment.get("worker_uid"):
+                await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=str(segment.get("id") or ""))
+                await _notify_worker_assignment(job_id, segment.get("worker_uid"), segment.get("label") or "your assigned part", segment.get("assignedAt"), segment_id=segment.get("id") or "")
         return {
             "status": "split_assigned",
             "job_id": job_id,
@@ -7009,6 +7191,9 @@ async def human_admin_assign(job_id: str, request: Request):
             "status": "split_assigned",
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
+        await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
+        await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id)
+        await _notify_worker_assignment(job_id, worker_uid, target.get("label") or "your assigned part", target.get("assignedAt"), segment_id=segment_id)
         return {"status": "split_assigned", "job_id": job_id, "segment_id": segment_id}
 
     if job.get("status") not in {"approved", "assigned"}:
@@ -7028,6 +7213,9 @@ async def human_admin_assign(job_id: str, request: Request):
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
+    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=job_id)
+    await _notify_worker_assignment(job_id, worker_uid, "your transcription job", now)
     return {"status": "assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
 
 
@@ -7059,6 +7247,9 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
         "assigned_worker_uids": assigned,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
+    await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
+    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id="proofreader")
+    await _notify_worker_assignment(job_id, worker_uid, "your proofreading assignment", now, segment_id="proofreader")
     return {"status": "proofreading_assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
 
 
@@ -7143,6 +7334,13 @@ async def human_admin_take_back(job_id: str, request: Request):
         "last_assignment_takeback_by_email": str(admin.get("email") or "").strip().lower(),
     })
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    if worker_uid:
+        await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+        await _create_user_notification(
+            str(worker_uid), f"human-takeback:{job_id}:{role}:{now.isoformat()}", "assignment_taken_back",
+            "A Human Work assignment changed", f"An admin returned {label.lower()} to the work queue.",
+            route="human_worker", job_id=job_id, target_id=job_id,
+        )
     return {"status": updates.get("status"), "job_id": job_id, "role": role, "label": label, "worker_uid": worker_uid}
 
 
@@ -7169,6 +7367,11 @@ async def human_admin_extend_tat(job_id: str, request: Request):
             "proofreader_tat_extension_minutes": int(job.get("proofreader_tat_extension_minutes") or 0) + extra_minutes,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
+        await _create_user_notification(
+            str(job.get("proofreader_uid") or ""), f"deadline-extended:{job_id}:proofreader:{now.isoformat()}",
+            "deadline_extended", "Proofreading time extended", f"Your deadline was extended by {extra_minutes} minutes.",
+            route="human_worker", job_id=job_id, target_id=job_id,
+        )
         return {"status": "extended", "job_id": job_id, "target": "proofreader", "minutes_added": extra_minutes}
     if job.get("split_mode") == "dual":
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
@@ -7181,6 +7384,11 @@ async def human_admin_extend_tat(job_id: str, request: Request):
         target["tat_seconds"] = int(target.get("tat_seconds") or 0) + extra_minutes * 60
         target["tat_extension_minutes"] = int(target.get("tat_extension_minutes") or 0) + extra_minutes
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "updatedAt": firestore.SERVER_TIMESTAMP})
+        await _create_user_notification(
+            str(target.get("worker_uid") or ""), f"deadline-extended:{job_id}:{segment_id}:{now.isoformat()}",
+            "deadline_extended", "Your job deadline was extended", f"Your deadline was extended by {extra_minutes} minutes.",
+            route="human_worker", job_id=job_id, target_id=job_id,
+        )
         return {"status": "extended", "job_id": job_id, "segment_id": segment_id, "minutes_added": extra_minutes}
     deadline = _as_dt(job.get("deadlineAt"))
     if job.get("status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
@@ -7191,6 +7399,11 @@ async def human_admin_extend_tat(job_id: str, request: Request):
         "tat_extension_minutes": int(job.get("tat_extension_minutes") or 0) + extra_minutes,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
+    await _create_user_notification(
+        str(job.get("worker_uid") or ""), f"deadline-extended:{job_id}:transcriber:{now.isoformat()}",
+        "deadline_extended", "Your job deadline was extended", f"Your deadline was extended by {extra_minutes} minutes.",
+        route="human_worker", job_id=job_id, target_id=job_id,
+    )
     return {"status": "extended", "job_id": job_id, "minutes_added": extra_minutes}
 
 
@@ -7207,9 +7420,11 @@ async def human_worker_start(job_id: str, request: Request):
         if target:
             target["status"] = "in_progress"
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": "split_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+            await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "segment_id": target.get("id")}
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"proofreader_status": "in_progress", "status": "proofreading_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+            await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "role": "proofreader"}
         raise HTTPException(status_code=409, detail="This assignment is not ready to start.")
     if job.get("worker_uid") != actor["uid"]:
@@ -7217,6 +7432,7 @@ async def human_worker_start(job_id: str, request: Request):
     if job.get("status") not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="This job is not ready to start.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+    await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
     return {"status": "in_progress", "job_id": job_id}
 
 
@@ -7264,6 +7480,11 @@ async def human_worker_submit(
                 "status": "proofreading_available" if both_submitted else "split_in_progress",
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             })
+            await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+            await _notify_human_admins(
+                f"human-submitted:{job_id}:{target.get('id')}", "job_submitted", "A job part was submitted",
+                "Review the submitted Human Work part.", route="human_ops", job_id=job_id, requires_action=True,
+            )
             return {"status": "proofreading_available" if both_submitted else "split_in_progress", "job_id": job_id, "segment_id": target.get("id")}
 
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
@@ -7287,6 +7508,11 @@ async def human_worker_submit(
                 "submittedAt": firestore.SERVER_TIMESTAMP,
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             })
+            await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+            await _notify_human_admins(
+                f"human-submitted:{job_id}:proofreader", "job_submitted", "Proofreading was submitted",
+                "Review the completed Human Work job.", route="human_ops", job_id=job_id, requires_action=True,
+            )
             return {"status": "submitted", "job_id": job_id, "role": "proofreader"}
         raise HTTPException(status_code=409, detail="This assignment is no longer active.")
 
@@ -7315,6 +7541,11 @@ async def human_worker_submit(
         "payout_status": "unassigned",
     }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+    await _notify_human_admins(
+        f"human-submitted:{job_id}:main", "job_submitted", "A Human Work job was submitted",
+        "Review the submitted job.", route="human_ops", job_id=job_id, requires_action=True,
+    )
     return {"status": "submitted", "job_id": job_id}
 
 
@@ -7332,6 +7563,13 @@ async def human_admin_review(job_id: str, request: Request):
         rating = None
     updates = {"status": "client_review", "admin_feedback": str(payload.get("feedback") or "")[:12000], "worker_rating": rating, "reviewedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    await _complete_human_admin_notifications(job_id, {"job_submitted"})
+    if job.get("client_uid"):
+        await _create_user_notification(
+            str(job["client_uid"]), f"human-review-ready:{job_id}", "human_review_ready",
+            "Your transcript is ready to review", "Open your Human Work job to review the completed transcript.",
+            route="human_job", job_id=job_id, target_id=job_id, requires_action=True,
+        )
     return {"status": "client_review", "job_id": job_id}
 
 
@@ -7352,6 +7590,11 @@ async def human_client_approve(job_id: str, request: Request):
     if job.get("status") != "client_review":
         raise HTTPException(status_code=409, detail="The job is not waiting for your approval.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "client_approved", "clientApprovedAt": firestore.SERVER_TIMESTAMP, "clientApprovedBy": actor["email"], "updatedAt": firestore.SERVER_TIMESTAMP})
+    await _update_user_notification_states(str(job.get("client_uid") or ""), job_id=job_id, kinds={"human_review_ready"}, read=True, completed=True)
+    await _notify_human_admins(
+        f"human-client-approved:{job_id}", "client_approved", "Client approved the completed work",
+        "Release the approved transcript to the client.", route="human_ops", job_id=job_id, requires_action=True,
+    )
     return {"status": "client_approved", "job_id": job_id, "credits_deducted": 0}
 
 
@@ -7374,6 +7617,13 @@ async def human_admin_release(job_id: str, request: Request):
             raise HTTPException(status_code=409, detail="The client's credits no longer cover this job. The work remains locked.")
     updates = {"status": "released", "credits_charged": int(charge.get("charged") or 0), "releasedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    await _complete_human_admin_notifications(job_id, {"client_approved"})
+    if job.get("client_uid"):
+        await _create_user_notification(
+            str(job["client_uid"]), f"human-released:{job_id}", "human_released",
+            "Your completed transcript is ready", "Your Human Work job has been released. Open it to download the completed files.",
+            route="human_job", job_id=job_id, target_id=job_id,
+        )
     return {"status": "released", "job_id": job_id, "credits_deducted": int(job.get("quote_credits") or 0)}
 
 
@@ -7605,14 +7855,13 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
     requested_thread = (thread or "").strip().lower()
-    # The admin Messages inbox represents the whole job, not one of the two
-    # internal job threads. When it opens a job without an explicit thread,
-    # show the client thread by default and clear unread messages in both the
-    # client and worker threads. The dedicated HumanJobWorkspace still passes
-    # thread=client or thread=worker when the admin wants to read only one.
+    # Older callers may open a job without choosing a side. Keep the default
+    # view on the client conversation, but never mark the worker's separate
+    # thread read as a side effect. The admin inbox passes an explicit thread
+    # for both client and worker conversations.
     inbox_open = actor["role"] == "admin" and not requested_thread
     target_thread = "client" if inbox_open else _human_thread_for(actor, requested_thread)
-    threads_to_mark_read = {"client", "worker"} if inbox_open else {target_thread}
+    threads_to_mark_read = {target_thread}
     ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
     messages = []
@@ -7640,6 +7889,7 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
         for message_ref in unread_refs:
             batch.update(message_ref, {"readBy": firestore.ArrayUnion([actor["uid"]])})
         await asyncio.to_thread(batch.commit)
+    await _update_user_notification_states(actor["uid"], thread_id=f"job:{job_id}:{target_thread}", kinds={"job_message"}, read=True)
     return {"messages": messages, "thread": target_thread}
 
 
@@ -8261,6 +8511,7 @@ async def user_chat_messages(other_uid: str, request: Request):
         for message_ref in unread_refs:
             batch.update(message_ref, {"readAt": firestore.SERVER_TIMESTAMP})
         await asyncio.to_thread(batch.commit)
+    await _update_user_notification_states(actor["uid"], thread_id=f"user:{target['uid']}", kinds={"direct_message"}, read=True)
     return {"thread_id": thread_id, "user": target, "messages": messages}
 
 
@@ -8318,10 +8569,12 @@ async def messaging_inbox(request: Request):
         if actor["role"] != "admin" and not is_admin_user(contact.get("email") or ""):
             continue
         latest = messages[-1]
-        unread_count = sum(
-            1 for message in messages
+        unread_messages = [
+            message for message in messages
             if message.get("recipient_uid") == actor["uid"] and not message.get("readAt")
-        )
+        ]
+        unread_count = len(unread_messages)
+        latest_unread = unread_messages[-1] if unread_messages else None
         latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else contact.get("name") or contact.get("email") or "Contact"
         threads.append({
             "id": f"user:{other_uid}",
@@ -8333,6 +8586,7 @@ async def messaging_inbox(request: Request):
             "latest": {"id": latest.get("id"), "senderName": latest_sender, "preview": latest.get("message") or "Attachment", "createdAt": latest.get("createdAt")},
             "latestAt": latest.get("createdAt"),
             "unreadCount": unread_count,
+            "latestUnread": {"id": latest_unread.get("id"), "createdAt": latest_unread.get("createdAt")} if latest_unread else None,
         })
 
     job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
@@ -8353,56 +8607,66 @@ async def messaging_inbox(request: Request):
         )
         if not message_snapshots:
             continue
-        visible_thread = None if actor["role"] == "admin" else ("worker" if actor["role"] == "worker" else "client")
-        messages = []
-        unread_count = 0
+        thread_groups = {"client": [], "worker": []}
         for message_snapshot in message_snapshots:
             data = message_snapshot.to_dict() or {}
             message_thread = str(data.get("thread") or "client").lower()
-            # Human-work jobs deliberately have separate client/admin and
-            # worker/admin channels. Never put the other side's preview, sender,
-            # or unread count into a user's inbox row.
-            if visible_thread and message_thread != visible_thread:
+            if message_thread not in thread_groups:
                 continue
-            read_by = data.get("readBy") or []
-            if data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
-                unread_count += 1
             data["id"] = message_snapshot.id
-            messages.append(_human_public(data))
-        if not messages:
-            continue
-        latest = messages[-1]
+            thread_groups[message_thread].append(_human_public(data))
+
+        visible_threads = ("client", "worker") if actor["role"] == "admin" else (("worker",) if actor["role"] == "worker" else ("client",))
         source = str(job.get("source_type") or "human_transcription").replace("_", " ").title()
         job_title = job.get("title") or job.get("name") or f"{source} · {job_id[:8]}"
-        participant = None
-        if actor["role"] == "admin":
-            participant_uid = job.get("client_uid") or ""
-            if participant_uid:
+        for message_thread in visible_threads:
+            messages = thread_groups.get(message_thread) or []
+            if not messages:
+                continue
+            unread_messages = [
+                message for message in messages
+                if message.get("sender_uid") != actor["uid"] and actor["uid"] not in (message.get("readBy") or [])
+            ]
+            unread_count = len(unread_messages)
+            latest = messages[-1]
+            latest_unread = unread_messages[-1] if unread_messages else None
+            if actor["role"] == "admin" and message_thread == "client":
+                participant_uid = job.get("client_uid") or ""
                 try:
-                    participant = await _user_chat_target(participant_uid)
+                    participant = await _user_chat_target(participant_uid) if participant_uid else None
                 except HTTPException:
                     participant = None
-            latest_role = str(latest.get("sender_role") or "client").lower()
-            latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else ("TypeMyworDz admin" if latest_role == "admin" else (latest.get("sender_email") or latest_role.title()))
-            conversation_user = participant or {"uid": participant_uid, "name": latest_sender, "email": latest.get("sender_email") or "", "role": latest_role}
-            conversation_title = participant.get("name") if participant else latest_sender
-            conversation_role = participant.get("role") if participant else latest_role
-        else:
-            latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else ("Another worker" if actor["role"] == "worker" and str(latest.get("sender_role") or "").lower() == "worker" else "TypeMyworDz admin")
-            conversation_user = {"uid": "", "name": "TypeMyworDz admin", "email": "", "role": "admin"}
-            conversation_title = "TypeMyworDz admin"
-            conversation_role = "admin"
-        threads.append({
-            "id": f"job:{job_id}",
-            "kind": "job",
-            "user": conversation_user,
-            "title": conversation_title,
-            "role": conversation_role,
-            "job": {"id": job_id, "title": job_title, "status": job.get("status") or "pending"},
-            "latest": {"id": latest.get("id"), "senderName": latest_sender, "preview": latest.get("message") or "Attachment", "createdAt": latest.get("createdAt")},
-            "latestAt": latest.get("createdAt"),
-            "unreadCount": unread_count,
-        })
+                latest_role = str(latest.get("sender_role") or "client").lower()
+                latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else (participant.get("name") if participant else "Client")
+                conversation_user = participant or {"uid": participant_uid, "name": "Client", "email": "", "role": "client"}
+                conversation_title = conversation_user.get("name") or conversation_user.get("email") or "Client conversation"
+                conversation_role = "client"
+            elif actor["role"] == "admin" and message_thread == "worker":
+                worker_names = list(dict.fromkeys(
+                    str(name).strip() for name in [job.get("worker_name"), job.get("proofreader_name"), *[(part or {}).get("worker_name") for part in (job.get("segments") or [])]] if name
+                ))
+                conversation_title = worker_names[0] if len(worker_names) == 1 else (f"{len(worker_names)} workers" if worker_names else "Worker conversation")
+                conversation_user = {"uid": "", "name": conversation_title, "email": "", "role": "worker"}
+                conversation_role = "worker"
+                latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else ("Another worker" if str(latest.get("sender_role") or "").lower() == "worker" else "Assigned worker")
+            else:
+                latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else ("Another worker" if actor["role"] == "worker" and str(latest.get("sender_role") or "").lower() == "worker" else "TypeMyworDz admin")
+                conversation_user = {"uid": "", "name": "TypeMyworDz admin", "email": "", "role": "admin"}
+                conversation_title = "TypeMyworDz admin"
+                conversation_role = "admin"
+            threads.append({
+                "id": f"job:{job_id}:{message_thread}",
+                "kind": "job",
+                "thread": message_thread,
+                "user": conversation_user,
+                "title": conversation_title,
+                "role": conversation_role,
+                "job": {"id": job_id, "title": job_title, "status": job.get("status") or "pending", "thread": message_thread},
+                "latest": {"id": latest.get("id"), "senderName": latest_sender, "preview": latest.get("message") or "Attachment", "createdAt": latest.get("createdAt")},
+                "latestAt": latest.get("createdAt"),
+                "unreadCount": unread_count,
+                "latestUnread": {"id": latest_unread.get("id"), "createdAt": latest_unread.get("createdAt")} if latest_unread else None,
+            })
 
     threads.sort(key=lambda item: str(item.get("latestAt") or ""), reverse=True)
     return {"threads": threads}
@@ -8453,6 +8717,140 @@ async def messaging_unread_count(request: Request):
             if data.get("sender_uid") != actor["uid"] and actor["uid"] not in (data.get("readBy") or []):
                 job_unread += 1
     return {"count": direct_unread + job_unread, "direct_count": direct_unread, "job_count": job_unread}
+
+
+@app.get("/api/notifications")
+async def application_notifications(request: Request):
+    """Return the signed-in user's persistent alerts and unread conversations."""
+    actor = await _human_actor(request)
+    if not db:
+        return {"notifications": [], "unread_count": 0, "unread_message_count": 0, "unread_event_count": 0}
+
+    # Reuse the participant-scoped inbox; previews stay server-side and are
+    # never copied into alert cards.
+    inbox = await messaging_inbox(request)
+    unread_threads = {}
+    unread_message_count = 0
+    for thread in inbox.get("threads") or []:
+        unread_count = int(thread.get("unreadCount") or 0)
+        latest_unread = thread.get("latestUnread") or {}
+        if unread_count <= 0 or not latest_unread.get("id"):
+            continue
+        unread_message_count += unread_count
+        thread_id = str(thread.get("id") or "")
+        kind = "direct_message" if thread.get("kind") == "user" else "job_message"
+        event_key = f"unread-thread:{thread_id}:{latest_unread['id']}"
+        job_id = str((thread.get("job") or {}).get("id") or "")
+        title = (f"New message from {thread.get('title') or 'your contact'}" if kind == "direct_message"
+                 else f"New message about {((thread.get('job') or {}).get('title')) or 'your Human Work job'}")
+        await _create_user_notification(
+            actor["uid"], event_key, kind, title,
+            "Open the conversation to read the latest message.",
+            route="messages", job_id=job_id, thread_id=thread_id,
+            target_id=thread_id.split(":", 1)[-1], created_at=latest_unread.get("createdAt"),
+        )
+        unread_threads[thread_id] = {**thread, "unreadCount": unread_count}
+
+    snapshots = await asyncio.to_thread(
+        lambda: list(db.collection(USER_NOTIFICATION_COLLECTION).where(
+            filter=FieldFilter("recipient_uid", "==", actor["uid"])
+        ).stream())
+    )
+    items = []
+    stale_message_refs = []
+    for snapshot in snapshots:
+        data = snapshot.to_dict() or {}
+        kind = str(data.get("kind") or "")
+        thread_id = str(data.get("thread_id") or "")
+        if kind in {"direct_message", "job_message"}:
+            thread = unread_threads.get(thread_id)
+            if not thread:
+                if not data.get("readAt"):
+                    stale_message_refs.append(snapshot.reference)
+                continue
+            latest_unread = (thread.get("latestUnread") or {}).get("id")
+            if data.get("event_key") != f"unread-thread:{thread_id}:{latest_unread}":
+                continue
+            data["unread_count"] = int(thread.get("unreadCount") or 0)
+            data["job_id"] = str((thread.get("job") or {}).get("id") or "")
+        created_at = data.get("createdAt")
+        items.append({
+            "id": str(data.get("notification_id") or snapshot.id),
+            "kind": kind,
+            "title": str(data.get("title") or "Notification"),
+            "body": str(data.get("body") or "Open TypeMyworDz to view this update."),
+            "route": str(data.get("route") or "notifications"),
+            "job_id": str(data.get("job_id") or ""),
+            "thread_id": thread_id,
+            "target_id": str(data.get("target_id") or ""),
+            "created_at": _human_iso(created_at),
+            "read_at": _human_iso(data.get("readAt")),
+            "snoozed_until": _human_iso(data.get("snoozedUntil")),
+            "last_rung_at": _human_iso(data.get("lastRungAt")),
+            "action_completed_at": _human_iso(data.get("actionCompletedAt")),
+            "requires_action": bool(data.get("requires_action")),
+            "unread_count": int(data.get("unread_count") or 0),
+        })
+    for start in range(0, len(stale_message_refs), 450):
+        batch = db.batch()
+        for ref in stale_message_refs[start:start + 450]:
+            batch.set(ref, {"readAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        await asyncio.to_thread(batch.commit)
+    items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    unread_event_count = sum(
+        1 for item in items
+        if item["kind"] not in {"direct_message", "job_message"} and not item["read_at"]
+    )
+    return {
+        "notifications": items[:300],
+        "unread_count": unread_message_count + unread_event_count,
+        "unread_message_count": unread_message_count,
+        "unread_event_count": unread_event_count,
+        "server_time": datetime.now().astimezone().isoformat(),
+    }
+
+
+@app.post("/api/notifications/{notification_id}/read")
+async def mark_application_notification_read(notification_id: str, request: Request):
+    actor = await _human_actor(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Notifications are not available yet.")
+    ref = db.collection(USER_NOTIFICATION_COLLECTION).document(notification_id)
+    snapshot = await asyncio.to_thread(ref.get)
+    data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+    if not snapshot.exists or data.get("recipient_uid") != actor["uid"]:
+        raise HTTPException(status_code=404, detail="That notification was not found.")
+    await asyncio.to_thread(ref.set, {"readAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"status": "read", "notification_id": notification_id}
+
+
+@app.post("/api/notifications/{notification_id}/snooze")
+async def snooze_application_notification(notification_id: str, request: Request):
+    actor = await _human_actor(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Notifications are not available yet.")
+    ref = db.collection(USER_NOTIFICATION_COLLECTION).document(notification_id)
+    snapshot = await asyncio.to_thread(ref.get)
+    data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+    if not snapshot.exists or data.get("recipient_uid") != actor["uid"]:
+        raise HTTPException(status_code=404, detail="That notification was not found.")
+    until = datetime.now() + timedelta(minutes=5)
+    await asyncio.to_thread(ref.set, {"snoozedUntil": until, "lastRungAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"status": "snoozed", "snoozed_until": until.isoformat()}
+
+
+@app.post("/api/notifications/{notification_id}/ringed")
+async def record_application_notification_ring(notification_id: str, request: Request):
+    actor = await _human_actor(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Notifications are not available yet.")
+    ref = db.collection(USER_NOTIFICATION_COLLECTION).document(notification_id)
+    snapshot = await asyncio.to_thread(ref.get)
+    data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+    if not snapshot.exists or data.get("recipient_uid") != actor["uid"]:
+        raise HTTPException(status_code=404, detail="That notification was not found.")
+    await asyncio.to_thread(ref.set, {"lastRungAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"status": "recorded", "notification_id": notification_id}
 
 
 @app.get("/api/messaging/notifications")
