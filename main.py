@@ -734,11 +734,51 @@ def _int(value):
 # the bridge and can be changed in one place before production charging starts.
 HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
-# Standard transcription pay is 25 KES per completed audio minute. Rush pay
-# remains separately configured; proofreading stays at 10 KES per minute.
-HUMAN_STANDARD_PAYOUT_KES = 25
+# Standard transcription starts at 30 KES per completed audio minute. The
+# main admin can change the rate for new jobs from Human Work > Worker rates.
+# Existing jobs keep the rate stored in their original quote; legacy jobs with
+# no stored rate retain the previous 25 KES fallback. Rush and proofreading
+# remain separately configured.
+HUMAN_STANDARD_PAYOUT_KES = 30
+HUMAN_LEGACY_STANDARD_PAYOUT_KES = 25
 HUMAN_RUSH_PAYOUT_KES = 38
 HUMAN_PROOFREADING_PAYOUT_KES = 10
+HUMAN_RATE_SETTINGS_COLLECTION = "system_settings"
+HUMAN_RATE_SETTINGS_DOCUMENT = "human_transcription_rates"
+HUMAN_MIN_TRANSCRIBER_RATE_KES = 1
+HUMAN_MAX_TRANSCRIBER_RATE_KES = 500
+
+
+def _validate_human_transcriber_rate(value):
+    """Accept only a whole-number KES rate within the admin UI's safe range."""
+    if isinstance(value, bool):
+        raise ValueError("The rate must be a whole number of KES.")
+    try:
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError
+        text = str(value).strip()
+        if not re.fullmatch(r"[0-9]+", text):
+            raise ValueError
+        rate = int(text)
+    except (TypeError, ValueError):
+        raise ValueError("The rate must be a whole number of KES.")
+    if not HUMAN_MIN_TRANSCRIBER_RATE_KES <= rate <= HUMAN_MAX_TRANSCRIBER_RATE_KES:
+        raise ValueError(f"The rate must be between KES {HUMAN_MIN_TRANSCRIBER_RATE_KES} and KES {HUMAN_MAX_TRANSCRIBER_RATE_KES} per minute.")
+    return rate
+
+
+async def _get_human_transcriber_rate():
+    """Load the current standard rate, falling back safely if settings are absent."""
+    if not db:
+        return HUMAN_STANDARD_PAYOUT_KES
+    try:
+        ref = db.collection(HUMAN_RATE_SETTINGS_COLLECTION).document(HUMAN_RATE_SETTINGS_DOCUMENT)
+        snapshot = await asyncio.to_thread(ref.get)
+        data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+        return _validate_human_transcriber_rate(data.get("transcriber_rate_kes_per_minute", HUMAN_STANDARD_PAYOUT_KES))
+    except Exception as exc:
+        logger.warning("Could not load Human Work rate settings: %s", exc)
+        return HUMAN_STANDARD_PAYOUT_KES
 
 # TMWD_HUMAN_TAT_V2
 # Jobs of one minute or less receive a six-minute minimum TAT. Longer jobs
@@ -779,7 +819,7 @@ def human_proofreading_tat_seconds(audio_seconds):
     return int(math.ceil(audio_minutes * HUMAN_PROOFREADING_TAT_MINUTES_PER_AUDIO_MINUTE * 60))
 
 
-def human_credit_quote(seconds, turnaround="standard", difficulty="standard", service="standard", speakers="1-2", timestamps=True, formatting="standard"):
+def human_credit_quote(seconds, turnaround="standard", difficulty="standard", service="standard", speakers="1-2", timestamps=True, formatting="standard", transcriber_rate_kes=None):
     """Return one server-owned quote for both human-work entry points."""
     try:
         duration = float(seconds or 0)
@@ -793,7 +833,10 @@ def human_credit_quote(seconds, turnaround="standard", difficulty="standard", se
     premium = rush or difficult
     minutes = max(1, int(math.ceil(duration / 60.0)))
     rate = HUMAN_RUSH_CREDITS_PER_MINUTE if premium else HUMAN_STANDARD_CREDITS_PER_MINUTE
-    payout = HUMAN_RUSH_PAYOUT_KES if premium else HUMAN_STANDARD_PAYOUT_KES
+    standard_payout = _validate_human_transcriber_rate(
+        HUMAN_STANDARD_PAYOUT_KES if transcriber_rate_kes is None else transcriber_rate_kes
+    )
+    payout = HUMAN_RUSH_PAYOUT_KES if premium else standard_payout
     multiplier = 1.0
     if str(service or "").strip().lower() == "proofread": multiplier *= 1.2
     if str(service or "").strip().lower() == "formatted": multiplier *= 1.3
@@ -4099,6 +4142,52 @@ async def credits_quote(seconds: float = 0, user_id: str = "", user_email: str =
 
 
 
+@app.get("/human-transcription/admin/rates")
+async def human_admin_get_transcriber_rate(request: Request):
+    """Return configurable rates to the general admin only, not Human Work ops."""
+    _require_admin(request)
+    return {
+        "transcriber_rate_kes_per_minute": await _get_human_transcriber_rate(),
+        "rush_rate_kes_per_minute": HUMAN_RUSH_PAYOUT_KES,
+        "proofreading_rate_kes_per_minute": HUMAN_PROOFREADING_PAYOUT_KES,
+        "minimum_rate_kes_per_minute": HUMAN_MIN_TRANSCRIBER_RATE_KES,
+        "maximum_rate_kes_per_minute": HUMAN_MAX_TRANSCRIBER_RATE_KES,
+        "applies_to": "new_jobs_only",
+    }
+
+
+@app.put("/human-transcription/admin/rates")
+async def human_admin_update_transcriber_rate(
+    request: Request,
+    transcriber_rate_kes: int = Form(...),
+):
+    """Save the standard per-minute worker rate for new jobs only."""
+    admin = _require_admin(request)
+    try:
+        rate = _validate_human_transcriber_rate(transcriber_rate_kes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    ref = db.collection(HUMAN_RATE_SETTINGS_COLLECTION).document(HUMAN_RATE_SETTINGS_DOCUMENT)
+    try:
+        await asyncio.to_thread(ref.set, {
+            "transcriber_rate_kes_per_minute": rate,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "updatedBy": str(admin.get("email") or "").strip().lower(),
+        }, merge=True)
+    except Exception as exc:
+        logger.exception("Main admin could not update Human Work transcriber rate")
+        raise HTTPException(status_code=500, detail="The new rate could not be saved.")
+    logger.info("Main admin %s set the standard Human Work rate to KES %s per minute", admin.get("email"), rate)
+    return {
+        "transcriber_rate_kes_per_minute": rate,
+        "rush_rate_kes_per_minute": HUMAN_RUSH_PAYOUT_KES,
+        "proofreading_rate_kes_per_minute": HUMAN_PROOFREADING_PAYOUT_KES,
+        "applies_to": "new_jobs_only",
+    }
+
+
 @app.post("/human-transcription/quote")
 async def human_transcription_quote(
     request: Request,
@@ -4123,7 +4212,8 @@ async def human_transcription_quote(
         raise HTTPException(status_code=401, detail="Your account could not be verified.")
 
     try:
-        quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting)
+        transcriber_rate = await _get_human_transcriber_rate()
+        quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting, transcriber_rate)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -6070,7 +6160,7 @@ def _human_worker_earning_items(job_id, job, include_processed=False):
     payment history and cleanup to use the same stable representation.
     """
     quote = job.get("quote") or {}
-    default_rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+    default_rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
 
     def normalize(source, raw, uid, email, name, minutes, completed_at, rate, payout_status, period_id, paid_at):
         if not uid or not completed_at:
@@ -6317,7 +6407,8 @@ async def human_create_job(
             if str(existing_job.get("client_request_id") or "") == client_request_id:
                 existing_job["id"] = existing_snapshot.id
                 return {"job": _human_public(existing_job), "reservation": "not_created", "credits_deducted": 0, "already_created": True}
-    quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting)
+    transcriber_rate = await _get_human_transcriber_rate()
+    quote = human_credit_quote(seconds, turnaround, difficulty, service, speakers, timestamps, formatting, transcriber_rate)
     profile = await _load_profile(actor["uid"])
     balance = read_balance(profile or {})
     # A real admin, or the dedicated human-job-admin account, never needs
@@ -7462,7 +7553,7 @@ async def human_worker_submit(
                 raise HTTPException(status_code=400, detail="Add your part of the transcript, or attach the finished file, before submitting.")
             quote = job.get("quote") or {}
             minutes = int(target.get("minutes") or 0)
-            rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+            rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
             target.update({
                 "status": "submitted",
                 "transcript": transcript_text[:1000000],
@@ -7526,7 +7617,7 @@ async def human_worker_submit(
         raise HTTPException(status_code=400, detail="Add the completed transcript, or attach the finished file, before submitting.")
     quote = job.get("quote") or {}
     minutes = int(job.get("minutes") or quote.get("minutes") or 0)
-    rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_STANDARD_PAYOUT_KES)
+    rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
     worker_amount_kes = max(0, minutes * rate)
     updates = {
         "status": "submitted",
