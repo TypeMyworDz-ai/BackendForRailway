@@ -93,6 +93,10 @@ async def _worker_actor(_request):
     return {"uid": "worker-1", "email": "worker@example.test", "role": "worker"}
 
 
+async def _admin_actor(_request):
+    return {"uid": "admin-1", "email": "typemywordz@gmail.com", "role": "admin"}
+
+
 async def _target(uid):
     contacts = {
         "admin-1": {"uid": "admin-1", "email": "typemywordz@gmail.com", "name": "Support", "role": "admin"},
@@ -137,6 +141,10 @@ class MessagingPrivacyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.functions = _load_functions()
+
+    def setUp(self):
+        self.functions["_human_actor"] = _worker_actor
+        self.functions["db"] = FakeDatabase({})
 
     def test_inbox_returns_only_participant_threads(self):
         functions = self.functions
@@ -190,10 +198,35 @@ class MessagingPrivacyTests(unittest.TestCase):
         })
         functions["db"] = database
         result = asyncio.run(functions["messaging_inbox"](object()))
-        job_thread = next(item for item in result["threads"] if item["id"] == "job:job-1")
+        job_thread = next(item for item in result["threads"] if item["id"] == "job:job-1:worker")
         self.assertEqual(job_thread["title"], "TypeMyworDz admin")
         self.assertEqual(job_thread["latest"]["preview"], "worker-job-update")
         self.assertNotIn("private-client-job-message", repr(result))
+
+    def test_admin_inbox_keeps_client_and_worker_job_threads_separate(self):
+        functions = self.functions
+        functions["_human_actor"] = _admin_actor
+        database = FakeDatabase({}, {
+            "job-2": {
+                "client_uid": "client-1",
+                "worker_uid": "worker-1",
+                "worker_name": "Worker One",
+                "title": "Confidential job",
+                "status": "in_progress",
+                "messages": [
+                    ("client-msg", {"thread": "client", "sender_uid": "client-1", "sender_role": "client", "message": "client-only message", "createdAt": "2026-09-25T10:00:00"}),
+                    ("worker-msg", {"thread": "worker", "sender_uid": "worker-1", "sender_role": "worker", "message": "worker-only message", "createdAt": "2026-09-25T10:01:00"}),
+                ],
+            },
+        })
+        functions["db"] = database
+        result = asyncio.run(functions["messaging_inbox"](object()))
+        job_threads = [item for item in result["threads"] if item["kind"] == "job"]
+        self.assertEqual({item["id"] for item in job_threads}, {"job:job-2:client", "job:job-2:worker"})
+        previews = {item["id"]: item["latest"]["preview"] for item in job_threads}
+        self.assertEqual(previews["job:job-2:client"], "client-only message")
+        self.assertEqual(previews["job:job-2:worker"], "worker-only message")
+        self.assertNotEqual(job_threads[0]["id"], job_threads[1]["id"])
 
     def test_message_must_belong_to_exact_actor_pair_and_path(self):
         functions = self.functions
