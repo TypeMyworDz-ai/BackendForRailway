@@ -8140,6 +8140,44 @@ def _user_chat_thread_id(first_uid: str, second_uid: str) -> str:
     return "--".join(sorted([str(first_uid), str(second_uid)]))
 
 
+def _user_chat_other_uid(message, actor_uid: str) -> str:
+    """Return the other participant only when this message belongs to actor."""
+    actor_uid = str(actor_uid or "")
+    sender_uid = str((message or {}).get("sender_uid") or "")
+    recipient_uid = str((message or {}).get("recipient_uid") or "")
+    if not actor_uid or not sender_uid or not recipient_uid or sender_uid == recipient_uid:
+        return ""
+    if sender_uid == actor_uid:
+        return recipient_uid
+    if recipient_uid == actor_uid:
+        return sender_uid
+    return ""
+
+
+def _user_chat_parent_matches(parent, actor_uid: str, other_uid: str) -> bool:
+    """Validate the stored participant list when a thread has one."""
+    participants = {str(uid) for uid in ((parent or {}).get("participants") or []) if uid}
+    return not participants or participants == {str(actor_uid), str(other_uid)}
+
+
+def _user_chat_message_matches_pair(message, actor_uid: str, other_uid: str, thread_id: str) -> bool:
+    actor_uid = str(actor_uid or "")
+    other_uid = str(other_uid or "")
+    return bool(
+        actor_uid
+        and other_uid
+        and actor_uid != other_uid
+        and str(thread_id or "") == _user_chat_thread_id(actor_uid, other_uid)
+        and _user_chat_other_uid(message, actor_uid) == other_uid
+    )
+
+
+def _user_chat_assert_target(actor, target):
+    """Only the admin may start direct chats with arbitrary accounts."""
+    if actor.get("role") != "admin" and not is_admin_user(target.get("email") or ""):
+        raise HTTPException(status_code=403, detail="Direct messages are available only with TypeMyworDz support.")
+
+
 async def _user_chat_target(other_uid: str):
     other_uid = str(other_uid or "").strip()
     if not other_uid:
@@ -8187,27 +8225,37 @@ async def _user_chat_file(thread_id: str, upload: UploadFile):
 async def user_chat_messages(other_uid: str, request: Request):
     actor = await _user_chat_actor(request)
     target = await _user_chat_target(other_uid)
+    _user_chat_assert_target(actor, target)
     if target["uid"] == actor["uid"]:
         raise HTTPException(status_code=400, detail="You cannot start a conversation with yourself.")
+    if not db:
+        raise HTTPException(status_code=503, detail="Messaging is not available yet.")
     thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
     thread_ref = db.collection("user_chats").document(thread_id)
-    # Repair older conversations whose messages were written before the
-    # parent-thread materialization fix.
-    await asyncio.to_thread(thread_ref.set, {
-        "participants": [actor["uid"], target["uid"]],
-        "participant_emails": [actor["email"], target["email"]],
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
+    parent_snapshot = await asyncio.to_thread(thread_ref.get)
+    parent = (parent_snapshot.to_dict() or {}) if parent_snapshot.exists else {}
+    if not _user_chat_parent_matches(parent, actor["uid"], target["uid"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this conversation.")
     ref = thread_ref.collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
     unread_refs = []
     messages = []
     for snap in snapshots:
         data = snap.to_dict() or {}
+        if not _user_chat_message_matches_pair(data, actor["uid"], target["uid"], thread_id):
+            continue
         if data.get("recipient_uid") == actor["uid"] and not data.get("readAt"):
             unread_refs.append(snap.reference)
         data["id"] = snap.id
         messages.append(_human_public(data))
+    # Older direct threads may exist only as a messages subcollection. Repair
+    # the parent only after this actor/target pair has been validated above.
+    if messages and not parent.get("participants"):
+        await asyncio.to_thread(thread_ref.set, {
+            "participants": [actor["uid"], target["uid"]],
+            "participant_emails": [actor["email"], target["email"]],
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
     if unread_refs:
         batch = db.batch()
         for message_ref in unread_refs:
@@ -8224,50 +8272,56 @@ async def messaging_inbox(request: Request):
         return {"threads": []}
 
     threads = []
-    user_chat_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
-    user_chat_entries = [(snapshot.id, snapshot.reference) for snapshot in user_chat_snapshots]
-    known_thread_ids = {thread_id for thread_id, _ in user_chat_entries}
-    # Older releases wrote only the messages subcollection. Include those
-    # orphaned threads in the inbox until a normal read/send repairs them.
-    try:
-        orphan_messages = await asyncio.to_thread(lambda: list(db.collection_group("messages").stream()))
-    except Exception:
-        orphan_messages = []
-    for message_snapshot in orphan_messages:
-        path_parts = message_snapshot.reference.path.split("/")
-        if len(path_parts) == 4 and path_parts[0] == "user_chats" and path_parts[2] == "messages":
-            thread_id = path_parts[1]
-            if thread_id not in known_thread_ids:
-                user_chat_entries.append((thread_id, db.collection("user_chats").document(thread_id)))
-                known_thread_ids.add(thread_id)
-    for thread_id, thread_ref in user_chat_entries:
+    # Firestore returns only threads whose participant array includes this
+    # account. The old implementation streamed every user_chats document (and
+    # every messages subcollection globally), exposing other users' names and
+    # private message previews to any signed-in worker or client.
+    user_chat_snapshots = await asyncio.to_thread(
+        lambda: list(
+            db.collection("user_chats").where(
+                filter=FieldFilter("participants", "array_contains", actor["uid"])
+            ).stream()
+        )
+    )
+    user_chat_entries = [(snapshot.id, snapshot.reference, snapshot.to_dict() or {}) for snapshot in user_chat_snapshots]
+
+    for thread_id, thread_ref, parent in user_chat_entries:
+        parent_participants = {str(uid) for uid in (parent.get("participants") or []) if uid}
+        if actor["uid"] not in parent_participants:
+            continue
         message_snapshots = await asyncio.to_thread(
             lambda ref=thread_ref.collection("messages"): list(ref.order_by("createdAt").stream())
         )
-        if not message_snapshots:
-            continue
-        other_uid = ""
         messages = []
-        unread_count = 0
+        other_uids = set()
         for message_snapshot in message_snapshots:
             data = message_snapshot.to_dict() or {}
-            sender_uid = str(data.get("sender_uid") or "")
-            recipient_uid = str(data.get("recipient_uid") or "")
-            if sender_uid != actor["uid"]:
-                other_uid = sender_uid
-            elif recipient_uid != actor["uid"]:
-                other_uid = recipient_uid
-            if recipient_uid == actor["uid"] and not data.get("readAt"):
-                unread_count += 1
+            other_uid = _user_chat_other_uid(data, actor["uid"])
+            if not _user_chat_message_matches_pair(data, actor["uid"], other_uid, thread_id):
+                continue
+            other_uids.add(other_uid)
             data["id"] = message_snapshot.id
             messages.append(_human_public(data))
-        if not other_uid:
+        # A direct thread is exactly one account pair. If its metadata or
+        # messages do not agree, fail closed rather than showing a mixed thread.
+        if len(other_uids) != 1:
+            continue
+        other_uid = next(iter(other_uids))
+        if not _user_chat_parent_matches(parent, actor["uid"], other_uid):
             continue
         try:
             contact = await _user_chat_target(other_uid)
         except HTTPException:
+            if actor["role"] != "admin":
+                continue
             contact = {"uid": other_uid, "name": "Contact", "email": "", "role": "client"}
+        if actor["role"] != "admin" and not is_admin_user(contact.get("email") or ""):
+            continue
         latest = messages[-1]
+        unread_count = sum(
+            1 for message in messages
+            if message.get("recipient_uid") == actor["uid"] and not message.get("readAt")
+        )
         latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else contact.get("name") or contact.get("email") or "Contact"
         threads.append({
             "id": f"user:{other_uid}",
@@ -8285,7 +8339,13 @@ async def messaging_inbox(request: Request):
     for job_snapshot in job_snapshots:
         job = job_snapshot.to_dict() or {}
         job_id = job_snapshot.id
-        has_access = actor["role"] == "admin" or job.get("client_uid") == actor["uid"] or job.get("worker_uid") == actor["uid"]
+        has_access = (
+            actor["role"] == "admin"
+            or job.get("client_uid") == actor["uid"]
+            or job.get("worker_uid") == actor["uid"]
+            or job.get("proofreader_uid") == actor["uid"]
+            or any((segment or {}).get("worker_uid") == actor["uid"] for segment in (job.get("segments") or []))
+        )
         if not has_access:
             continue
         message_snapshots = await asyncio.to_thread(
@@ -8293,33 +8353,51 @@ async def messaging_inbox(request: Request):
         )
         if not message_snapshots:
             continue
+        visible_thread = None if actor["role"] == "admin" else ("worker" if actor["role"] == "worker" else "client")
         messages = []
         unread_count = 0
         for message_snapshot in message_snapshots:
             data = message_snapshot.to_dict() or {}
+            message_thread = str(data.get("thread") or "client").lower()
+            # Human-work jobs deliberately have separate client/admin and
+            # worker/admin channels. Never put the other side's preview, sender,
+            # or unread count into a user's inbox row.
+            if visible_thread and message_thread != visible_thread:
+                continue
             read_by = data.get("readBy") or []
             if data.get("sender_uid") != actor["uid"] and actor["uid"] not in read_by:
                 unread_count += 1
             data["id"] = message_snapshot.id
             messages.append(_human_public(data))
+        if not messages:
+            continue
         latest = messages[-1]
         source = str(job.get("source_type") or "human_transcription").replace("_", " ").title()
         job_title = job.get("title") or job.get("name") or f"{source} · {job_id[:8]}"
-        participant_uid = job.get("client_uid") if actor["role"] == "admin" else (job.get("worker_uid") or "")
         participant = None
-        if participant_uid:
-            try:
-                participant = await _user_chat_target(participant_uid)
-            except HTTPException:
-                participant = None
-        latest_role = str(latest.get("sender_role") or "client").lower()
-        latest_sender = "TypeMyworDz admin" if latest_role == "admin" else (latest.get("sender_email") or latest_role.title())
+        if actor["role"] == "admin":
+            participant_uid = job.get("client_uid") or ""
+            if participant_uid:
+                try:
+                    participant = await _user_chat_target(participant_uid)
+                except HTTPException:
+                    participant = None
+            latest_role = str(latest.get("sender_role") or "client").lower()
+            latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else ("TypeMyworDz admin" if latest_role == "admin" else (latest.get("sender_email") or latest_role.title()))
+            conversation_user = participant or {"uid": participant_uid, "name": latest_sender, "email": latest.get("sender_email") or "", "role": latest_role}
+            conversation_title = participant.get("name") if participant else latest_sender
+            conversation_role = participant.get("role") if participant else latest_role
+        else:
+            latest_sender = "You" if latest.get("sender_uid") == actor["uid"] else ("Another worker" if actor["role"] == "worker" and str(latest.get("sender_role") or "").lower() == "worker" else "TypeMyworDz admin")
+            conversation_user = {"uid": "", "name": "TypeMyworDz admin", "email": "", "role": "admin"}
+            conversation_title = "TypeMyworDz admin"
+            conversation_role = "admin"
         threads.append({
             "id": f"job:{job_id}",
             "kind": "job",
-            "user": participant or {"uid": participant_uid, "name": latest_sender, "email": latest.get("sender_email") or "", "role": latest_role},
-            "title": participant.get("name") if participant else latest_sender,
-            "role": participant.get("role") if participant else latest_role,
+            "user": conversation_user,
+            "title": conversation_title,
+            "role": conversation_role,
             "job": {"id": job_id, "title": job_title, "status": job.get("status") or "pending"},
             "latest": {"id": latest.get("id"), "senderName": latest_sender, "preview": latest.get("message") or "Attachment", "createdAt": latest.get("createdAt")},
             "latestAt": latest.get("createdAt"),
@@ -8338,47 +8416,133 @@ async def messaging_unread_count(request: Request):
         return {"count": 0, "direct_count": 0, "job_count": 0}
     direct_unread = 0
     job_unread = 0
-    thread_snapshots = await asyncio.to_thread(lambda: list(db.collection("user_chats").stream()))
-    for thread_snapshot in thread_snapshots:
-        message_ref = thread_snapshot.reference.collection("messages")
-        messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
-        direct_unread += sum(
-            1 for message in messages
-            if (message.to_dict() or {}).get("recipient_uid") == actor["uid"]
-            and not (message.to_dict() or {}).get("readAt")
+    incoming_direct = await asyncio.to_thread(
+        lambda: list(
+            db.collection_group("messages").where(
+                filter=FieldFilter("recipient_uid", "==", actor["uid"])
+            ).stream()
         )
+    )
+    direct_unread = sum(
+        1 for message_snapshot in incoming_direct
+        if len(message_snapshot.reference.path.split("/")) == 4
+        and message_snapshot.reference.path.split("/")[0] == "user_chats"
+        and not (message_snapshot.to_dict() or {}).get("readAt")
+    )
 
     job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
     for job_snapshot in job_snapshots:
         job = job_snapshot.to_dict() or {}
-        has_access = actor["role"] == "admin" or job.get("client_uid") == actor["uid"] or job.get("worker_uid") == actor["uid"]
+        has_access = (
+            actor["role"] == "admin"
+            or job.get("client_uid") == actor["uid"]
+            or job.get("worker_uid") == actor["uid"]
+            or job.get("proofreader_uid") == actor["uid"]
+            or any((segment or {}).get("worker_uid") == actor["uid"] for segment in (job.get("segments") or []))
+        )
         if not has_access:
             continue
         message_ref = job_snapshot.reference.collection("messages")
         messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
-        job_unread += sum(
-            1 for message in messages
-            if (message.to_dict() or {}).get("sender_uid") != actor["uid"]
-            and actor["uid"] not in ((message.to_dict() or {}).get("readBy") or [])
-        )
+        visible_thread = None if actor["role"] == "admin" else ("worker" if actor["role"] == "worker" else "client")
+        for message in messages:
+            data = message.to_dict() or {}
+            message_thread = str(data.get("thread") or "client").lower()
+            if visible_thread and message_thread != visible_thread:
+                continue
+            if data.get("sender_uid") != actor["uid"] and actor["uid"] not in (data.get("readBy") or []):
+                job_unread += 1
     return {"count": direct_unread + job_unread, "direct_count": direct_unread, "job_count": job_unread}
+
+
+@app.get("/api/messaging/notifications")
+async def direct_message_notifications(request: Request, since: str = ""):
+    """Return only new incoming direct-message event IDs for this account."""
+    actor = await _user_chat_actor(request)
+    if not db:
+        return {"events": [], "server_time": datetime.now().astimezone().isoformat()}
+    try:
+        since_dt = _as_dt(datetime.fromisoformat(str(since).replace("Z", "+00:00"))) if since else None
+    except Exception:
+        since_dt = None
+    if not since_dt:
+        since_dt = datetime.now() - timedelta(seconds=10)
+
+    snapshots = await asyncio.to_thread(
+        lambda: list(
+            db.collection_group("messages").where(
+                filter=FieldFilter("recipient_uid", "==", actor["uid"])
+            ).stream()
+        )
+    )
+    candidates = {}
+    for snapshot in snapshots:
+        path_parts = snapshot.reference.path.split("/")
+        if len(path_parts) != 4 or path_parts[0] != "user_chats" or path_parts[2] != "messages":
+            continue
+        data = snapshot.to_dict() or {}
+        other_uid = _user_chat_other_uid(data, actor["uid"])
+        created_at = _as_dt(data.get("createdAt"))
+        if not other_uid or not created_at or created_at < since_dt:
+            continue
+        thread_id = path_parts[1]
+        if not _user_chat_message_matches_pair(data, actor["uid"], other_uid, thread_id):
+            continue
+        candidates.setdefault(thread_id, []).append({
+            "message_id": snapshot.id,
+            "other_uid": other_uid,
+            "created_at": created_at,
+        })
+
+    events = []
+    for thread_id, items in candidates.items():
+        other_uid = items[0]["other_uid"]
+        if any(item["other_uid"] != other_uid for item in items):
+            continue
+        parent_snapshot = await asyncio.to_thread(db.collection("user_chats").document(thread_id).get)
+        parent = (parent_snapshot.to_dict() or {}) if parent_snapshot.exists else {}
+        if not _user_chat_parent_matches(parent, actor["uid"], other_uid):
+            continue
+        try:
+            contact = await _user_chat_target(other_uid)
+        except HTTPException:
+            if actor["role"] != "admin":
+                continue
+            contact = {"uid": other_uid, "email": ""}
+        if actor["role"] != "admin" and not is_admin_user(contact.get("email") or ""):
+            continue
+        events.extend({
+            "type": "direct_message",
+            "thread_id": thread_id,
+            "message_id": item["message_id"],
+            "created_at": _human_iso(item["created_at"]),
+        } for item in items)
+    events.sort(key=lambda event: str(event.get("created_at") or ""))
+    return {"events": events, "server_time": datetime.now().astimezone().isoformat()}
 
 
 @app.post("/api/user-chats/{other_uid}/messages")
 async def user_chat_send(other_uid: str, request: Request, attachment: UploadFile = File(None), message: str = Form("")):
     actor = await _user_chat_actor(request)
     target = await _user_chat_target(other_uid)
+    _user_chat_assert_target(actor, target)
     if target["uid"] == actor["uid"]:
         raise HTTPException(status_code=400, detail="You cannot message yourself.")
-    text = (message or "").strip()
+    if not db:
+        raise HTTPException(status_code=503, detail="Messaging is not available yet.")
     thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
+    thread_ref = db.collection("user_chats").document(thread_id)
+    parent_snapshot = await asyncio.to_thread(thread_ref.get)
+    parent = (parent_snapshot.to_dict() or {}) if parent_snapshot.exists else {}
+    if not _user_chat_parent_matches(parent, actor["uid"], target["uid"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this conversation.")
+    text = (message or "").strip()
     attachment_meta = await _user_chat_file(thread_id, attachment) if attachment else None
     if not text and not attachment_meta:
         raise HTTPException(status_code=400, detail="Write a message or attach a file.")
     # Materialize the parent thread before writing its first message. Without
     # this document Firestore only shows a phantom path created by the
-    # subcollection, and inbox queries over user_chats cannot discover it.
-    thread_ref = db.collection("user_chats").document(thread_id)
+    # subcollection, and inbox queries over participant arrays cannot discover it.
     await asyncio.to_thread(thread_ref.set, {
         "participants": [actor["uid"], target["uid"]],
         "participant_emails": [actor["email"], target["email"]],
@@ -8408,11 +8572,23 @@ async def user_chat_send(other_uid: str, request: Request, attachment: UploadFil
 async def user_chat_attachment(other_uid: str, message_id: str, request: Request):
     actor = await _user_chat_actor(request)
     target = await _user_chat_target(other_uid)
+    _user_chat_assert_target(actor, target)
+    if target["uid"] == actor["uid"]:
+        raise HTTPException(status_code=400, detail="You cannot open a conversation with yourself.")
+    if not db:
+        raise HTTPException(status_code=503, detail="Messaging is not available yet.")
     thread_id = _user_chat_thread_id(actor["uid"], target["uid"])
-    snapshot = await asyncio.to_thread(db.collection("user_chats").document(thread_id).collection("messages").document(message_id).get)
+    thread_ref = db.collection("user_chats").document(thread_id)
+    parent_snapshot = await asyncio.to_thread(thread_ref.get)
+    parent = (parent_snapshot.to_dict() or {}) if parent_snapshot.exists else {}
+    if not _user_chat_parent_matches(parent, actor["uid"], target["uid"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this conversation.")
+    snapshot = await asyncio.to_thread(thread_ref.collection("messages").document(message_id).get)
     if not snapshot.exists:
         raise HTTPException(status_code=404, detail="That attachment was not found.")
     data = snapshot.to_dict() or {}
+    if not _user_chat_message_matches_pair(data, actor["uid"], target["uid"], thread_id):
+        raise HTTPException(status_code=403, detail="That attachment does not belong to this conversation.")
     meta = data.get("attachment") or {}
     path = meta.get("storage_path")
     if not path or not str(path).startswith(f"user-chats/{thread_id}/"):
