@@ -699,7 +699,11 @@ def _as_dt(value):
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None)
+        # Firestore's DatetimeWithNanoseconds can survive replace() as its
+        # subclass, then fail when written back because Firestore expects its
+        # internal nanosecond field. Rebuild as a plain datetime; this app uses
+        # microsecond precision for deadlines and payout records.
+        return datetime(value.year, value.month, value.day, value.hour, value.minute, value.second, value.microsecond)
     for attr in ('to_datetime', 'ToDatetime'):
         fn = getattr(value, attr, None)
         if callable(fn):
@@ -5563,6 +5567,14 @@ def _human_public_for(data, actor_role, actor_uid=""):
     data = data or {}
     out = _human_public(data)
     segments = data.get("segments") or []
+    if actor_role in {"worker", "client"}:
+        for key in (
+            "last_assignment_takeback_at", "last_assignment_takeback_worker_uid",
+            "last_assignment_takeback_worker_name", "last_assignment_takeback_role",
+            "last_assignment_takeback_label", "last_assignment_takeback_by_uid",
+            "last_assignment_takeback_by_email",
+        ):
+            out.pop(key, None)
 
     def remaining(deadline, status):
         deadline_dt = _as_dt(deadline)
@@ -6311,6 +6323,8 @@ async def human_workflow_notifications(request: Request, since: str = ""):
         for field, op in (("worker_uid", "=="), ("assigned_worker_uids", "array_contains"), ("proofreader_uid", "==")):
             snapshots = await asyncio.to_thread(lambda field=field, op=op: list(ref.where(filter=FieldFilter(field, op, actor["uid"])).stream()))
             found.update({snap.id: snap for snap in snapshots})
+        takebacks = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("last_assignment_takeback_at", ">=", since_dt)).stream()))
+        found.update({snap.id: snap for snap in takebacks})
     else:
         snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("client_uid", "==", actor["uid"])).stream()))
         found.update({snap.id: snap for snap in snapshots})
@@ -6357,6 +6371,13 @@ async def human_workflow_notifications(request: Request, since: str = ""):
             for role, assigned_at in assignments:
                 if recent(assigned_at):
                     events.append({"type": "assignment", "job_id": job_id, "job_name": job_name, "label": role, "updated_at": _human_iso(assigned_at)})
+            takeback_at = job.get("last_assignment_takeback_at")
+            if job.get("last_assignment_takeback_worker_uid") == actor["uid"] and recent(takeback_at):
+                events.append({
+                    "type": "assignment_taken_back", "job_id": job_id, "job_name": job_name,
+                    "label": job.get("last_assignment_takeback_label") or "Your assignment",
+                    "updated_at": _human_iso(takeback_at), "event_id": _human_iso(takeback_at),
+                })
         message_summaries = job.get("last_message_by_thread") or {}
         if not message_summaries and job.get("last_message"):
             legacy = job.get("last_message") or {}
@@ -7041,6 +7062,90 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
     return {"status": "proofreading_assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
 
 
+@app.post("/human-transcription/jobs/{job_id}/take-back")
+async def human_admin_take_back(job_id: str, request: Request):
+    """Return an active worker assignment to its queue without undoing submitted work."""
+    admin = _require_human_job_admin(request)
+    payload = await request.json()
+    role = str(payload.get("role") or "transcriber").strip().lower()
+    if role not in {"transcriber", "proofreader"}:
+        raise HTTPException(status_code=400, detail="Choose a transcription part or proofreading assignment.")
+    job = await _human_job(job_id)
+    now = datetime.now()
+    active_statuses = {"assigned", "in_progress"}
+    worker_uid = ""
+    worker_name = ""
+    label = "Transcription"
+    updates = {"updatedAt": firestore.SERVER_TIMESTAMP}
+
+    if role == "proofreader":
+        if job.get("proofreader_status") not in active_statuses or not job.get("proofreader_uid"):
+            raise HTTPException(status_code=409, detail="Only an active proofreading assignment can be taken back.")
+        worker_uid = str(job.get("proofreader_uid") or "")
+        worker_name = str(job.get("proofreader_name") or job.get("proofreader_email") or "")
+        label = "Final proofreading"
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        updates.update({
+            "proofreader_status": "available", "proofreader_uid": None, "proofreader_email": None,
+            "proofreader_name": None, "proofreader_assignedAt": None, "proofreader_deadlineAt": None,
+            "proofreader_tat_seconds": None, "proofreader_tat_extension_minutes": 0,
+            "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
+            "status": "proofreading_available" if job.get("split_mode") == "dual" else "approved",
+        })
+    elif job.get("split_mode") == "dual":
+        segment_id = str(payload.get("segment_id") or "").strip()
+        if not segment_id:
+            raise HTTPException(status_code=400, detail="Choose the active part to take back.")
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        target = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
+        if not target or target.get("status") not in active_statuses or not target.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="Only an active part can be taken back.")
+        worker_uid = str(target.get("worker_uid") or "")
+        worker_name = str(target.get("worker_name") or target.get("worker_email") or "")
+        label = str(target.get("label") or "Transcription part")
+        # Keep any draft text or attachments on the part. Only clear the live
+        # assignment; previously submitted sibling parts are left untouched.
+        target.update({
+            "status": "available", "worker_uid": None, "worker_email": None, "worker_name": None,
+            "assignedAt": None, "deadlineAt": None, "tat_seconds": None, "tat_extension_minutes": 0,
+        })
+        proofreader_uid = job.get("proofreader_uid") if job.get("proofreader_status") in active_statuses | {"submitted"} else None
+        assigned_uids = [item.get("worker_uid") for item in segments if item.get("worker_uid")]
+        if proofreader_uid:
+            assigned_uids.append(proofreader_uid)
+        if job.get("proofreader_status") in active_statuses:
+            next_status = "proofreading_in_progress" if job.get("proofreader_status") == "in_progress" else "proofreading_assigned"
+        elif all(item.get("status") == "submitted" for item in segments):
+            next_status = "proofreading_available"
+        elif any(item.get("status") == "in_progress" for item in segments):
+            next_status = "split_in_progress"
+        else:
+            next_status = "split_assigned"
+        updates.update({"segments": segments, "assigned_worker_uids": list(dict.fromkeys(assigned_uids)), "status": next_status})
+    else:
+        if job.get("status") not in active_statuses or not job.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="Only an active transcription assignment can be taken back.")
+        worker_uid = str(job.get("worker_uid") or "")
+        worker_name = str(job.get("worker_name") or job.get("worker_email") or "")
+        updates.update({
+            "status": "approved", "worker_uid": None, "worker_email": None, "worker_name": None,
+            "assignedAt": None, "deadlineAt": None, "tat_seconds": None,
+            "tat_extension_minutes": 0, "assigned_worker_uids": [],
+        })
+
+    updates.update({
+        "last_assignment_takeback_at": now,
+        "last_assignment_takeback_worker_uid": worker_uid,
+        "last_assignment_takeback_worker_name": worker_name,
+        "last_assignment_takeback_role": role,
+        "last_assignment_takeback_label": label,
+        "last_assignment_takeback_by_uid": str(admin.get("uid") or ""),
+        "last_assignment_takeback_by_email": str(admin.get("email") or "").strip().lower(),
+    })
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    return {"status": updates.get("status"), "job_id": job_id, "role": role, "label": label, "worker_uid": worker_uid}
+
+
 @app.post("/human-transcription/jobs/{job_id}/extend-tat")
 async def human_admin_extend_tat(job_id: str, request: Request):
     _require_human_job_admin(request)
@@ -7277,11 +7382,12 @@ def _human_archive_id(job_id, source, segment_id=None):
     return uuid.uuid5(uuid.NAMESPACE_URL, identity).hex
 
 
-async def _human_archive_job_earnings(job_id, job):
+async def _human_archive_job_earnings(job_id, job, delete_source=True):
     """Copy every completed earning into a durable, transcript-free ledger."""
     earnings = list(_human_worker_earning_items(job_id, job, include_processed=True))
     if not earnings:
-        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).delete)
+        if delete_source:
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).delete)
         return 0
     refs = []
     for item in earnings:
@@ -7307,9 +7413,10 @@ async def _human_archive_job_earnings(job_id, job):
         batch = db.batch()
         for ref, record in refs:
             batch.set(ref, record, merge=True)
-        batch.delete(db.collection(HUMAN_JOB_COLLECTION).document(job_id))
+        if delete_source:
+            batch.delete(db.collection(HUMAN_JOB_COLLECTION).document(job_id))
         await asyncio.to_thread(batch.commit)
-    else:
+    elif delete_source:
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).delete)
     return len(earnings)
 
@@ -7343,9 +7450,13 @@ async def _human_delete_job_messages(message_snapshots):
 async def _human_delete_job_safely(job_id, job):
     job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
     message_snapshots = await asyncio.to_thread(lambda: list(job_ref.collection("messages").stream()))
+    # Archive first, but keep the source job until files and messages are
+    # removed. If any later cleanup step fails, a retry is safe and the worker
+    # can still see the job; payment history is deduplicated by earning ID.
+    earnings_archived = await _human_archive_job_earnings(job_id, job, delete_source=False)
     deleted_files = await _human_delete_job_storage(job_id, job, message_snapshots)
     await _human_delete_job_messages(message_snapshots)
-    earnings_archived = await _human_archive_job_earnings(job_id, job)
+    await asyncio.to_thread(job_ref.delete)
     return {"deleted": True, "job_id": job_id, "previous_status": job.get("status"), "files_deleted": deleted_files, "earnings_archived": earnings_archived}
 
 
@@ -7422,7 +7533,7 @@ async def human_admin_bulk_cleanup(request: Request):
 @app.delete("/human-transcription/jobs/{job_id}")
 async def human_admin_delete(job_id: str, request: Request):
     """Permanently remove a human/proofreading job while preserving earnings."""
-    _require_admin(request)
+    _require_human_job_admin(request)
     job = await _human_job(job_id)
     if not db:
         raise HTTPException(status_code=503, detail="Database is not ready.")
@@ -7430,9 +7541,9 @@ async def human_admin_delete(job_id: str, request: Request):
         return await _human_delete_job_safely(job_id, job)
     except HTTPException:
         raise
-    except Exception as exc:
-        logger.error("Could not delete human job %s: %s", job_id, exc)
-        raise HTTPException(status_code=500, detail="The human job could not be deleted.")
+    except Exception:
+        logger.exception("Could not delete human job %s", job_id)
+        raise HTTPException(status_code=500, detail="The job could not be fully removed. Worker payment history is protected; please retry, and contact support if the issue continues.")
 
 
 def _human_thread_for(actor, requested_thread=""):
