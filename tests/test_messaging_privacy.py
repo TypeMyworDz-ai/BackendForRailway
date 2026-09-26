@@ -115,6 +115,9 @@ def _load_functions():
         "_user_chat_parent_matches",
         "_user_chat_message_matches_pair",
         "_user_chat_assert_target",
+        "_human_job_worker_uids",
+        "_human_assert_job_conversation_access",
+        "_human_thread_for",
         "messaging_inbox",
     }
     nodes = []
@@ -203,30 +206,53 @@ class MessagingPrivacyTests(unittest.TestCase):
         self.assertEqual(job_thread["latest"]["preview"], "worker-job-update")
         self.assertNotIn("private-client-job-message", repr(result))
 
-    def test_admin_inbox_keeps_client_and_worker_job_threads_separate(self):
+    def test_admin_inbox_exposes_only_worker_thread_for_split_claimants(self):
         functions = self.functions
         functions["_human_actor"] = _admin_actor
         database = FakeDatabase({}, {
             "job-2": {
                 "client_uid": "client-1",
-                "worker_uid": "worker-1",
-                "worker_name": "Worker One",
+                "assigned_worker_uids": ["worker-1", "worker-2"],
+                "segments": [
+                    {"worker_uid": "worker-1", "worker_name": "Worker One"},
+                    {"worker_uid": "worker-2", "worker_name": "Worker Two"},
+                ],
                 "title": "Confidential job",
-                "status": "in_progress",
+                "status": "split_in_progress",
                 "messages": [
-                    ("client-msg", {"thread": "client", "sender_uid": "client-1", "sender_role": "client", "message": "client-only message", "createdAt": "2026-09-25T10:00:00"}),
-                    ("worker-msg", {"thread": "worker", "sender_uid": "worker-1", "sender_role": "worker", "message": "worker-only message", "createdAt": "2026-09-25T10:01:00"}),
+                    ("client-msg", {"thread": "client", "sender_uid": "client-1", "sender_role": "client", "message": "legacy-client-only message", "createdAt": "2026-09-25T10:00:00"}),
+                    ("worker-msg", {"thread": "worker", "sender_uid": "worker-2", "sender_role": "worker", "message": "worker-only message", "createdAt": "2026-09-25T10:01:00"}),
                 ],
             },
         })
         functions["db"] = database
         result = asyncio.run(functions["messaging_inbox"](object()))
         job_threads = [item for item in result["threads"] if item["kind"] == "job"]
-        self.assertEqual({item["id"] for item in job_threads}, {"job:job-2:client", "job:job-2:worker"})
-        previews = {item["id"]: item["latest"]["preview"] for item in job_threads}
-        self.assertEqual(previews["job:job-2:client"], "client-only message")
-        self.assertEqual(previews["job:job-2:worker"], "worker-only message")
-        self.assertNotEqual(job_threads[0]["id"], job_threads[1]["id"])
+        self.assertEqual([item["id"] for item in job_threads], ["job:job-2:worker"])
+        self.assertEqual(job_threads[0]["title"], "2 workers")
+        self.assertEqual(job_threads[0]["latest"]["preview"], "worker-only message")
+        self.assertNotIn("legacy-client-only message", repr(result))
+
+    def test_only_admins_and_assigned_workers_can_use_job_conversations(self):
+        functions = self.functions
+        allowed_job = {"segments": [{"worker_uid": "worker-1"}]}
+        functions["_human_assert_job_conversation_access"](allowed_job, {"uid": "admin-1", "role": "admin"})
+        functions["_human_assert_job_conversation_access"](allowed_job, {"uid": "worker-1", "role": "worker"})
+        for actor in (
+            {"uid": "client-1", "role": "client"},
+            {"uid": "worker-2", "role": "worker"},
+        ):
+            with self.subTest(actor=actor), self.assertRaises(FakeHTTPException):
+                functions["_human_assert_job_conversation_access"](allowed_job, actor)
+
+    def test_legacy_client_thread_is_not_selectable_by_any_user(self):
+        choose = self.functions["_human_thread_for"]
+        self.assertEqual(choose({"role": "admin"}, ""), "worker")
+        self.assertEqual(choose({"role": "worker"}, "client"), "worker")
+        with self.assertRaises(FakeHTTPException):
+            choose({"role": "admin"}, "client")
+        with self.assertRaises(FakeHTTPException):
+            choose({"role": "client"}, "worker")
 
     def test_message_must_belong_to_exact_actor_pair_and_path(self):
         functions = self.functions

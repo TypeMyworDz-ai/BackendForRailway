@@ -596,7 +596,9 @@ PLAN_CREDITS = {
     'Yearly Plan':    {'credits': 1400,  'days': 365, 'monthly_refill': True},
 }
 
-FREE_TRIAL_CREDITS = 5           # once per account; one credit equals one minute
+FREE_TRIAL_CREDITS = 30          # new accounts; one credit equals one audio minute
+LEGACY_FREE_TRIAL_CREDITS = 5    # keep the pre-release amount for first-time legacy conversion
+MIN_HUMAN_WORKER_RATING = 3.5
 TOPUP_VALID_DAYS = 365           # bought credits last a year
 REFILL_DAYS = 30                 # yearly plan tops up every 30 days
 
@@ -1069,14 +1071,17 @@ def grant_topup_credits(profile, bundle_id, country_code='KE', now=None):
             'newTotal': bal['planCredits'] + updates['topUpCredits']}
 
 
-def grant_free_trial(profile, now=None):
-    """Ten credits, once, for a brand new account."""
+def grant_free_trial(profile, now=None, credits=None):
+    """Grant the new-account allowance once; existing balance is never topped up."""
     profile = profile or {}
-    if profile.get('hasReceivedInitialFreeMinutes'):
+    if (profile.get('hasReceivedInitialFreeMinutes')
+            or _int(profile.get('planCredits'))
+            or _int(profile.get('topUpCredits'))):
         return {}
     now = now or datetime.now()
+    credits = FREE_TRIAL_CREDITS if credits is None else credits
     return {
-        'planCredits': FREE_TRIAL_CREDITS,
+        'planCredits': credits,
         'planCreditsExpireAt': now + timedelta(days=30),
         'planCreditsRefillAt': None,
         'hasReceivedInitialFreeMinutes': True,
@@ -1117,7 +1122,11 @@ def backfill_credits(profile, now=None):
 
     if profile.get('creditsBackfilledAt'):
         return {}, {'skipped': 'already done'}
-    # An account that already has a live credit purse came in after credits
+    # Do not replace any balance that is already present, even when a legacy
+    # or partial record is missing its expiry metadata.
+    if _int(profile.get('planCredits')) or _int(profile.get('topUpCredits')):
+        return {'creditsBackfilledAt': now}, {'skipped': 'existing credit balance preserved'}
+    # An account that already has a credit expiry came in after credits
     # existed, so there is nothing to convert.
     if _as_dt(profile.get('planCreditsExpireAt')) is not None:
         return {'creditsBackfilledAt': now}, {'skipped': 'already on credits'}
@@ -1141,13 +1150,16 @@ def backfill_credits(profile, now=None):
         return updates, {'granted': credits, 'plan': plan,
                          'remainingMinutes': remaining, 'reason': 'paid plan converted'}
 
-    # Free account that has not used its trial yet: give it the trial in
-    # credits. One that has already used it gets nothing, which matches what
-    # it had before.
+    # Profiles created by the current signup flow carry a version marker.
+    # Unmarked legacy accounts keep the prior amount when they are converted;
+    # changing the new-signup allowance must not silently change their first backfill.
     if not profile.get('hasReceivedInitialFreeMinutes'):
-        updates = dict(grant_free_trial(profile, now))
+        is_new_trial = profile.get('freeTrialVersion') == 2
+        trial_credits = FREE_TRIAL_CREDITS if is_new_trial else LEGACY_FREE_TRIAL_CREDITS
+        updates = dict(grant_free_trial(profile, now, credits=trial_credits))
         updates['creditsBackfilledAt'] = now
-        return updates, {'granted': FREE_TRIAL_CREDITS, 'reason': 'free trial'}
+        reason = 'new account free trial' if is_new_trial else 'legacy free trial'
+        return updates, {'granted': trial_credits, 'reason': reason}
 
     return {'creditsBackfilledAt': now}, {'granted': 0, 'reason': 'trial already used'}
 
@@ -5823,6 +5835,9 @@ def _human_public_for(data, actor_role, actor_uid=""):
     """
     data = data or {}
     out = _human_public(data)
+    if actor_role not in {"admin", "human_ops_admin"}:
+        out.pop("worker_ratings", None)
+        out.pop("worker_rating", None)
     segments = data.get("segments") or []
     if actor_role in {"worker", "client"}:
         for key in (
@@ -6073,15 +6088,94 @@ def _human_claim_is_active(job, worker_uid, claim):
     return job.get("worker_uid") == worker_uid and job.get("status") in active
 
 
-async def _human_worker_has_active_assignment(worker_uid):
+def _human_job_worker_uids(job):
+    job = job or {}
+    worker_uids = {str(uid) for uid in (job.get("assigned_worker_uids") or []) if uid}
+    for key in ("worker_uid", "proofreader_uid"):
+        if job.get(key):
+            worker_uids.add(str(job[key]))
+    worker_uids.update(
+        str((item or {}).get("worker_uid"))
+        for item in (job.get("segments") or [])
+        if (item or {}).get("worker_uid")
+    )
+    return worker_uids
+
+
+def _human_worker_rating_for_job(job, worker_uid):
+    job = job or {}
+    worker_uid = str(worker_uid or "")
+    ratings_by_worker = job.get("worker_ratings") or {}
+    if worker_uid in ratings_by_worker:
+        raw_rating = ratings_by_worker.get(worker_uid)
+    elif worker_uid in _human_job_worker_uids(job):
+        raw_rating = job.get("worker_rating")
+    else:
+        return None
+    try:
+        rating = float(raw_rating)
+    except (TypeError, ValueError):
+        return None
+    return rating if math.isfinite(rating) and 1 <= rating <= 5 else None
+
+
+def _human_worker_rating_summary_from_jobs(jobs, worker_uid):
+    ratings = [
+        rating for job in (jobs or [])
+        if (rating := _human_worker_rating_for_job(job, worker_uid)) is not None
+    ]
+    return {
+        "average": round(sum(ratings) / len(ratings), 2) if ratings else None,
+        "count": len(ratings),
+    }
+
+
+async def _human_worker_job_snapshots(worker_uid, include_legacy_segments=False):
     if not db or not worker_uid:
-        return False
+        return []
     ref = db.collection(HUMAN_JOB_COLLECTION)
     found = {}
     for field, operator in (("worker_uid", "=="), ("assigned_worker_uids", "array_contains"), ("proofreader_uid", "==")):
         snapshots = await asyncio.to_thread(lambda field=field, operator=operator: list(ref.where(filter=FieldFilter(field, operator, worker_uid)).stream()))
         found.update({snapshot.id: snapshot for snapshot in snapshots})
-    for snapshot in found.values():
+    if include_legacy_segments:
+        # Older split records may identify a claimant only inside segments[].
+        # Backfill that history once into the worker profile; new assignments
+        # already maintain assigned_worker_uids for indexed lookups.
+        snapshots = await asyncio.to_thread(lambda: list(ref.stream()))
+        for snapshot in snapshots:
+            job = snapshot.to_dict() or {}
+            if any(str((item or {}).get("worker_uid") or "") == str(worker_uid) for item in (job.get("segments") or [])):
+                found[snapshot.id] = snapshot
+    return list(found.values())
+
+
+async def _human_worker_rating_summary(worker_uid, profile=None, force_refresh=False):
+    profile = profile or {}
+    if not force_refresh and "worker_rating_count" in profile:
+        try:
+            count = max(0, int(profile.get("worker_rating_count") or 0))
+            average = float(profile.get("worker_rating_average")) if count else None
+            if average is not None and not math.isfinite(average):
+                average = None
+            return {"average": round(average, 2) if average is not None else None, "count": count}
+        except (TypeError, ValueError):
+            pass
+    snapshots = await _human_worker_job_snapshots(worker_uid, include_legacy_segments=True)
+    summary = _human_worker_rating_summary_from_jobs(
+        [(snapshot.to_dict() or {}) for snapshot in snapshots], worker_uid,
+    )
+    if db and worker_uid:
+        await asyncio.to_thread(
+            db.collection("users").document(str(worker_uid)).set,
+            {"worker_rating_average": summary["average"], "worker_rating_count": summary["count"]},
+            merge=True,
+        )
+    return summary
+
+
+async def _human_worker_has_active_assignment(worker_uid):
+    for snapshot in await _human_worker_job_snapshots(worker_uid):
         job = snapshot.to_dict() or {}
         job["id"] = snapshot.id
         job = await _human_check_expiry(snapshot.id, job)
@@ -6120,7 +6214,7 @@ async def _human_release_worker_claim(worker_uid, job_id, segment_id="", role="t
     await asyncio.to_thread(release_if_current, transaction)
 
 
-def _human_claim_assignment_transaction(job_id, actor, segment_id=""):
+def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supervised_starter=False):
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     worker_uid = str(actor.get("uid") or "")
@@ -6141,6 +6235,14 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id=""):
             raise HTTPException(status_code=403, detail="Approved worker access is required.")
         if worker_profile.get("is_available", True) is False:
             raise HTTPException(status_code=409, detail="Your account is marked unavailable. Change your availability before claiming work.")
+        if not allow_supervised_starter:
+            try:
+                rating_count = int(worker_profile.get("worker_rating_count") or 0)
+                rating_average = float(worker_profile.get("worker_rating_average")) if rating_count else None
+            except (TypeError, ValueError):
+                rating_count, rating_average = 0, None
+            if rating_average is None or rating_average < MIN_HUMAN_WORKER_RATING:
+                raise HTTPException(status_code=403, detail="A worker rating of 3.5/5 or higher is required to claim Available Jobs. Contact an admin about a supervised starter assignment.")
         claim_snapshot = claim_ref.get(transaction=tx)
         current_claim = claim_snapshot.to_dict() if claim_snapshot.exists else {}
         if current_claim.get("status") == "active":
@@ -6813,21 +6915,44 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     available_scope = actor["role"] == "worker" and scope == "available"
     worker_can_claim = False
     claim_block_reason = ""
+    worker_active_assignment = False
+    worker_available = (actor.get("profile") or {}).get("is_available", True) is not False
+    worker_rating_summary = {"average": None, "count": 0}
+    worker_meets_rating = False
+    if actor["role"] == "worker":
+        worker_rating_summary = await _human_worker_rating_summary(actor["uid"], actor.get("profile") or {})
+        worker_meets_rating = (
+            worker_rating_summary["average"] is not None
+            and worker_rating_summary["average"] >= MIN_HUMAN_WORKER_RATING
+        )
     if available_scope:
         snapshots_by_id = {}
         for status in ("approved", "split_assigned", "split_in_progress"):
             rows = await asyncio.to_thread(lambda status=status: list(ref.where(filter=FieldFilter("status", "==", status)).stream()))
             snapshots_by_id.update({snapshot.id: snapshot for snapshot in rows})
         snapshots = list(snapshots_by_id.values())
-        worker_available = (actor.get("profile") or {}).get("is_available", True) is not False
-        active_assignment = await _human_worker_has_active_assignment(actor["uid"])
-        worker_can_claim = worker_available and not active_assignment
-        claim_block_reason = "Your account is marked unavailable. Change your availability before claiming work." if not worker_available else ("Finish your current assignment before claiming another." if active_assignment else "")
+        worker_active_assignment = await _human_worker_has_active_assignment(actor["uid"])
+        worker_can_claim = worker_meets_rating and worker_available and not worker_active_assignment
+        if not worker_meets_rating:
+            average = worker_rating_summary["average"]
+            claim_block_reason = (
+                f"Your current average is {average:.2f}/5; a rating of at least 3.5/5 is required to see Available Jobs."
+                if average is not None else
+                "A rating of at least 3.5/5 is required to see Available Jobs. Ask an admin about a supervised starter assignment."
+            )
+        elif not worker_available:
+            claim_block_reason = "Your account is marked unavailable. Change your availability before claiming work."
+        elif worker_active_assignment:
+            claim_block_reason = "Finish your current assignment before claiming another."
     elif scope == "available":
         raise HTTPException(status_code=403, detail="Only approved workers can view available Human Work.")
-    elif actor["role"] == "admin" or scope == "admin":
+    elif scope == "admin" and actor["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required to view the Human Work queue.")
+    elif actor["role"] == "admin":
         snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream()))
-    elif actor["role"] == "worker" or scope in {"assigned", "finished"}:
+    elif scope in {"assigned", "finished"} and actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required to view assigned or finished jobs.")
+    elif actor["role"] == "worker":
         # Keep the original single-worker query and add the split parent query.
         found = {}
         for snap in await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream())):
@@ -6842,6 +6967,8 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     jobs = []
     view_role = "human_ops_admin" if actor["role"] == "admin" and not is_admin_user(actor.get("email") or "") else actor["role"]
     for snap in snapshots:
+        if available_scope and not worker_meets_rating:
+            continue
         item = snap.to_dict() or {}
         item["id"] = snap.id
         item = await _human_check_expiry(snap.id, item)
@@ -6884,19 +7011,12 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     response = {"jobs": jobs}
     if actor["role"] == "worker":
-        ratings = []
-        for snapshot in snapshots:
-            raw_rating = (snapshot.to_dict() or {}).get("worker_rating")
-            try:
-                value = float(raw_rating)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value) and 1 <= value <= 5:
-                ratings.append(value)
-        response["worker_rating_summary"] = {
-            "average": round(sum(ratings) / len(ratings), 2) if ratings else None,
-            "count": len(ratings),
-        }
+        response["worker_rating_summary"] = worker_rating_summary
+        response["worker_can_view_available"] = worker_meets_rating
+        response["worker_active_assignment"] = worker_active_assignment
+        response["worker_available"] = worker_available
+        response["worker_can_claim"] = worker_can_claim
+        response["worker_claim_block_reason"] = claim_block_reason
     return response
 
 
@@ -6980,7 +7100,7 @@ async def human_workflow_notifications(request: Request, since: str = ""):
         if not message_summaries and job.get("last_message"):
             legacy = job.get("last_message") or {}
             message_summaries = {legacy.get("thread") or "client": legacy}
-        visible_threads = ("client", "worker") if actor["role"] == "admin" else (("client",) if actor["role"] == "client" else (("worker",) if actor["role"] == "worker" else ()))
+        visible_threads = ("worker",) if actor["role"] in {"admin", "worker"} else ()
         for message_thread in visible_threads:
             last_message = message_summaries.get(message_thread) or {}
             if last_message.get("sender_uid") != actor["uid"] and recent(last_message.get("createdAt")):
@@ -7541,6 +7661,9 @@ async def human_worker_claim(job_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Only approved workers can claim Human Work.")
     if (actor.get("profile") or {}).get("is_available", True) is False:
         raise HTTPException(status_code=403, detail="Your account is marked unavailable. Change your availability before claiming work.")
+    rating_summary = await _human_worker_rating_summary(actor["uid"], actor.get("profile") or {})
+    if rating_summary["average"] is None or rating_summary["average"] < MIN_HUMAN_WORKER_RATING:
+        raise HTTPException(status_code=403, detail="A worker rating of 3.5/5 or higher is required to claim Available Jobs. Contact an admin about a supervised starter assignment.")
     payload = await request.json()
     segment_id = str(payload.get("segment_id") or "").strip()
     await _human_job(job_id)
@@ -7613,6 +7736,8 @@ async def human_admin_assign(job_id: str, request: Request):
     _require_human_job_admin(request)
     payload = await request.json()
     job = await _human_job(job_id)
+    if payload.get("supervised_starter") is not True:
+        raise HTTPException(status_code=409, detail="Workers who meet the rating standard claim open work themselves. Admin assignment is reserved for a supervised starter assessment.")
     assignment_mode = str(payload.get("assignment_mode") or "single").strip().lower()
     requested_workers = payload.get("workers") if isinstance(payload.get("workers"), list) else []
     if not requested_workers and payload.get("worker_uid"):
@@ -7627,40 +7752,51 @@ async def human_admin_assign(job_id: str, request: Request):
     ]
     split_requested = assignment_mode in {"dual", "multi", "split"} or len(requested_workers) > 1
     if split_requested:
-        raise HTTPException(status_code=409, detail="New jobs are split automatically when approved. Workers claim available parts from the Work Room.")
-
+        raise HTTPException(status_code=409, detail="New jobs are split automatically when approved. Assign one supervised starter part at a time.")
     if len(requested_workers) != 1:
-        raise HTTPException(status_code=400, detail="Choose an approved worker first.")
+        raise HTTPException(status_code=400, detail="Choose one approved worker for the supervised starter assignment.")
+
     worker = requested_workers[0]
     worker_uid = str(worker.get("worker_uid") or "").strip()
     if not worker_uid:
-        raise HTTPException(status_code=400, detail="Choose an approved worker first.")
+        raise HTTPException(status_code=400, detail="Choose one approved worker for the supervised starter assignment.")
     worker_profile = await _load_profile(worker_uid)
     if not worker_profile or worker_profile.get("workerApproved") is not True:
         raise HTTPException(status_code=403, detail="Approved worker access is required.")
     if worker_profile.get("is_available", True) is False:
         raise HTTPException(status_code=409, detail="This worker is marked unavailable for new work.")
+    worker_rating = await _human_worker_rating_summary(worker_uid, worker_profile)
+    if worker_rating["average"] is not None and worker_rating["average"] >= MIN_HUMAN_WORKER_RATING:
+        raise HTTPException(status_code=409, detail="This worker already meets the rating standard and should claim open work from the Available Jobs board.")
+
+    segment_id = str(payload.get("segment_id") or "").strip()
+    if _human_is_split_job(job):
+        if not segment_id:
+            raise HTTPException(status_code=400, detail="Choose an available part for the supervised starter assignment.")
+    elif segment_id or job.get("status") != "approved":
+        raise HTTPException(status_code=409, detail="Choose an approved job or an available part for the supervised starter assignment.")
+
     verified_actor = {
         "uid": worker_uid,
         "email": str(worker_profile.get("email") or worker.get("worker_email") or "").strip().lower(),
         "profile": worker_profile,
     }
-    if not _human_is_split_job(job):
-        raise HTTPException(status_code=409, detail="Approved jobs are claimed by workers from the Available Jobs board.")
-    segment_id = str(payload.get("segment_id") or "").strip()
-    if not segment_id:
-        raise HTTPException(status_code=400, detail="Choose a part waiting for assignment.")
     try:
-        assignment = await asyncio.to_thread(_human_claim_assignment_transaction, job_id, verified_actor, segment_id)
+        assignment = await asyncio.to_thread(
+            _human_claim_assignment_transaction, job_id, verified_actor, segment_id, True,
+        )
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Could not assign legacy Human Work part %s to %s", segment_id, worker_uid)
-        raise HTTPException(status_code=409, detail="That part could not be assigned. Refresh and try again.") from exc
+        logger.exception("Could not create a supervised Human Work starter assignment for %s", worker_uid)
+        raise HTTPException(status_code=409, detail="The supervised starter assignment could not be saved. Refresh and try again.") from exc
     await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
-    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id)
-    await _notify_worker_assignment(job_id, worker_uid, assignment.get("label") or "your assigned part", assignment.get("assignedAt"), segment_id=segment_id)
-    return {"status": "split_assigned", "job_id": job_id, "segment_id": segment_id}
+    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id or job_id)
+    await _notify_worker_assignment(
+        job_id, worker_uid, assignment.get("label") or "your supervised starter assignment",
+        assignment.get("assignedAt"), segment_id=segment_id,
+    )
+    return {"status": "supervised_starter_assigned", "job_id": job_id, "segment_id": segment_id}
 
 @app.post("/human-transcription/jobs/{job_id}/assign-proofreader")
 async def human_admin_assign_proofreader(job_id: str, request: Request):
@@ -7669,6 +7805,10 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
     worker_uid = str(payload.get("worker_uid") or "").strip()
     if not worker_uid:
         raise HTTPException(status_code=400, detail="Choose an approved proofreader first.")
+    proofreader_profile = await _load_profile(worker_uid) or {}
+    proofreader_rating = await _human_worker_rating_summary(worker_uid, proofreader_profile)
+    if proofreader_rating["average"] is None or proofreader_rating["average"] < MIN_HUMAN_WORKER_RATING:
+        raise HTTPException(status_code=409, detail="A worker rating of 3.5/5 or higher is required for proofreading assignments.")
     if await _human_worker_has_active_assignment(worker_uid):
         raise HTTPException(status_code=409, detail="This worker must finish their current assignment before taking proofreading work.")
     job = await _human_job(job_id)
@@ -8008,8 +8148,22 @@ async def human_admin_review(job_id: str, request: Request):
         rating = max(1, min(5, int(rating))) if rating is not None else None
     except (TypeError, ValueError):
         rating = None
-    updates = {"status": "client_review", "admin_feedback": str(payload.get("feedback") or "")[:12000], "worker_rating": rating, "reviewedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP}
+    worker_uids = _human_job_worker_uids(job)
+    ratings_by_worker = dict(job.get("worker_ratings") or {})
+    if rating is not None:
+        for worker_uid in worker_uids:
+            ratings_by_worker[worker_uid] = rating
+    updates = {
+        "status": "client_review",
+        "admin_feedback": str(payload.get("feedback") or "")[:12000],
+        "worker_rating": rating,
+        "worker_ratings": ratings_by_worker,
+        "reviewedAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    for worker_uid in worker_uids:
+        await _human_worker_rating_summary(worker_uid, force_refresh=True)
     await _complete_human_admin_notifications(job_id, {"job_submitted"})
     if job.get("client_uid"):
         await _create_user_notification(
@@ -8243,25 +8397,23 @@ async def human_admin_delete(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail="The job could not be fully removed. Worker payment history is protected; please retry, and contact support if the issue continues.")
 
 
-def _human_thread_for(actor, requested_thread=""):
-    """Which conversation is this request allowed to touch?
+def _human_assert_job_conversation_access(job, actor):
+    if actor.get("role") == "admin":
+        return
+    if actor.get("role") != "worker" or str(actor.get("uid") or "") not in _human_job_worker_uids(job):
+        raise HTTPException(status_code=403, detail="Only the admin team and workers assigned to this job can access its conversation.")
 
-    A worker is never in contact with the client and a client is never in
-    contact with the worker; every human job routes through admin instead.
-    So there are two separate conversations per job, "client" and "worker",
-    and admin is the only actor allowed to choose which one to open. A
-    client or worker cannot pick a thread; the server picks it for them from
-    their role, which is what actually keeps the two sides apart even if the
-    browser were tricked into asking for the wrong one.
-    """
-    if actor["role"] == "client":
-        return "client"
-    if actor["role"] == "worker":
-        return "worker"
+
+def _human_thread_for(actor, requested_thread=""):
+    """Human-job conversations are exclusively for admins and assigned workers."""
+    if actor.get("role") not in {"admin", "worker"}:
+        raise HTTPException(status_code=403, detail="Job conversations are available only to the admin team and assigned workers.")
     thread = (requested_thread or "").strip().lower()
-    if thread not in ("client", "worker"):
-        raise HTTPException(status_code=400, detail="Choose whether this message is to the client or the worker.")
-    return thread
+    if actor.get("role") == "worker":
+        return "worker"
+    if thread not in {"", "worker"}:
+        raise HTTPException(status_code=403, detail="Client messages are handled separately from job conversations.")
+    return "worker"
 
 
 def _human_message_read_by_role(message, job):
@@ -8301,13 +8453,11 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
+    _human_assert_job_conversation_access(job, actor)
     requested_thread = (thread or "").strip().lower()
-    # Older callers may open a job without choosing a side. Keep the default
-    # view on the client conversation, but never mark the worker's separate
-    # thread read as a side effect. The admin inbox passes an explicit thread
-    # for both client and worker conversations.
-    inbox_open = actor["role"] == "admin" and not requested_thread
-    target_thread = "client" if inbox_open else _human_thread_for(actor, requested_thread)
+    # Legacy client-thread messages remain stored for history, but are no
+    # longer visible or writable through the job-conversation interface.
+    target_thread = _human_thread_for(actor, requested_thread)
     threads_to_mark_read = {target_thread}
     ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
     snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
@@ -8345,9 +8495,10 @@ async def human_send_message(job_id: str, request: Request, attachment: UploadFi
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
+    _human_assert_job_conversation_access(job, actor)
     target_thread = _human_thread_for(actor, thread)
-    if target_thread == "worker" and not job.get("worker_uid"):
-        raise HTTPException(status_code=409, detail="This job has no worker assigned yet.")
+    if not _human_job_worker_uids(job):
+        raise HTTPException(status_code=409, detail="The worker conversation opens after a worker claims a job or part.")
     text = (message or "").strip()
     attachment_meta = await _human_store_upload(job_id, attachment, "chat") if attachment else None
     if not text and not attachment_meta:
@@ -8384,14 +8535,15 @@ async def human_message_attachment(job_id: str, message_id: str, request: Reques
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
+    _human_assert_job_conversation_access(job, actor)
     message_snapshot = await asyncio.to_thread(
         db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages").document(message_id).get
     )
     if not message_snapshot.exists:
         raise HTTPException(status_code=404, detail="That attachment was not found.")
     message = message_snapshot.to_dict() or {}
-    if actor["role"] in ("client", "worker") and (message.get("thread") or "client") != actor["role"]:
-        raise HTTPException(status_code=403, detail="You do not have access to this attachment.")
+    if str(message.get("thread") or "client").lower() != "worker":
+        raise HTTPException(status_code=403, detail="That attachment is from a legacy client conversation and is no longer available in this job thread.")
     meta = message.get("attachment") or {}
     path = meta.get("storage_path")
     bucket = _human_bucket()
@@ -9047,6 +9199,8 @@ async def messaging_inbox(request: Request):
 
     job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
     for job_snapshot in job_snapshots:
+        if actor["role"] not in {"admin", "worker"}:
+            continue
         job = job_snapshot.to_dict() or {}
         job_id = job_snapshot.id
         has_access = (
@@ -9072,7 +9226,7 @@ async def messaging_inbox(request: Request):
             data["id"] = message_snapshot.id
             thread_groups[message_thread].append(_human_public(data))
 
-        visible_threads = ("client", "worker") if actor["role"] == "admin" else (("worker",) if actor["role"] == "worker" else ("client",))
+        visible_threads = ("worker",)
         source = str(job.get("source_type") or "human_transcription").replace("_", " ").title()
         job_title = job.get("title") or job.get("name") or f"{source} · {job_id[:8]}"
         for message_thread in visible_threads:
@@ -9152,6 +9306,8 @@ async def messaging_unread_count(request: Request):
 
     job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
     for job_snapshot in job_snapshots:
+        if actor["role"] not in {"admin", "worker"}:
+            continue
         job = job_snapshot.to_dict() or {}
         has_access = (
             actor["role"] == "admin"
@@ -9164,7 +9320,7 @@ async def messaging_unread_count(request: Request):
             continue
         message_ref = job_snapshot.reference.collection("messages")
         messages = await asyncio.to_thread(lambda ref=message_ref: list(ref.stream()))
-        visible_thread = None if actor["role"] == "admin" else ("worker" if actor["role"] == "worker" else "client")
+        visible_thread = "worker"
         for message in messages:
             data = message.to_dict() or {}
             message_thread = str(data.get("thread") or "client").lower()
