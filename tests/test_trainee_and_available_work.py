@@ -3,6 +3,7 @@ import ast
 import math
 import re
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -26,6 +27,13 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
             "_human_build_available_segments",
             "_human_claim_is_active",
             "_human_available_public_for",
+            "_human_job_worker_uids",
+            "_human_worker_rating_for_job",
+            "_human_worker_rating_summary_from_jobs",
+            "_as_dt",
+            "_int",
+            "grant_free_trial",
+            "backfill_credits",
         }
         functions = [
             node for node in tree.body
@@ -37,23 +45,52 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                 continue
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id in {
-                    "TRAINEE_PRICE_USD", "FREE_TRIAL_CREDITS", "HUMAN_AVAILABLE_SLICE_MINUTES"
+                    "TRAINEE_PRICE_USD", "FREE_TRIAL_CREDITS", "LEGACY_FREE_TRIAL_CREDITS",
+                    "HUMAN_AVAILABLE_SLICE_MINUTES", "MIN_HUMAN_WORKER_RATING",
+                    "PLAN_CREDITS"
                 }:
                     constants[target.id] = ast.literal_eval(node.value)
         cls.namespace = {
             **constants,
             "math": math,
             "re": re,
+            "datetime": datetime,
+            "timedelta": timedelta,
             "HTTPException": FakeHTTPException,
             "_human_public_for": lambda data, role, actor_uid: dict(data),
         }
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(MAIN_PATH), "exec"), cls.namespace)
         cls.tree = tree
 
-    def test_prices_and_trial_allowance_match_the_product_copy(self):
+    def test_prices_trial_allowance_and_worker_threshold_match_product_policy(self):
         self.assertEqual(self.namespace["TRAINEE_PRICE_USD"], 1.0)
-        self.assertEqual(self.namespace["FREE_TRIAL_CREDITS"], 5)
+        self.assertEqual(self.namespace["FREE_TRIAL_CREDITS"], 30)
         self.assertEqual(self.namespace["HUMAN_AVAILABLE_SLICE_MINUTES"], 5)
+        self.assertEqual(self.namespace["MIN_HUMAN_WORKER_RATING"], 3.5)
+
+    def test_new_trials_are_30_but_legacy_backfill_preserves_old_allowance_and_balances(self):
+        now = datetime(2026, 9, 26, 16, 0, 0)
+        grant_trial = self.namespace["grant_free_trial"]
+        new_account = grant_trial({}, now)
+        self.assertEqual(new_account["planCredits"], 30)
+        self.assertTrue(new_account["hasReceivedInitialFreeMinutes"])
+
+        backfill = self.namespace["backfill_credits"]
+        legacy_updates, detail = backfill({}, now)
+        self.assertEqual(legacy_updates["planCredits"], 5)
+        self.assertEqual(detail["granted"], 5)
+
+        signup_updates, signup_detail = backfill({"freeTrialVersion": 2}, now)
+        self.assertEqual(signup_updates["planCredits"], 30)
+        self.assertEqual(signup_detail["granted"], 30)
+
+        existing = {"planCredits": 17, "topUpCredits": 23}
+        self.assertEqual(grant_trial(existing, now), {})
+        updates, detail = backfill(existing, now)
+        self.assertEqual(updates, {"creditsBackfilledAt": now})
+        self.assertEqual(detail["skipped"], "existing credit balance preserved")
+        self.assertEqual(existing["planCredits"], 17)
+        self.assertEqual(existing["topUpCredits"], 23)
 
     def test_typing_gate_requires_full_thirty_seconds_and_at_least_fifty_wpm(self):
         validate = self.namespace["_validated_trainee_typing_test"]
@@ -117,6 +154,28 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         job["segments"][0]["status"] = "submitted"
         self.assertFalse(is_active(job, "worker-1", claim))
 
+    def test_split_worker_ratings_use_job_history_and_ignore_unrelated_workers(self):
+        summarize = self.namespace["_human_worker_rating_summary_from_jobs"]
+        jobs = [
+            {"worker_rating": 5, "segments": [{"worker_uid": "worker-1"}]},
+            {"worker_rating": 3, "assigned_worker_uids": ["worker-1", "worker-2"]},
+            {"worker_rating": 1, "worker_uid": "worker-3"},
+            {"worker_rating": 7, "worker_uid": "worker-1"},
+        ]
+        self.assertEqual(summarize(jobs, "worker-1"), {"average": 4.0, "count": 2})
+        self.assertEqual(summarize(jobs, "worker-2"), {"average": 3.0, "count": 1})
+        self.assertEqual(summarize(jobs, "new-worker"), {"average": None, "count": 0})
+
+    def test_per_worker_split_rating_overrides_parent_rating(self):
+        summarize = self.namespace["_human_worker_rating_summary_from_jobs"]
+        jobs = [{
+            "worker_rating": 5,
+            "worker_ratings": {"worker-1": 3.5, "worker-2": 4.5},
+            "segments": [{"worker_uid": "worker-1"}, {"worker_uid": "worker-2"}],
+        }]
+        self.assertEqual(summarize(jobs, "worker-1"), {"average": 3.5, "count": 1})
+        self.assertEqual(summarize(jobs, "worker-2"), {"average": 4.5, "count": 1})
+
     def test_claim_transaction_reads_and_writes_the_job_and_worker_lock(self):
         node = next(item for item in self.tree.body if isinstance(item, ast.FunctionDef) and item.name == "_human_claim_assignment_transaction")
         source = ast.unparse(node)
@@ -129,10 +188,21 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         self.assertIn("tx.set(claim_ref", source)
         self.assertIn("already claimed that part", source)
 
+    def test_worker_claims_require_a_qualifying_rating_and_admin_scope_is_private(self):
+        claim_route = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "human_worker_claim")
+        claim_source = ast.unparse(claim_route)
+        self.assertIn("_human_worker_rating_summary", claim_source)
+        self.assertIn("MIN_HUMAN_WORKER_RATING", claim_source)
+        list_route = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "human_list_jobs")
+        list_source = ast.unparse(list_route)
+        self.assertIn('scope == \'admin\' and actor[\'role\'] != \'admin\'', list_source)
+        self.assertIn("worker_meets_rating", list_source)
+
     def test_admin_legacy_route_blocks_new_manual_splits_and_uses_claim_lock(self):
         route = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "human_admin_assign")
         source = ast.unparse(route)
-        self.assertIn("New jobs are split automatically", source)
+        self.assertIn("supervised_starter", source)
+        self.assertIn("_human_worker_rating_summary", source)
         self.assertIn("_human_claim_assignment_transaction", source)
         self.assertIn("workerApproved", source)
 
