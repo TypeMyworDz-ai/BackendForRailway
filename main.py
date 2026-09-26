@@ -596,7 +596,7 @@ PLAN_CREDITS = {
     'Yearly Plan':    {'credits': 1400,  'days': 365, 'monthly_refill': True},
 }
 
-FREE_TRIAL_CREDITS = 30          # once per account
+FREE_TRIAL_CREDITS = 5           # once per account; one credit equals one minute
 TOPUP_VALID_DAYS = 365           # bought credits last a year
 REFILL_DAYS = 30                 # yearly plan tops up every 30 days
 
@@ -614,8 +614,26 @@ CUSTOM_TOPUP_MAX = 50000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
 # Training enrollment test price; keep checkout and displayed pricing aligned.
-TRAINEE_PRICE_USD = 20.00
+TRAINEE_PRICE_USD = 1.00
 TRAINEE_COUNTRY = 'KE'
+
+
+def _validated_trainee_typing_test(value):
+    """Validate the trainee's 30-second net-WPM assessment before checkout."""
+    if not isinstance(value, dict):
+        raise HTTPException(status_code=400, detail="Complete the 30-second typing test before enrollment.")
+    try:
+        correct_chars = max(0, int(value.get("correct_chars") or 0))
+        elapsed_ms = int(value.get("elapsed_ms") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="The typing test result could not be verified. Please take the test again.")
+    if elapsed_ms < 30000:
+        raise HTTPException(status_code=400, detail="The typing test must run for the full 30 seconds.")
+    wpm = correct_chars / 5.0 / (elapsed_ms / 60000.0)
+    if wpm < 50.0:
+        raise HTTPException(status_code=400, detail="A score of at least 50 WPM is required before trainee enrollment.")
+    return {"correct_chars": correct_chars, "elapsed_ms": elapsed_ms, "wpm": round(wpm, 2)}
+
 
 # What everything costs, in US dollars, decided here and nowhere else.
 #
@@ -2214,7 +2232,7 @@ async def enroll_paid_trainee(email: str, reference: str, amount: float, currenc
         "trainingPaymentReference": reference,
         "lastTrainingPaymentReference": reference,
         "trainingPaymentProvider": payment_provider,
-        "trainingPaymentAmountUsd": TRAINEE_PRICE_USD,
+        "trainingPaymentAmountUsd": float(amount or TRAINEE_PRICE_USD),
         "trainingPaymentCurrency": currency,
         "trainingRoomAccess": True,
         "workerApproved": False,
@@ -2245,9 +2263,17 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
             logger.error(f"User with email {email} not found in Firestore. Cannot update plan.")
             return {'success': False, 'error': f"User {email} not found in Firestore."}
 
-        # 2a. Trainee enrollment is a product, not an AI plan or credit top-up.
+        # Trainee payment is recorded here, but enrollment waits until the
+        # applicant submits and confirms their M-Pesa payout details.
         if plan_name == TRAINEE_PRODUCT:
-            return await enroll_paid_trainee(email, reference or "", amount, currency, country_code or "", "paystack")
+            if reference:
+                await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
+                    "email": email, "product": TRAINEE_PRODUCT, "provider": "paystack",
+                    "countryCode": (country_code or TRAINEE_COUNTRY).upper(),
+                    "amountUsd": TRAINEE_PRICE_USD, "currency": currency,
+                    "status": "paid", "paidAt": firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+            return {"success": True, "email": email, "plan": TRAINEE_PRODUCT, "trainee_enrolled": False, "requires_mpesa_details": True}
 
         # 2b. A top-up is not a plan. Buying credits adds them to the bought
         # purse and leaves the plan, the free-trial flag and everything else
@@ -3028,6 +3054,7 @@ async def root():
 async def register_trainee(request: Request):
     actor = await _trainee_actor(request)
     payload = await request.json()
+    _validated_trainee_typing_test(payload.get("typing_test"))
     official_name = str(payload.get("official_name") or "").strip()
     country_code = str(payload.get("country_code") or "").strip().upper()
     if len(official_name) < 2:
@@ -3101,6 +3128,7 @@ async def cancel_pending_trainee(request: Request):
 async def initialize_trainee_payment(request: Request):
     """Start trainee checkout before Firebase signup; no account exists yet."""
     payload = await request.json()
+    _validated_trainee_typing_test(payload.get("typing_test"))
     email = str(payload.get("email") or "").strip().lower()
     official_name = str(payload.get("official_name") or "").strip()
     country_code = str(payload.get("country_code") or "").strip().upper()
@@ -3190,6 +3218,7 @@ async def initialize_trainee_payment(request: Request):
 async def initialize_kora_trainee_payment(request: Request):
     actor = await _trainee_actor(request)
     payload = await request.json()
+    _validated_trainee_typing_test(payload.get("typing_test"))
     official_name = str(payload.get("official_name") or actor["profile"].get("officialIdName") or actor["profile"].get("name") or "").strip()
     country_code = str(payload.get("country_code") or actor["profile"].get("countryCode") or "").upper()
     if country_code != TRAINEE_COUNTRY:
@@ -3199,7 +3228,12 @@ async def initialize_kora_trainee_payment(request: Request):
     local_amount, local_currency = get_local_amount_and_currency(TRAINEE_PRICE_USD, TRAINEE_COUNTRY, "trainee-training")
     reference = "tmw-trainee-" + uuid.uuid4().hex
     notification_url = KORA_NOTIFICATION_URL or f"{BACKEND_PUBLIC_URL}/api/kora-webhook"
-    redirect_url = str(payload.get("redirect_url") or f"{APP_URL}/?kora=success")
+    redirect_url = str(payload.get("redirect_url") or f"{APP_URL}/trainee-signup?trainee=1&kora=success")
+    separator = "&" if "?" in redirect_url else "?"
+    for parameter in ("trainee=1", "kora=success", f"reference={reference}"):
+        if parameter not in redirect_url:
+            redirect_url = f"{redirect_url}{separator}{parameter}"
+            separator = "&"
     kora_payload = {
         "amount": int(round(local_amount)),
         "currency": local_currency,
@@ -3253,20 +3287,20 @@ async def verify_kora_and_enroll(reference: str):
         return {"success": False, "error": "Unknown Kora payment reference"}
 
     if intent.get("status") == "paid":
-        return {"success": True, "already_applied": True, "plan": product, "trainee_enrolled": product == TRAINEE_PRODUCT}
+        return {"success": True, "already_applied": True, "plan": product, "trainee_enrolled": False}
 
     email = intent.get("email")
     country_code = str(intent.get("countryCode") or "").upper()
     currency = str(charge.get("currency") or intent.get("currency") or "KES")
     amount_usd = float(intent.get("amountUsd") or price_for(product, country_code) or 0)
     if product == TRAINEE_PRODUCT:
-        if not await get_user_profile_by_email_firestore(email):
-            await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
-                "status": "paid", "paidAt": firestore.SERVER_TIMESTAMP,
-                "amountUsd": TRAINEE_PRICE_USD, "currency": currency,
-            }, merge=True)
-            return {"success": True, "requires_account": True, "email": email, "trainee_enrolled": False, "plan": product}
-        result = await enroll_paid_trainee(email, reference, TRAINEE_PRICE_USD, currency, country_code, "kora")
+        await asyncio.to_thread(db.collection("payment_intents").document(reference).set, {
+            "email": email, "product": TRAINEE_PRODUCT, "provider": "kora",
+            "countryCode": TRAINEE_COUNTRY, "amountUsd": TRAINEE_PRICE_USD,
+            "amountLocal": intent.get("amountLocal"), "currency": currency,
+            "status": "paid", "paidAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return {"success": True, "requires_profile": True, "email": email, "trainee_enrolled": False, "plan": product}
     else:
         result = await update_user_credits_paystack(
             email=email,
@@ -3482,19 +3516,19 @@ async def verify_payment(request: PaystackVerificationRequest):
             country_code = verification_result['raw_data'].get('metadata', {}).get('country_code')
             update_admin_revenue_flag = verification_result['raw_data'].get('metadata', {}).get('update_admin_revenue', 'False').lower() == 'true'
 
-            # Trainee checkout is payment-first. If the account does not exist
-            # yet, record the paid intent and let the browser create the account
-            # only after Paystack has confirmed success.
-            if plan_name == TRAINEE_PRODUCT and not await get_user_profile_by_email_firestore(email):
-                if db:
-                    await asyncio.to_thread(db.collection('payment_intents').document(reference).set, {
-                        'email': email, 'product': TRAINEE_PRODUCT, 'provider': 'paystack',
-                        'countryCode': country_code or TRAINEE_COUNTRY,
-                        'officialName': verification_result['raw_data'].get('metadata', {}).get('official_name') or '',
-                        'amountUsd': TRAINEE_PRICE_USD, 'currency': currency,
-                        'status': 'paid', 'paidAt': firestore.SERVER_TIMESTAMP,
-                    }, merge=True)
-                return {"status": "success", "message": "Payment verified. Create the trainee account to continue.", "data": {"amount": amount, "currency": currency, "email": email, "plan": plan_name, "reference": reference, "trainee_pending_account": True}}
+            # Trainee payment verification records the purchase only. Account
+            # enrollment and Training Room access wait for confirmed M-Pesa details.
+            if plan_name == TRAINEE_PRODUCT:
+                if not db:
+                    raise HTTPException(status_code=503, detail="Enrollment records are temporarily unavailable.")
+                await asyncio.to_thread(db.collection('payment_intents').document(reference).set, {
+                    'email': email, 'product': TRAINEE_PRODUCT, 'provider': 'paystack',
+                    'countryCode': country_code or TRAINEE_COUNTRY,
+                    'officialName': verification_result['raw_data'].get('metadata', {}).get('official_name') or '',
+                    'amountUsd': TRAINEE_PRICE_USD, 'currency': currency,
+                    'status': 'paid', 'paidAt': firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+                return {"status": "success", "message": "Payment verified. Add your M-Pesa details to continue.", "data": {"amount": amount, "currency": currency, "email": email, "plan": plan_name, "reference": reference, "training_room": False, "trainee_pending_account": not bool(await get_user_profile_by_email_firestore(email))}}
 
             # Pass base_usd_amount, country_code, and update_admin_revenue_flag
             credit_result = await update_user_credits_paystack(email, plan_name, base_usd_amount or amount, currency, update_admin_revenue_flag, country_code, reference) 
@@ -5721,6 +5755,8 @@ async def admin_adjust_credits(payload: AdminCreditAdjustmentRequest, request: R
 # credits; the client cannot download the finished work until the admin has
 # released it after the client's approval.
 HUMAN_JOB_COLLECTION = "human_jobs"
+HUMAN_WORKER_CLAIM_COLLECTION = "human_worker_claims"
+HUMAN_AVAILABLE_SLICE_MINUTES = 5
 HUMAN_JOB_STATUSES = {
     "pending_admin",
     "approved",
@@ -5918,6 +5954,30 @@ def _human_public_for(data, actor_role, actor_uid=""):
     return out
 
 
+def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full_job, can_claim, claim_block_reason):
+    """Expose only claim-list metadata until the worker owns the job or part."""
+    public_item = _human_public_for(data, "worker", actor_uid)
+    audio_meta = public_item.get("audio") or {}
+    public_item["audio"] = {key: audio_meta[key] for key in ("name", "content_type", "size") if key in audio_meta}
+    public_item["instruction_attachments"] = []
+    public_item["transcript"] = ""
+    public_item["worker_notes"] = ""
+    public_item["final_attachment"] = None
+    public_item["proofreader_parts"] = []
+    public_item.pop("worker_assignment", None)
+    public_item.pop("segments", None)
+    public_item.pop("assigned_worker_uids", None)
+    public_item.pop("worker_uid", None)
+    public_item.pop("worker_email", None)
+    public_item.pop("worker_name", None)
+    public_item.pop("last_auto_reassigned_worker_name", None)
+    public_item["claimable_parts"] = claimable_parts
+    public_item["claimable_full_job"] = claimable_full_job
+    public_item["can_claim"] = can_claim
+    public_item["claim_block_reason"] = claim_block_reason
+    return public_item
+
+
 def _human_bucket():
     if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
         return None
@@ -5979,6 +6039,7 @@ async def _human_reclaim_expired_job(job_id: str, job: dict):
     worker_uid = str(job.get("worker_uid") or "")
     assignment_token = _human_iso(job.get("assignedAt")) or now.isoformat()
     if worker_uid:
+        await _human_release_worker_claim(worker_uid, job_id, "", "transcriber")
         await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
         await _create_user_notification(
             worker_uid, f"human-expired:{job_id}:main:{assignment_token}", "assignment_taken_back",
@@ -5994,13 +6055,223 @@ async def _human_reclaim_expired_job(job_id: str, job: dict):
     return job
 
 
+def _human_is_split_job(job):
+    job = job or {}
+    return str(job.get("split_mode") or "").strip().lower() in {"dual", "multi"} and bool(job.get("segments"))
+
+
+def _human_claim_is_active(job, worker_uid, claim):
+    if not job or not claim:
+        return False
+    active = {"assigned", "in_progress"}
+    if claim.get("role") == "proofreader":
+        return job.get("proofreader_uid") == worker_uid and job.get("proofreader_status") in active
+    segment_id = str(claim.get("segment_id") or "")
+    if segment_id:
+        part = next((item for item in (job.get("segments") or []) if str(item.get("id") or "") == segment_id), None)
+        return bool(part and part.get("worker_uid") == worker_uid and part.get("status") in active)
+    return job.get("worker_uid") == worker_uid and job.get("status") in active
+
+
+async def _human_worker_has_active_assignment(worker_uid):
+    if not db or not worker_uid:
+        return False
+    ref = db.collection(HUMAN_JOB_COLLECTION)
+    found = {}
+    for field, operator in (("worker_uid", "=="), ("assigned_worker_uids", "array_contains"), ("proofreader_uid", "==")):
+        snapshots = await asyncio.to_thread(lambda field=field, operator=operator: list(ref.where(filter=FieldFilter(field, operator, worker_uid)).stream()))
+        found.update({snapshot.id: snapshot for snapshot in snapshots})
+    for snapshot in found.values():
+        job = snapshot.to_dict() or {}
+        job["id"] = snapshot.id
+        job = await _human_check_expiry(snapshot.id, job)
+        if _human_claim_is_active(job, worker_uid, {"role": "transcriber"}):
+            return True
+        if any(
+            item.get("worker_uid") == worker_uid and item.get("status") in {"assigned", "in_progress"}
+            for item in (job.get("segments") or [])
+        ):
+            return True
+        if _human_claim_is_active(job, worker_uid, {"role": "proofreader"}):
+            return True
+    return False
+
+
+async def _human_release_worker_claim(worker_uid, job_id, segment_id="", role="transcriber"):
+    if not db or not worker_uid:
+        return
+    claim_ref = db.collection(HUMAN_WORKER_CLAIM_COLLECTION).document(str(worker_uid))
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def release_if_current(tx):
+        snapshot = claim_ref.get(transaction=tx)
+        current = snapshot.to_dict() if snapshot.exists else {}
+        if (
+            current.get("status") == "active"
+            and current.get("job_id") == job_id
+            and str(current.get("segment_id") or "") == str(segment_id or "")
+            and current.get("role") == role
+        ):
+            tx.set(claim_ref, {"status": "released", "releasedAt": datetime.now(), "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+            return True
+        return False
+
+    await asyncio.to_thread(release_if_current, transaction)
+
+
+def _human_claim_assignment_transaction(job_id, actor, segment_id=""):
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    worker_uid = str(actor.get("uid") or "")
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    claim_ref = db.collection(HUMAN_WORKER_CLAIM_COLLECTION).document(worker_uid)
+    worker_ref = db.collection("users").document(worker_uid)
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def claim(tx):
+        job_snapshot = job_ref.get(transaction=tx)
+        if not job_snapshot.exists:
+            raise HTTPException(status_code=404, detail="This job is no longer available.")
+        job = job_snapshot.to_dict() or {}
+        worker_snapshot = worker_ref.get(transaction=tx)
+        worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
+        if worker_profile.get("workerApproved") is not True:
+            raise HTTPException(status_code=403, detail="Approved worker access is required.")
+        if worker_profile.get("is_available", True) is False:
+            raise HTTPException(status_code=409, detail="Your account is marked unavailable. Change your availability before claiming work.")
+        claim_snapshot = claim_ref.get(transaction=tx)
+        current_claim = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        if current_claim.get("status") == "active":
+            old_job_id = str(current_claim.get("job_id") or "")
+            old_ref = db.collection(HUMAN_JOB_COLLECTION).document(old_job_id) if old_job_id else None
+            old_snapshot = old_ref.get(transaction=tx) if old_ref else None
+            old_job = old_snapshot.to_dict() if old_snapshot and old_snapshot.exists else None
+            if _human_claim_is_active(old_job, worker_uid, current_claim):
+                raise HTTPException(status_code=409, detail="Finish your current slice before claiming another.")
+
+        now = datetime.now()
+        if _human_is_split_job(job):
+            if not segment_id:
+                raise HTTPException(status_code=400, detail="Choose an available audio part to claim.")
+            segments = [dict(item or {}) for item in (job.get("segments") or [])]
+            target = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
+            if not target or target.get("status") not in {"available", "approved"}:
+                raise HTTPException(status_code=409, detail="Another worker has already claimed that part.")
+            if any(item.get("worker_uid") == worker_uid and item.get("status") in {"assigned", "in_progress"} for item in segments):
+                raise HTTPException(status_code=409, detail="Finish your current part of this job before claiming another.")
+            seconds = max(0.0, float(target.get("end_seconds") or 0) - float(target.get("start_seconds") or 0))
+            tat_seconds = human_tat_seconds(seconds)
+            deadline = now + timedelta(seconds=tat_seconds)
+            target.update({
+                "worker_uid": worker_uid,
+                "worker_email": str(actor.get("email") or "").strip().lower(),
+                "worker_name": str((actor.get("profile") or {}).get("name") or (actor.get("profile") or {}).get("displayName") or "").strip(),
+                "status": "assigned",
+                "assignedAt": now,
+                "deadlineAt": deadline,
+                "tat_seconds": tat_seconds,
+            })
+            updates = {
+                "segments": segments,
+                "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
+                "status": "split_assigned",
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+            tx.update(job_ref, updates)
+            tx.set(claim_ref, {"worker_uid": worker_uid, "job_id": job_id, "segment_id": segment_id, "role": "transcriber", "status": "active", "assignedAt": now, "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+            return {"job_id": job_id, "segment_id": segment_id, "label": target.get("label") or "your assigned part", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
+
+        if segment_id:
+            raise HTTPException(status_code=400, detail="This job does not have claimable parts.")
+        if job.get("status") != "approved" or job.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="Another worker has already claimed this job.")
+        tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
+        deadline = now + timedelta(seconds=tat_seconds)
+        tx.update(job_ref, {
+            "status": "assigned", "worker_uid": worker_uid,
+            "worker_email": str(actor.get("email") or "").strip().lower(),
+            "worker_name": str((actor.get("profile") or {}).get("name") or (actor.get("profile") or {}).get("displayName") or "").strip(),
+            "assignedAt": now, "deadlineAt": deadline, "tat_seconds": tat_seconds,
+            "assigned_worker_uids": [worker_uid], "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        tx.set(claim_ref, {"worker_uid": worker_uid, "job_id": job_id, "segment_id": "", "role": "transcriber", "status": "active", "assignedAt": now, "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        return {"job_id": job_id, "segment_id": "", "label": "your transcription job", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
+
+    return claim(transaction)
+
+
+def _human_assign_proofreader_transaction(job_id, worker, tat_seconds):
+    """Assign the final proofreader while taking the same per-worker claim lock."""
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    worker_uid = str(worker.get("worker_uid") or "").strip()
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    claim_ref = db.collection(HUMAN_WORKER_CLAIM_COLLECTION).document(worker_uid)
+    worker_ref = db.collection("users").document(worker_uid)
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def assign(tx):
+        job_snapshot = job_ref.get(transaction=tx)
+        if not job_snapshot.exists:
+            raise HTTPException(status_code=404, detail="This job is no longer available.")
+        job = job_snapshot.to_dict() or {}
+        worker_snapshot = worker_ref.get(transaction=tx)
+        worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
+        if worker_profile.get("workerApproved") is not True:
+            raise HTTPException(status_code=403, detail="Approved worker access is required.")
+        if worker_profile.get("is_available", True) is False:
+            raise HTTPException(status_code=409, detail="This worker is marked unavailable for new work.")
+        claim_snapshot = claim_ref.get(transaction=tx)
+        current_claim = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        if current_claim.get("status") == "active":
+            old_job_id = str(current_claim.get("job_id") or "")
+            old_ref = db.collection(HUMAN_JOB_COLLECTION).document(old_job_id) if old_job_id else None
+            old_snapshot = old_ref.get(transaction=tx) if old_ref else None
+            old_job = old_snapshot.to_dict() if old_snapshot and old_snapshot.exists else None
+            if _human_claim_is_active(old_job, worker_uid, current_claim):
+                raise HTTPException(status_code=409, detail="This worker must finish their current assignment before proofreading another job.")
+        if not _human_is_split_job(job) or not all((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+            raise HTTPException(status_code=409, detail="Every transcription part must be submitted before assigning the final proofreader.")
+        if job.get("proofreader_status") in {"assigned", "in_progress"}:
+            raise HTTPException(status_code=409, detail="A proofreader is already working on this job. Take back that assignment before changing it.")
+        now = datetime.now()
+        deadline = now + timedelta(seconds=tat_seconds)
+        assigned = list(job.get("assigned_worker_uids") or [])
+        if worker_uid not in assigned:
+            assigned.append(worker_uid)
+        tx.update(job_ref, {
+            "status": "proofreading_assigned",
+            "proofreader_uid": worker_uid,
+            "proofreader_email": str(worker.get("worker_email") or "").strip().lower(),
+            "proofreader_name": str(worker.get("worker_name") or "").strip(),
+            "proofreader_status": "assigned",
+            "proofreader_assignedAt": now,
+            "proofreader_deadlineAt": deadline,
+            "proofreader_tat_seconds": tat_seconds,
+            "proofreader_tat_extension_minutes": 0,
+            "assigned_worker_uids": assigned,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        tx.set(claim_ref, {
+            "worker_uid": worker_uid, "job_id": job_id, "segment_id": "proofreader",
+            "role": "proofreader", "status": "active", "assignedAt": now,
+            "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return {"assignedAt": now, "deadlineAt": deadline, "worker_uid": worker_uid}
+
+    return assign(transaction)
+
+
 async def _human_check_expiry(job_id: str, job: dict):
     """Return expired work to the admin queue without taking live work away."""
     if not db or not job:
         return job
     now = datetime.now()
     original_job = dict(job)
-    if job.get("split_mode") == "dual":
+    if _human_is_split_job(job):
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         expired_assignments = []
         changed = False
@@ -6062,6 +6333,9 @@ async def _human_check_expiry(job_id: str, job: dict):
                 return original_job
             for worker_uid, role, assignment_id, label, assignment_token in expired_assignments:
                 if worker_uid:
+                    claim_role = "proofreader" if role == "proofreader" else "transcriber"
+                    claim_segment = "proofreader" if role == "proofreader" else assignment_id
+                    await _human_release_worker_claim(worker_uid, job_id, claim_segment, claim_role)
                     await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
                     await _create_user_notification(
                         worker_uid, f"human-expired:{job_id}:{role}:{assignment_id}:{assignment_token}", "assignment_taken_back",
@@ -6342,12 +6616,38 @@ async def _human_actor(request: Request):
     role = "admin" if is_human_job_admin(email) else "client"
     profile = await _load_profile(uid)
     profile = profile or {}
-    profile_role = str(profile.get("role") or profile.get("user_type") or "").strip().lower()
     # A trainee belongs in the private Training Room until an admin explicitly
     # promotes them.  Only approved workers may see assigned human jobs.
-    if profile.get("workerApproved") or profile_role in {"worker", "transcriber"}:
+    if profile.get("workerApproved") is True:
         role = "worker"
     return {"uid": uid, "email": email, "role": role, "profile": profile}
+
+
+def _human_can_edit_own_payment_profile(actor):
+    if actor.get("role") == "worker":
+        return True
+    profile = actor.get("profile") or {}
+    profile_role = str(profile.get("role") or profile.get("user_type") or "").strip().lower()
+    return bool(
+        profile_role == "trainee"
+        and profile.get("trainingRoomAccess") is True
+        and str(profile.get("trainingPaymentStatus") or "").lower() == "paid"
+    )
+
+
+def _normalize_mpesa_details(registered_name, raw_number):
+    name = re.sub(r"\s+", " ", str(registered_name or "").strip())[:120]
+    number = re.sub(r"[\s()+.-]", "", str(raw_number or ""))
+    if bool(name) != bool(number):
+        raise HTTPException(status_code=400, detail="Enter both the M-Pesa registered name and number, or clear both fields.")
+    if not name:
+        return "", ""
+    if len(name) < 2:
+        raise HTTPException(status_code=400, detail="Enter the M-Pesa account name as it appears in M-Pesa.")
+    if not re.fullmatch(r"(?:254|0)(?:7|1)\d{8}", number):
+        raise HTTPException(status_code=400, detail="Enter a valid Kenyan M-Pesa number, such as 0712 345 678 or 254712345678.")
+    normalized = "254" + number[1:] if number.startswith("0") else number
+    return name, normalized
 
 
 async def _human_assert_access(job, actor, allow_admin=True):
@@ -6510,7 +6810,22 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     if not db:
         return {"jobs": []}
     ref = db.collection(HUMAN_JOB_COLLECTION)
-    if actor["role"] == "admin" or scope == "admin":
+    available_scope = actor["role"] == "worker" and scope == "available"
+    worker_can_claim = False
+    claim_block_reason = ""
+    if available_scope:
+        snapshots_by_id = {}
+        for status in ("approved", "split_assigned", "split_in_progress"):
+            rows = await asyncio.to_thread(lambda status=status: list(ref.where(filter=FieldFilter("status", "==", status)).stream()))
+            snapshots_by_id.update({snapshot.id: snapshot for snapshot in rows})
+        snapshots = list(snapshots_by_id.values())
+        worker_available = (actor.get("profile") or {}).get("is_available", True) is not False
+        active_assignment = await _human_worker_has_active_assignment(actor["uid"])
+        worker_can_claim = worker_available and not active_assignment
+        claim_block_reason = "Your account is marked unavailable. Change your availability before claiming work." if not worker_available else ("Finish your current assignment before claiming another." if active_assignment else "")
+    elif scope == "available":
+        raise HTTPException(status_code=403, detail="Only approved workers can view available Human Work.")
+    elif actor["role"] == "admin" or scope == "admin":
         snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).limit(100).stream()))
     elif actor["role"] == "worker" or scope in {"assigned", "finished"}:
         # Keep the original single-worker query and add the split parent query.
@@ -6530,7 +6845,32 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         item = snap.to_dict() or {}
         item["id"] = snap.id
         item = await _human_check_expiry(snap.id, item)
-        if actor["role"] == "worker" or scope in {"assigned", "finished"}:
+        if available_scope:
+            if _human_is_split_job(item):
+                if item.get("status") not in {"split_assigned", "split_in_progress"}:
+                    continue
+                claimable_parts = [
+                    {key: part.get(key) for key in ("id", "label", "index", "minutes", "start_seconds", "end_seconds")}
+                    for part in (item.get("segments") or [])
+                    if part.get("status") in {"available", "approved"}
+                ]
+                if not claimable_parts:
+                    continue
+                claimable_full_job = False
+            else:
+                if item.get("status") != "approved":
+                    continue
+                claimable_parts = []
+                claimable_full_job = True
+            # A worker can assess the listing but cannot read client files or
+            # the AI draft until the claim transaction assigns the work.
+            public_item = _human_available_public_for(
+                item, actor.get("uid") or "", claimable_parts, claimable_full_job,
+                worker_can_claim, claim_block_reason,
+            )
+            jobs.append(public_item)
+            continue
+        if actor["role"] == "worker" and scope in {"assigned", "finished"}:
             assignment = _human_worker_segment(item.get("segments") or [], actor["uid"])
             is_proofreader = item.get("proofreader_uid") == actor["uid"]
             current_status = item.get("proofreader_status") if is_proofreader else (assignment.get("status") if assignment else item.get("status"))
@@ -6791,11 +7131,38 @@ async def human_list_workers(request: Request):
     return {"workers": workers}
 
 
+@app.get("/human-transcription/worker/availability")
+async def human_worker_availability(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    profile = actor.get("profile") or {}
+    return {"available": profile.get("is_available", True) is not False}
+
+
+@app.post("/human-transcription/worker/availability")
+async def human_worker_set_availability(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    payload = await request.json()
+    available = payload.get("available")
+    if not isinstance(available, bool):
+        raise HTTPException(status_code=400, detail="Choose whether you are available for new work.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {
+        "is_available": available,
+        "availability_updated_at": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return {"saved": True, "available": available}
+
+
 @app.get("/human-transcription/worker/payment-profile")
 async def human_worker_payment_profile(request: Request):
     actor = await _human_actor(request)
-    if actor["role"] != "worker":
-        raise HTTPException(status_code=403, detail="Worker access is required.")
+    if not _human_can_edit_own_payment_profile(actor):
+        raise HTTPException(status_code=403, detail="An enrolled trainee or approved worker account is required.")
     profile = actor.get("profile") or {}
     return {
         "official_id_name": profile.get("officialIdName") or profile.get("name") or "",
@@ -6808,20 +7175,12 @@ async def human_worker_payment_profile(request: Request):
 @app.post("/human-transcription/worker/payment-profile")
 async def human_worker_save_payment_profile(request: Request):
     actor = await _human_actor(request)
-    if actor["role"] != "worker":
-        raise HTTPException(status_code=403, detail="Worker access is required.")
+    if not _human_can_edit_own_payment_profile(actor):
+        raise HTTPException(status_code=403, detail="An enrolled trainee or approved worker account is required.")
     payload = await request.json()
-    registered_name = re.sub(r"\s+", " ", str(payload.get("mpesa_registered_name") or "").strip())[:120]
-    raw_number = re.sub(r"[\s()+.-]", "", str(payload.get("mpesa_number") or ""))
-    if bool(registered_name) != bool(raw_number):
-        raise HTTPException(status_code=400, detail="Enter both the M-Pesa registered name and number, or clear both fields.")
-    normalized_number = ""
-    if registered_name:
-        if len(registered_name) < 2:
-            raise HTTPException(status_code=400, detail="Enter the M-Pesa account name as it appears in M-Pesa.")
-        if not re.fullmatch(r"(?:254|0)(?:7|1)\d{8}", raw_number):
-            raise HTTPException(status_code=400, detail="Enter a valid Kenyan M-Pesa number, such as 0712 345 678 or 254712345678.")
-        normalized_number = "254" + raw_number[1:] if raw_number.startswith("0") else raw_number
+    registered_name, normalized_number = _normalize_mpesa_details(
+        payload.get("mpesa_registered_name"), payload.get("mpesa_number")
+    )
     updates = {
         "mpesaRegisteredName": registered_name,
         "mpesaNumber": normalized_number,
@@ -7143,18 +7502,110 @@ async def human_admin_approve(job_id: str, request: Request):
     job = await _human_job(job_id)
     if job.get("status") != "pending_admin":
         raise HTTPException(status_code=409, detail="This job is not waiting for admin approval.")
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "approved", "updatedAt": firestore.SERVER_TIMESTAMP})
+    now = datetime.now()
+    try:
+        segments = _human_build_available_segments(job, now)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    next_status = "split_assigned" if segments else "approved"
+    updates = {
+        "status": next_status,
+        "split_mode": "multi" if segments else "single",
+        "segments": segments,
+        "assigned_worker_uids": [],
+        "approvedAt": now,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     await _complete_human_admin_notifications(job_id, {"job_request"})
     if job.get("client_uid"):
         await _create_user_notification(
             str(job["client_uid"]), f"human-approved:{job_id}", "job_approved", "Your Human Work request is approved",
-            "The team is arranging the next step for your job.", route="human_job", job_id=job_id, target_id=job_id,
+            "Approved work is now being picked up by an available transcriber.", route="human_job", job_id=job_id, target_id=job_id,
         )
-    await _notify_human_admins(
-        f"human-approved-awaiting-assignment:{job_id}", "job_approved", "Human Work ready for assignment",
-        "Choose a transcriber in the Human Work queue.", route="human_ops", job_id=job_id, requires_action=True,
+    board_message = (
+        f"{len(segments)} parts are now available for approved workers to claim."
+        if segments else "The job is now available for an approved worker to claim."
     )
-    return {"status": "approved", "job_id": job_id}
+    await _notify_human_admins(
+        f"human-approved-awaiting-assignment:{job_id}", "job_approved", "Human Work is available to workers",
+        board_message, route="human_ops", job_id=job_id, requires_action=False,
+    )
+    return {"status": next_status, "job_id": job_id, "parts_count": len(segments)}
+
+
+@app.post("/human-transcription/jobs/{job_id}/claim")
+async def human_worker_claim(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Only approved workers can claim Human Work.")
+    if (actor.get("profile") or {}).get("is_available", True) is False:
+        raise HTTPException(status_code=403, detail="Your account is marked unavailable. Change your availability before claiming work.")
+    payload = await request.json()
+    segment_id = str(payload.get("segment_id") or "").strip()
+    await _human_job(job_id)
+    if await _human_worker_has_active_assignment(actor["uid"]):
+        raise HTTPException(status_code=409, detail="Finish your current assignment before claiming another.")
+    try:
+        assignment = await asyncio.to_thread(_human_claim_assignment_transaction, job_id, actor, segment_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not claim Human Work %s for %s", job_id, actor["uid"])
+        raise HTTPException(status_code=409, detail="That work could not be claimed. Refresh the board and try again.") from exc
+    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id or job_id)
+    await _notify_worker_assignment(
+        job_id, actor["uid"], assignment.get("label") or "your assigned work",
+        assignment.get("assignedAt"), segment_id=segment_id,
+    )
+    return assignment
+
+
+def _human_build_available_segments(job, now):
+    """Split approved long recordings into open, approximately five-minute slices."""
+    try:
+        total_seconds = float(job.get("seconds") or 0)
+        total_minutes = max(1, int(job.get("minutes") or math.ceil(total_seconds / 60.0)))
+    except (TypeError, ValueError):
+        raise ValueError("The audio length could not be read. Please review the job before approving it.")
+    if total_seconds <= 0:
+        raise ValueError("The audio length is missing. Please review the job before approving it.")
+    count = int(math.ceil(total_minutes / float(HUMAN_AVAILABLE_SLICE_MINUTES)))
+    if count <= 1:
+        return []
+    minutes_per_part, extra_minutes = divmod(total_minutes, count)
+    segments = []
+    for index in range(count):
+        start_seconds = total_seconds * index / count
+        end_seconds = total_seconds * (index + 1) / count
+        segments.append({
+            "id": f"part_{index + 1}",
+            "label": f"Part {index + 1} of {count}",
+            "index": index + 1,
+            "start_seconds": round(start_seconds, 2),
+            "end_seconds": round(end_seconds, 2),
+            "minutes": minutes_per_part + (1 if index < extra_minutes else 0),
+            "worker_uid": None,
+            "worker_email": "",
+            "worker_name": "",
+            "status": "available",
+            "assignedAt": None,
+            "deadlineAt": None,
+            "tat_seconds": None,
+            "tat_extension_minutes": 0,
+            "transcript": "",
+            "worker_notes": "",
+            "final_attachment": None,
+            "workerCompletedAt": None,
+            "worker_minutes": None,
+            "worker_amount_kes": None,
+            "payout_status": None,
+            "payout_period_id": None,
+            "auto_reassigned_count": 0,
+            "last_auto_reassigned_at": None,
+            "last_auto_reassigned_worker_name": None,
+        })
+    return segments
 
 
 @app.post("/human-transcription/jobs/{job_id}/assign")
@@ -7170,82 +7621,13 @@ async def human_admin_assign(job_id: str, request: Request):
             "worker_email": payload.get("worker_email"),
             "worker_name": payload.get("worker_name"),
         }]
-    requested_workers = [item for item in requested_workers if str(item.get("worker_uid") or "").strip()]
-    if assignment_mode == "dual" or len(requested_workers) == 2:
-        if len(requested_workers) != 2:
-            raise HTTPException(status_code=400, detail="Choose a worker for each part of the split assignment.")
-        if job.get("split_mode") == "dual" and job.get("segments"):
-            raise HTTPException(status_code=409, detail="This job is already split. Assign or reassign one part at a time so submitted work is preserved.")
-        worker_uids = [str(item.get("worker_uid")).strip() for item in requested_workers]
-        same_worker_sequential = worker_uids[0] == worker_uids[1]
-        if job.get("status") not in {"approved", "split_assigned", "split_in_progress", "proofreading_available", "proofreading_assigned"}:
-            raise HTTPException(status_code=409, detail="Approve the job before assigning its parts.")
-        try:
-            total_seconds = float(job.get("seconds") or 0)
-        except (TypeError, ValueError):
-            total_seconds = 0
-        midpoint = total_seconds / 2.0
-        total_minutes = max(1, int(job.get("minutes") or math.ceil(total_seconds / 60.0)))
-        first_minutes = max(1, int(math.ceil(total_minutes / 2.0)))
-        second_minutes = max(1, total_minutes - first_minutes)
-        part_seconds = [midpoint, max(1.0, total_seconds - midpoint)]
-        now = datetime.now()
-        segments = []
-        for index, worker in enumerate(requested_workers):
-            staged_part = same_worker_sequential and index == 1
-            tat_seconds = human_tat_seconds(part_seconds[index]) if not staged_part else None
-            segments.append({
-                "id": f"part_{index + 1}",
-                "label": f"Part {index + 1} of 2",
-                "index": index + 1,
-                "start_seconds": 0 if index == 0 else round(midpoint, 2),
-                "end_seconds": round(midpoint, 2) if index == 0 else round(total_seconds, 2),
-                "minutes": first_minutes if index == 0 else second_minutes,
-                "worker_uid": None if staged_part else str(worker.get("worker_uid")).strip(),
-                "worker_email": "" if staged_part else str(worker.get("worker_email") or "").strip().lower(),
-                "worker_name": "" if staged_part else str(worker.get("worker_name") or "").strip(),
-                "status": "available" if staged_part else "assigned",
-                "assignedAt": None if staged_part else now,
-                "deadlineAt": None if staged_part else now + timedelta(seconds=tat_seconds),
-                "tat_seconds": tat_seconds,
-                "tat_extension_minutes": 0,
-                "transcript": "",
-                "worker_notes": "",
-                "final_attachment": None,
-                "workerCompletedAt": None,
-                "worker_minutes": None,
-                "worker_amount_kes": None,
-                "payout_status": None,
-                "payout_period_id": None,
-                "auto_reassigned_count": 0,
-                "last_auto_reassigned_at": None,
-                "last_auto_reassigned_worker_name": None,
-            })
-        updates = {
-            "status": "split_assigned",
-            "split_mode": "dual",
-            "segments": segments,
-            "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
-            "worker_uid": None,
-            "worker_email": None,
-            "worker_name": None,
-            "assignedAt": now,
-            "deadlineAt": None,
-            "tat_seconds": None,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        }
-        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
-        await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
-        for segment in segments:
-            if segment.get("worker_uid"):
-                await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=str(segment.get("id") or ""))
-                await _notify_worker_assignment(job_id, segment.get("worker_uid"), segment.get("label") or "your assigned part", segment.get("assignedAt"), segment_id=segment.get("id") or "")
-        return {
-            "status": "split_assigned",
-            "job_id": job_id,
-            "same_worker_sequential": same_worker_sequential,
-            "segments": [{"id": item["id"], "worker_uid": item["worker_uid"], "status": item["status"], "tat_seconds": item["tat_seconds"]} for item in segments],
-        }
+    requested_workers = [
+        item for item in requested_workers
+        if isinstance(item, dict) and str(item.get("worker_uid") or "").strip()
+    ]
+    split_requested = assignment_mode in {"dual", "multi", "split"} or len(requested_workers) > 1
+    if split_requested:
+        raise HTTPException(status_code=409, detail="New jobs are split automatically when approved. Workers claim available parts from the Work Room.")
 
     if len(requested_workers) != 1:
         raise HTTPException(status_code=400, detail="Choose an approved worker first.")
@@ -7253,62 +7635,32 @@ async def human_admin_assign(job_id: str, request: Request):
     worker_uid = str(worker.get("worker_uid") or "").strip()
     if not worker_uid:
         raise HTTPException(status_code=400, detail="Choose an approved worker first.")
-    if job.get("split_mode") == "dual":
-        segment_id = str(payload.get("segment_id") or "").strip()
-        if not segment_id:
-            raise HTTPException(status_code=400, detail="Choose a part waiting for assignment.")
-        segments = [dict(item or {}) for item in (job.get("segments") or [])]
-        target = next((item for item in segments if item.get("id") == segment_id), None)
-        if not target or target.get("status") not in {"available", "approved"}:
-            raise HTTPException(status_code=409, detail="That part is not waiting for assignment.")
-        active_part = next((item for item in segments if item.get("id") != target.get("id") and item.get("worker_uid") == worker_uid and item.get("status") in {"assigned", "in_progress"}), None)
-        if active_part:
-            label = active_part.get("label") or "the current part"
-            raise HTTPException(status_code=409, detail=f"Let this worker submit {label} before assigning another part to them.")
-        tat_seconds = human_tat_seconds(float(target.get("end_seconds") or 0) - float(target.get("start_seconds") or 0))
-        now = datetime.now()
-        target.update({
-            "worker_uid": worker_uid,
-            "worker_email": str(worker.get("worker_email") or "").strip().lower(),
-            "worker_name": str(worker.get("worker_name") or "").strip(),
-            "status": "assigned",
-            "assignedAt": now,
-            "deadlineAt": now + timedelta(seconds=tat_seconds),
-            "tat_seconds": tat_seconds,
-        })
-        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-            "segments": segments,
-            "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
-            "status": "split_assigned",
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        })
-        await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
-        await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id)
-        await _notify_worker_assignment(job_id, worker_uid, target.get("label") or "your assigned part", target.get("assignedAt"), segment_id=segment_id)
-        return {"status": "split_assigned", "job_id": job_id, "segment_id": segment_id}
-
-    if job.get("status") not in {"approved", "assigned"}:
-        raise HTTPException(status_code=409, detail="Approve the job before assigning it.")
-    tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
-    now = datetime.now()
-    deadline = now + timedelta(seconds=tat_seconds)
-    updates = {
-        "status": "assigned",
-        "worker_uid": worker_uid,
-        "worker_email": str(worker.get("worker_email") or "").strip().lower(),
-        "worker_name": str(worker.get("worker_name") or "").strip(),
-        "assignedAt": now,
-        "deadlineAt": deadline,
-        "tat_seconds": tat_seconds,
-        "tat_extension_minutes": 0,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
+    worker_profile = await _load_profile(worker_uid)
+    if not worker_profile or worker_profile.get("workerApproved") is not True:
+        raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    if worker_profile.get("is_available", True) is False:
+        raise HTTPException(status_code=409, detail="This worker is marked unavailable for new work.")
+    verified_actor = {
+        "uid": worker_uid,
+        "email": str(worker_profile.get("email") or worker.get("worker_email") or "").strip().lower(),
+        "profile": worker_profile,
     }
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    if not _human_is_split_job(job):
+        raise HTTPException(status_code=409, detail="Approved jobs are claimed by workers from the Available Jobs board.")
+    segment_id = str(payload.get("segment_id") or "").strip()
+    if not segment_id:
+        raise HTTPException(status_code=400, detail="Choose a part waiting for assignment.")
+    try:
+        assignment = await asyncio.to_thread(_human_claim_assignment_transaction, job_id, verified_actor, segment_id)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not assign legacy Human Work part %s to %s", segment_id, worker_uid)
+        raise HTTPException(status_code=409, detail="That part could not be assigned. Refresh and try again.") from exc
     await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
-    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=job_id)
-    await _notify_worker_assignment(job_id, worker_uid, "your transcription job", now)
-    return {"status": "assigned", "job_id": job_id, "worker_uid": worker_uid, "tat_seconds": tat_seconds}
-
+    await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id)
+    await _notify_worker_assignment(job_id, worker_uid, assignment.get("label") or "your assigned part", assignment.get("assignedAt"), segment_id=segment_id)
+    return {"status": "split_assigned", "job_id": job_id, "segment_id": segment_id}
 
 @app.post("/human-transcription/jobs/{job_id}/assign-proofreader")
 async def human_admin_assign_proofreader(job_id: str, request: Request):
@@ -7317,27 +7669,25 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
     worker_uid = str(payload.get("worker_uid") or "").strip()
     if not worker_uid:
         raise HTTPException(status_code=400, detail="Choose an approved proofreader first.")
+    if await _human_worker_has_active_assignment(worker_uid):
+        raise HTTPException(status_code=409, detail="This worker must finish their current assignment before taking proofreading work.")
     job = await _human_job(job_id)
-    if job.get("split_mode") != "dual" or not all((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
-        raise HTTPException(status_code=409, detail="Both parts must be submitted before assigning the final proofreader.")
+    if not _human_is_split_job(job) or not all((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+        raise HTTPException(status_code=409, detail="Every transcription part must be submitted before assigning the final proofreader.")
     tat_seconds = human_proofreading_tat_seconds(float(job.get("seconds") or 0))
-    now = datetime.now()
-    assigned = list(job.get("assigned_worker_uids") or [])
-    if worker_uid not in assigned:
-        assigned.append(worker_uid)
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-        "status": "proofreading_assigned",
-        "proofreader_uid": worker_uid,
-        "proofreader_email": str(payload.get("worker_email") or "").strip().lower(),
-        "proofreader_name": str(payload.get("worker_name") or "").strip(),
-        "proofreader_status": "assigned",
-        "proofreader_assignedAt": now,
-        "proofreader_deadlineAt": now + timedelta(seconds=tat_seconds),
-        "proofreader_tat_seconds": tat_seconds,
-        "proofreader_tat_extension_minutes": 0,
-        "assigned_worker_uids": assigned,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    })
+    worker = {
+        "worker_uid": worker_uid,
+        "worker_email": payload.get("worker_email"),
+        "worker_name": payload.get("worker_name"),
+    }
+    try:
+        assignment = await asyncio.to_thread(_human_assign_proofreader_transaction, job_id, worker, tat_seconds)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not assign proofreader %s to Human Work %s", worker_uid, job_id)
+        raise HTTPException(status_code=409, detail="The proofreader assignment could not be saved. Refresh the job and try again.") from exc
+    now = assignment["assignedAt"]
     await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
     await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id="proofreader")
     await _notify_worker_assignment(job_id, worker_uid, "your proofreading assignment", now, segment_id="proofreader")
@@ -7372,9 +7722,9 @@ async def human_admin_take_back(job_id: str, request: Request):
             "proofreader_name": None, "proofreader_assignedAt": None, "proofreader_deadlineAt": None,
             "proofreader_tat_seconds": None, "proofreader_tat_extension_minutes": 0,
             "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
-            "status": "proofreading_available" if job.get("split_mode") == "dual" else "approved",
+            "status": "proofreading_available" if _human_is_split_job(job) else "approved",
         })
-    elif job.get("split_mode") == "dual":
+    elif _human_is_split_job(job):
         segment_id = str(payload.get("segment_id") or "").strip()
         if not segment_id:
             raise HTTPException(status_code=400, detail="Choose the active part to take back.")
@@ -7426,6 +7776,9 @@ async def human_admin_take_back(job_id: str, request: Request):
     })
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     if worker_uid:
+        claim_role = "proofreader" if role == "proofreader" else "transcriber"
+        claim_segment = "proofreader" if role == "proofreader" else str(payload.get("segment_id") or "")
+        await _human_release_worker_claim(worker_uid, job_id, claim_segment, claim_role)
         await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
         await _create_user_notification(
             str(worker_uid), f"human-takeback:{job_id}:{role}:{now.isoformat()}", "assignment_taken_back",
@@ -7464,7 +7817,7 @@ async def human_admin_extend_tat(job_id: str, request: Request):
             route="human_worker", job_id=job_id, target_id=job_id,
         )
         return {"status": "extended", "job_id": job_id, "target": "proofreader", "minutes_added": extra_minutes}
-    if job.get("split_mode") == "dual":
+    if _human_is_split_job(job):
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         target = next((item for item in segments if item.get("id") == segment_id), None) if segment_id else None
         if not target:
@@ -7505,7 +7858,7 @@ async def human_worker_start(job_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Worker access is required.")
     job = await _human_job(job_id)
     await _human_assert_access(job, actor, allow_admin=False)
-    if job.get("split_mode") == "dual":
+    if _human_is_split_job(job):
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
@@ -7542,7 +7895,7 @@ async def human_worker_submit(
     await _human_assert_access(job, actor, allow_admin=False)
     transcript_text = str(transcript or "").strip()
 
-    if job.get("split_mode") == "dual":
+    if _human_is_split_job(job):
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
@@ -7571,6 +7924,7 @@ async def human_worker_submit(
                 "status": "proofreading_available" if both_submitted else "split_in_progress",
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             })
+            await _human_release_worker_claim(actor["uid"], job_id, str(target.get("id") or ""), "transcriber")
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             await _notify_human_admins(
                 f"human-submitted:{job_id}:{target.get('id')}", "job_submitted", "A job part was submitted",
@@ -7599,6 +7953,7 @@ async def human_worker_submit(
                 "submittedAt": firestore.SERVER_TIMESTAMP,
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             })
+            await _human_release_worker_claim(actor["uid"], job_id, "proofreader", "proofreader")
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             await _notify_human_admins(
                 f"human-submitted:{job_id}:proofreader", "job_submitted", "Proofreading was submitted",
@@ -7632,6 +7987,7 @@ async def human_worker_submit(
         "payout_status": "unassigned",
     }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    await _human_release_worker_claim(actor["uid"], job_id, "", "transcriber")
     await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
     await _notify_human_admins(
         f"human-submitted:{job_id}:main", "job_submitted", "A Human Work job was submitted",
@@ -8196,9 +8552,9 @@ async def human_audio(job_id: str, request: Request, segment_id: str = ""):
     if not blob.exists():
         raise HTTPException(status_code=404, detail="The source audio is no longer available.")
     raw = await asyncio.to_thread(blob.download_as_bytes)
-    # Split workers receive only their assigned half of the recording. Admins,
+    # Split workers receive only their assigned part of the recording. Admins,
     # clients and proofreaders continue to receive the complete source audio.
-    if segment_id and actor.get("role") == "worker" and job.get("split_mode") == "dual":
+    if segment_id and actor.get("role") == "worker" and _human_is_split_job(job):
         segment = next((item for item in (job.get("segments") or []) if item.get("id") == segment_id and item.get("worker_uid") == actor.get("uid")), None)
         if not segment:
             raise HTTPException(status_code=403, detail="That audio segment is not assigned to you.")
@@ -8310,10 +8666,19 @@ async def complete_trainee_signup(request: Request):
     saved_official_name = str((actor.get("profile") or {}).get("officialIdName") or "").strip()
     if saved_official_name and saved_official_name.casefold() != official_name.casefold():
         raise HTTPException(status_code=409, detail="The official name from your trainee registration is locked. Contact support if it needs correcting.")
+    if payload.get("mpesa_confirmed") is not True:
+        raise HTTPException(status_code=400, detail="Confirm that the submitted details are registered to your M-Pesa account.")
+    mpesa_name, mpesa_number = _normalize_mpesa_details(payload.get("mpesa_registered_name"), payload.get("mpesa_number"))
+    if not mpesa_name or not mpesa_number:
+        raise HTTPException(status_code=400, detail="Enter both the M-Pesa registered name and number before opening the Training Room.")
+    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {
+        "name": official_name, "officialIdName": official_name,
+        "mpesaRegisteredName": mpesa_name, "mpesaNumber": mpesa_number,
+        "mpesaDetailsUpdatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
     result = await enroll_paid_trainee(actor["email"], reference, TRAINEE_PRICE_USD, str(intent.get("currency") or "KES"), TRAINEE_COUNTRY, str(intent.get("provider") or "paystack"), user_id=actor["uid"])
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error") or "The trainee account could not be completed.")
-    await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, {"name": official_name, "officialIdName": official_name}, merge=True)
 
     # Trainees bypass the normal profile-creation path, so send their own
     # welcome message after payment and enrolment have both succeeded. Email
