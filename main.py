@@ -18,6 +18,8 @@ import secrets
 from datetime import datetime, timedelta
 import requests
 from pydub import AudioSegment
+import pypdfium2 as pdfium
+from PIL import Image, ImageOps
 
 # Audio written for clients must open in ordinary playback software, not just
 # in a browser. MP3 has three variants and the encoder picks one from the
@@ -5769,6 +5771,11 @@ async def admin_adjust_credits(payload: AdminCreditAdjustmentRequest, request: R
 HUMAN_JOB_COLLECTION = "human_jobs"
 HUMAN_WORKER_CLAIM_COLLECTION = "human_worker_claims"
 HUMAN_AVAILABLE_SLICE_MINUTES = 5
+PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
+PDF_JOB_WORKER_PAY_KES = 100
+PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+PDF_JOB_MAX_PAGES_PER_FILE = 100
+PDF_JOB_MAX_IMAGES_PER_BATCH = 200
 HUMAN_JOB_STATUSES = {
     "pending_admin",
     "approved",
@@ -5835,6 +5842,9 @@ def _human_public_for(data, actor_role, actor_uid=""):
     """
     data = data or {}
     out = _human_public(data)
+    pdf_image = out.get("pdf_image") or {}
+    if pdf_image:
+        out["pdf_image"] = {key: pdf_image[key] for key in ("name", "content_type", "size", "source_filename", "page_number", "page_count") if key in pdf_image}
     if actor_role not in {"admin", "human_ops_admin"}:
         out.pop("worker_ratings", None)
         out.pop("worker_rating", None)
@@ -6004,6 +6014,21 @@ def _human_bucket():
         return None
 
 
+def _training_assets_bucket():
+    """Use a dedicated private bucket so training files never change job storage."""
+    if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
+        return None
+    try:
+        configured = (os.getenv("TRAINING_ASSET_STORAGE_BUCKET") or "").strip()
+        if not configured:
+            logger.warning("Training asset storage bucket is not configured.")
+            return None
+        return firebase_storage.bucket(configured)
+    except Exception as exc:
+        logger.warning("Private training asset storage is unavailable: %s", exc)
+        return None
+
+
 async def _human_store_upload(job_id: str, upload: UploadFile, folder: str):
     if not upload or not upload.filename:
         return None
@@ -6025,6 +6050,18 @@ async def _human_store_upload(job_id: str, upload: UploadFile, folder: str):
         "content_type": upload.content_type or "application/octet-stream",
         "size": len(raw),
     }
+
+
+def _human_store_raw_bytes(job_id: str, filename: str, raw: bytes, content_type: str, folder: str):
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"{filename or 'The uploaded image'} is empty.")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(filename or "image.jpg"))[:180] or "image.jpg"
+    path = f"human-workflow/{job_id}/{folder}/{uuid.uuid4().hex}-{safe_name}"
+    bucket = _human_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="File storage is not ready yet. Please try again shortly.")
+    bucket.blob(path).upload_from_string(raw, content_type=content_type or "application/octet-stream")
+    return {"name": filename or safe_name, "storage_path": path, "content_type": content_type or "application/octet-stream", "size": len(raw)}
 
 
 async def _human_reclaim_expired_job(job_id: str, job: dict):
@@ -6568,7 +6605,11 @@ def _human_worker_earning_items(job_id, job, include_processed=False):
             "payout_period_id": period_id, "paid_at": _as_dt(paid_at) if paid_at else None,
         }
 
-    single = normalize("job", job, job.get("worker_uid"), job.get("worker_email"), job.get("worker_name"), job.get("worker_minutes") or job.get("minutes"), job.get("workerCompletedAt"), default_rate, job.get("payout_status"), job.get("payout_period_id"), job.get("workerPaidAt"))
+    is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
+    single_source = "pdf" if is_pdf_job else "job"
+    if is_pdf_job:
+        default_rate = PDF_JOB_WORKER_PAY_KES
+    single = normalize(single_source, job, job.get("worker_uid"), job.get("worker_email"), job.get("worker_name"), job.get("worker_minutes") or job.get("minutes"), job.get("workerCompletedAt"), default_rate, job.get("payout_status"), job.get("payout_period_id"), job.get("workerPaidAt"))
     if single:
         yield single
     for segment in (job.get("segments") or []):
@@ -6679,7 +6720,7 @@ async def _close_due_pay_periods():
             snap = await asyncio.to_thread(job_ref.get)
             job = snap.to_dict() or {}
             update = {"updatedAt": firestore.SERVER_TIMESTAMP}
-            if item["source"] == "job":
+            if item["source"] in {"job", "pdf"}:
                 update.update({"payout_status": "invoiced", "payout_period_id": label})
             elif item["source"] == "proofreader":
                 update.update({"proofreader_payout_status": "invoiced", "proofreader_payout_period_id": label})
@@ -7020,6 +7061,161 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     return response
 
 
+def _pdf_job_jpeg_bytes(image):
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    max_pixels = 18_000_000
+    if image.width * image.height > max_pixels:
+        scale = (max_pixels / float(image.width * image.height)) ** 0.5
+        image = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=90, optimize=True)
+    return output.getvalue()
+
+
+def _pdf_job_images_from_upload(filename, raw):
+    original_name = os.path.basename(filename or "uploaded-image")[:180]
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(original_name)[0])[:120] or "image"
+    is_pdf = original_name.lower().endswith(".pdf") or raw[:5] == b"%PDF-"
+    images = []
+    if is_pdf:
+        document = None
+        try:
+            document = pdfium.PdfDocument(raw)
+            page_count = len(document)
+            if page_count < 1:
+                raise HTTPException(status_code=400, detail=f"{original_name} has no pages.")
+            if page_count > PDF_JOB_MAX_PAGES_PER_FILE:
+                raise HTTPException(status_code=413, detail=f"{original_name} has more than {PDF_JOB_MAX_PAGES_PER_FILE} pages.")
+            for index in range(page_count):
+                page = document[index]
+                width, height = page.get_size()
+                scale = min(1.75, (18_000_000 / max(float(width * height), 1.0)) ** 0.5)
+                rendered = page.render(scale=max(0.5, scale)).to_pil()
+                page_name = f"{safe_stem}-page-{index + 1:03d}.jpg"
+                images.append({"name": page_name, "raw": _pdf_job_jpeg_bytes(rendered), "source_filename": original_name, "page_number": index + 1, "page_count": page_count})
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.info("PDF Job upload could not be rendered (%s): %s", original_name, exc)
+            raise HTTPException(status_code=400, detail=f"{original_name} could not be read as a PDF.") from exc
+        finally:
+            if document is not None:
+                try:
+                    document.close()
+                except Exception:
+                    logger.debug("PDFium document cleanup failed for %s", original_name)
+        return images
+    try:
+        image = Image.open(BytesIO(raw))
+        image.load()
+        if image.width * image.height > 100_000_000:
+            raise HTTPException(status_code=413, detail=f"{original_name} has too many image pixels.")
+        images.append({"name": f"{safe_stem}.jpg", "raw": _pdf_job_jpeg_bytes(image), "source_filename": original_name, "page_number": 1, "page_count": 1})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"{original_name} is not a supported PDF or image file.") from exc
+    return images
+
+
+@app.post("/human-transcription/admin/pdf-jobs")
+async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] = File(...)):
+    actor = await _human_actor(request)
+    if actor.get("email") != PDF_JOB_ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail=f"PDF Jobs upload is available only to {PDF_JOB_ADMIN_EMAIL}.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    if not files:
+        raise HTTPException(status_code=400, detail="Choose at least one PDF or image file.")
+    if len(files) > 50:
+        raise HTTPException(status_code=413, detail="Upload no more than 50 source files at once.")
+    created_jobs, stored_paths = [], []
+
+    async def rollback():
+        bucket = _human_bucket()
+        for path in stored_paths:
+            if bucket:
+                try:
+                    await asyncio.to_thread(bucket.blob(path).delete)
+                except Exception:
+                    logger.warning("Could not remove failed PDF Job upload file %s", path)
+        for job_id in created_jobs:
+            try:
+                await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).delete)
+            except Exception:
+                logger.warning("Could not remove failed PDF Job record %s", job_id)
+
+    try:
+        image_count = 0
+        for upload in files:
+            raw = await upload.read(PDF_JOB_MAX_UPLOAD_BYTES + 1)
+            if not raw:
+                raise HTTPException(status_code=400, detail=f"{upload.filename or 'A selected file'} is empty.")
+            if len(raw) > PDF_JOB_MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"{upload.filename} is larger than 25 MB.")
+            rendered_images = await asyncio.to_thread(_pdf_job_images_from_upload, upload.filename, raw)
+            image_count += len(rendered_images)
+            if image_count > PDF_JOB_MAX_IMAGES_PER_BATCH:
+                raise HTTPException(status_code=413, detail=f"A single upload batch can contain up to {PDF_JOB_MAX_IMAGES_PER_BATCH} image pages.")
+            for rendered in rendered_images:
+                job_id = uuid.uuid4().hex
+                image_meta = await asyncio.to_thread(_human_store_raw_bytes, job_id, rendered["name"], rendered["raw"], "image/jpeg", "pdf")
+                stored_paths.append(image_meta["storage_path"])
+                image_meta.update({key: rendered[key] for key in ("source_filename", "page_number", "page_count")})
+                now = firestore.SERVER_TIMESTAMP
+                job = {
+                    "job_type": "pdf_job", "source_type": "pdf_job", "status": "approved",
+                    "createdAt": now, "updatedAt": now,
+                    "seconds": 180, "minutes": 1,
+                    "turnaround": "standard", "difficulty": "standard", "service": "pdf_transcription", "formatting": "standard",
+                    "timestamps": False, "speakers": "1", "speaker_labels": False,
+                    "instructions": "Always use Gemini for image transcription",
+                    "pdf_image": image_meta, "audio": None,
+                    "quote_credits": 0,
+                    "quote": {"credits": 0, "minutes": 1, "transcriber_payout_kes_per_minute": PDF_JOB_WORKER_PAY_KES, "worker_fixed_amount_kes": PDF_JOB_WORKER_PAY_KES},
+                    "worker_uid": None, "worker_email": None, "worker_name": None,
+                    "worker_minutes": 1, "worker_amount_kes": None, "worker_gross_amount_kes": None,
+                    "worker_deduction_kes": 0, "worker_deduction_reason": "",
+                    "payout_status": None, "payout_period_id": None, "workerPaymentStatus": None,
+                    "assigned_worker_uids": [], "transcript": "", "worker_notes": "", "final_attachment": None,
+                    "client_uid": None, "client_email": "",
+                }
+                await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, job)
+                created_jobs.append(job_id)
+        return {"created_count": len(created_jobs), "jobs": created_jobs, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES}
+    except HTTPException:
+        await rollback()
+        raise
+    except Exception as exc:
+        await rollback()
+        logger.exception("PDF Jobs batch upload failed for %s", actor.get("email"))
+        raise HTTPException(status_code=500, detail="The PDF Jobs upload could not be completed. Please retry the batch.") from exc
+
+
+@app.get("/human-transcription/admin/pdf-jobs")
+async def human_admin_list_pdf_jobs(request: Request):
+    actor = await _human_actor(request)
+    if actor.get("email") != PDF_JOB_ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail=f"PDF Jobs are available only to {PDF_JOB_ADMIN_EMAIL}.")
+    if not db:
+        return {"jobs": []}
+    snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("job_type", "==", "pdf_job")).stream()))
+    jobs = []
+    for snapshot in snapshots:
+        item = snapshot.to_dict() or {}
+        image = item.get("pdf_image") or {}
+        jobs.append({
+            "id": snapshot.id, "name": image.get("name") or image.get("source_filename") or "Image job",
+            "source_filename": image.get("source_filename") or "", "page_number": image.get("page_number") or 1,
+            "page_count": image.get("page_count") or 1, "status": item.get("status") or "approved",
+            "worker_name": item.get("worker_name") or "", "worker_email": item.get("worker_email") or "",
+            "worker_amount_kes": int(item.get("worker_amount_kes") or 0),
+            "created_at": _human_iso(item.get("createdAt")), "submitted_at": _human_iso(item.get("workerCompletedAt")),
+        })
+    jobs.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return {"jobs": jobs[:500], "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES}
+
+
 @app.get("/human-transcription/notifications")
 async def human_workflow_notifications(request: Request, since: str = ""):
     """Return small, role-filtered human-work events for app-wide alerts."""
@@ -7134,7 +7330,7 @@ async def human_worker_payment_history(request: Request):
         if identity in seen_earnings:
             return
         seen_earnings.add(identity)
-        role = "Proofreader" if item.get("source") == "proofreader" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber")
+        role = "Proofreader" if item.get("source") == "proofreader" else ("PDF Transcriber" if item.get("source") == "pdf" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber"))
         payout_status = item.get("payout_status") or "accruing"
         if payout_status == "unassigned":
             payout_status = "accruing"
@@ -7164,14 +7360,17 @@ async def human_worker_payment_history(request: Request):
     label, start_dt, end_dt = _pay_period_bounds(datetime.now())
     current_accrued = [item for item in upcoming if item.get("payout_status") in (None, "accruing", "unassigned") and item.get("payout_period_id") in (None, label)]
     is_proofreading = lambda row: row.get("role") == "Proofreader"
+    is_pdf_earning = lambda row: row.get("role") == "PDF Transcriber"
     def earning_breakdown(rows):
-        transcription_rows = [row for row in rows if not is_proofreading(row)]
+        transcription_rows = [row for row in rows if not is_proofreading(row) and not is_pdf_earning(row)]
         proofreading_rows = [row for row in rows if is_proofreading(row)]
+        pdf_rows = [row for row in rows if is_pdf_earning(row)]
         return {
             "transcription_kes": sum(row["amount_kes"] for row in transcription_rows),
             "transcription_minutes": sum(row["minutes"] for row in transcription_rows),
             "proofreading_kes": sum(row["amount_kes"] for row in proofreading_rows),
             "proofreading_minutes": sum(row["minutes"] for row in proofreading_rows),
+            "pdf_kes": sum(row["amount_kes"] for row in pdf_rows),
             "total_kes": sum(row["amount_kes"] for row in rows),
             "total_minutes": sum(row["minutes"] for row in rows),
         }
@@ -7185,8 +7384,9 @@ async def human_worker_payment_history(request: Request):
         if payout.get("status") == "paid":
             continue
         payout_items = payout.get("items") or []
-        transcription_items = [item for item in payout_items if item.get("source") != "proofreader"]
+        transcription_items = [item for item in payout_items if item.get("source") not in {"proofreader", "pdf"}]
         proofreading_items = [item for item in payout_items if item.get("source") == "proofreader"]
+        pdf_items = [item for item in payout_items if item.get("source") == "pdf"]
         pending_payouts.append({
             "payout_id": snap.id,
             "period_label": payout.get("period_label"),
@@ -7198,6 +7398,7 @@ async def human_worker_payment_history(request: Request):
             "gross_total_kes": int(payout.get("total_amount_kes") or 0) + sum(int(item.get("deduction_kes") or 0) for item in payout_items),
             "transcription_amount_kes": sum(int(item.get("amount_kes") or 0) for item in transcription_items),
             "proofreading_amount_kes": sum(int(item.get("amount_kes") or 0) for item in proofreading_items),
+            "pdf_amount_kes": sum(int(item.get("amount_kes") or 0) for item in pdf_items),
             "status": payout.get("status") or "pending",
         })
         if not payout_items:
@@ -7213,6 +7414,8 @@ async def human_worker_payment_history(request: Request):
             "paid_proofreading_kes": paid_breakdown["proofreading_kes"],
             "upcoming_transcription_kes": upcoming_breakdown["transcription_kes"],
             "upcoming_proofreading_kes": upcoming_breakdown["proofreading_kes"],
+            "paid_pdf_kes": paid_breakdown["pdf_kes"],
+            "upcoming_pdf_kes": upcoming_breakdown["pdf_kes"],
         },
         "current_period": {
             "label": label, "start": start_dt.isoformat(), "end": end_dt.isoformat(),
@@ -7222,6 +7425,7 @@ async def human_worker_payment_history(request: Request):
             "transcription_minutes": current_breakdown["transcription_minutes"],
             "proofreading_kes": current_breakdown["proofreading_kes"],
             "proofreading_minutes": current_breakdown["proofreading_minutes"],
+            "pdf_kes": current_breakdown["pdf_kes"],
         },
         "pending_payouts": pending_payouts,
     }
@@ -7370,7 +7574,7 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
             payout_status = "paid"
         if status != "all" and payout_status != status:
             return
-        role = "Proofreader" if item.get("source") == "proofreader" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber")
+        role = "Proofreader" if item.get("source") == "proofreader" else ("PDF Transcriber" if item.get("source") == "pdf" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber"))
         amount = int(item.get("amount_kes") or 0)
         seen.add(identity)
         rows.append({
@@ -7394,8 +7598,9 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
         item = snap.to_dict() or {}
         append_admin_payment(item, item.get("job_status"))
     rows.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
-    transcription_rows = [item for item in rows if item["role"] != "Proofreader"]
+    transcription_rows = [item for item in rows if item["role"] not in {"Proofreader", "PDF Transcriber"}]
     proofreading_rows = [item for item in rows if item["role"] == "Proofreader"]
+    pdf_rows = [item for item in rows if item["role"] == "PDF Transcriber"]
     return {
         "jobs": rows,
         "total_minutes": sum(item["minutes"] for item in rows),
@@ -7404,6 +7609,7 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
         "gross_total_kes": sum(item["gross_amount_kes"] for item in rows),
         "transcription_amount_kes": sum(item["amount_kes"] for item in transcription_rows),
         "proofreading_amount_kes": sum(item["amount_kes"] for item in proofreading_rows),
+        "pdf_amount_kes": sum(item["amount_kes"] for item in pdf_rows),
         "transcription_minutes": sum(item["minutes"] for item in transcription_rows),
         "proofreading_minutes": sum(item["minutes"] for item in proofreading_rows),
         "job_count": len(rows),
@@ -7436,8 +7642,9 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
         if status != "all" and payout_status != status:
             continue
         invoice_items = payout.get("items") or []
-        transcription_items = [item for item in invoice_items if item.get("source") != "proofreader"]
+        transcription_items = [item for item in invoice_items if item.get("source") not in {"proofreader", "pdf"}]
         proofreading_items = [item for item in invoice_items if item.get("source") == "proofreader"]
+        pdf_items = [item for item in invoice_items if item.get("source") == "pdf"]
         payouts.append({
             "payout_id": snap.id,
             "worker_uid": payout.get("worker_uid"),
@@ -7454,6 +7661,7 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
             "transcription_amount_kes": sum(int(item.get("amount_kes") or 0) for item in transcription_items),
             "proofreading_minutes": sum(int(item.get("minutes") or 0) for item in proofreading_items),
             "proofreading_amount_kes": sum(int(item.get("amount_kes") or 0) for item in proofreading_items),
+            "pdf_amount_kes": sum(int(item.get("amount_kes") or 0) for item in pdf_items),
             "status": payout_status,
             "job_ids": payout.get("job_ids") or [],
             "paid_at": _human_iso(payout.get("paidAt")),
@@ -7500,7 +7708,7 @@ async def admin_mark_payout_paid(payout_id: str, request: Request):
                 continue
             job = snap.to_dict() or {}
             update = {"updatedAt": firestore.SERVER_TIMESTAMP}
-            if source == "job":
+            if source in {"job", "pdf"}:
                 update.update({"payout_status": "paid", "workerPaymentStatus": "paid", "workerPaidAt": now})
             elif source == "proofreader":
                 update.update({"proofreader_payout_status": "paid", "proofreaderPaidAt": now})
@@ -7532,7 +7740,7 @@ async def admin_deduct_worker_job_payment(job_id: str, request: Request):
     except (TypeError, ValueError):
         deduction_amount = 0
     reason = re.sub(r"\s+", " ", str(payload.get("reason") or "").strip())[:500]
-    if source not in {"job", "segment", "proofreader"}:
+    if source not in {"job", "segment", "proofreader", "pdf"}:
         raise HTTPException(status_code=400, detail="Choose a valid worker payment item.")
     if source == "segment" and not segment_id:
         raise HTTPException(status_code=400, detail="Choose the submitted segment to adjust.")
@@ -7587,7 +7795,7 @@ async def admin_deduct_worker_job_payment(job_id: str, request: Request):
     if archive_snapshot is not None:
         archive_ref = archive_snapshot.reference
         batch.set(archive_ref, {"gross_amount_kes": gross, "deduction_kes": new_deduction, "deduction_reason": reason, "amount_kes": new_amount, "updated_at": datetime.now()}, merge=True)
-    elif source == "job":
+    elif source in {"job", "pdf"}:
         batch.update(job_ref, {"worker_gross_amount_kes": gross, "worker_deduction_kes": new_deduction, "worker_deduction_reason": reason, "worker_amount_kes": new_amount, "updatedAt": firestore.SERVER_TIMESTAMP})
     elif source == "proofreader":
         batch.update(job_ref, {"proofreader_gross_amount_kes": gross, "proofreader_deduction_kes": new_deduction, "proofreader_deduction_reason": reason, "proofreader_amount_kes": new_amount, "updatedAt": firestore.SERVER_TIMESTAMP})
@@ -8111,9 +8319,10 @@ async def human_worker_submit(
     if not transcript_text and not final_attachment:
         raise HTTPException(status_code=400, detail="Add the completed transcript, or attach the finished file, before submitting.")
     quote = job.get("quote") or {}
+    is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
     minutes = int(job.get("minutes") or quote.get("minutes") or 0)
-    rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
-    worker_amount_kes = max(0, minutes * rate)
+    rate = PDF_JOB_WORKER_PAY_KES if is_pdf_job else int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+    worker_amount_kes = PDF_JOB_WORKER_PAY_KES if is_pdf_job else max(0, minutes * rate)
     updates = {
         "status": "submitted",
         "transcript": transcript_text[:1000000],
@@ -8124,6 +8333,7 @@ async def human_worker_submit(
         "workerCompletedAt": datetime.now(),
         "worker_minutes": minutes,
         "worker_amount_kes": worker_amount_kes,
+        "worker_gross_amount_kes": worker_amount_kes,
         "payout_status": "unassigned",
     }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
@@ -8153,25 +8363,29 @@ async def human_admin_review(job_id: str, request: Request):
     if rating is not None:
         for worker_uid in worker_uids:
             ratings_by_worker[worker_uid] = rating
+    is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
+    review_status = "released" if is_pdf_job else "client_review"
     updates = {
-        "status": "client_review",
+        "status": review_status,
         "admin_feedback": str(payload.get("feedback") or "")[:12000],
         "worker_rating": rating,
         "worker_ratings": ratings_by_worker,
         "reviewedAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
+    if is_pdf_job:
+        updates["releasedAt"] = firestore.SERVER_TIMESTAMP
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
     for worker_uid in worker_uids:
         await _human_worker_rating_summary(worker_uid, force_refresh=True)
     await _complete_human_admin_notifications(job_id, {"job_submitted"})
-    if job.get("client_uid"):
+    if job.get("client_uid") and not is_pdf_job:
         await _create_user_notification(
             str(job["client_uid"]), f"human-review-ready:{job_id}", "human_review_ready",
             "Your transcript is ready to review", "Open your Human Work job to review the completed transcript.",
             route="human_job", job_id=job_id, target_id=job_id, requires_action=True,
         )
-    return {"status": "client_review", "job_id": job_id}
+    return {"status": review_status, "job_id": job_id}
 
 
 @app.post("/human-transcription/jobs/{job_id}/client-approve")
@@ -8274,7 +8488,7 @@ async def _human_archive_job_earnings(job_id, job, delete_source=True):
 
 async def _human_delete_job_storage(job_id, job, message_snapshots):
     bucket = _human_bucket()
-    has_known_files = bool(job.get("audio") or job.get("audio_url") or job.get("audio_storage_path") or job.get("instruction_attachments") or job.get("final_attachment") or any((x or {}).get("final_attachment") for x in (job.get("segments") or [])) or any((x.to_dict() or {}).get("attachment") for x in message_snapshots))
+    has_known_files = bool(job.get("audio") or job.get("pdf_image") or job.get("audio_url") or job.get("audio_storage_path") or job.get("instruction_attachments") or job.get("final_attachment") or any((x or {}).get("final_attachment") for x in (job.get("segments") or [])) or any((x.to_dict() or {}).get("attachment") for x in message_snapshots))
     if bucket is None:
         if has_known_files:
             raise HTTPException(status_code=503, detail="File storage is unavailable, so this job was kept safely.")
@@ -8690,6 +8904,28 @@ def _human_worker_split_mp3_bytes(clipped):
     return output.getvalue()
 
 
+@app.get("/human-transcription/jobs/{job_id}/image")
+async def human_pdf_job_image(job_id: str, request: Request):
+    actor = await _human_actor(request)
+    if actor.get("role") not in {"admin", "worker"}:
+        raise HTTPException(status_code=403, detail="Only the admin team and assigned worker can view this image.")
+    job = await _human_job(job_id)
+    if str(job.get("job_type") or "").lower() != "pdf_job":
+        raise HTTPException(status_code=404, detail="This job does not contain an image.")
+    await _human_assert_access(job, actor)
+    meta = job.get("pdf_image") or {}
+    path = meta.get("storage_path")
+    bucket = _human_bucket()
+    if not path or bucket is None:
+        raise HTTPException(status_code=404, detail="The source image is not available.")
+    blob = bucket.blob(path)
+    if not await asyncio.to_thread(blob.exists):
+        raise HTTPException(status_code=404, detail="The source image is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(meta.get("name") or "pdf-job-image.jpg")) or "pdf-job-image.jpg"
+    return Response(content=raw, media_type=meta.get("content_type") or "image/jpeg", headers={"Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "private, no-store"})
+
+
 @app.get("/human-transcription/jobs/{job_id}/audio")
 async def human_audio(job_id: str, request: Request, segment_id: str = ""): 
     actor = await _human_actor(request)
@@ -8756,13 +8992,30 @@ TRAINING_GUIDELINES = {
 }
 
 TRAINING_LEVELS = [
-    {"level": 1, "name": "Orientation and standards", "kind": "study", "description": "Read the programme, understand the workflow, and begin the first conversation with the admin."},
-    {"level": 2, "name": "TypeMyworDz guidelines", "kind": "study", "description": "Study the human-work guidelines, ask questions, and discuss examples with the admin.", "guidelines": True},
+    {"level": 1, "name": "Orientation and standards", "kind": "study", "description": "Read the programme, understand the workflow, and complete the first knowledge check."},
+    {"level": 2, "name": "TypeMyworDz guidelines", "kind": "study", "description": "Study the human-work guidelines and complete the standards check.", "guidelines": True},
     {"level": 3, "name": "Tools, privacy and review habits", "kind": "study", "description": "Learn the editor, timestamp checks, file handling, privacy expectations, and quality-control routine."},
-    {"level": 4, "name": "Practical: clean transcript", "kind": "practical", "description": "Complete a short clean-transcript exercise using the required brief and formatting rules."},
-    {"level": 5, "name": "Practical: speakers and timestamps", "kind": "practical", "description": "Complete a timestamp and speaker-review exercise, checking difficult audio carefully."},
-    {"level": 6, "name": "Practical: client-ready delivery", "kind": "practical", "description": "Complete a full client-ready exercise and respond to admin feedback."},
+    {"level": 4, "name": "Practical: clean transcript", "kind": "practical", "description": "Complete a short clean-transcript exercise and explain the choices you made."},
+    {"level": 5, "name": "Practical: speakers and timestamps", "kind": "practical", "description": "Complete a speaker and timestamp review exercise, checking difficult audio carefully."},
+    {"level": 6, "name": "Final practical: Human Job audio", "kind": "practical", "description": "Transcribe the attached recording using the supplied TypeMyworDz guidelines and formatting reference. The admin reviews this with your other five modules."},
 ]
+TRAINING_CHECKLIST_COUNTS = {1: 5, 2: 5, 3: 5, 4: 3, 5: 3, 6: 3}
+TRAINING_QUIZ_ANSWERS = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
+TRAINING_REVIEW_CONTENT = {
+    1: {"checklist": ["I can explain the difference between a transcript and a summary.", "I understand why difficult audio may need repeated listening.", "I can name at least three kinds of general-transcription assignments.", "I know the TypeMyworDz workflow from brief to final review.", "I know where to ask the admin a question."], "quiz": "What should guide your first pass through a difficult recording?", "options": ["Speed, even if the words are uncertain", "Accuracy, meaning, and the assignment brief", "Making every sentence sound formal"]},
+    2: {"checklist": ["I understand that I must preserve the speaker’s wording and follow the assignment brief.", "I can distinguish a filler from a meaningful phrase.", "I know when to use an uncertainty marker.", "I understand the paragraphing instructions.", "I can explain when a proper noun needs research."], "quiz": "What should you do when a distinctive name is unclear?", "options": ["Guess and move on", "Replay the audio and research the name when appropriate", "Replace it with a simpler name"]},
+
+    3: {"checklist": ["I know how to use timestamps and speaker labels.", "I can keep client files private.", "I can explain my final review routine in order.", "I know how to flag uncertainty instead of guessing.", "I know how to use Messages to discuss an example with the admin."], "quiz": "What is the best response to a word that does not sound right?", "options": ["Leave it without checking", "Replay the audio and compare the surrounding meaning", "Invent a word that fits the sentence"]},
+    4: {"checklist": ["I removed only clear fillers, stutters, or duplicates.", "I kept the speaker’s wording and order.", "I reviewed the complete transcript before submitting."], "quiz": "Which change is appropriate?", "options": ["Rewriting a rough sentence to sound elegant", "Removing an obvious repeated word", "Adding a conclusion the speaker did not say"]},
+    5: {"checklist": ["I marked speaker changes consistently.", "I checked timestamps against the audio.", "I flagged uncertainty instead of guessing."], "quiz": "When should you add or correct a timestamp?", "options": ["Only at the very end without replaying", "When the brief requires it and after checking the audio", "Whenever a paragraph looks too long"]},
+    6: {"checklist": ["I followed the attached TypeMyworDz General Guidelines.", "I applied the supplied formatting instructions and checked proper nouns.", "I replayed the complete recording and reviewed my transcript before submitting."], "quiz": "What should you do if the speaker’s wording sounds awkward but is clear?", "options": ["Rewrite it to sound professional", "Preserve the wording and follow the supplied guidelines", "Replace it with a summary"]},
+}
+TRAINING_ASSET_STORAGE_PREFIX = "training-materials/"
+TRAINING_ASSETS = {
+    "human-job-practical.mp3": ("audio/mpeg", "inline", "human-job-practical.mp3"),
+    "transcription-guidelines.docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "attachment", "TypeMyworDz General Guidelines.docx"),
+    "formatting-default.docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "attachment", "SW Default Formatting UPDATED.docx"),
+}
 
 
 async def _trainee_actor(request: Request):
@@ -8839,10 +9092,77 @@ async def complete_trainee_signup(request: Request):
     await _send_resend_message(actor["email"], trainee_subject, trainee_html, trainee_text, "Trainee welcome email")
     return {"success": True, "training_room": True}
 
+async def _load_training_submissions(uid):
+    if not db:
+        return {}
+    def read_all():
+        return [db.collection("training_submissions").document(f"{uid}-{level}").get() for level in range(1, len(TRAINING_LEVELS) + 1)]
+    snapshots = await asyncio.to_thread(read_all)
+    results = {}
+    for snapshot in snapshots:
+        if snapshot.exists:
+            item = snapshot.to_dict() or {}
+            item.pop("uid", None)
+            item.pop("email", None)
+            results[str(item.get("level") or snapshot.id.rsplit("-", 1)[-1])] = _human_public(item)
+    return results
+
+
+@app.get("/human-transcription/trainee/training/materials/{asset_name}")
+async def trainee_training_material(asset_name: str, request: Request):
+    if asset_name not in TRAINING_ASSETS:
+        raise HTTPException(status_code=404, detail="That training material was not found.")
+    actor = await _human_actor(request)
+    profile = actor.get("profile") or {}
+    profile_role = str(profile.get("role") or profile.get("user_type") or "").lower()
+    paid_trainee = profile_role == "trainee" and profile.get("trainingRoomAccess") is True and str(profile.get("trainingPaymentStatus") or "").lower() == "paid"
+    if actor.get("role") not in {"admin", "worker"} and not paid_trainee:
+        raise HTTPException(status_code=403, detail="Paid Training Room access is required to view these materials.")
+    media_type, disposition, download_name = TRAINING_ASSETS[asset_name]
+    bucket = _training_assets_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Private training materials are temporarily unavailable.")
+    path = f"{TRAINING_ASSET_STORAGE_PREFIX}{asset_name}"
+    try:
+        raw = await asyncio.to_thread(bucket.blob(path).download_as_bytes)
+    except Exception as exc:
+        logger.exception("Private training material is missing: %s", asset_name)
+        raise HTTPException(status_code=503, detail="This training material is temporarily unavailable.") from exc
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", download_name) or "training-material"
+    return Response(content=raw, media_type=media_type, headers={"Content-Disposition": f'{disposition}; filename="{safe_name}"', "Cache-Control": "private, no-store"})
+
+
+async def _advance_legacy_training_progress(uid, profile):
+    """Move trainees past an already-submitted module saved under the old manual-approval flow."""
+    profile = dict(profile or {})
+    if not db or str(profile.get("trainingStatus") or "").lower() != "review":
+        return profile
+    try:
+        current_level = max(1, min(len(TRAINING_LEVELS), int(profile.get("trainingLevel") or 1)))
+    except (TypeError, ValueError):
+        current_level = 1
+    submitted = profile.get("trainingSubmissions") or {}
+    if str(submitted.get(str(current_level)) or "").lower() != "submitted":
+        return profile
+    all_submitted = all(str(submitted.get(str(level)) or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
+    final = all_submitted and current_level >= len(TRAINING_LEVELS)
+    updates = {
+        "trainingLevel": len(TRAINING_LEVELS) if final else min(len(TRAINING_LEVELS), current_level + 1),
+        "trainingStatus": "pending_final_review" if final else "active",
+        "traineeStatus": "pending_review" if final else (profile.get("traineeStatus") or "enrolled"),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
+    profile.update({key: value for key, value in updates.items() if key != "updatedAt"})
+    return profile
+
+
 @app.get("/human-transcription/trainee/status")
 async def trainee_status(request: Request):
     actor = await _trainee_actor(request)
-    profile = actor["profile"]
+    profile = await _advance_legacy_training_progress(actor["uid"], actor["profile"])
+    actor["profile"] = profile
+    results = await _load_training_submissions(actor["uid"])
     return {
         "application": {
             "status": profile.get("traineeStatus") or "not_started",
@@ -8856,6 +9176,7 @@ async def trainee_status(request: Request):
             "level": int(profile.get("trainingLevel") or 0),
             "status": profile.get("trainingStatus") or "not_started",
             "submissions": profile.get("trainingSubmissions") or {},
+            "results": results,
         },
         "levels": TRAINING_LEVELS,
         "guidelines": TRAINING_GUIDELINES,
@@ -8910,9 +9231,50 @@ async def admin_trainees(request: Request):
         data["id"] = snap.id
         data["email"] = data.get("email") or ""
         data["name"] = data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed applicant"
+        submitted = data.get("trainingSubmissions") or {}
+        completed_levels = [level for level in range(1, len(TRAINING_LEVELS) + 1) if str(submitted.get(str(level)) or "").lower() == "submitted"]
+        data["trainingCompletedModules"] = len(completed_levels)
+        data["trainingReviewReady"] = len(completed_levels) == len(TRAINING_LEVELS)
         rows.append(_human_public(data))
     rows.sort(key=lambda item: str(item.get("traineeAppliedAt") or ""), reverse=True)
     return {"trainees": rows}
+
+
+@app.get("/api/admin/trainees/{uid}/submissions")
+async def admin_trainee_submissions(uid: str, request: Request):
+    _require_admin(request)
+    profile = await _load_profile(uid)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="That trainee account was not found.")
+    saved = await _load_training_submissions(uid)
+    modules = []
+    for definition in TRAINING_LEVELS:
+        level = definition["level"]
+        result = saved.get(str(level)) or {}
+        raw_answers = result.get("answers") or {}
+        content = TRAINING_REVIEW_CONTENT.get(level) or {"checklist": [], "quiz": "", "options": []}
+        try:
+            quiz_index = int(raw_answers.get("quizAnswer"))
+        except (TypeError, ValueError):
+            quiz_index = -1
+        checked_indices = set(raw_answers.get("checklist") or [])
+        modules.append({
+            **definition,
+            "status": result.get("status") or "not_submitted",
+            "transcript": result.get("transcript") or "",
+            "notes": result.get("notes") or "",
+            "answers": {
+                "checklist": [{"label": label, "checked": index in checked_indices} for index, label in enumerate(content["checklist"])],
+                "quiz_question": content["quiz"],
+                "quiz_answer": content["options"][quiz_index] if 0 <= quiz_index < len(content["options"]) else "No answer saved",
+                "quiz_answer_correct": quiz_index == TRAINING_QUIZ_ANSWERS.get(level),
+                "activity": raw_answers.get("activity") or "",
+            },
+            "submitted_at": _human_iso(result.get("createdAt") or result.get("updatedAt")),
+        })
+    complete = all(item["status"] == "submitted" for item in modules)
+    final_transcript_present = bool(modules[-1].get("transcript", "").strip())
+    return {"uid": uid, "complete": complete and final_transcript_present, "modules": modules}
 
 
 @app.post("/api/admin/trainees/{uid}/decision")
@@ -8923,6 +9285,8 @@ async def admin_trainee_decision(uid: str, request: Request):
     payment_status = str(payload.get("payment_status") or "").strip().lower()
     if decision not in {"reject", "promote_worker", "approve_level"}:
         raise HTTPException(status_code=400, detail="That trainee decision is not supported.")
+    if decision == "approve_level":
+        raise HTTPException(status_code=409, detail="Module progression is automatic; admins review only after all six modules are submitted.")
     profile = await _load_profile(uid)
     if profile is None:
         raise HTTPException(status_code=404, detail="That trainee account was not found.")
@@ -8930,11 +9294,13 @@ async def admin_trainee_decision(uid: str, request: Request):
     if payment_status in {"verified", "rejected", "pending_verification"}:
         updates["trainingPaymentStatus"] = payment_status
     if decision == "reject":
-        updates.update({"role": "client", "traineeStatus": "rejected", "trainingStatus": "rejected", "workerApproved": False})
-    elif decision == "approve_level":
-        current = max(1, int(profile.get("trainingLevel") or 1))
-        updates.update({"role": "trainee", "traineeStatus": "enrolled", "trainingStatus": "active", "trainingRoomAccess": True, "trainingLevel": min(len(TRAINING_LEVELS), current + 1), "workerApproved": False})
+        updates.update({"role": "client", "traineeStatus": "rejected", "trainingStatus": "rejected", "trainingRoomAccess": False, "workerApproved": False})
     elif decision == "promote_worker":
+        results = await _load_training_submissions(uid)
+        complete = all(str(results.get(str(level), {}).get("status") or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
+        final_transcript = str((results.get(str(len(TRAINING_LEVELS))) or {}).get("transcript") or "").strip()
+        if not complete or not final_transcript:
+            raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
         updates.update({"role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed", "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP})
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     return {"status": "updated", "uid": uid, "decision": decision}
@@ -8945,23 +9311,84 @@ async def trainee_submit_training(level: int, request: Request):
     actor = await _trainee_actor(request)
     profile = actor["profile"]
     role = str(profile.get("role") or profile.get("user_type") or "").lower()
-    if role not in {"trainee", "worker"} and not profile.get("workerApproved"):
-        raise HTTPException(status_code=403, detail="Trainee access is required.")
+    is_worker = role == "worker" or profile.get("workerApproved") is True
+    has_paid_training_access = role == "trainee" and profile.get("trainingRoomAccess") is True and str(profile.get("trainingPaymentStatus") or "").lower() == "paid"
+    if not is_worker and not has_paid_training_access:
+        raise HTTPException(status_code=403, detail="Paid Training Room access is required.")
     if level < 1 or level > len(TRAINING_LEVELS):
-        raise HTTPException(status_code=400, detail="That training level does not exist.")
+        raise HTTPException(status_code=400, detail="That training module does not exist.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The training records are unavailable.")
     current_level = max(1, int(profile.get("trainingLevel") or 1))
-    if level > current_level:
-        raise HTTPException(status_code=403, detail="Complete the current module and wait for admin approval before opening that module.")
+    prior_submissions = profile.get("trainingSubmissions") or {}
+    if str(prior_submissions.get(str(level)) or "").lower() == "submitted":
+        raise HTTPException(status_code=409, detail="This module has already been submitted and saved.")
+    if level != current_level:
+        raise HTTPException(status_code=409, detail="Finish the open module first; the next module unlocks automatically after a complete submission.")
     payload = await request.json()
     transcript = str(payload.get("transcript") or "").strip()
-    notes = str(payload.get("notes") or "").strip()
+    notes = str(payload.get("notes") or "").strip()[:12000]
+    raw_answers = payload.get("answers") if isinstance(payload.get("answers"), dict) else {}
+    if not raw_answers and notes:
+        try:
+            legacy_answers = json.loads(notes)
+            if isinstance(legacy_answers, dict):
+                raw_answers = legacy_answers
+                notes = ""
+        except (TypeError, ValueError):
+            pass
+    raw_checklist = raw_answers.get("checklist", [])
+    if not isinstance(raw_checklist, list):
+        raise HTTPException(status_code=400, detail="Complete every module checklist item before submitting.")
+    checked = []
+    for value in raw_checklist:
+        try:
+            checked.append(int(value))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="The module checklist answers are invalid.")
+    expected_checklist = list(range(TRAINING_CHECKLIST_COUNTS[level]))
+    if sorted(set(checked)) != expected_checklist:
+        raise HTTPException(status_code=400, detail="Complete every module checklist item before submitting.")
+    try:
+        quiz_answer = int(raw_answers.get("quizAnswer"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Answer the module knowledge check before submitting.")
+    if quiz_answer != TRAINING_QUIZ_ANSWERS[level]:
+        raise HTTPException(status_code=400, detail="Review the lesson and choose the correct answer before submitting.")
+    activity_answer = str(raw_answers.get("activity") or "").strip()
+    if not activity_answer:
+        raise HTTPException(status_code=400, detail="Complete the module response before submitting.")
     if level >= 4 and not transcript:
-        raise HTTPException(status_code=400, detail="Submit the completed practical transcript first.")
-    submission = {"level": level, "transcript": transcript[:1000000], "notes": notes[:12000], "status": "submitted", "createdAt": firestore.SERVER_TIMESTAMP, "uid": actor["uid"], "email": actor["email"]}
+        raise HTTPException(status_code=400, detail="Submit the practical transcript first.")
+    if len(transcript) > 1000000:
+        raise HTTPException(status_code=413, detail="The transcript is too long to save. Please shorten it and try again.")
+    answers = {"checklist": expected_checklist, "quizAnswer": quiz_answer, "activity": activity_answer[:12000]}
+    now = firestore.SERVER_TIMESTAMP
+    submission = {
+        "level": level,
+        "module_name": TRAINING_LEVELS[level - 1]["name"],
+        "transcript": transcript,
+        "notes": notes,
+        "answers": answers,
+        "status": "submitted",
+        "createdAt": now,
+        "updatedAt": now,
+        "uid": actor["uid"],
+        "email": actor["email"],
+    }
     await asyncio.to_thread(db.collection("training_submissions").document(f"{actor['uid']}-{level}").set, submission, merge=True)
-    updates = {"trainingSubmissions": {**(profile.get("trainingSubmissions") or {}), str(level): "submitted"}, "trainingStatus": "review", "updatedAt": firestore.SERVER_TIMESTAMP}
+    submissions = {**prior_submissions, str(level): "submitted"}
+    final_module = level == len(TRAINING_LEVELS)
+    next_level = level if final_module else level + 1
+    updates = {
+        "trainingSubmissions": submissions,
+        "trainingLevel": next_level,
+        "trainingStatus": "pending_final_review" if final_module else "active",
+        "traineeStatus": "pending_review" if final_module else (profile.get("traineeStatus") or "enrolled"),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
     await asyncio.to_thread(db.collection("users").document(actor["uid"]).set, updates, merge=True)
-    return {"status": "submitted", "level": level}
+    return {"status": "submitted", "level": level, "next_level": next_level if not final_module else None, "training_status": updates["trainingStatus"]}
 
 
 
