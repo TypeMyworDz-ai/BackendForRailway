@@ -1,10 +1,17 @@
 """Production-data-free checks for trainee enrollment and claim-board helpers."""
 import ast
+import logging
 import math
+import os
 import re
 import unittest
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
+
+import pypdfium2 as pdfium
+from PIL import Image, ImageOps
+from pypdf import PdfWriter
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -30,6 +37,9 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
             "_human_job_worker_uids",
             "_human_worker_rating_for_job",
             "_human_worker_rating_summary_from_jobs",
+            "_human_worker_earning_items",
+            "_pdf_job_jpeg_bytes",
+            "_pdf_job_images_from_upload",
             "_as_dt",
             "_int",
             "grant_free_trial",
@@ -47,15 +57,23 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                 if isinstance(target, ast.Name) and target.id in {
                     "TRAINEE_PRICE_USD", "FREE_TRIAL_CREDITS", "LEGACY_FREE_TRIAL_CREDITS",
                     "HUMAN_AVAILABLE_SLICE_MINUTES", "MIN_HUMAN_WORKER_RATING",
+                    "HUMAN_LEGACY_STANDARD_PAYOUT_KES", "HUMAN_PROOFREADING_PAYOUT_KES",
+                    "PDF_JOB_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE",
                     "PLAN_CREDITS"
                 }:
                     constants[target.id] = ast.literal_eval(node.value)
         cls.namespace = {
             **constants,
             "math": math,
+            "os": os,
             "re": re,
             "datetime": datetime,
             "timedelta": timedelta,
+            "BytesIO": BytesIO,
+            "Image": Image,
+            "ImageOps": ImageOps,
+            "pdfium": pdfium,
+            "logger": logging.getLogger(__name__),
             "HTTPException": FakeHTTPException,
             "_human_public_for": lambda data, role, actor_uid: dict(data),
         }
@@ -216,6 +234,103 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                 if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
             }
             self.assertIn("_human_release_worker_claim", calls, node.name)
+
+    def test_pdf_pages_and_images_become_single_normalized_image_jobs(self):
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        writer.add_blank_page(width=612, height=792)
+        source = BytesIO()
+        writer.write(source)
+
+        convert = self.namespace["_pdf_job_images_from_upload"]
+        pages = convert("client form.pdf", source.getvalue())
+        self.assertEqual([page["page_number"] for page in pages], [1, 2])
+        self.assertEqual([page["page_count"] for page in pages], [2, 2])
+        self.assertEqual([page["name"] for page in pages], ["client_form-page-001.jpg", "client_form-page-002.jpg"])
+        for page in pages:
+            with Image.open(BytesIO(page["raw"])) as rendered:
+                self.assertEqual(rendered.format, "JPEG")
+                self.assertEqual(rendered.mode, "RGB")
+
+        image_source = BytesIO()
+        Image.new("RGBA", (16, 12), (20, 90, 160, 255)).save(image_source, format="PNG")
+        images = convert("photo.png", image_source.getvalue())
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["source_filename"], "photo.png")
+        self.assertEqual(images[0]["page_number"], 1)
+        with Image.open(BytesIO(images[0]["raw"])) as normalized:
+            self.assertEqual(normalized.format, "JPEG")
+            self.assertEqual(normalized.mode, "RGB")
+
+    def test_pdf_job_earning_is_exactly_100_kes_and_separately_categorized(self):
+        earn = self.namespace["_human_worker_earning_items"]
+        job = {
+            "job_type": "pdf_job",
+            "worker_uid": "worker-1",
+            "worker_email": "worker@example.test",
+            "worker_minutes": 1,
+            "workerCompletedAt": datetime(2026, 9, 27, 8, 0),
+        }
+        items = list(earn("pdf-1", job))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["source"], "pdf")
+        self.assertEqual(items[0]["gross_amount_kes"], 100)
+        self.assertEqual(items[0]["amount_kes"], 100)
+        self.assertEqual(self.namespace["PDF_JOB_WORKER_PAY_KES"], 100)
+
+    def test_training_progress_is_automatic_and_admin_promotion_waits_for_all_six(self):
+        submit = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "trainee_submit_training")
+        submit_source = ast.unparse(submit)
+        self.assertIn("expected_checklist", submit_source)
+        self.assertIn("TRAINING_QUIZ_ANSWERS[level]", submit_source)
+        self.assertIn("level >= 4", submit_source)
+        self.assertIn("not transcript", submit_source)
+        self.assertIn("pending_final_review", submit_source)
+        self.assertIn("next_level", submit_source)
+
+        decision = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "admin_trainee_decision")
+        decision_source = ast.unparse(decision)
+        self.assertIn("approve_level", decision_source)
+        self.assertIn("len(TRAINING_LEVELS) + 1", decision_source)
+        self.assertIn("final_transcript", decision_source)
+        self.assertIn("if not complete or not final_transcript", decision_source)
+
+    def test_private_materials_and_pdf_images_require_authorized_access(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        image_route = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "human_pdf_job_image")
+        image_source = ast.unparse(image_route)
+        self.assertIn("_human_assert_access", image_source)
+        self.assertIn("Cache-Control", image_source)
+        self.assertIn("private, no-store", image_source)
+        self.assertIn("not in", image_source)
+        self.assertIn("worker", image_source)
+
+        material_route = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "trainee_training_material")
+        material_source = ast.unparse(material_route)
+        self.assertIn("paid_trainee", material_source)
+        self.assertIn("TRAINING_ASSET_STORAGE_PREFIX", material_source)
+        self.assertIn("_training_assets_bucket()", material_source)
+        self.assertNotIn("_human_bucket()", material_source)
+        self.assertIn("bucket.blob", material_source)
+        self.assertIn("download_as_bytes", material_source)
+        self.assertNotIn("open(", material_source)
+        self.assertIn("Cache-Control", material_source)
+        self.assertIn("private, no-store", material_source)
+        training_bucket = next(item for item in self.tree.body if isinstance(item, ast.FunctionDef) and item.name == "_training_assets_bucket")
+        training_bucket_source = ast.unparse(training_bucket)
+        self.assertIn("TRAINING_ASSET_STORAGE_BUCKET", training_bucket_source)
+        self.assertIn("firebase_storage.bucket(configured)", training_bucket_source)
+        for filename in (
+            "human-job-practical.mp3",
+            "transcription-guidelines.docx",
+            "formatting-default.docx",
+        ):
+            self.assertIn(filename, source)
+
+        serializer = next(item for item in self.tree.body if isinstance(item, ast.FunctionDef) and item.name == "_human_public_for")
+        serializer_source = ast.unparse(serializer)
+        self.assertIn("page_count", serializer_source)
+        self.assertNotIn("storage_path", serializer_source)
 
 
 if __name__ == "__main__":
