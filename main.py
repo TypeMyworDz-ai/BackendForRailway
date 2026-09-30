@@ -384,6 +384,16 @@ ASK_MODEL_CATALOGUE = [
         "credits": 1,
         "transcript_only": False,
     },
+    {
+        "id": "deepseek-v4-flash",
+        "provider": "deepseek",
+        "label": "DeepSeek V4 Flash",
+        "blurb": "A very low-cost model for quick questions and summaries. Text only.",
+        "tier": "standard",
+        "credits": 1,
+        "transcript_only": False,
+        "text_only": True,
+    },
     # Mistral is wired up and working, but their free tier rejects calls from
     # this server's address with "Invalid API Key" even though the same key
     # succeeds elsewhere. Until a payment method is added to the Mistral
@@ -422,21 +432,21 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "claude-sonnet-5",
+        "id": "claude-sonnet-5-5",
         "provider": "claude",
-        "label": "Claude Sonnet 5",
+        "label": "Claude Sonnet 5.5",
         "blurb": "An excellent all-rounder. Careful, thorough answers.",
         "tier": "premium",
         "credits": 10,
         "transcript_only": False,
     },
     {
-        "id": "claude-opus-4-6",
+        "id": "claude-opus-5-5",
         "provider": "claude",
-        "label": "Claude Opus 4.6",
-        "blurb": "The most capable Claude. Slower, best for difficult work.",
+        "label": "Claude Opus 5.5",
+        "blurb": "The most capable Claude for everyday use. Best for difficult work.",
         "tier": "premium",
-        "credits": 22,
+        "credits": 18,
         "transcript_only": False,
     },
     {
@@ -449,15 +459,23 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "gemini-3.6-flash",
+        "id": "gemini-3.8-flash",
         "provider": "gemini",
-        "label": "Gemini 3.6 Flash",
-        "blurb": "Google's deeper model. Available when you are working on a transcript.",
+        "label": "Gemini 3.8 Flash",
+        "blurb": "Google's newest deeper model. Available when you are working on a transcript.",
         "tier": "premium",
         "credits": 10,
         "transcript_only": True,
     },
 ]
+
+# Model ids that were renamed or replaced. A client who saved one in Settings
+# is moved to its successor instead of being dropped back to the default.
+ASK_MODEL_ALIASES = {
+    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-opus-4-6": "claude-opus-5-5",
+    "gemini-3.6-flash": "gemini-3.8-flash",
+}
 
 ASK_DEFAULT_MODEL = "gpt-5.6-luna"
 
@@ -474,6 +492,17 @@ PREMIUM_AI_PLANS = ['Monthly Plan', 'Yearly Plan']
 # off on the models that allow it.
 GEMINI_MIN_OUTPUT_TOKENS = 8000
 GEMINI_THINKING_OFF = {"gemini-3.1-flash-lite"}
+
+
+def _ask_provider_ready(provider: str) -> bool:
+    """A model is only offered when its provider's key is set on the server.
+
+    This lets a new provider be added to the catalogue safely: it stays hidden
+    until its key is added, then appears by itself.
+    """
+    if provider == "deepseek":
+        return bool(os.environ.get("DEEPSEEK_API_KEY"))
+    return True
 
 
 def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = True, has_credits: bool = False):
@@ -497,6 +526,8 @@ def ask_models_for(user_plan: str, user_email: str = "", has_transcript: bool = 
         if m["tier"] != "standard" and not premium_ok:
             continue
         if m.get("transcript_only") and not has_transcript:
+            continue
+        if not _ask_provider_ready(m["provider"]):
             continue
         out.append(m)
     return out
@@ -530,6 +561,8 @@ def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: 
             continue
         if m.get("transcript_only") and not has_transcript:
             continue
+        if not _ask_provider_ready(m["provider"]):
+            continue
         out.append(m)
     return out
 
@@ -545,6 +578,7 @@ def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_
     if not allowed:
         return ASK_DEFAULT_MODEL, "openai"
     wanted = (requested or "").strip()
+    wanted = ASK_MODEL_ALIASES.get(wanted, wanted)
     for m in allowed:
         if m["id"] == wanted:
             return m["id"], m["provider"]
@@ -1372,9 +1406,13 @@ async def _notify_worker_assignment(job_id: str, worker_uid: str, label: str, as
         return
     moment = _human_iso(assigned_at) or datetime.now().isoformat()
     part = f":{segment_id}" if segment_id else ""
+    if segment_id == "proofreader":
+        title, body = "You were assigned a proofreading job", "An admin assigned you to proofread. Open the Work Room to begin."
+    else:
+        title, body = "An admin assigned you work", f"Open the Work Room to start {label}."
     await _create_user_notification(
         str(worker_uid), f"human-assignment:{job_id}:{label}{part}:{moment}", "assignment",
-        "New Human Work assigned", f"Open Work Room to start {label}.",
+        title, body,
         route="human_worker", job_id=job_id, target_id=segment_id or job_id, created_at=assigned_at, requires_action=True,
     )
 
@@ -2371,8 +2409,89 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         logger.error(f"❌ Error updating user credits in Firestore: {str(e)}")
         return {'success': False, 'error': str(e)}
 
+OPENAI_TRANSCRIBE_MODEL = os.environ.get("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe")
+# OpenAI accepts files up to 25 MB. Anything bigger is sent in pieces.
+OPENAI_TRANSCRIBE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _openai_transcribe_blocking(path: str, language_code: str) -> str:
+    """One file to OpenAI's speech-to-text, returning the text."""
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    lang = (language_code or "").strip().lower()
+    attempts = [{"languages[]": lang}] if lang else [{}]
+    if lang:
+        attempts.append({})
+    last = ""
+    for extra in attempts:
+        with open(path, "rb") as handle:
+            r = requests.post(
+                url,
+                headers=headers,
+                data={"model": OPENAI_TRANSCRIBE_MODEL, "response_format": "json", **extra},
+                files={"file": (os.path.basename(path), handle, "audio/mpeg")},
+                timeout=600,
+            )
+        if r.status_code == 200:
+            return str((r.json() or {}).get("text") or "").strip()
+        last = f"{r.status_code}: {r.text[:300]}"
+        if r.status_code not in (400, 422):
+            break
+    raise RuntimeError(last or "no response")
+
+
+async def transcribe_with_openai_direct(audio_path: str, language_code: str, job_id: str) -> dict:
+    """Transcribe with OpenAI's current model, called straight from this server."""
+    if not OPENAI_API_KEY:
+        return {"status": "failed", "error": "OpenAI is not configured."}
+    pieces = []
+    try:
+        if os.path.getsize(audio_path) <= OPENAI_TRANSCRIBE_MAX_BYTES:
+            paths = [audio_path]
+        else:
+            audio = await asyncio.to_thread(AudioSegment.from_file, audio_path)
+            step = 15 * 60 * 1000
+            paths = []
+            for start in range(0, len(audio), step):
+                piece = audio[start:start + step].set_channels(1).set_frame_rate(16000)
+                tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+                tmp.close()
+                await asyncio.to_thread(lambda pc=piece, t=tmp.name: pc.export(t, format="mp3", bitrate="64k"))
+                paths.append(tmp.name)
+                pieces.append(tmp.name)
+        texts = []
+        for path in paths:
+            texts.append(await asyncio.to_thread(_openai_transcribe_blocking, path, language_code))
+        text = "\n\n".join(t for t in texts if t).strip()
+        if not text:
+            return {"status": "failed", "error": "OpenAI returned no text."}
+        return {
+            "status": "completed",
+            "transcription": text,
+            "language": language_code,
+            "service_used": "openai_whisper",
+            "model_used": OPENAI_TRANSCRIBE_MODEL,
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(f"OpenAI direct transcription failed for job {job_id}: {exc}")
+        return {"status": "failed", "error": "Transcription failed. Please try again later."}
+    finally:
+        for path in pieces:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 async def transcribe_with_openai_whisper(audio_path: str, language_code: str, job_id: str) -> dict:
-    """Calls the dedicated OpenAI Whisper service deployed on Render."""
+    """OpenAI transcription. The current model is called directly; the older
+    dedicated service is kept only as a fallback."""
+    direct = await transcribe_with_openai_direct(audio_path, language_code, job_id)
+    if direct.get("status") == "completed":
+        return direct
+    logger.warning(f"Direct OpenAI call failed for job {job_id}; trying the dedicated service")
     if not OPENAI_WHISPER_SERVICE_RAILWAY_URL:
         logger.error(f"{TYPEMYWORDZ2_NAME} Service URL not configured, skipping {TYPEMYWORDZ2_NAME} for job {job_id}")
         return {
@@ -2942,7 +3061,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 model_used = (transcription_result.get("model_used")
                               or job_data.get("assemblyai_model", "unknown"))
             elif service_used_name == "openai_whisper":
-                model_used = "whisper-1"
+                model_used = transcription_result.get("model_used") or "whisper-1"
             elif service_used_name == "deepgram":
                 model_used = "deepgram-nova"
 
@@ -4018,6 +4137,7 @@ async def ai_models(user_plan: str = "free", user_email: str = "", has_transcrip
 OPENAI_FORMAT_ENDPOINTS = {
     "openai": ("https://api.openai.com/v1/chat/completions", lambda: OPENAI_API_KEY),
     "mistral": ("https://api.mistral.ai/v1/chat/completions", lambda: MISTRAL_API_KEY),
+    "deepseek": ("https://api.deepseek.com/chat/completions", lambda: os.environ.get("DEEPSEEK_API_KEY")),
 }
 
 
@@ -4028,6 +4148,8 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
     if not key:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} is not connected to that model right now.")
 
+    if provider == "deepseek" and images:
+        raise HTTPException(status_code=400, detail="This model reads text only. Choose another model in Settings to work with images.")
     content = []
     for img in images:
         content.append({
@@ -8102,14 +8224,6 @@ async def human_admin_approve(job_id: str, request: Request):
             str(job["client_uid"]), f"human-approved:{job_id}", "job_approved", "Your Human Work request is approved",
             "Approved work is now being picked up by an available transcriber.", route="human_job", job_id=job_id, target_id=job_id,
         )
-    board_message = (
-        f"{len(segments)} parts are now available for approved workers to claim."
-        if segments else "The job is now available for an approved worker to claim."
-    )
-    await _notify_human_admins(
-        f"human-approved-awaiting-assignment:{job_id}", "job_approved", "Human Work is available to workers",
-        board_message, route="human_ops", job_id=job_id, requires_action=False,
-    )
     return {"status": next_status, "job_id": job_id, "parts_count": len(segments)}
 
 
@@ -8136,10 +8250,9 @@ async def human_worker_claim(job_id: str, request: Request):
         logger.exception("Could not claim Human Work %s for %s", job_id, actor["uid"])
         raise HTTPException(status_code=409, detail="That work could not be claimed. Refresh the board and try again.") from exc
     await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id or job_id)
-    await _notify_worker_assignment(
-        job_id, actor["uid"], assignment.get("label") or "your assigned work",
-        assignment.get("assignedAt"), segment_id=segment_id,
-    )
+    # A worker who claims work for themselves is already looking at it, so no
+    # notification is sent. Notifications are kept for things that happen TO
+    # a worker: direct assignments, proofreading jobs, deadline changes.
     return assignment
 
 
@@ -9265,8 +9378,39 @@ async def human_pdf_job_image(job_id: str, request: Request):
     return Response(content=raw, media_type=meta.get("content_type") or "image/jpeg", headers={"Content-Disposition": f'inline; filename="{safe_name}"', "Cache-Control": "private, no-store"})
 
 
+_AUDIO_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm", "ogg": "audio/ogg", "flac": "audio/flac", "aac": "audio/aac"}
+
+
+def _human_audio_response(request: Request, raw: bytes, media_type: str, filename: str, download: bool):
+    """Send audio the way browsers expect: with a length, byte ranges and a
+    sensible filename, so the player can seek and downloads complete."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "audio") or "audio"
+    headers = {
+        "Content-Disposition": f'{"attachment" if download else "inline"}; filename="{safe}"',
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, max-age=600",
+    }
+    total = len(raw)
+    header = request.headers.get("range", "")
+    match = re.match(r"bytes=(\d*)-(\d*)$", header.strip()) if header else None
+    if match and total:
+        start_text, end_text = match.groups()
+        if start_text == "" and end_text:
+            start = max(0, total - int(end_text))
+            end = total - 1
+        else:
+            start = int(start_text or 0)
+            end = int(end_text) if end_text else total - 1
+        end = min(end, total - 1)
+        if start > end or start >= total:
+            return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{total}"})
+        chunk = raw[start:end + 1]
+        return Response(content=chunk, status_code=206, media_type=media_type, headers={**headers, "Content-Range": f"bytes {start}-{end}/{total}", "Content-Length": str(len(chunk))})
+    return Response(content=raw, media_type=media_type, headers={**headers, "Content-Length": str(total)})
+
+
 @app.get("/human-transcription/jobs/{job_id}/audio")
-async def human_audio(job_id: str, request: Request, segment_id: str = ""): 
+async def human_audio(job_id: str, request: Request, segment_id: str = "", download: int = 0):
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
@@ -9276,29 +9420,47 @@ async def human_audio(job_id: str, request: Request, segment_id: str = ""):
     if not path or bucket is None:
         raise HTTPException(status_code=404, detail="The source audio is not available.")
     blob = bucket.blob(path)
-    if not blob.exists():
-        raise HTTPException(status_code=404, detail="The source audio is no longer available.")
-    raw = await asyncio.to_thread(blob.download_as_bytes)
+    suffix = str(meta.get("name") or "").rsplit(".", 1)[-1].lower()
     # Split workers receive only their assigned part of the recording. Admins,
     # clients and proofreaders continue to receive the complete source audio.
     if segment_id and actor.get("role") == "worker" and _human_is_split_job(job):
         segment = next((item for item in (job.get("segments") or []) if item.get("id") == segment_id and item.get("worker_uid") == actor.get("uid")), None)
         if not segment:
             raise HTTPException(status_code=403, detail="That audio segment is not assigned to you.")
+        start_s = float(segment.get("start_seconds") or 0)
+        end_s = float(segment.get("end_seconds") or 0)
+        cache_path = f"human-workflow/{job_id}/audio-cache/{re.sub(r'[^A-Za-z0-9_-]', '_', segment_id)}-{int(start_s * 1000)}-{int(end_s * 1000)}.mp3"
+        cache_blob = bucket.blob(cache_path)
+        label = re.sub(r"[^A-Za-z0-9]+", "-", str(segment.get("label") or segment_id)).strip("-").lower() or "part"
+        filename = f"{label}.mp3"
         try:
-            suffix = str(meta.get("name") or "").rsplit(".", 1)[-1].lower()
-            source = AudioSegment.from_file(BytesIO(raw), format=suffix if suffix in {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac"} else None)
-            start_ms = max(0, int(float(segment.get("start_seconds") or 0) * 1000))
-            end_ms = min(len(source), int(float(segment.get("end_seconds") or len(source) / 1000) * 1000))
-            clipped = source[start_ms:end_ms]
-            raw = _human_worker_split_mp3_bytes(clipped)
-            return Response(content=raw, media_type="audio/mpeg", headers={"Content-Disposition": f"inline; filename={segment.get('id') or 'assigned-part'}.mp3"})
+            if await asyncio.to_thread(cache_blob.exists):
+                clip = await asyncio.to_thread(cache_blob.download_as_bytes)
+            else:
+                if not await asyncio.to_thread(blob.exists):
+                    raise HTTPException(status_code=404, detail="The source audio is no longer available.")
+                raw = await asyncio.to_thread(blob.download_as_bytes)
+                source = await asyncio.to_thread(lambda: AudioSegment.from_file(BytesIO(raw), format=suffix if suffix in _AUDIO_TYPES else None))
+                start_ms = max(0, int(start_s * 1000))
+                end_ms = min(len(source), int((end_s or len(source) / 1000) * 1000))
+                clip = await asyncio.to_thread(lambda: _human_worker_split_mp3_bytes(source[start_ms:end_ms]))
+                try:
+                    await asyncio.to_thread(cache_blob.upload_from_string, clip, content_type="audio/mpeg")
+                except Exception as exc:
+                    logger.warning("Could not cache audio part %s: %s", cache_path, exc)
+            return _human_audio_response(request, clip, "audio/mpeg", filename, bool(download))
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning("Could not clip split audio %s/%s: %s", job_id, segment_id, exc)
             # Never send the full source recording when a worker is authorized
             # for only one part and segment preparation fails.
             raise HTTPException(status_code=502, detail="The assigned audio segment could not be prepared. Please try again or contact the admin.")
-    return Response(content=raw, media_type=meta.get("content_type") or "application/octet-stream", headers={"Content-Disposition": f"inline; filename={meta.get('name') or 'source-audio'}"})
+    if not await asyncio.to_thread(blob.exists):
+        raise HTTPException(status_code=404, detail="The source audio is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    media_type = _AUDIO_TYPES.get(suffix) or meta.get("content_type") or "application/octet-stream"
+    return _human_audio_response(request, raw, media_type, str(meta.get("name") or "source-audio"), bool(download))
 
 
 @app.get("/human-transcription/jobs/{job_id}/download")
@@ -9693,16 +9855,18 @@ async def human_worker_ai_draft(job_id: str, request: Request):
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
             tmp_path = handle.name
         await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
-        result = await transcribe_with_assemblyai(tmp_path, "en", False, "universal-3-5-pro", f"draft-{job_id}-{key}")
+        result = await transcribe_with_assemblyai(tmp_path, "en", False, ["universal-3-5-pro", "universal-2"], f"draft-{job_id}-{key}")
     finally:
         if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-    if result.get("status") != "completed" or not str(result.get("transcript") or result.get("text") or "").strip():
+    # transcribe_with_assemblyai returns the words under "transcription".
+    text = str(result.get("transcription") or result.get("transcript") or result.get("text") or "").strip()
+    if result.get("status") != "completed" or not text:
+        logger.warning("AI draft for %s came back empty: %s", job_id, result.get("error") or result.get("status"))
         raise HTTPException(status_code=502, detail="The AI draft could not be generated. You have not been charged.")
-    text = str(result.get("transcript") or result.get("text") or "").strip()
     charge = await charge_credits(uid, email, cost, "worker AI draft", usage_category="worker_ai_draft")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
         f"ai_drafts.{key}": {"text": text[:400000], "worker_uid": uid, "credits": charge.get("charged", cost), "createdAt": datetime.now().isoformat()},
