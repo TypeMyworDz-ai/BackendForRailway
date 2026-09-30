@@ -60,7 +60,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                     "TRAINEE_PRICE_USD", "TRAINEE_MIN_WPM", "FREE_TRIAL_CREDITS", "REFILL_DAYS",
                     "HUMAN_AVAILABLE_SLICE_MINUTES", "MIN_HUMAN_WORKER_RATING",
                     "HUMAN_LEGACY_STANDARD_PAYOUT_KES", "HUMAN_PROOFREADING_PAYOUT_KES",
-                    "PDF_JOB_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE",
+                    "PDF_JOB_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE", "PDF_JOB_WORD_EXTENSIONS",
                     "PLAN_CREDITS"
                 }:
                     constants[target.id] = ast.literal_eval(node.value)
@@ -75,6 +75,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
             "Image": Image,
             "ImageOps": ImageOps,
             "pdfium": pdfium,
+            "doc_tools": __import__("doc_tools"),
             "logger": logging.getLogger(__name__),
             "HTTPException": FakeHTTPException,
             "_human_public_for": lambda data, role, actor_uid: dict(data),
