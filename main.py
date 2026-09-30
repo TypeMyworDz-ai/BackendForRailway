@@ -3,6 +3,7 @@ import sys
 import asyncio
 import subprocess
 import os
+import time
 import json
 import base64
 import hashlib
@@ -599,8 +600,8 @@ PLAN_CREDITS = {
 }
 
 FREE_TRIAL_CREDITS = 30          # new accounts; one credit equals one audio minute
-LEGACY_FREE_TRIAL_CREDITS = 5    # keep the pre-release amount for first-time legacy conversion
 MIN_HUMAN_WORKER_RATING = 3.5
+MIN_PROOFREADER_RATING = 4.5     # only top-rated workers may proofread
 TOPUP_VALID_DAYS = 365           # bought credits last a year
 REFILL_DAYS = 30                 # yearly plan tops up every 30 days
 
@@ -620,6 +621,7 @@ TRAINEE_PRODUCT = 'trainee-training'
 # Training enrollment test price; keep checkout and displayed pricing aligned.
 TRAINEE_PRICE_USD = 1.00
 TRAINEE_COUNTRY = 'KE'
+TRAINEE_MIN_WPM = 40.0
 
 
 def _validated_trainee_typing_test(value):
@@ -634,8 +636,8 @@ def _validated_trainee_typing_test(value):
     if elapsed_ms < 30000:
         raise HTTPException(status_code=400, detail="The typing test must run for the full 30 seconds.")
     wpm = correct_chars / 5.0 / (elapsed_ms / 60000.0)
-    if wpm < 50.0:
-        raise HTTPException(status_code=400, detail="A score of at least 50 WPM is required before trainee enrollment.")
+    if wpm < TRAINEE_MIN_WPM:
+        raise HTTPException(status_code=400, detail=f"A score of at least {int(TRAINEE_MIN_WPM)} WPM is required before trainee enrollment.")
     return {"correct_chars": correct_chars, "elapsed_ms": elapsed_ms, "wpm": round(wpm, 2)}
 
 
@@ -1152,19 +1154,42 @@ def backfill_credits(profile, now=None):
         return updates, {'granted': credits, 'plan': plan,
                          'remainingMinutes': remaining, 'reason': 'paid plan converted'}
 
-    # Profiles created by the current signup flow carry a version marker.
-    # Unmarked legacy accounts keep the prior amount when they are converted;
-    # changing the new-signup allowance must not silently change their first backfill.
+    # Every account that has never received an allowance gets the same one,
+    # however the profile was created (email, Google, Microsoft or trainee
+    # enrolment). There is deliberately no second, smaller amount.
     if not profile.get('hasReceivedInitialFreeMinutes'):
-        is_new_trial = profile.get('freeTrialVersion') == 2
-        trial_credits = FREE_TRIAL_CREDITS if is_new_trial else LEGACY_FREE_TRIAL_CREDITS
-        updates = dict(grant_free_trial(profile, now, credits=trial_credits))
+        updates = dict(grant_free_trial(profile, now, credits=FREE_TRIAL_CREDITS))
         updates['creditsBackfilledAt'] = now
-        reason = 'new account free trial' if is_new_trial else 'legacy free trial'
-        return updates, {'granted': trial_credits, 'reason': reason}
+        updates['freeTrialGrantedCredits'] = FREE_TRIAL_CREDITS
+        return updates, {'granted': FREE_TRIAL_CREDITS, 'reason': 'new account free trial'}
 
     return {'creditsBackfilledAt': now}, {'granted': 0, 'reason': 'trial already used'}
 
+
+
+
+def free_trial_correction(profile, had_reduced_grant, now=None):
+    """One-time top-up for accounts that were wrongly given 5 instead of 30.
+
+    Pure. `had_reduced_grant` is True when the account's own credit ledger
+    shows the old reduced trial grant. The account is brought up to the
+    standard allowance exactly once and the correction is recorded.
+    """
+    now = now or datetime.now()
+    profile = profile or {}
+    if profile.get('freeTrialCorrectedAt') or not had_reduced_grant:
+        return {}
+    shortfall = FREE_TRIAL_CREDITS - 5
+    if shortfall <= 0:
+        return {}
+    bal = read_balance(profile, now)
+    plan_expires = _as_dt(profile.get('planCreditsExpireAt')) or (now + timedelta(days=30))
+    return {
+        'planCredits': bal['planCredits'] + shortfall,
+        'planCreditsExpireAt': max(plan_expires, now + timedelta(days=30)) if not bal['planActive'] else plan_expires,
+        'freeTrialCorrectedAt': now,
+        'freeTrialGrantedCredits': FREE_TRIAL_CREDITS,
+    }
 
 # --- end of backfill ---
 
@@ -4316,7 +4341,22 @@ async def credits_backfill(user_id: str = Form(""), user_email: str = Form("")):
         await _save_credit_updates(user_id, updates, ledger_reason=detail.get("reason", "credit backfill"), ledger_context={"operation": "backfill"})
         logger.info(f"Credit backfill for {user_id}: {detail}")
 
-    bal = read_balance({**profile, **updates})
+    # Accounts that an earlier release gave 5 credits instead of 30 are
+    # brought up to 30 the next time they sign in, once, and never twice.
+    merged = {**profile, **updates}
+    if not merged.get("freeTrialCorrectedAt") and db:
+        try:
+            ledger_docs = await asyncio.to_thread(lambda: list(db.collection("users").document(user_id).collection("credit_ledger").where("reason", "==", "legacy free trial").limit(1).stream()))
+        except Exception as exc:
+            logger.warning("Could not check the free-trial ledger for %s: %s", user_id, exc)
+            ledger_docs = []
+        fix = free_trial_correction(merged, bool(ledger_docs))
+        if fix:
+            await _save_credit_updates(user_id, fix, ledger_reason="free trial corrected to 30 credits", ledger_context={"operation": "free_trial_correction"})
+            updates = {**updates, **fix}
+            merged = {**profile, **updates}
+
+    bal = read_balance(merged)
     return {"exempt": False, "detail": detail,
             "planCredits": bal["planCredits"],
             "topUpCredits": bal["topUpCredits"],
@@ -4712,6 +4752,7 @@ async def ai_ask(
     user_email: str = Form(""),
     user_id: str = Form(""),
     files: List[UploadFile] = File(default=[]),
+    system_extra: str = Form(""),
 ):
     """Ask TypeMyworDz.
 
@@ -4779,6 +4820,10 @@ async def ai_ask(
     chosen_model, chosen_provider = resolve_ask_model(
         model or provider, user_plan, user_email, has_transcript
     )
+    # Only the admin's own pinned thread sends extra standing instructions
+    # (the editable guidelines). Everyone else's field is ignored.
+    if system_extra and system_extra.strip() and is_admin_user(user_email):
+        ask_system_prompt = f"{ask_system_prompt}\n\n{system_extra.strip()[:60000]}"
 
     try:
         if chosen_provider in OPENAI_FORMAT_ENDPOINTS:
@@ -5880,6 +5925,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
             assignment = {
                 "id": "transcriber", "label": "Full transcript", "role": "transcriber",
                 "status": data.get("status"), "transcript": data.get("transcript") or "",
+                "transcript_html": data.get("transcript_html") or "",
                 "final_attachment": _human_public(data.get("final_attachment") or {}) if data.get("final_attachment") else None,
                 "assignedAt": data.get("assignedAt"), "deadlineAt": data.get("deadlineAt"),
                 "time_remaining_seconds": remaining(data.get("deadlineAt"), data.get("status")),
@@ -5894,6 +5940,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
                 "transcript": data.get("transcript") or "\n\n".join(
                     item.get("transcript", "") for item in segments if item.get("transcript")
                 ),
+                "transcript_html": data.get("transcript_html") or "",
                 "assignedAt": data.get("proofreader_assignedAt"),
                 # The proofreader must start with a clean final-file input;
                 # the earlier segment attachments are presented separately.
@@ -5902,16 +5949,26 @@ def _human_public_for(data, actor_role, actor_uid=""):
                 "time_remaining_seconds": remaining(data.get("proofreader_deadlineAt"), data.get("proofreader_status")),
                 "worker_minutes": data.get("minutes"),
             }
+            author_numbers = {}
+            for item in segments:
+                uid = str((item or {}).get("worker_uid") or "")
+                if uid and uid not in author_numbers:
+                    author_numbers[uid] = len(author_numbers) + 1
             out["proofreader_parts"] = [
                 {
                     "id": item.get("id"),
                     "label": item.get("label") or f"Part {index + 1}",
+                    "index": index + 1,
                     "status": item.get("status"),
-                    "transcript": item.get("transcript") or "",
-                    "final_attachment": _human_public(item.get("final_attachment") or {}) if item.get("final_attachment") else None,
+                    "pending": item.get("status") != "submitted",
+                    # Workers are anonymous to each other; "Worker 2" is enough
+                    # to show where one person's part ends and another begins.
+                    "author_label": f"Worker {author_numbers.get(str(item.get('worker_uid') or ''), 0)}" if item.get("worker_uid") else "",
+                    "transcript": (item.get("transcript") or "") if item.get("status") == "submitted" else "",
+                    "transcript_html": (item.get("transcript_html") or "") if item.get("status") == "submitted" else "",
+                    "final_attachment": _human_public(item.get("final_attachment") or {}) if item.get("final_attachment") and item.get("status") == "submitted" else None,
                 }
                 for index, item in enumerate(segments)
-                if item.get("status") == "submitted"
             ]
         if assignment is not None:
             for key in ("worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason", "workerPaymentStatus", "workerPaidAt", "payout_status", "payout_period_id"):
@@ -5920,7 +5977,16 @@ def _human_public_for(data, actor_role, actor_uid=""):
             out["worker_assignment"] = assignment
             out["time_remaining_seconds"] = assignment.get("time_remaining_seconds")
             out["transcript"] = assignment.get("transcript") or ""
+            out["transcript_html"] = assignment.get("transcript_html") or ""
             out["final_attachment"] = assignment.get("final_attachment")
+            if assignment.get("role") == "transcriber":
+                draft = (data.get("ai_drafts") or {}).get(str(assignment.get("id") or "main") if owned_segment else "main") or {}
+                if draft.get("worker_uid") == actor_uid and draft.get("text"):
+                    out["ai_draft"] = draft.get("text")
+        else:
+            out["transcript_html"] = ""
+        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment"):
+            out.pop(key, None)
         for key in (
             "worker_minutes", "worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason",
             "workerPaymentStatus", "workerPaidAt", "payout_status", "payout_period_id",
@@ -5942,6 +6008,8 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("proofreader_payout_status", None)
         out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
+        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment"):
+            out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
         for key in _HUMAN_WORKER_IDENTITY_FIELDS:
@@ -6110,6 +6178,29 @@ async def _human_reclaim_expired_job(job_id: str, job: dict):
 def _human_is_split_job(job):
     job = job or {}
     return str(job.get("split_mode") or "").strip().lower() in {"dual", "multi"} and bool(job.get("segments"))
+
+
+def _human_split_parent_status(job, segments=None):
+    """Parent status for a split job, aware of an early proofreader.
+
+    A proofreader may start on the submitted parts while other parts are still
+    being transcribed, so the parent status must not fall back to a
+    transcription status while that proofreading assignment is live.
+    """
+    job = job or {}
+    segments = list(segments if segments is not None else (job.get("segments") or []))
+    proofreader_status = job.get("proofreader_status")
+    if proofreader_status == "in_progress":
+        return "proofreading_in_progress"
+    if proofreader_status == "assigned":
+        return "proofreading_assigned"
+    if proofreader_status == "submitted":
+        return job.get("status") or "submitted"
+    if segments and all((item or {}).get("status") == "submitted" for item in segments):
+        return "proofreading_available"
+    if any((item or {}).get("status") == "in_progress" for item in segments):
+        return "split_in_progress"
+    return "split_assigned"
 
 
 def _human_claim_is_active(job, worker_uid, claim):
@@ -6314,8 +6405,11 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
             })
             updates = {
                 "segments": segments,
-                "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
-                "status": "split_assigned",
+                "assigned_worker_uids": list(dict.fromkeys(
+                    [item.get("worker_uid") for item in segments if item.get("worker_uid")]
+                    + ([job.get("proofreader_uid")] if job.get("proofreader_status") in {"assigned", "in_progress"} and job.get("proofreader_uid") else [])
+                )),
+                "status": _human_split_parent_status(job, segments),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             }
             tx.update(job_ref, updates)
@@ -6372,8 +6466,8 @@ def _human_assign_proofreader_transaction(job_id, worker, tat_seconds):
             old_job = old_snapshot.to_dict() if old_snapshot and old_snapshot.exists else None
             if _human_claim_is_active(old_job, worker_uid, current_claim):
                 raise HTTPException(status_code=409, detail="This worker must finish their current assignment before proofreading another job.")
-        if not _human_is_split_job(job) or not all((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
-            raise HTTPException(status_code=409, detail="Every transcription part must be submitted before assigning the final proofreader.")
+        if not _human_is_split_job(job) or not any((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+            raise HTTPException(status_code=409, detail="At least one transcription part must be submitted before assigning a proofreader.")
         if job.get("proofreader_status") in {"assigned", "in_progress"}:
             raise HTTPException(status_code=409, detail="A proofreader is already working on this job. Take back that assignment before changing it.")
         now = datetime.now()
@@ -6400,6 +6494,156 @@ def _human_assign_proofreader_transaction(job_id, worker, tat_seconds):
             "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP,
         }, merge=True)
         return {"assignedAt": now, "deadlineAt": deadline, "worker_uid": worker_uid}
+
+    return assign(transaction)
+
+
+_EDITOR_HTML_TAGS = {
+    "p", "br", "b", "strong", "i", "em", "u", "s", "strike", "sub", "sup", "span", "div",
+    "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "table", "thead", "tbody", "tr", "td", "th",
+    "hr", "blockquote", "pre", "font",
+}
+_EDITOR_HTML_DROP = {"script", "style", "iframe", "object", "embed", "link", "meta", "form", "input", "button", "textarea", "select", "svg", "math", "head", "title", "xml"}
+_EDITOR_STYLE_PROPS = {
+    "font-weight", "font-style", "text-decoration", "text-align", "text-indent", "margin-left", "margin-right",
+    "margin", "padding", "margin-top", "margin-bottom", "padding-left", "line-height", "font-family", "font-size", "color",
+    "background-color", "white-space", "text-transform", "letter-spacing", "vertical-align",
+}
+
+
+def _sanitize_editor_html(value, limit=1500000):
+    """Keep Word-style formatting from pasted text and remove anything active.
+
+    Only a small allow-list of tags and style properties survives, every
+    attribute other than a cleaned style, colspan or rowspan is dropped, and
+    links, scripts, images and event handlers never reach storage.
+    """
+    from html.parser import HTMLParser
+    from html import escape
+
+    raw = str(value or "")[:limit]
+    if not raw.strip():
+        return ""
+
+    class Cleaner(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.out = []
+            self.skip = 0
+
+        def handle_starttag(self, tag, attrs):
+            tag = tag.lower()
+            if tag in _EDITOR_HTML_DROP:
+                self.skip += 1
+                return
+            if self.skip or tag not in _EDITOR_HTML_TAGS:
+                return
+            kept = []
+            for name, val in attrs:
+                name = (name or "").lower()
+                val = val or ""
+                if name == "style":
+                    pairs = []
+                    for chunk in val.split(";"):
+                        if ":" not in chunk:
+                            continue
+                        prop, _, rest = chunk.partition(":")
+                        prop = prop.strip().lower()
+                        rest = rest.strip()
+                        low = rest.lower()
+                        if prop in _EDITOR_STYLE_PROPS and rest and not any(bad in low for bad in ("url(", "expression", "javascript", "@import", "<", ">")):
+                            pairs.append(f"{prop}:{rest}")
+                    if pairs:
+                        kept.append(f' style="{escape("; ".join(pairs), quote=True)}"')
+                elif name in {"colspan", "rowspan"} and val.isdigit():
+                    kept.append(f' {name}="{val}"')
+            if tag in {"br", "hr"}:
+                self.out.append(f"<{tag}{''.join(kept)}>")
+            else:
+                self.out.append(f"<{tag}{''.join(kept)}>")
+
+        def handle_endtag(self, tag):
+            tag = tag.lower()
+            if tag in _EDITOR_HTML_DROP:
+                self.skip = max(0, self.skip - 1)
+                return
+            if self.skip or tag not in _EDITOR_HTML_TAGS or tag in {"br", "hr"}:
+                return
+            self.out.append(f"</{tag}>")
+
+        def handle_data(self, data):
+            if not self.skip:
+                self.out.append(escape(data, quote=False))
+
+    cleaner = Cleaner()
+    try:
+        cleaner.feed(raw)
+        cleaner.close()
+    except Exception:
+        return ""
+    return "".join(cleaner.out)[:limit]
+
+
+def _human_assign_whole_job_transaction(job_id, actor):
+    """Give an entire not-yet-started job to one worker, ignoring their rating.
+
+    For urgent work. The job is un-split only while nothing on it has been
+    claimed or submitted, and the worker's one-active-assignment lock and
+    approval are still enforced.
+    """
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    worker_uid = str(actor.get("uid") or "")
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    claim_ref = db.collection(HUMAN_WORKER_CLAIM_COLLECTION).document(worker_uid)
+    worker_ref = db.collection("users").document(worker_uid)
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def assign(tx):
+        job_snapshot = job_ref.get(transaction=tx)
+        if not job_snapshot.exists:
+            raise HTTPException(status_code=404, detail="This job is no longer available.")
+        job = job_snapshot.to_dict() or {}
+        worker_snapshot = worker_ref.get(transaction=tx)
+        worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
+        if worker_profile.get("workerApproved") is not True:
+            raise HTTPException(status_code=403, detail="Approved worker access is required.")
+        if worker_profile.get("is_available", True) is False:
+            raise HTTPException(status_code=409, detail="This worker is marked unavailable for new work.")
+        claim_snapshot = claim_ref.get(transaction=tx)
+        current_claim = claim_snapshot.to_dict() if claim_snapshot.exists else {}
+        if current_claim.get("status") == "active":
+            old_job_id = str(current_claim.get("job_id") or "")
+            old_ref = db.collection(HUMAN_JOB_COLLECTION).document(old_job_id) if old_job_id else None
+            old_snapshot = old_ref.get(transaction=tx) if old_ref else None
+            old_job = old_snapshot.to_dict() if old_snapshot and old_snapshot.exists else None
+            if _human_claim_is_active(old_job, worker_uid, current_claim):
+                raise HTTPException(status_code=409, detail="This worker must finish their current assignment before taking a whole job.")
+        if _human_is_split_job(job):
+            segments = job.get("segments") or []
+            untouched = all((item or {}).get("status") in {"available", "approved"} and not (item or {}).get("worker_uid") for item in segments)
+            if not untouched or job.get("proofreader_status") in {"assigned", "in_progress", "submitted"}:
+                raise HTTPException(status_code=409, detail="A part of this job has already been claimed. Take that part back first, or assign the remaining parts individually.")
+        elif job.get("status") != "approved" or job.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="Only an approved job that nobody has claimed can be assigned as a whole job.")
+        now = datetime.now()
+        tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
+        deadline = now + timedelta(seconds=tat_seconds)
+        tx.update(job_ref, {
+            "status": "assigned",
+            "segments": [],
+            "split_mode": "single",
+            "worker_uid": worker_uid,
+            "worker_email": str(actor.get("email") or "").strip().lower(),
+            "worker_name": str((actor.get("profile") or {}).get("name") or (actor.get("profile") or {}).get("displayName") or "").strip(),
+            "assignedAt": now, "deadlineAt": deadline, "tat_seconds": tat_seconds,
+            "assigned_worker_uids": [worker_uid],
+            "whole_job_assignment": True,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        tx.set(claim_ref, {"worker_uid": worker_uid, "job_id": job_id, "segment_id": "", "role": "transcriber", "status": "active", "assignedAt": now, "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        return {"job_id": job_id, "segment_id": "", "label": "your whole transcription job", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
 
     return assign(transaction)
 
@@ -6968,7 +7212,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         )
     if available_scope:
         snapshots_by_id = {}
-        for status in ("approved", "split_assigned", "split_in_progress"):
+        for status in ("approved", "split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"):
             rows = await asyncio.to_thread(lambda status=status: list(ref.where(filter=FieldFilter("status", "==", status)).stream()))
             snapshots_by_id.update({snapshot.id: snapshot for snapshot in rows})
         snapshots = list(snapshots_by_id.values())
@@ -7015,7 +7259,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         item = await _human_check_expiry(snap.id, item)
         if available_scope:
             if _human_is_split_job(item):
-                if item.get("status") not in {"split_assigned", "split_in_progress"}:
+                if item.get("status") not in {"split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"}:
                     continue
                 claimable_parts = [
                     {key: part.get(key) for key in ("id", "label", "index", "minutes", "start_seconds", "end_seconds")}
@@ -7444,6 +7688,10 @@ async def human_list_workers(request: Request):
         # workers should appear in the assignment list.
         if not data.get("workerApproved") and role not in {"worker", "transcriber"}:
             continue
+        try:
+            rating = await _human_worker_rating_summary(snap.id, data)
+        except Exception:
+            rating = {"average": None, "count": 0}
         workers.append({
             "uid": data.get("uid") or snap.id,
             "email": data.get("email") or "",
@@ -7451,6 +7699,9 @@ async def human_list_workers(request: Request):
             "role": role or "worker",
             "approved": bool(data.get("workerApproved") or role == "worker"),
             "available": data.get("is_available", True),
+            "rating": rating.get("average"),
+            "rating_count": rating.get("count") or 0,
+            "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
     return {"workers": workers}
 
@@ -8006,6 +8257,82 @@ async def human_admin_assign(job_id: str, request: Request):
     )
     return {"status": "supervised_starter_assigned", "job_id": job_id, "segment_id": segment_id}
 
+@app.post("/human-transcription/jobs/{job_id}/assign-whole")
+async def human_admin_assign_whole(job_id: str, request: Request):
+    """Urgent work: one worker takes the entire job, whatever their rating."""
+    _require_human_job_admin(request)
+    payload = await request.json()
+    worker_uid = str(payload.get("worker_uid") or "").strip()
+    if not worker_uid:
+        raise HTTPException(status_code=400, detail="Choose an approved worker for this urgent job.")
+    await _human_job(job_id)
+    worker_profile = await _load_profile(worker_uid)
+    if not worker_profile or worker_profile.get("workerApproved") is not True:
+        raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    verified_actor = {
+        "uid": worker_uid,
+        "email": str(worker_profile.get("email") or payload.get("worker_email") or "").strip().lower(),
+        "profile": worker_profile,
+    }
+    try:
+        assignment = await asyncio.to_thread(_human_assign_whole_job_transaction, job_id, verified_actor)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not assign whole Human Work job %s to %s", job_id, worker_uid)
+        raise HTTPException(status_code=409, detail="The whole-job assignment could not be saved. Refresh and try again.") from exc
+    await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
+    await _notify_worker_assignment(job_id, worker_uid, assignment.get("label") or "your whole transcription job", assignment.get("assignedAt"), segment_id="")
+    return {"status": "whole_job_assigned", "job_id": job_id, "worker_uid": worker_uid}
+
+
+@app.post("/human-transcription/jobs/{job_id}/rate-part")
+async def human_admin_rate_part(job_id: str, request: Request):
+    """Rate one worker's submitted part (or the proofreader) on its own.
+
+    Available as soon as that part is submitted, and still available after the
+    job has been proofread or released.
+    """
+    _require_human_job_admin(request)
+    payload = await request.json()
+    job = await _human_job(job_id)
+    target_id = str(payload.get("segment_id") or "").strip()
+    try:
+        rating = int(payload.get("rating"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Choose a rating from 1 to 5.")
+    if rating < 1 or rating > 5:
+        raise HTTPException(status_code=400, detail="Choose a rating from 1 to 5.")
+    note = str(payload.get("note") or "").strip()[:2000]
+    if target_id == "proofreader":
+        if job.get("proofreader_status") != "submitted" or not job.get("proofreader_uid"):
+            raise HTTPException(status_code=409, detail="The proofreader has not submitted yet.")
+        worker_uid = str(job.get("proofreader_uid"))
+    elif _human_is_split_job(job):
+        part = next((item for item in (job.get("segments") or []) if str((item or {}).get("id") or "") == target_id), None)
+        if not part or part.get("status") != "submitted" or not part.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="That part has not been submitted yet.")
+        worker_uid = str(part.get("worker_uid"))
+    else:
+        if job.get("status") not in {"submitted", "client_review", "client_approved", "released"} or not job.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="This job has not been submitted yet.")
+        worker_uid = str(job.get("worker_uid"))
+        target_id = "main"
+    part_ratings = dict(job.get("part_ratings") or {})
+    part_ratings[target_id] = {"rating": rating, "note": note, "worker_uid": worker_uid, "source": str(payload.get("source") or "admin")[:20]}
+    # A worker's score on this job is the average of the parts they did.
+    own = [float(item["rating"]) for item in part_ratings.values() if str(item.get("worker_uid")) == worker_uid]
+    ratings_by_worker = dict(job.get("worker_ratings") or {})
+    ratings_by_worker[worker_uid] = round(sum(own) / len(own), 2)
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "part_ratings": part_ratings,
+        "worker_ratings": ratings_by_worker,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    await _human_worker_rating_summary(worker_uid, force_refresh=True)
+    return {"status": "rated", "job_id": job_id, "segment_id": target_id, "rating": rating, "worker_average_on_job": ratings_by_worker[worker_uid]}
+
+
 @app.post("/human-transcription/jobs/{job_id}/assign-proofreader")
 async def human_admin_assign_proofreader(job_id: str, request: Request):
     _require_human_job_admin(request)
@@ -8015,13 +8342,13 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Choose an approved proofreader first.")
     proofreader_profile = await _load_profile(worker_uid) or {}
     proofreader_rating = await _human_worker_rating_summary(worker_uid, proofreader_profile)
-    if proofreader_rating["average"] is None or proofreader_rating["average"] < MIN_HUMAN_WORKER_RATING:
-        raise HTTPException(status_code=409, detail="A worker rating of 3.5/5 or higher is required for proofreading assignments.")
+    if proofreader_rating["average"] is None or proofreader_rating["average"] < MIN_PROOFREADER_RATING:
+        raise HTTPException(status_code=409, detail="Only workers rated 4.5/5 or higher can proofread.")
     if await _human_worker_has_active_assignment(worker_uid):
         raise HTTPException(status_code=409, detail="This worker must finish their current assignment before taking proofreading work.")
     job = await _human_job(job_id)
-    if not _human_is_split_job(job) or not all((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
-        raise HTTPException(status_code=409, detail="Every transcription part must be submitted before assigning the final proofreader.")
+    if not _human_is_split_job(job) or not any((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+        raise HTTPException(status_code=409, detail="At least one transcription part must be submitted before assigning a proofreader.")
     tat_seconds = human_proofreading_tat_seconds(float(job.get("seconds") or 0))
     worker = {
         "worker_uid": worker_uid,
@@ -8070,7 +8397,7 @@ async def human_admin_take_back(job_id: str, request: Request):
             "proofreader_name": None, "proofreader_assignedAt": None, "proofreader_deadlineAt": None,
             "proofreader_tat_seconds": None, "proofreader_tat_extension_minutes": 0,
             "assigned_worker_uids": list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid"))),
-            "status": "proofreading_available" if _human_is_split_job(job) else "approved",
+            "status": _human_split_parent_status({**job, "proofreader_status": "available"}, segments) if _human_is_split_job(job) else "approved",
         })
     elif _human_is_split_job(job):
         segment_id = str(payload.get("segment_id") or "").strip()
@@ -8211,7 +8538,7 @@ async def human_worker_start(job_id: str, request: Request):
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
             target["status"] = "in_progress"
-            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": "split_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": _human_split_parent_status(job, segments), "updatedAt": firestore.SERVER_TIMESTAMP})
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "segment_id": target.get("id")}
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
@@ -8235,6 +8562,7 @@ async def human_worker_submit(
     transcript: str = Form(""),
     notes: str = Form(""),
     attachment: UploadFile = File(None),
+    transcript_html: str = Form(""),
 ):
     actor = await _human_actor(request)
     if actor["role"] != "worker":
@@ -8242,6 +8570,7 @@ async def human_worker_submit(
     job = await _human_job(job_id)
     await _human_assert_access(job, actor, allow_admin=False)
     transcript_text = str(transcript or "").strip()
+    clean_html = _sanitize_editor_html(transcript_html)
 
     if _human_is_split_job(job):
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
@@ -8258,6 +8587,7 @@ async def human_worker_submit(
             target.update({
                 "status": "submitted",
                 "transcript": transcript_text[:1000000],
+                "transcript_html": clean_html,
                 "final_attachment": final_attachment,
                 "worker_notes": str(notes or "")[:12000],
                 "submittedAt": datetime.now(),
@@ -8266,24 +8596,27 @@ async def human_worker_submit(
                 "worker_amount_kes": max(0, minutes * rate),
                 "payout_status": "unassigned",
             })
-            both_submitted = all(item.get("status") == "submitted" for item in segments)
+            parent_status = _human_split_parent_status(job, segments)
+            both_submitted = parent_status == "proofreading_available"
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
                 "segments": segments,
-                "status": "proofreading_available" if both_submitted else "split_in_progress",
+                "status": parent_status,
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             })
             await _human_release_worker_claim(actor["uid"], job_id, str(target.get("id") or ""), "transcriber")
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             await _notify_human_admins(
                 f"human-submitted:{job_id}:{target.get('id')}", "job_submitted", "A job part was submitted",
-                "Review the submitted Human Work part.", route="human_ops", job_id=job_id, requires_action=True,
+                "Open the job to read this part and rate the worker now. You do not need to wait for the other parts.", route="human_ops", job_id=job_id, requires_action=True,
             )
-            return {"status": "proofreading_available" if both_submitted else "split_in_progress", "job_id": job_id, "segment_id": target.get("id")}
+            return {"status": parent_status, "job_id": job_id, "segment_id": target.get("id")}
 
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
             final_attachment = job.get("final_attachment")
             if attachment and attachment.filename:
                 final_attachment = await _human_store_upload(job_id, attachment, "final")
+            if not all(item.get("status") == "submitted" for item in segments):
+                raise HTTPException(status_code=409, detail="Some parts have not been submitted yet. Load them into your editor, proofread them, then submit the final transcript once every part is in.")
             combined = transcript_text or "\n\n".join(item.get("transcript", "") for item in segments if item.get("transcript"))
             if not combined and not final_attachment:
                 raise HTTPException(status_code=400, detail="Review both parts and submit the combined transcript or a finished file.")
@@ -8291,6 +8624,7 @@ async def human_worker_submit(
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
                 "status": "submitted",
                 "transcript": combined[:1000000],
+                "transcript_html": clean_html,
                 "final_attachment": final_attachment,
                 "worker_notes": str(notes or "")[:12000],
                 "proofreader_status": "submitted",
@@ -8326,6 +8660,7 @@ async def human_worker_submit(
     updates = {
         "status": "submitted",
         "transcript": transcript_text[:1000000],
+        "transcript_html": clean_html,
         "final_attachment": final_attachment,
         "worker_notes": str(notes or "")[:12000],
         "submittedAt": firestore.SERVER_TIMESTAMP,
@@ -8361,7 +8696,11 @@ async def human_admin_review(job_id: str, request: Request):
     worker_uids = _human_job_worker_uids(job)
     ratings_by_worker = dict(job.get("worker_ratings") or {})
     if rating is not None:
+        rated_parts = {str(item.get("worker_uid")) for item in (job.get("part_ratings") or {}).values() if item.get("worker_uid")}
         for worker_uid in worker_uids:
+            # Workers already rated part by part keep those ratings.
+            if worker_uid in rated_parts:
+                continue
             ratings_by_worker[worker_uid] = rating
     is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
     review_status = "released" if is_pdf_job else "client_review"
@@ -9014,7 +9353,7 @@ TRAINING_ASSET_STORAGE_PREFIX = "training-materials/"
 TRAINING_ASSETS = {
     "human-job-practical.mp3": ("audio/mpeg", "inline", "human-job-practical.mp3"),
     "transcription-guidelines.docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "attachment", "TypeMyworDz General Guidelines.docx"),
-    "formatting-default.docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "attachment", "SW Default Formatting UPDATED.docx"),
+    "formatting-default.docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "attachment", "TypeMyworDz Default Document settings.docx"),
 }
 
 
@@ -9108,6 +9447,379 @@ async def _load_training_submissions(uid):
     return results
 
 
+_GUIDELINES_CACHE = {"at": 0.0, "html": "", "text": ""}
+
+
+def _docx_to_html_and_text(raw: bytes):
+    """Render the guidelines document to safe HTML plus plain text."""
+    from html import escape
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    document = Document(BytesIO(raw))
+
+    def runs_html(paragraph):
+        out = []
+        for run in paragraph.runs:
+            text = escape(run.text or "")
+            if not text:
+                continue
+            if run.bold:
+                text = f"<strong>{text}</strong>"
+            if run.italic:
+                text = f"<em>{text}</em>"
+            if run.underline:
+                text = f"<u>{text}</u>"
+            out.append(text)
+        return "".join(out)
+
+    html_parts, text_parts = [], []
+    in_list = False
+    for child in document.element.body.iterchildren():
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            paragraph = Paragraph(child, document)
+            plain = (paragraph.text or "").strip()
+            style = (paragraph.style.name if paragraph.style is not None else "") or ""
+            is_item = "list" in style.lower() or child.find(".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numPr") is not None
+            if not plain:
+                if in_list:
+                    html_parts.append("</ul>")
+                    in_list = False
+                continue
+            body = runs_html(paragraph) or escape(plain)
+            if is_item:
+                if not in_list:
+                    html_parts.append("<ul>")
+                    in_list = True
+                html_parts.append(f"<li>{body}</li>")
+                text_parts.append(f"- {plain}")
+                continue
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            if style.lower().startswith("heading") or style.lower() == "title":
+                level = 2 if style.lower() in {"title", "heading 1"} else 3
+                html_parts.append(f"<h{level}>{escape(plain)}</h{level}>")
+                text_parts.append(f"\n{plain.upper()}")
+            else:
+                html_parts.append(f"<p>{body}</p>")
+                text_parts.append(plain)
+        elif tag == "tbl":
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            table = Table(child, document)
+            html_parts.append("<table>")
+            for row in table.rows:
+                cells = []
+                for cell in row.cells:
+                    cells.append(f"<td>{escape(cell.text or '')}</td>")
+                html_parts.append("<tr>" + "".join(cells) + "</tr>")
+                text_parts.append(" | ".join((cell.text or "").strip() for cell in row.cells))
+            html_parts.append("</table>")
+    if in_list:
+        html_parts.append("</ul>")
+    return "".join(html_parts), "\n".join(text_parts)
+
+
+async def _guidelines_content():
+    """Guidelines HTML and text, read from the private bucket (cached briefly)."""
+    if _GUIDELINES_CACHE["html"] and time.time() - _GUIDELINES_CACHE["at"] < 600:
+        return _GUIDELINES_CACHE["html"], _GUIDELINES_CACHE["text"]
+    bucket = _training_assets_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="The guidelines are temporarily unavailable.")
+    try:
+        raw = await asyncio.to_thread(bucket.blob(f"{TRAINING_ASSET_STORAGE_PREFIX}transcription-guidelines.docx").download_as_bytes)
+        html_out, text_out = await asyncio.to_thread(_docx_to_html_and_text, raw)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not read the guidelines document")
+        raise HTTPException(status_code=503, detail="The guidelines are temporarily unavailable.") from exc
+    _GUIDELINES_CACHE.update({"at": time.time(), "html": html_out, "text": text_out})
+    return html_out, text_out
+
+
+def _can_view_training_materials(actor):
+    profile = actor.get("profile") or {}
+    profile_role = str(profile.get("role") or profile.get("user_type") or "").lower()
+    paid_trainee = profile_role == "trainee" and profile.get("trainingRoomAccess") is True and str(profile.get("trainingPaymentStatus") or "").lower() == "paid"
+    return actor.get("role") in {"admin", "worker"} or paid_trainee
+
+
+@app.get("/human-transcription/guidelines")
+async def human_guidelines(request: Request):
+    """The general guidelines as a readable page for workers, trainees and admins."""
+    actor = await _human_actor(request)
+    if not _can_view_training_materials(actor):
+        raise HTTPException(status_code=403, detail="Worker, trainee or admin access is required to read the guidelines.")
+    html_out, _ = await _guidelines_content()
+    return {"title": "TypeMyworDz General Guidelines", "html": html_out}
+
+
+@app.get("/api/admin/ai-guidelines")
+async def admin_get_ai_guidelines(request: Request):
+    _require_admin(request)
+    ref = db.collection("admin_settings").document("ai_guidelines")
+    snap = await asyncio.to_thread(ref.get)
+    data = snap.to_dict() if snap.exists else None
+    if not data or not str(data.get("text") or "").strip():
+        try:
+            _, seed = await _guidelines_content()
+        except HTTPException:
+            seed = ""
+        data = {"text": seed}
+        if seed:
+            await asyncio.to_thread(ref.set, {"text": seed, "seededAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"text": str(data.get("text") or ""), "updated_at": _human_iso(data.get("updatedAt"))}
+
+
+@app.put("/api/admin/ai-guidelines")
+async def admin_put_ai_guidelines(request: Request):
+    _require_admin(request)
+    payload = await request.json()
+    text = str(payload.get("text") or "")[:120000]
+    await asyncio.to_thread(db.collection("admin_settings").document("ai_guidelines").set, {"text": text, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"status": "saved", "length": len(text)}
+
+
+async def _admin_guidelines_text():
+    snap = await asyncio.to_thread(db.collection("admin_settings").document("ai_guidelines").get)
+    data = snap.to_dict() if snap.exists else {}
+    text = str((data or {}).get("text") or "").strip()
+    if text:
+        return text
+    try:
+        return (await _guidelines_content())[1]
+    except HTTPException:
+        return ""
+
+
+@app.get("/api/admin/workers")
+async def admin_workers(request: Request):
+    """Promoted workers with their contact details and current rating."""
+    _require_admin(request)
+    if not db:
+        return {"workers": []}
+    snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
+    rows = []
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        try:
+            rating = await _human_worker_rating_summary(snap.id, data)
+        except Exception:
+            rating = {"average": None, "count": 0}
+        rows.append({
+            "uid": snap.id,
+            "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
+            "email": data.get("email") or "",
+            "phone": data.get("mpesaNumber") or data.get("phone") or "",
+            "rating": rating.get("average"),
+            "rating_count": rating.get("count") or 0,
+            "is_available": data.get("is_available", True) is not False,
+            "approved_at": _human_iso(data.get("workerApprovedAt")),
+            "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
+        })
+    rows.sort(key=lambda item: (-(item["rating"] or 0), item["name"].lower()))
+    return {"workers": rows, "min_claim_rating": MIN_HUMAN_WORKER_RATING, "min_proofread_rating": MIN_PROOFREADER_RATING}
+
+
+@app.post("/human-transcription/jobs/{job_id}/ai-draft")
+async def human_worker_ai_draft(job_id: str, request: Request):
+    """An AI first draft for the audio a worker has been assigned.
+
+    Paid for with the worker's own credits, and saved on the job so that
+    reopening or refreshing never charges a second time.
+    """
+    actor = await _human_actor(request)
+    if actor.get("role") != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor, allow_admin=False)
+    if str(job.get("job_type") or "").lower() == "pdf_job":
+        raise HTTPException(status_code=400, detail="AI drafts are for audio jobs. Use Gemini for image jobs.")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    uid = actor["uid"]
+    segment = None
+    if _human_is_split_job(job):
+        wanted = str((payload or {}).get("segment_id") or "")
+        segment = next((item for item in (job.get("segments") or []) if item.get("worker_uid") == uid and item.get("status") in {"assigned", "in_progress"} and (not wanted or item.get("id") == wanted)), None)
+        if not segment:
+            raise HTTPException(status_code=403, detail="You do not have an open part on this job.")
+        key = str(segment.get("id"))
+    else:
+        if job.get("worker_uid") != uid or job.get("status") not in {"assigned", "in_progress"}:
+            raise HTTPException(status_code=403, detail="This job is not open for you.")
+        key = "main"
+    existing = (job.get("ai_drafts") or {}).get(key)
+    if existing and existing.get("worker_uid") == uid and existing.get("text"):
+        return {"draft": existing.get("text"), "already_generated": True, "credits_charged": 0}
+
+    meta = job.get("audio") or {}
+    bucket = _human_bucket()
+    path = meta.get("storage_path")
+    if not path or bucket is None:
+        raise HTTPException(status_code=404, detail="The source audio is not available.")
+    blob = bucket.blob(path)
+    if not await asyncio.to_thread(blob.exists):
+        raise HTTPException(status_code=404, detail="The source audio is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    suffix = str(meta.get("name") or "").rsplit(".", 1)[-1].lower()
+    fmt = suffix if suffix in {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac"} else None
+    try:
+        source = await asyncio.to_thread(lambda: AudioSegment.from_file(BytesIO(raw), format=fmt))
+    except Exception as exc:
+        logger.warning("AI draft could not read audio for %s: %s", job_id, exc)
+        raise HTTPException(status_code=502, detail="The audio could not be prepared for a draft. Try again in a moment.")
+    if segment is not None:
+        start_ms = max(0, int(float(segment.get("start_seconds") or 0) * 1000))
+        end_ms = min(len(source), int(float(segment.get("end_seconds") or len(source) / 1000) * 1000))
+        source = source[start_ms:end_ms]
+    seconds = max(1.0, len(source) / 1000.0)
+    cost = minutes_to_credits(seconds)
+    email = actor.get("email") or ""
+    exempt = credits_exempt(email)
+    if not exempt:
+        balance = read_balance(actor.get("profile") or {})
+        if int(balance.get("total") or 0) < cost:
+            raise HTTPException(status_code=402, detail=f"This draft needs {cost} credits and you have {int(balance.get('total') or 0)}. Top up your credits to generate it.")
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+            tmp_path = handle.name
+        await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
+        result = await transcribe_with_assemblyai(tmp_path, "en", False, "universal-3-5-pro", f"draft-{job_id}-{key}")
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    if result.get("status") != "completed" or not str(result.get("transcript") or result.get("text") or "").strip():
+        raise HTTPException(status_code=502, detail="The AI draft could not be generated. You have not been charged.")
+    text = str(result.get("transcript") or result.get("text") or "").strip()
+    charge = await charge_credits(uid, email, cost, "worker AI draft", usage_category="worker_ai_draft")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        f"ai_drafts.{key}": {"text": text[:400000], "worker_uid": uid, "credits": charge.get("charged", cost), "createdAt": datetime.now().isoformat()},
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return {"draft": text, "already_generated": False, "credits_charged": charge.get("charged", cost), "credits_remaining": charge.get("remaining")}
+
+
+def _run_ask_model(model_id, provider, system_prompt, question, max_tokens=8000):
+    """One plain question to the chosen provider, no history or images."""
+    if provider in OPENAI_FORMAT_ENDPOINTS:
+        return _ask_openai_format(provider, model_id, system_prompt, [], question, [], max_tokens)
+    if provider == "gemini":
+        return _ask_gemini(model_id, system_prompt, [], question, [], max_tokens)
+    return _ask_claude(model_id, system_prompt, [], question, [], max_tokens)
+
+
+def _parse_json_object(text):
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("no JSON object")
+    return json.loads(raw[start:end + 1])
+
+
+@app.post("/human-transcription/jobs/{job_id}/ai-review")
+async def human_admin_ai_review(job_id: str, request: Request):
+    """AI proofreading and combining: standardise, merge and rate the parts."""
+    actor = await _human_actor(request)
+    if actor.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    job = await _human_job(job_id)
+    if not _human_is_split_job(job):
+        raise HTTPException(status_code=409, detail="AI combining is for jobs that were split into parts.")
+    segments = job.get("segments") or []
+    if not segments or not all(item.get("status") == "submitted" for item in segments):
+        raise HTTPException(status_code=409, detail="Every part must be submitted before the AI can combine them.")
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    email = actor.get("email") or ""
+    model_id, provider = resolve_ask_model(str((payload or {}).get("model") or ""), "free", email, True, True)
+    guidelines = await _admin_guidelines_text()
+    instructions = str(job.get("instructions") or job.get("notes") or job.get("client_notes") or job.get("special_instructions") or "")[:8000]
+    part_blocks = []
+    for index, item in enumerate(segments):
+        part_blocks.append(f"=== PART {index + 1} (id: {item.get('id')}) ===\n{item.get('transcript') or ''}")
+    system_prompt = (
+        "You are the senior quality reviewer for a human transcription company. "
+        "You receive transcript parts written by different transcribers, the company's general guidelines, and this job's specific instructions. "
+        "Do three things: (1) merge the parts into one final transcript in order, standardising spelling, names, numbers, dates, punctuation and formatting "
+        "to the guidelines and the job instructions, WITHOUT paraphrasing, adding or removing meaning; (2) rate each part from 1 to 5 for accuracy and for following "
+        "the guidelines and job instructions, with a short note; (3) list any issues you could not resolve. "
+        "Reply with ONE JSON object only, no commentary, in exactly this shape: "
+        '{"combined_text": string, "parts": [{"segment_id": string, "rating": number, "accuracy": string, "notes": string}], "issues": [string], "summary": string}'
+    )
+    question = (
+        f"GENERAL GUIDELINES:\n{guidelines[:60000]}\n\nJOB INSTRUCTIONS:\n{instructions or 'None supplied.'}\n\nTRANSCRIPT PARTS:\n\n" + "\n\n".join(part_blocks)
+    )[:400000]
+    try:
+        answer = await asyncio.to_thread(_run_ask_model, model_id, provider, system_prompt, question, 16000)
+        review = _parse_json_object(answer)
+    except Exception as exc:
+        logger.warning("AI review failed for %s: %s", job_id, exc)
+        raise HTTPException(status_code=502, detail="The AI review could not be completed. Try again, or pick a different model in settings.")
+    ids = {str(item.get("id")) for item in segments}
+    clean_parts = []
+    for item in review.get("parts") or []:
+        sid = str(item.get("segment_id") or "")
+        try:
+            rating = max(1, min(5, int(round(float(item.get("rating"))))))
+        except (TypeError, ValueError):
+            continue
+        if sid in ids:
+            clean_parts.append({"segment_id": sid, "rating": rating, "accuracy": str(item.get("accuracy") or "")[:600], "notes": str(item.get("notes") or "")[:1200]})
+    saved = {
+        "combined_text": str(review.get("combined_text") or "")[:1000000],
+        "parts": clean_parts,
+        "issues": [str(x)[:600] for x in (review.get("issues") or [])][:40],
+        "summary": str(review.get("summary") or "")[:2000],
+        "model": model_id,
+        "createdAt": datetime.now().isoformat(),
+    }
+    if not saved["combined_text"].strip():
+        raise HTTPException(status_code=502, detail="The AI returned an empty transcript. Please run it again.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"ai_review": saved, "updatedAt": firestore.SERVER_TIMESTAMP})
+    return {"ai_review": saved}
+
+
+@app.post("/human-transcription/jobs/{job_id}/ai-review/apply")
+async def human_admin_apply_ai_review(job_id: str, request: Request):
+    """Use the AI's combined text as the final transcript, without a proofreader."""
+    actor = await _human_actor(request)
+    if actor.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    job = await _human_job(job_id)
+    review = job.get("ai_review") or {}
+    if not str(review.get("combined_text") or "").strip():
+        raise HTTPException(status_code=409, detail="Run the AI review first.")
+    segments = job.get("segments") or []
+    if not segments or not all(item.get("status") == "submitted" for item in segments):
+        raise HTTPException(status_code=409, detail="Every part must be submitted first.")
+    if job.get("proofreader_status") in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="A proofreader is working on this job. Take it back first.")
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "status": "submitted", "transcript": review.get("combined_text"), "transcript_html": "",
+        "ai_combined": True, "proofreader_status": "skipped",
+        "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "submitted", "job_id": job_id}
+
+
 @app.get("/human-transcription/trainee/training/materials/{asset_name}")
 async def trainee_training_material(asset_name: str, request: Request):
     if asset_name not in TRAINING_ASSETS:
@@ -9177,6 +9889,9 @@ async def trainee_status(request: Request):
             "status": profile.get("trainingStatus") or "not_started",
             "submissions": profile.get("trainingSubmissions") or {},
             "results": results,
+            "redo_levels": [int(item) for item in (profile.get("trainingRedoLevels") or []) if str(item).isdigit()],
+            "redo_message": profile.get("trainingRedoMessage") or "",
+            "waitlisted": str(profile.get("traineeStatus") or "").lower() == "waitlisted" or str(profile.get("trainingStatus") or "").lower() == "waitlisted",
         },
         "levels": TRAINING_LEVELS,
         "guidelines": TRAINING_GUIDELINES,
@@ -9226,6 +9941,9 @@ async def admin_trainees(request: Request):
         status = str(data.get("traineeStatus") or "").lower()
         role = str(data.get("role") or data.get("user_type") or "").lower()
         if not status and role not in {"trainee", "worker"}:
+            continue
+        if data.get("workerApproved") is True or role == "worker":
+            # Promoted trainees live on the Workers tab now.
             continue
         data["uid"] = data.get("uid") or snap.id
         data["id"] = snap.id
@@ -9283,7 +10001,7 @@ async def admin_trainee_decision(uid: str, request: Request):
     payload = await request.json()
     decision = str(payload.get("decision") or "").strip().lower()
     payment_status = str(payload.get("payment_status") or "").strip().lower()
-    if decision not in {"reject", "promote_worker", "approve_level"}:
+    if decision not in {"reject", "promote_worker", "approve_level", "invite_redo", "waitlist"}:
         raise HTTPException(status_code=400, detail="That trainee decision is not supported.")
     if decision == "approve_level":
         raise HTTPException(status_code=409, detail="Module progression is automatic; admins review only after all six modules are submitted.")
@@ -9295,13 +10013,61 @@ async def admin_trainee_decision(uid: str, request: Request):
         updates["trainingPaymentStatus"] = payment_status
     if decision == "reject":
         updates.update({"role": "client", "traineeStatus": "rejected", "trainingStatus": "rejected", "trainingRoomAccess": False, "workerApproved": False})
+    elif decision == "invite_redo":
+        raw_levels = payload.get("levels")
+        total = len(TRAINING_LEVELS)
+        if raw_levels in ("all", None, "") or (isinstance(raw_levels, list) and "all" in raw_levels):
+            levels = list(range(1, total + 1))
+        else:
+            try:
+                levels = sorted({int(item) for item in (raw_levels if isinstance(raw_levels, list) else [raw_levels])})
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Choose which modules the trainee should redo.")
+        if not levels or any(level < 1 or level > total for level in levels):
+            raise HTTPException(status_code=400, detail="Choose which modules the trainee should redo.")
+        message = str(payload.get("message") or "").strip()[:1000]
+        existing = await _load_training_submissions(uid)
+        submissions = dict(profile.get("trainingSubmissions") or {})
+        for level in levels:
+            ref = db.collection("training_submissions").document(f"{uid}-{level}")
+            previous = existing.get(str(level)) or {}
+            history = list(previous.get("previous_attempts") or [])
+            if previous.get("status") == "submitted":
+                history.append({
+                    "transcript": previous.get("transcript") or "",
+                    "notes": previous.get("notes") or "",
+                    "answers": previous.get("answers") or {},
+                    "archivedAt": datetime.now().isoformat(),
+                })
+            await asyncio.to_thread(ref.set, {
+                "level": level, "uid": uid, "status": "redo_requested",
+                "previous_attempts": history[-10:], "redoRequestedAt": datetime.now().isoformat(),
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+            submissions[str(level)] = "redo_requested"
+        updates.update({
+            "trainingSubmissions": submissions,
+            "trainingLevel": min(levels),
+            "trainingStatus": "active",
+            "traineeStatus": "enrolled",
+            "trainingRedoLevels": levels,
+            "trainingRedoMessage": message,
+            "trainingRedoInvitedAt": firestore.SERVER_TIMESTAMP,
+        })
+    elif decision == "waitlist":
+        updates.update({
+            "traineeStatus": "waitlisted",
+            "trainingStatus": "waitlisted",
+            "trainingWaitlistedAt": firestore.SERVER_TIMESTAMP,
+            "workerApproved": False,
+        })
     elif decision == "promote_worker":
         results = await _load_training_submissions(uid)
         complete = all(str(results.get(str(level), {}).get("status") or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
         final_transcript = str((results.get(str(len(TRAINING_LEVELS))) or {}).get("transcript") or "").strip()
         if not complete or not final_transcript:
             raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
-        updates.update({"role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed", "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP})
+        updates.update({"role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed", "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP, "trainingRedoLevels": [], "trainingRedoMessage": ""})
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     return {"status": "updated", "uid": uid, "decision": decision}
 
@@ -9323,7 +10089,8 @@ async def trainee_submit_training(level: int, request: Request):
     prior_submissions = profile.get("trainingSubmissions") or {}
     if str(prior_submissions.get(str(level)) or "").lower() == "submitted":
         raise HTTPException(status_code=409, detail="This module has already been submitted and saved.")
-    if level != current_level:
+    is_redo = str(prior_submissions.get(str(level)) or "").lower() == "redo_requested"
+    if level != current_level and not is_redo:
         raise HTTPException(status_code=409, detail="Finish the open module first; the next module unlocks automatically after a complete submission.")
     payload = await request.json()
     transcript = str(payload.get("transcript") or "").strip()
@@ -9378,9 +10145,11 @@ async def trainee_submit_training(level: int, request: Request):
     }
     await asyncio.to_thread(db.collection("training_submissions").document(f"{actor['uid']}-{level}").set, submission, merge=True)
     submissions = {**prior_submissions, str(level): "submitted"}
-    final_module = level == len(TRAINING_LEVELS)
-    next_level = level if final_module else level + 1
+    remaining = [item for item in range(1, len(TRAINING_LEVELS) + 1) if str(submissions.get(str(item)) or "").lower() != "submitted"]
+    final_module = not remaining
+    next_level = level if final_module else min(remaining)
     updates = {
+        "trainingRedoLevels": [item for item in remaining if str(submissions.get(str(item)) or "").lower() == "redo_requested"],
         "trainingSubmissions": submissions,
         "trainingLevel": next_level,
         "trainingStatus": "pending_final_review" if final_module else "active",

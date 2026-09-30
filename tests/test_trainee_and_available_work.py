@@ -43,6 +43,8 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
             "_as_dt",
             "_int",
             "grant_free_trial",
+            "free_trial_correction",
+            "read_balance",
             "backfill_credits",
         }
         functions = [
@@ -55,7 +57,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                 continue
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id in {
-                    "TRAINEE_PRICE_USD", "FREE_TRIAL_CREDITS", "LEGACY_FREE_TRIAL_CREDITS",
+                    "TRAINEE_PRICE_USD", "TRAINEE_MIN_WPM", "FREE_TRIAL_CREDITS", "REFILL_DAYS",
                     "HUMAN_AVAILABLE_SLICE_MINUTES", "MIN_HUMAN_WORKER_RATING",
                     "HUMAN_LEGACY_STANDARD_PAYOUT_KES", "HUMAN_PROOFREADING_PAYOUT_KES",
                     "PDF_JOB_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE",
@@ -86,36 +88,41 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         self.assertEqual(self.namespace["HUMAN_AVAILABLE_SLICE_MINUTES"], 5)
         self.assertEqual(self.namespace["MIN_HUMAN_WORKER_RATING"], 3.5)
 
-    def test_new_trials_are_30_but_legacy_backfill_preserves_old_allowance_and_balances(self):
-        now = datetime(2026, 9, 26, 16, 0, 0)
+    def test_every_new_account_gets_exactly_30_credits_and_old_5_grants_are_corrected(self):
+        now = datetime(2026, 9, 30, 9, 0, 0)
         grant_trial = self.namespace["grant_free_trial"]
         new_account = grant_trial({}, now)
         self.assertEqual(new_account["planCredits"], 30)
         self.assertTrue(new_account["hasReceivedInitialFreeMinutes"])
+        self.assertNotIn("LEGACY_FREE_TRIAL_CREDITS", self.namespace)
 
         backfill = self.namespace["backfill_credits"]
-        legacy_updates, detail = backfill({}, now)
-        self.assertEqual(legacy_updates["planCredits"], 5)
-        self.assertEqual(detail["granted"], 5)
-
-        signup_updates, signup_detail = backfill({"freeTrialVersion": 2}, now)
-        self.assertEqual(signup_updates["planCredits"], 30)
-        self.assertEqual(signup_detail["granted"], 30)
+        for profile in ({}, {"freeTrialVersion": 2}, {"role": "trainee"}):
+            updates, detail = backfill(profile, now)
+            self.assertEqual(updates["planCredits"], 30, profile)
+            self.assertEqual(detail["granted"], 30, profile)
 
         existing = {"planCredits": 17, "topUpCredits": 23}
         self.assertEqual(grant_trial(existing, now), {})
         updates, detail = backfill(existing, now)
         self.assertEqual(updates, {"creditsBackfilledAt": now})
-        self.assertEqual(detail["skipped"], "existing credit balance preserved")
         self.assertEqual(existing["planCredits"], 17)
-        self.assertEqual(existing["topUpCredits"], 23)
 
-    def test_typing_gate_requires_full_thirty_seconds_and_at_least_fifty_wpm(self):
+        fix = self.namespace["free_trial_correction"]
+        reduced = {"planCredits": 5, "planCreditsExpireAt": now + timedelta(days=20), "plan": "free"}
+        corrected = fix(reduced, True, now)
+        self.assertEqual(corrected["planCredits"], 30)
+        self.assertEqual(fix({**reduced, **corrected}, True, now), {})
+        self.assertEqual(fix(reduced, False, now), {})
+        used = fix({"planCredits": 2, "planCreditsExpireAt": now + timedelta(days=20)}, True, now)
+        self.assertEqual(used["planCredits"], 27)
+
+    def test_typing_gate_requires_full_thirty_seconds_and_at_least_forty_wpm(self):
         validate = self.namespace["_validated_trainee_typing_test"]
-        self.assertEqual(validate({"correct_chars": 125, "elapsed_ms": 30000})["wpm"], 50.0)
+        self.assertEqual(validate({"correct_chars": 100, "elapsed_ms": 30000})["wpm"], 40.0)
         for value in (
-            {"correct_chars": 124, "elapsed_ms": 30000},
-            {"correct_chars": 125, "elapsed_ms": 29999},
+            {"correct_chars": 99, "elapsed_ms": 30000},
+            {"correct_chars": 100, "elapsed_ms": 29999},
             None,
         ):
             with self.subTest(value=value), self.assertRaises(FakeHTTPException):
