@@ -67,3 +67,4 @@ firebase-admin==6.9.0
 pypdf==5.1.0
 pypdfium2==5.13.0
 Pillow==12.3.0
+pdf2docx==0.5.13

@@ -40,6 +40,7 @@ from io import BytesIO
 from fastapi.responses import StreamingResponse
 import re
 import anthropic
+import doc_tools
 
 def claude_text(message) -> str:
     """Pull the answer text out of a Claude reply.
@@ -5983,6 +5984,10 @@ PDF_JOB_WORKER_PAY_KES = 100
 PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PDF_JOB_MAX_PAGES_PER_FILE = 100
 PDF_JOB_MAX_IMAGES_PER_BATCH = 200
+PDF_JOB_TAT_SECONDS = 20 * 60
+PDF_JOB_DEFAULT_INSTRUCTION = "Always use Gemini for image transcription"
+PDF_JOB_WORD_EXTENSIONS = (".docx", ".doc", ".rtf", ".odt")
+PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
 HUMAN_JOB_STATUSES = {
     "pending_admin",
     "approved",
@@ -6147,7 +6152,10 @@ def _human_public_for(data, actor_role, actor_uid=""):
                     out["ai_draft"] = draft.get("text")
         else:
             out["transcript_html"] = ""
-        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment"):
+        if data.get("proofreader_uid") == actor_uid:
+            mine = data.get("proofreader_suggested_ratings") or {}
+            out["my_suggested_ratings"] = {k: {"rating": v.get("rating"), "note": v.get("note") or ""} for k, v in mine.items() if isinstance(v, dict)}
+        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings"):
             out.pop(key, None)
         for key in (
             "worker_minutes", "worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason",
@@ -6170,7 +6178,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("proofreader_payout_status", None)
         out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
-        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment"):
+        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings"):
             out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
@@ -6519,6 +6527,8 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
         if not job_snapshot.exists:
             raise HTTPException(status_code=404, detail="This job is no longer available.")
         job = job_snapshot.to_dict() or {}
+        if str(job.get("job_type") or "").strip().lower() == "pdf_job":
+            raise HTTPException(status_code=403, detail="PDF jobs are assigned by an admin.")
         worker_snapshot = worker_ref.get(transaction=tx)
         worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
         if worker_profile.get("workerApproved") is not True:
@@ -6790,7 +6800,10 @@ def _human_assign_whole_job_transaction(job_id, actor):
         elif job.get("status") != "approved" or job.get("worker_uid"):
             raise HTTPException(status_code=409, detail="Only an approved job that nobody has claimed can be assigned as a whole job.")
         now = datetime.now()
-        tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
+        if str(job.get("job_type") or "").strip().lower() == "pdf_job":
+            tat_seconds = PDF_JOB_TAT_SECONDS
+        else:
+            tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
         deadline = now + timedelta(seconds=tat_seconds)
         tx.update(job_ref, {
             "status": "assigned",
@@ -7434,6 +7447,8 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
             else:
                 if item.get("status") != "approved":
                     continue
+                if str(item.get("job_type") or "").strip().lower() == "pdf_job":
+                    continue
                 claimable_parts = []
                 claimable_full_job = True
             # A worker can assess the listing but cannot read client files or
@@ -7481,6 +7496,12 @@ def _pdf_job_jpeg_bytes(image):
 def _pdf_job_images_from_upload(filename, raw):
     original_name = os.path.basename(filename or "uploaded-image")[:180]
     safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(original_name)[0])[:120] or "image"
+    if original_name.lower().endswith(PDF_JOB_WORD_EXTENSIONS):
+        try:
+            raw = doc_tools.office_to_pdf_bytes(raw, original_name)
+        except doc_tools.ConversionError as exc:
+            raise HTTPException(status_code=400, detail=f"{original_name}: {exc}") from exc
+        original_name = os.path.splitext(original_name)[0] + ".pdf"
     is_pdf = original_name.lower().endswith(".pdf") or raw[:5] == b"%PDF-"
     images = []
     if is_pdf:
@@ -7525,7 +7546,7 @@ def _pdf_job_images_from_upload(filename, raw):
 
 
 @app.post("/human-transcription/admin/pdf-jobs")
-async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] = File(...)):
+async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] = File(...), attachments: List[UploadFile] = File(default=[]), instructions: str = Form("")):
     actor = await _human_actor(request)
     if actor.get("email") != PDF_JOB_ADMIN_EMAIL:
         raise HTTPException(status_code=403, detail=f"PDF Jobs upload is available only to {PDF_JOB_ADMIN_EMAIL}.")
@@ -7536,6 +7557,19 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
     if len(files) > 50:
         raise HTTPException(status_code=413, detail="Upload no more than 50 source files at once.")
     created_jobs, stored_paths = [], []
+    extra_files = []
+    for extra in [item for item in (attachments or []) if getattr(item, "filename", "")][:6]:
+        extra_name = os.path.basename(extra.filename or "reference")[:180]
+        if doc_tools.file_extension(extra_name) not in PDF_JOB_ATTACHMENT_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"{extra_name} is not a supported reference file. Use PDF, Word or audio.")
+        extra_raw = await extra.read(PDF_JOB_MAX_UPLOAD_BYTES + 1)
+        if not extra_raw:
+            raise HTTPException(status_code=400, detail=f"{extra_name} is empty.")
+        if len(extra_raw) > PDF_JOB_MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"{extra_name} is larger than 25 MB.")
+        extra_files.append((extra_name, extra_raw, extra.content_type or "application/octet-stream"))
+    admin_note = str(instructions or "").strip()[:4000]
+    job_instructions = PDF_JOB_DEFAULT_INSTRUCTION + (f"\n\n{admin_note}" if admin_note else "")
 
     async def rollback():
         bucket = _human_bucket()
@@ -7568,14 +7602,20 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                 image_meta = await asyncio.to_thread(_human_store_raw_bytes, job_id, rendered["name"], rendered["raw"], "image/jpeg", "pdf")
                 stored_paths.append(image_meta["storage_path"])
                 image_meta.update({key: rendered[key] for key in ("source_filename", "page_number", "page_count")})
+                reference_meta = []
+                for extra_name, extra_raw, extra_type in extra_files:
+                    meta = await asyncio.to_thread(_human_store_raw_bytes, job_id, extra_name, extra_raw, extra_type, "instructions")
+                    stored_paths.append(meta["storage_path"])
+                    reference_meta.append(meta)
                 now = firestore.SERVER_TIMESTAMP
                 job = {
                     "job_type": "pdf_job", "source_type": "pdf_job", "status": "approved",
+                    "tat_seconds": PDF_JOB_TAT_SECONDS, "instruction_attachments": reference_meta,
                     "createdAt": now, "updatedAt": now,
                     "seconds": 180, "minutes": 1,
                     "turnaround": "standard", "difficulty": "standard", "service": "pdf_transcription", "formatting": "standard",
                     "timestamps": False, "speakers": "1", "speaker_labels": False,
-                    "instructions": "Always use Gemini for image transcription",
+                    "instructions": job_instructions,
                     "pdf_image": image_meta, "audio": None,
                     "quote_credits": 0,
                     "quote": {"credits": 0, "minutes": 1, "transcriber_payout_kes_per_minute": PDF_JOB_WORKER_PAY_KES, "worker_fixed_amount_kes": PDF_JOB_WORKER_PAY_KES},
@@ -7588,7 +7628,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                 }
                 await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, job)
                 created_jobs.append(job_id)
-        return {"created_count": len(created_jobs), "jobs": created_jobs, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES}
+        return {"created_count": len(created_jobs), "jobs": created_jobs, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
     except HTTPException:
         await rollback()
         raise
@@ -7615,11 +7655,14 @@ async def human_admin_list_pdf_jobs(request: Request):
             "source_filename": image.get("source_filename") or "", "page_number": image.get("page_number") or 1,
             "page_count": image.get("page_count") or 1, "status": item.get("status") or "approved",
             "worker_name": item.get("worker_name") or "", "worker_email": item.get("worker_email") or "",
+            "worker_uid": item.get("worker_uid") or "",
+            "reference_files": len(item.get("instruction_attachments") or []),
+            "deadline_at": _human_iso(item.get("deadlineAt")),
             "worker_amount_kes": int(item.get("worker_amount_kes") or 0),
             "created_at": _human_iso(item.get("createdAt")), "submitted_at": _human_iso(item.get("workerCompletedAt")),
         })
     jobs.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-    return {"jobs": jobs[:500], "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES}
+    return {"jobs": jobs[:500], "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
 
 
 @app.get("/human-transcription/notifications")
@@ -8484,11 +8527,14 @@ async def human_admin_rate_part(job_id: str, request: Request):
     own = [float(item["rating"]) for item in part_ratings.values() if str(item.get("worker_uid")) == worker_uid]
     ratings_by_worker = dict(job.get("worker_ratings") or {})
     ratings_by_worker[worker_uid] = round(sum(own) / len(own), 2)
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+    rating_update = {
         "part_ratings": part_ratings,
         "worker_ratings": ratings_by_worker,
         "updatedAt": firestore.SERVER_TIMESTAMP,
-    })
+    }
+    if target_id in (job.get("proofreader_suggested_ratings") or {}):
+        rating_update[f"proofreader_suggested_ratings.{target_id}"] = firestore.DELETE_FIELD
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, rating_update)
     await _human_worker_rating_summary(worker_uid, force_refresh=True)
     return {"status": "rated", "job_id": job_id, "segment_id": target_id, "rating": rating, "worker_average_on_job": ratings_by_worker[worker_uid]}
 
@@ -11238,6 +11284,164 @@ async def user_chat_attachment(other_uid: str, message_id: str, request: Request
     raw = await asyncio.to_thread(blob.download_as_bytes)
     filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "attachment")) or "attachment"
     return Response(content=raw, media_type=meta.get("content_type") or "application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+@app.post("/human-transcription/jobs/{job_id}/proofreader-ratings")
+async def human_proofreader_save_ratings(job_id: str, request: Request):
+    """A proofreader's suggested ratings. Saved for the admin to apply or ignore;
+    nothing here changes any worker's real rating."""
+    actor = await _human_actor(request)
+    job = await _human_job(job_id)
+    if job.get("proofreader_uid") != actor.get("uid") or job.get("proofreader_status") not in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=403, detail="Only the assigned proofreader can rate this job's parts.")
+    payload = await request.json()
+    valid_ids = {str((item or {}).get("id") or "") for item in (job.get("segments") or [])}
+    saved = {}
+    for entry in (payload.get("ratings") or [])[:60]:
+        if not isinstance(entry, dict):
+            continue
+        segment_id = str(entry.get("segment_id") or "").strip()
+        if segment_id not in valid_ids:
+            continue
+        try:
+            rating = int(entry.get("rating"))
+        except (TypeError, ValueError):
+            continue
+        if rating < 1 or rating > 5:
+            continue
+        saved[segment_id] = {"rating": rating, "note": str(entry.get("note") or "").strip()[:1000], "proofreader_uid": actor["uid"], "at": datetime.now().isoformat()}
+    if not saved:
+        return {"status": "nothing_to_save", "saved": 0}
+    updates = {f"proofreader_suggested_ratings.{key}": value for key, value in saved.items()}
+    updates["updatedAt"] = firestore.SERVER_TIMESTAMP
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    return {"status": "saved", "saved": len(saved)}
+
+
+@app.post("/human-transcription/jobs/{job_id}/proofreader-ratings/dismiss")
+async def human_admin_dismiss_proofreader_rating(job_id: str, request: Request):
+    _require_human_job_admin(request)
+    payload = await request.json()
+    segment_id = str(payload.get("segment_id") or "").strip()
+    if not segment_id:
+        raise HTTPException(status_code=400, detail="Choose which suggestion to dismiss.")
+    await _human_job(job_id)
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        f"proofreader_suggested_ratings.{segment_id}": firestore.DELETE_FIELD,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    return {"status": "dismissed", "segment_id": segment_id}
+
+
+@app.get("/human-transcription/admin/worker-options")
+async def human_admin_worker_options(request: Request):
+    """Approved workers an admin can pick from, reachable by the PDF Jobs admin too."""
+    _require_human_job_admin(request)
+    snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
+    workers = []
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        workers.append({"uid": snap.id, "name": data.get("name") or data.get("displayName") or data.get("email") or "Worker", "email": data.get("email") or "", "available": data.get("is_available", True) is not False})
+    workers.sort(key=lambda item: str(item["name"]).lower())
+    return {"workers": workers}
+
+
+# ---------------------------------------------------------------------------
+# Free document tools (public, no account needed, nothing is stored)
+# ---------------------------------------------------------------------------
+TOOLS_MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+TOOLS_RATE_LIMIT = 20
+TOOLS_RATE_WINDOW_SECONDS = 3600
+_tools_hits = {}
+
+
+def _tools_client_ip(request: Request):
+    forwarded = request.headers.get("x-forwarded-for") or ""
+    return (forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown"))[:64]
+
+
+def _tools_rate_limited(ip, now=None, hits=None, limit=TOOLS_RATE_LIMIT, window=TOOLS_RATE_WINDOW_SECONDS):
+    """True when this address has used up its conversions for the hour."""
+    hits = _tools_hits if hits is None else hits
+    now = time.time() if now is None else now
+    recent = [t for t in hits.get(ip, []) if now - t < window]
+    if len(recent) >= limit:
+        hits[ip] = recent
+        return True
+    recent.append(now)
+    hits[ip] = recent
+    if len(hits) > 5000:
+        for key in [k for k, v in hits.items() if not v or now - v[-1] >= window]:
+            hits.pop(key, None)
+    return False
+
+
+@app.post("/tools/convert")
+async def tools_convert(request: Request, file: UploadFile = File(...), target: str = Form(...)):
+    if _tools_rate_limited(_tools_client_ip(request)):
+        raise HTTPException(status_code=429, detail="You have reached the free limit of 20 conversions an hour. Please try again a little later.")
+    raw = await file.read(TOOLS_MAX_UPLOAD_BYTES + 1)
+    if not raw:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    if len(raw) > TOOLS_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="That file is larger than 15 MB. The free tool handles files up to 15 MB.")
+    try:
+        name, content_type, data = await asyncio.to_thread(doc_tools.convert, file.filename or "document", raw, target)
+    except doc_tools.ConversionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        logger.exception("Free document conversion failed")
+        raise HTTPException(status_code=500, detail="The conversion failed. Please try a different file.")
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "", name) or "converted"
+    return Response(content=data, media_type=content_type, headers={
+        "Content-Disposition": f'attachment; filename="{safe}"',
+        "Access-Control-Expose-Headers": "Content-Disposition",
+        "Cache-Control": "no-store",
+    })
+
+
+# ---------------------------------------------------------------------------
+# info@typemywordz.ai only: format a finished transcript with the general guidelines
+# ---------------------------------------------------------------------------
+FORMAT_SYSTEM_PROMPT = (
+    "You format finished transcripts for TypeMyworDz. Apply the GUIDELINES below to the transcript the user sends. "
+    "Keep the speaker's words, meaning, word order and grammar exactly; never paraphrase, add or remove content. "
+    "Fix only what the guidelines ask for: numbers, dates, times, capitalisation, punctuation, spelling of spelled-out words, headings and paragraphing. "
+    "Start every body paragraph with a tab character and put two spaces after every sentence. Use straight quotes and apostrophes. "
+    "Reply with the formatted transcript only, no introduction and no commentary.\n\nGUIDELINES:\n"
+)
+
+
+@app.post("/api/format-transcript")
+async def format_transcript_with_guidelines(request: Request):
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    if email != PDF_JOB_ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="This option is not available on your account.")
+    payload = await request.json()
+    text = str((payload or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="There is no transcript to format.")
+    if len(text) > 180000:
+        raise HTTPException(status_code=413, detail="This transcript is too long to format in one go.")
+    guidelines = await _admin_guidelines_text()
+    if not guidelines.strip():
+        raise HTTPException(status_code=503, detail="The guidelines are not available right now.")
+    model_id, provider = resolve_ask_model(str((payload or {}).get("model") or ""), "free", email, True, True)
+    try:
+        result = await asyncio.to_thread(_run_ask_model, model_id, provider, FORMAT_SYSTEM_PROMPT + guidelines[:60000], text, 16000)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Format with guidelines failed")
+        raise HTTPException(status_code=502, detail="The formatting could not be completed. Please try again.")
+    formatted = str(result if isinstance(result, str) else (result or {}).get("text") or "").strip()
+    if formatted.startswith("```"):
+        formatted = re.sub(r"^```[a-zA-Z]*\n?|```$", "", formatted).strip()
+    if not formatted:
+        raise HTTPException(status_code=502, detail="The formatting came back empty. Please try again.")
+    formatted = _review_enforce_indent(_review_normalise_sentence_spacing(formatted), [text])
+    return {"text": formatted, "html": _review_text_to_html(formatted), "model": model_id}
+
 
 if __name__ == "__main__":
     logger.info("Starting Uvicorn server directly...")

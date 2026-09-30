@@ -79,6 +79,24 @@ RUN set -eux; \
     FFPROBE_V="$(ffprobe -version)"; echo "$FFPROBE_V" | head -1; \
     rm -rf /var/lib/apt/lists/*
 
+# LibreOffice turns Word documents into PDF for the free Tools pages and for
+# PDF Jobs. It is a nice-to-have, so this layer is deliberately NON-FATAL: there
+# is no "set -e", a failed attempt only logs, and the last line always succeeds.
+# If it is missing the app still starts and the Word conversions reply that
+# they are temporarily unavailable.
+RUN for attempt in 1 2 3; do \
+        echo "libreoffice install, attempt $attempt of 3"; \
+        if apt-get update -o Acquire::Retries=5 \
+           && apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+                libreoffice-writer libreoffice-core fonts-liberation fonts-dejavu-core; then \
+            break; \
+        fi; \
+        rm -rf /var/lib/apt/lists/*; \
+        sleep 5; \
+    done; \
+    rm -rf /var/lib/apt/lists/*; \
+    (command -v soffice && echo "libreoffice ready") || echo "libreoffice missing, Word conversion disabled"
+
 # A current pip resolves this dependency set far more reliably than the
 # one bundled with the base image.
 RUN pip install --no-cache-dir --upgrade pip
