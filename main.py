@@ -9943,18 +9943,179 @@ def _parse_json_object(text):
     return json.loads(raw[start:end + 1])
 
 
+_SENTENCE_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "jr", "sr", "st", "vs", "no", "inc", "ltd", "co", "corp", "etc", "e.g", "i.e",
+    "prof", "gen", "sgt", "lt", "col", "capt", "rev", "hon", "mt", "ave", "blvd", "dept", "u.s", "a.m", "p.m",
+}
+
+
+def _review_two_space_style(texts):
+    """True when the submitted transcripts already put two spaces after sentences."""
+    two = len(re.findall(r"[.!?][\"')\]]?  +[A-Z\"'(\[0-9]", "\n".join(texts)))
+    one = len(re.findall(r"[.!?][\"')\]]? [A-Z\"'(\[0-9]", "\n".join(texts)))
+    return two > 0 and two >= one
+
+
+def _review_normalise_sentence_spacing(text):
+    """Exactly two spaces after a sentence end, leaving abbreviations and initials alone."""
+    def fix(match):
+        head = match.string[max(0, match.start() - 12):match.start()]
+        word = re.search(r"([A-Za-z.]+)$", head)
+        token = (word.group(1) if word else "").lower().strip(".")
+        if match.group(1) == "." and (token in _SENTENCE_ABBREVIATIONS or (len(token) == 1 and token.isalpha())):
+            return match.group(0)
+        return match.group(1) + "  "
+    return re.sub(r"([.!?][\"')\]]?)[ ]{1,3}(?=[A-Z\"'(\[0-9])", fix, text)
+
+
+def _review_text_to_html(text):
+    from html import escape
+    lines = str(text or "").split("\n")
+    return "".join(f"<div>{escape(line) if line else '<br>'}</div>" for line in lines)
+
+
+def _review_enforce_indent(text, source_texts):
+    """If the parts are written with a tab at the start of each paragraph, keep that."""
+    lines = [line for src in source_texts for line in str(src or "").split("\n") if line.strip()]
+    if not lines:
+        return text
+    if sum(1 for line in lines if line.startswith("\t")) / len(lines) < 0.6:
+        return text
+    out = []
+    for line in str(text or "").split("\n"):
+        stripped = line.lstrip(" \t")
+        if not stripped or line.startswith("\t"):
+            out.append(line)
+            continue
+        letters = [ch for ch in stripped if ch.isalpha()]
+        is_heading = bool(letters) and all(ch.isupper() for ch in letters) and len(stripped) <= 90
+        is_flush = stripped.startswith(("[", "Client spellings", "My spellings", "I searched"))
+        out.append(line if (is_heading or is_flush) else "\t" + stripped)
+    return "\n".join(out)
+
+
+def _gemini_research_blocking(prompt, model_id="gemini-3.8-flash"):
+    """Ask Gemini, with Google Search switched on, to verify spellings on the open web."""
+    if not GEMINI_API_KEY:
+        return ""
+    r = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent",
+        params={"key": GEMINI_API_KEY},
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "tools": [{"google_search": {}}],
+            "generationConfig": {"maxOutputTokens": 8000},
+        },
+        timeout=180,
+    )
+    if r.status_code != 200:
+        logger.warning("Research call returned %s: %s", r.status_code, r.text[:300])
+        return ""
+    cand = (r.json().get("candidates") or [{}])[0]
+    return "".join(p.get("text", "") for p in ((cand.get("content") or {}).get("parts") or [])).strip()
+
+
+async def _human_review_context(job_id, job):
+    """Job instructions, reference files and admin notes to workers, as plain text."""
+    notes = []
+    base = str(job.get("instructions") or job.get("notes") or job.get("client_notes") or job.get("special_instructions") or "").strip()
+    if base:
+        notes.append("JOB INSTRUCTIONS:\n" + base[:12000])
+    for item in (job.get("segments") or []):
+        extra = str((item or {}).get("instructions") or (item or {}).get("notes") or "").strip()
+        if extra:
+            notes.append(f"NOTE FOR {item.get('label') or item.get('id')}:\n{extra[:4000]}")
+    try:
+        ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id).collection("messages")
+        snaps = await asyncio.to_thread(lambda: list(ref.order_by("createdAt").stream()))
+        said = []
+        for snap in snaps:
+            data = snap.to_dict() or {}
+            if str(data.get("thread") or "client") == "worker" and str(data.get("sender_role") or "") == "admin" and data.get("message"):
+                said.append("- " + str(data["message"])[:1500])
+        if said:
+            notes.append("MESSAGES THE ADMIN SENT TO THE WORKERS ON THIS JOB:\n" + "\n".join(said[:30]))
+    except Exception as exc:
+        logger.warning("Could not read job messages for review %s: %s", job_id, exc)
+    files = []
+    bucket = _human_bucket()
+    for meta in (job.get("instruction_attachments") or [])[:6]:
+        path = (meta or {}).get("storage_path")
+        if not path or bucket is None or not str(path).startswith(f"human-workflow/{job_id}/instructions/"):
+            continue
+        try:
+            blob = bucket.blob(path)
+            if not await asyncio.to_thread(blob.exists):
+                continue
+            raw = await asyncio.to_thread(blob.download_as_bytes)
+            read = read_attachment(str(meta.get("name") or "file"), raw)
+            if read.get("kind") == "text":
+                files.append(f"REFERENCE FILE \"{read['name']}\":\n{read['text'][:30000]}")
+            else:
+                files.append(f"REFERENCE FILE \"{meta.get('name')}\" could not be read as text.")
+        except Exception as exc:
+            logger.warning("Could not read reference file for review %s: %s", job_id, exc)
+    return "\n\n".join(notes + files)
+
+
+_REVIEW_SYSTEM = (
+    "You are the senior quality reviewer for a human transcription company. You turn the transcript parts written by one or more "
+    "transcribers into ONE final, client-ready transcript.\n"
+    "RULES\n"
+    "1. The FIRST part is the authority for spellings. Its dictation contains the spellings the client gave (names, terms, places). Every name and word in every later part must be spelled exactly as the first part spells it. Never re-spell anything the client spelled out.\n"
+    "2. Follow the job instructions, the reference files, the admin's notes to the workers and the company guidelines. Where they conflict, the job instructions and reference files win over the general guidelines.\n"
+    "3. Use the RESEARCH RESULTS to correct spelling or capitalisation of proper nouns that the client did not spell. Change a term only when the research is confident. Research never permits changing the dictated wording, adding words or replacing one entity with another.\n"
+    "4. Do NOT paraphrase, rearrange, professionalise or add or remove meaning. Only fix spelling, capitalisation, numbers, dates, times, punctuation, spacing and formatting to the rules above. Keep the dictated wording and word order.\n"
+    "5. Keep the formatting exactly as the parts use it: real TAB characters at the start of paragraphs, a blank line between paragraphs, flush-left plain headings, and two spaces after every sentence if the parts use that. Never convert tabs to spaces and never collapse double spaces.\n"
+    "6. Output the transcript once, in order, with no part labels and no commentary inside it.\n"
+    "REPLY FORMAT (exactly, with these two marker lines):\n"
+    "<<<TRANSCRIPT>>>\n(the full final transcript)\n<<<NOTES>>>\n"
+    "then ONE JSON object: "
+    '{"parts": [{"segment_id": string, "rating": number 1-5, "accuracy": string, "notes": string}], '
+    '"changes": [{"part": string, "before": string, "after": string, "why": string}], '
+    '"issues": [string], "summary": string}. '
+    "List EVERY change you made to a part (spelling, name, number, format, instruction followed) in \"changes\", each with a short reason. "
+    "Rate each part 1-5 for accuracy and for following the instructions and guidelines."
+)
+
+
+def _review_split_output(answer):
+    raw = str(answer or "")
+    if "<<<TRANSCRIPT>>>" not in raw or "<<<NOTES>>>" not in raw:
+        raise ValueError("missing markers")
+    body = raw.split("<<<TRANSCRIPT>>>", 1)[1]
+    text, notes = body.split("<<<NOTES>>>", 1)
+    text = text.strip("\n")
+    if text.strip().startswith("```"):
+        text = text.strip().strip("`")
+    try:
+        data = _parse_json_object(notes)
+    except Exception:
+        data = {}
+    return text, data
+
+
 @app.post("/human-transcription/jobs/{job_id}/ai-review")
 async def human_admin_ai_review(job_id: str, request: Request):
-    """AI proofreading and combining: standardise, merge and rate the parts."""
+    """AI proofreading: standardise one or more parts into a single client-ready transcript."""
     actor = await _human_actor(request)
     if actor.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
     job = await _human_job(job_id)
-    if not _human_is_split_job(job):
-        raise HTTPException(status_code=409, detail="AI combining is for jobs that were split into parts.")
-    segments = job.get("segments") or []
-    if not segments or not all(item.get("status") == "submitted" for item in segments):
-        raise HTTPException(status_code=409, detail="Every part must be submitted before the AI can combine them.")
+    if str(job.get("job_type") or "").lower() == "pdf_job":
+        raise HTTPException(status_code=409, detail="The AI review is for audio jobs.")
+    if _human_is_split_job(job):
+        segments = job.get("segments") or []
+        if not all(item.get("status") == "submitted" for item in segments):
+            raise HTTPException(status_code=409, detail="Every part must be submitted before the AI can combine them.")
+        parts = [{"id": str(item.get("id")), "label": str(item.get("label") or f"Part {i + 1}"), "text": str(item.get("transcript") or "")} for i, item in enumerate(segments)]
+    else:
+        if job.get("status") not in {"submitted", "client_review", "client_approved", "released"} or not str(job.get("transcript") or "").strip():
+            raise HTTPException(status_code=409, detail="The worker has not submitted a transcript for this job yet.")
+        parts = [{"id": "main", "label": "Full transcript", "text": str(job.get("transcript") or "")}]
+    if not any(p["text"].strip() for p in parts):
+        raise HTTPException(status_code=409, detail="The submitted parts have no typed text. Attached files cannot be reviewed by the AI.")
     try:
         payload = await request.json()
     except Exception:
@@ -9962,55 +10123,107 @@ async def human_admin_ai_review(job_id: str, request: Request):
     email = actor.get("email") or ""
     model_id, provider = resolve_ask_model(str((payload or {}).get("model") or ""), "free", email, True, True)
     guidelines = await _admin_guidelines_text()
-    instructions = str(job.get("instructions") or job.get("notes") or job.get("client_notes") or job.get("special_instructions") or "")[:8000]
-    part_blocks = []
-    for index, item in enumerate(segments):
-        part_blocks.append(f"=== PART {index + 1} (id: {item.get('id')}) ===\n{item.get('transcript') or ''}")
-    system_prompt = (
-        "You are the senior quality reviewer for a human transcription company. "
-        "You receive transcript parts written by different transcribers, the company's general guidelines, and this job's specific instructions. "
-        "Do three things: (1) merge the parts into one final transcript in order, standardising spelling, names, numbers, dates, punctuation and formatting "
-        "to the guidelines and the job instructions, WITHOUT paraphrasing, adding or removing meaning; (2) rate each part from 1 to 5 for accuracy and for following "
-        "the guidelines and job instructions, with a short note; (3) list any issues you could not resolve. "
-        "Reply with ONE JSON object only, no commentary, in exactly this shape: "
-        '{"combined_text": string, "parts": [{"segment_id": string, "rating": number, "accuracy": string, "notes": string}], "issues": [string], "summary": string}'
-    )
-    question = (
-        f"GENERAL GUIDELINES:\n{guidelines[:60000]}\n\nJOB INSTRUCTIONS:\n{instructions or 'None supplied.'}\n\nTRANSCRIPT PARTS:\n\n" + "\n\n".join(part_blocks)
-    )[:400000]
+    context = await _human_review_context(job_id, job)
+    texts = [p["text"] for p in parts]
+    first_text = parts[0]["text"]
+
+    research_text = ""
+    issues = []
     try:
-        answer = await asyncio.to_thread(_run_ask_model, model_id, provider, system_prompt, question, 16000)
-        review = _parse_json_object(answer)
+        research_prompt = (
+            "Below is a dictated transcript. List every proper noun and specialist term in it: people, agencies, organisations, programs, companies, places, street addresses, statutes or citations, and unusual medical or legal terms. "
+            "The FIRST PART is where the client gave correct spellings, so any term the client spelled out or whose spelling the first part fixes is authoritative and needs no search. "
+            "For every other term, search the web to confirm the correct spelling and capitalisation and what it is. "
+            "Answer with one line per term in this form: written form | verified spelling | what it is | confident (yes/no). Do not include anything else.\n\n"
+            f"JOB CONTEXT:\n{context[:8000] or 'None.'}\n\nFIRST PART:\n{first_text[:30000]}\n\nTHE REST:\n" + "\n\n".join(texts[1:])[:60000]
+        )
+        research_text = await asyncio.to_thread(_gemini_research_blocking, research_prompt)
+        if not research_text:
+            issues.append("Web research could not be completed, so spellings were standardised to the first part and the guidelines only.")
     except Exception as exc:
-        logger.warning("AI review failed for %s: %s", job_id, exc)
-        raise HTTPException(status_code=502, detail="The AI review could not be completed. Try again, or pick a different model in settings.")
-    ids = {str(item.get("id")) for item in segments}
+        logger.warning("AI review research failed for %s: %s", job_id, exc)
+        issues.append("Web research could not be completed, so spellings were standardised to the first part and the guidelines only.")
+
+    indent_hint = "Paragraphs start with a TAB character." if sum(1 for line in "\n".join(texts).split("\n") if line.startswith("\t")) > 0 else "Follow the layout the parts use."
+    spacing_hint = "Use two spaces after every sentence." if _review_two_space_style(texts) else "Follow the sentence spacing the parts use."
+    shared = (
+        f"COMPANY GUIDELINES:\n{guidelines[:50000]}\n\n{context or 'NO EXTRA JOB INSTRUCTIONS WERE SUPPLIED.'}\n\n"
+        f"RESEARCH RESULTS (spelling checks):\n{research_text[:12000] or 'None available.'}\n\nFORMAT: {indent_hint} {spacing_hint}\n\n"
+    )
+    # Long jobs are reviewed in batches so nothing is cut off. Every batch is
+    # shown the first part so the spellings stay identical across the job.
+    batches, current, size = [], [], 0
+    for index, part in enumerate(parts):
+        length = len(part["text"])
+        if current and size + length > 45000:
+            batches.append(current)
+            current, size = [], 0
+        current.append(index)
+        size += length
+    if current:
+        batches.append(current)
+
+    final_chunks, all_parts, all_changes, summary_bits = [], [], [], []
+    for batch in batches:
+        blocks = []
+        if 0 not in batch:
+            blocks.append(f"=== FIRST PART (spelling authority only, do not repeat it in your transcript) ===\n{first_text[:30000]}")
+        for index in batch:
+            blocks.append(f"=== {parts[index]['label'].upper()} (id: {parts[index]['id']}) ===\n{parts[index]['text']}")
+        question = shared + "TRANSCRIPT PARTS TO REVIEW:\n\n" + "\n\n".join(blocks)
+        try:
+            answer = await asyncio.to_thread(_run_ask_model, model_id, provider, _REVIEW_SYSTEM, question[:450000], 16000)
+            text, data = _review_split_output(answer)
+        except Exception as exc:
+            logger.warning("AI review failed for %s: %s", job_id, exc)
+            raise HTTPException(status_code=502, detail="The AI review could not be completed. Try again, or pick a different model in settings.")
+        if not text.strip():
+            raise HTTPException(status_code=502, detail="The AI returned an empty transcript. Please run it again.")
+        final_chunks.append(text)
+        all_parts.extend(data.get("parts") or [])
+        all_changes.extend(data.get("changes") or [])
+        issues.extend(str(x)[:600] for x in (data.get("issues") or []))
+        if data.get("summary"):
+            summary_bits.append(str(data["summary"]))
+
+    combined = "\n\n".join(chunk.strip("\n") for chunk in final_chunks)
+    combined = _review_enforce_indent(combined, texts)
+    if _review_two_space_style(texts):
+        combined = _review_normalise_sentence_spacing(combined)
+
+    ids = {p["id"] for p in parts}
     clean_parts = []
-    for item in review.get("parts") or []:
-        sid = str(item.get("segment_id") or "")
+    for item in all_parts:
+        sid = str((item or {}).get("segment_id") or "")
         try:
             rating = max(1, min(5, int(round(float(item.get("rating"))))))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             continue
         if sid in ids:
             clean_parts.append({"segment_id": sid, "rating": rating, "accuracy": str(item.get("accuracy") or "")[:600], "notes": str(item.get("notes") or "")[:1200]})
+    clean_changes = []
+    for item in all_changes[:400]:
+        if isinstance(item, dict) and (item.get("why") or item.get("after")):
+            clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     saved = {
-        "combined_text": str(review.get("combined_text") or "")[:1000000],
+        "combined_text": combined[:1000000],
+        "combined_html": _review_text_to_html(combined[:1000000]),
         "parts": clean_parts,
-        "issues": [str(x)[:600] for x in (review.get("issues") or [])][:40],
-        "summary": str(review.get("summary") or "")[:2000],
+        "changes": clean_changes,
+        "issues": issues[:40],
+        "research": research_text[:12000],
+        "summary": " ".join(summary_bits)[:2000],
+        "whole_job": not _human_is_split_job(job),
         "model": model_id,
         "createdAt": datetime.now().isoformat(),
     }
-    if not saved["combined_text"].strip():
-        raise HTTPException(status_code=502, detail="The AI returned an empty transcript. Please run it again.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"ai_review": saved, "updatedAt": firestore.SERVER_TIMESTAMP})
     return {"ai_review": saved}
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-review/apply")
 async def human_admin_apply_ai_review(job_id: str, request: Request):
-    """Use the AI's combined text as the final transcript, without a proofreader."""
+    """Use the AI's final transcript, keeping the Word-style formatting."""
     actor = await _human_actor(request)
     if actor.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
@@ -10018,13 +10231,21 @@ async def human_admin_apply_ai_review(job_id: str, request: Request):
     review = job.get("ai_review") or {}
     if not str(review.get("combined_text") or "").strip():
         raise HTTPException(status_code=409, detail="Run the AI review first.")
+    html = review.get("combined_html") or _review_text_to_html(review.get("combined_text"))
+    if not _human_is_split_job(job):
+        if job.get("status") != "submitted":
+            raise HTTPException(status_code=409, detail="This job has already moved past admin review.")
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+            "transcript": review.get("combined_text"), "transcript_html": html, "ai_combined": True, "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        return {"status": "submitted", "job_id": job_id}
     segments = job.get("segments") or []
     if not segments or not all(item.get("status") == "submitted" for item in segments):
         raise HTTPException(status_code=409, detail="Every part must be submitted first.")
     if job.get("proofreader_status") in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="A proofreader is working on this job. Take it back first.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-        "status": "submitted", "transcript": review.get("combined_text"), "transcript_html": "",
+        "status": "submitted", "transcript": review.get("combined_text"), "transcript_html": html,
         "ai_combined": True, "proofreader_status": "skipped",
         "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
     })
