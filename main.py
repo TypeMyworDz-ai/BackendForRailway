@@ -1401,6 +1401,46 @@ async def _complete_human_admin_notifications(job_id: str, kinds, *, target_id: 
         await _update_user_notification_states(uid, job_id=job_id, target_id=target_id, kinds=set(kinds or []), read=True, completed=True)
 
 
+async def _notify_available_workers(job_id: str, title: str, body: str):
+    """Tell every approved, available worker who can claim that work is open.
+    Runs as a background task so approval never waits on it."""
+    if not db:
+        return
+    try:
+        snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
+    except Exception as exc:
+        logger.warning("Could not load workers to notify for %s: %s", job_id, exc)
+        return
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        if data.get("is_available", True) is False:
+            continue
+        try:
+            count = int(data.get("worker_rating_count") or 0)
+            average = float(data.get("worker_rating_average")) if count else None
+        except (TypeError, ValueError):
+            average = None
+        if average is None or average < MIN_HUMAN_WORKER_RATING:
+            continue
+        await _create_user_notification(
+            snap.id, f"human-available:{job_id}", "job_available", title, body,
+            route="human_worker", job_id=job_id, target_id=job_id, requires_action=False,
+        )
+
+
+async def _complete_available_notifications(job_id: str):
+    """Clear the 'work is available' alerts once a whole job has been taken."""
+    if not db:
+        return
+    try:
+        snapshots = await asyncio.to_thread(lambda: list(db.collection(USER_NOTIFICATION_COLLECTION).where(filter=FieldFilter("job_id", "==", job_id)).stream()))
+        for snap in snapshots:
+            if (snap.to_dict() or {}).get("kind") == "job_available":
+                await asyncio.to_thread(snap.reference.set, {"readAt": firestore.SERVER_TIMESTAMP, "actionCompletedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    except Exception as exc:
+        logger.warning("Could not clear availability alerts for %s: %s", job_id, exc)
+
+
 async def _notify_worker_assignment(job_id: str, worker_uid: str, label: str, assigned_at, *, segment_id: str = ""):
     if not worker_uid:
         return
@@ -8224,6 +8264,11 @@ async def human_admin_approve(job_id: str, request: Request):
             str(job["client_uid"]), f"human-approved:{job_id}", "job_approved", "Your Human Work request is approved",
             "Approved work is now being picked up by an available transcriber.", route="human_job", job_id=job_id, target_id=job_id,
         )
+    available_body = (
+        f"{len(segments)} parts are open to claim on the Available Jobs board."
+        if segments else "A new job is open to claim on the Available Jobs board."
+    )
+    asyncio.create_task(_notify_available_workers(job_id, "New work is available", available_body))
     return {"status": next_status, "job_id": job_id, "parts_count": len(segments)}
 
 
@@ -8250,6 +8295,8 @@ async def human_worker_claim(job_id: str, request: Request):
         logger.exception("Could not claim Human Work %s for %s", job_id, actor["uid"])
         raise HTTPException(status_code=409, detail="That work could not be claimed. Refresh the board and try again.") from exc
     await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id=segment_id or job_id)
+    if not segment_id:
+        asyncio.create_task(_complete_available_notifications(job_id))
     # A worker who claims work for themselves is already looking at it, so no
     # notification is sent. Notifications are kept for things that happen TO
     # a worker: direct assignments, proofreading jobs, deadline changes.
