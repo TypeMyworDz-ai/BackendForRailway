@@ -11475,11 +11475,11 @@ TOOLS_MAX_AUDIO_BYTES = 40 * 1024 * 1024
 
 
 @app.post("/tools/convert-audio")
-async def tools_convert_audio(request: Request, file: UploadFile = File(...), target: str = Form("mp3"), bitrate: str = Form("96"), mono: str = Form("")):
+async def tools_convert_audio(request: Request, file: UploadFile = File(...), target: str = Form("mp3"), bitrate: str = Form("96"), mono: str = Form(""), trim: str = Form("")):
     _tools_check_rate(request)
     raw = await _tools_read(request, file, TOOLS_MAX_AUDIO_BYTES)
     async with _tools_audio_slots:
-        name, content_type, data = await _tools_run(doc_tools.audio_convert, file.filename or "audio", raw, target, bitrate, mono.lower() in ("1", "true", "on", "yes"))
+        name, content_type, data = await _tools_run(doc_tools.audio_convert, file.filename or "audio", raw, target, bitrate, mono.lower() in ("1", "true", "on", "yes"), 180, trim.lower() in ("1", "true", "on", "yes"))
     return _tools_download(name, content_type, data, {"X-Original-Size": str(len(raw)), "X-Result-Size": str(len(data))})
 
 

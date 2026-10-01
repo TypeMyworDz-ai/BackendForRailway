@@ -421,7 +421,7 @@ def compress_pdf(filename, raw, level="recommended"):
     return f"{safe_stem(filename)}-compressed.pdf", "application/pdf", data, len(raw)
 
 
-def audio_convert(filename, raw, target="mp3", bitrate="96", mono=False, timeout=180):
+def audio_convert(filename, raw, target="mp3", bitrate="96", mono=False, timeout=180, trim_silence=False):
     """Any audio or video file in, a smaller or different audio file out, via ffmpeg."""
     target = (target or "mp3").lower()
     if target not in AUDIO_TARGETS:
@@ -442,6 +442,9 @@ def audio_convert(filename, raw, target="mp3", bitrate="96", mono=False, timeout
             command += ["-b:a", f"{bitrate}k"]
         if mono:
             command += ["-ac", "1"]
+        if trim_silence:
+            # Cut the lead-in and shorten every pause longer than 1.2 seconds to 0.4 seconds.
+            command += ["-af", "silenceremove=start_periods=1:start_threshold=-45dB:start_silence=0.2:stop_periods=-1:stop_duration=1.2:stop_threshold=-45dB:stop_silence=0.4"]
         command.append(dst)
         try:
             result = subprocess.run(command, capture_output=True, timeout=timeout)
