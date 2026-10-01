@@ -1957,21 +1957,62 @@ async def update_monthly_revenue_firestore(amount: float):
         return {'success': False, 'error': str(e)}
 
 async def get_user_profile_by_email_firestore(email: str):
-    """Fetches user profile by email to get UID (for webhook processing)."""
+    """Finds the account id for an email address.
+
+    Profiles written by the server (trainees and workers) did not always carry
+    an email field, so after the exact and lower-case lookups we ask Firebase
+    sign-in, which knows every account, and record the email on the profile so
+    the next lookup is instant.
+    """
     if not db:
         logger.error("Firestore client not initialized. Cannot fetch user by email.")
         return None
+    address = str(email or "").strip()
+    if not address:
+        return None
     try:
         users_ref = db.collection('users')
-        query_ref = users_ref.where(filter=FieldFilter("email", "==", email)).limit(1)
-        snapshot = await asyncio.to_thread(query_ref.get) 
-
-        for doc in snapshot:
-            return doc.id
-        return None
+        for candidate in dict.fromkeys([address, address.lower()]):
+            query_ref = users_ref.where(filter=FieldFilter("email", "==", candidate)).limit(1)
+            snapshot = await asyncio.to_thread(query_ref.get)
+            for doc in snapshot:
+                return doc.id
     except Exception as e:
-        logger.error(f"Error fetching user by email {email}: {e}")
+        logger.error(f"Error fetching user by email {address}: {e}")
+    try:
+        auth_user = await asyncio.to_thread(firebase_auth.get_user_by_email, address.lower())
+        uid = auth_user.uid
+        await asyncio.to_thread(db.collection('users').document(uid).set, {"email": address.lower()}, merge=True)
+        return uid
+    except Exception as e:
+        logger.warning(f"No account found for {address}: {e}")
         return None
+
+
+async def _heal_profile_identity(uid: str, email: str, profile: dict) -> dict:
+    """Adds a missing email, and Kenya for trainees and workers, to a profile.
+
+    Additive only: existing values are never overwritten.
+    """
+    if not db or not uid:
+        return profile or {}
+    profile = dict(profile or {})
+    updates = {}
+    if email and not str(profile.get("email") or "").strip():
+        updates["email"] = email.lower()
+    is_kenyan_role = bool(profile.get("workerApproved") is True or profile.get("traineeStatus") or str(profile.get("role") or profile.get("user_type") or "").lower() in {"trainee", "worker"})
+    if is_kenyan_role:
+        if not str(profile.get("country") or "").strip():
+            updates["country"] = "Kenya"
+        if not str(profile.get("countryCode") or "").strip():
+            updates["countryCode"] = "KE"
+    if updates:
+        try:
+            await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
+            profile.update(updates)
+        except Exception as exc:
+            logger.warning("Could not complete profile for %s: %s", uid, exc)
+    return profile
 
 async def analyze_audio_characteristics(audio_path: str) -> dict:
     try:
@@ -2372,7 +2413,7 @@ async def enroll_paid_trainee(email: str, reference: str, amount: float, currenc
     return {"success": True, "trainee_enrolled": True, "email": email, "reference": reference}
 
 
-async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None, reference: Optional[str] = None):
+async def update_user_credits_paystack(email: str, plan_name: str, amount: float, currency: str, update_admin_revenue: bool = False, country_code: Optional[str] = None, reference: Optional[str] = None, user_id: Optional[str] = None):
     """
     Update user credits/plan in Firestore.
     The real-time revenue counter logic is now handled purely on the frontend.
@@ -2385,7 +2426,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
         logger.info(f"📝 Updating credits for {email} - {plan_name} ({amount} {currency}) in Firestore.")
         
         # 1. Get user UID from email
-        user_id = await get_user_profile_by_email_firestore(email)
+        user_id = user_id or await get_user_profile_by_email_firestore(email)
         if not user_id:
             logger.error(f"User with email {email} not found in Firestore. Cannot update plan.")
             return {'success': False, 'error': f"User {email} not found in Firestore."}
@@ -3518,6 +3559,7 @@ async def verify_kora_and_enroll(reference: str):
             update_admin_revenue=bool(intent.get("updateAdminRevenue")),
             country_code=country_code,
             reference=reference,
+            user_id=intent.get("uid") or None,
         )
     if result.get("success"):
         result["plan"] = product
@@ -7206,6 +7248,7 @@ async def _human_actor(request: Request):
     role = "admin" if is_human_job_admin(email) else "client"
     profile = await _load_profile(uid)
     profile = profile or {}
+    profile = await _heal_profile_identity(uid, email, profile)
     # A trainee belongs in the private Training Room until an admin explicitly
     # promotes them.  Only approved workers may see assigned human jobs.
     if profile.get("workerApproved") is True:
@@ -9645,6 +9688,7 @@ async def _trainee_actor(request: Request):
     uid = decoded.get("uid") or ""
     email = (decoded.get("email") or "").strip().lower()
     profile = await _load_profile(uid) or {}
+    profile = await _heal_profile_identity(uid, email, profile)
     return {"uid": uid, "email": email, "profile": profile}
 
 
@@ -9880,6 +9924,21 @@ async def _admin_guidelines_text():
         return ""
 
 
+async def _admin_fill_identity(uid: str, data: dict) -> dict:
+    """Fills a missing email from Firebase sign-in so admins always see it."""
+    data = dict(data or {})
+    email = str(data.get("email") or "").strip()
+    if not email:
+        try:
+            auth_user = await asyncio.to_thread(firebase_auth.get_user, uid)
+            email = (auth_user.email or "").strip().lower()
+            if not data.get("name") and not data.get("displayName") and auth_user.display_name:
+                data["displayName"] = auth_user.display_name
+        except Exception:
+            email = ""
+    return await _heal_profile_identity(uid, email, data)
+
+
 @app.get("/api/admin/workers")
 async def admin_workers(request: Request):
     """Promoted workers with their contact details and current rating."""
@@ -9894,10 +9953,14 @@ async def admin_workers(request: Request):
             rating = await _human_worker_rating_summary(snap.id, data)
         except Exception:
             rating = {"average": None, "count": 0}
+        data = await _admin_fill_identity(snap.id, data)
         rows.append({
             "uid": snap.id,
             "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
             "email": data.get("email") or "",
+            "country": data.get("country") or "Kenya",
+            "official_name": data.get("officialIdName") or "",
+            "mpesa_name": data.get("mpesaRegisteredName") or "",
             "phone": data.get("mpesaNumber") or data.get("phone") or "",
             "rating": rating.get("average"),
             "rating_count": rating.get("count") or 0,
@@ -10049,12 +10112,9 @@ def _review_text_to_html(text):
 
 
 def _review_enforce_indent(text, source_texts):
-    """If the parts are written with a tab at the start of each paragraph, keep that."""
-    lines = [line for src in source_texts for line in str(src or "").split("\n") if line.strip()]
-    if not lines:
-        return text
-    if sum(1 for line in lines if line.startswith("\t")) / len(lines) < 0.6:
-        return text
+    """Put a real tab at the start of every body paragraph."""
+    # The company's default (SW) style is a real tab at the start of every
+    # body paragraph, so it is applied even when the workers' parts lost it.
     out = []
     for line in str(text or "").split("\n"):
         stripped = line.lstrip(" \t")
@@ -10063,7 +10123,7 @@ def _review_enforce_indent(text, source_texts):
             continue
         letters = [ch for ch in stripped if ch.isalpha()]
         is_heading = bool(letters) and all(ch.isupper() for ch in letters) and len(stripped) <= 90
-        is_flush = stripped.startswith(("[", "Client spellings", "My spellings", "I searched"))
+        is_flush = stripped.startswith(("[", "Client spellings", "My spellings", "I searched", "Research Notes"))
         out.append(line if (is_heading or is_flush) else "\t" + stripped)
     return "\n".join(out)
 
@@ -10453,7 +10513,11 @@ async def admin_trainees(request: Request):
             continue
         data["uid"] = data.get("uid") or snap.id
         data["id"] = snap.id
+        data = await _admin_fill_identity(snap.id, data)
+        data["uid"] = data.get("uid") or snap.id
+        data["id"] = snap.id
         data["email"] = data.get("email") or ""
+        data["country"] = data.get("country") or "Kenya"
         data["name"] = data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed applicant"
         submitted = data.get("trainingSubmissions") or {}
         completed_levels = [level for level in range(1, len(TRAINING_LEVELS) + 1) if str(submitted.get(str(level)) or "").lower() == "submitted"]
