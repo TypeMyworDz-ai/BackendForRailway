@@ -5679,9 +5679,9 @@ def build_trainee_welcome_email(name: str):
       <tr><td align="center">
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border:1px solid #e5e6ea;border-radius:10px;padding:32px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
           <tr><td style="font-size:20px;font-weight:700;color:#14161a;padding-bottom:4px;">
-            <span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
+            <img src="https://typemywordz.ai/android-chrome-192x192.png" width="32" height="32" alt="" style="vertical-align:middle;margin-right:8px;border-radius:50%;"><span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
           </td></tr>
-          <tr><td style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#858a95;padding-bottom:24px;">Your everyday AI companion</td></tr>
+          <tr><td style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#858a95;padding-bottom:24px;">Your Transcription Companion</td></tr>
           <tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">GREETING</td></tr>
           <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">Your paid training enrolment is confirmed and your Training Room account is ready.</td></tr>
           <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">Sign in to review the TypeMyworDz standards, work through the training modules, and submit each exercise for review. Your progress is saved in the Training Room.</td></tr>
@@ -5726,10 +5726,10 @@ def build_welcome_email(name: str, free_credits: int = None):
                  style="max-width:560px;background:#ffffff;border:1px solid #e5e6ea;border-radius:10px;padding:32px;
                         font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
             <tr><td style="font-size:20px;font-weight:700;color:#14161a;padding-bottom:4px;">
-              <span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
+              <img src="https://typemywordz.ai/android-chrome-192x192.png" width="32" height="32" alt="" style="vertical-align:middle;margin-right:8px;border-radius:50%;"><span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span>
             </td></tr>
             <tr><td style="font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#858a95;padding-bottom:24px;">
-              Your everyday AI companion
+              Your Transcription Companion
             </td></tr>
             <tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">GREETING</td></tr>
             <tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;">
@@ -11397,6 +11397,93 @@ async def tools_convert(request: Request, file: UploadFile = File(...), target: 
         "Access-Control-Expose-Headers": "Content-Disposition",
         "Cache-Control": "no-store",
     })
+
+
+def _tools_download(name, content_type, data, extra=None):
+    safe = re.sub(r"[^A-Za-z0-9._ -]+", "", name) or "result"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{safe}"',
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Original-Size, X-Result-Size",
+        "Cache-Control": "no-store",
+    }
+    headers.update(extra or {})
+    return Response(content=data, media_type=content_type, headers=headers)
+
+
+async def _tools_read(request: Request, upload: UploadFile, limit=None):
+    limit = limit or TOOLS_MAX_UPLOAD_BYTES
+    raw = await upload.read(limit + 1)
+    if not raw:
+        raise HTTPException(status_code=400, detail="That file is empty.")
+    if len(raw) > limit:
+        raise HTTPException(status_code=413, detail=f"That file is larger than {limit // (1024 * 1024)} MB. The free tool handles files up to {limit // (1024 * 1024)} MB.")
+    return raw
+
+
+def _tools_check_rate(request: Request):
+    if _tools_rate_limited(_tools_client_ip(request)):
+        raise HTTPException(status_code=429, detail="You have reached the free limit of 20 conversions an hour. Please try again a little later.")
+
+
+async def _tools_run(func, *args):
+    try:
+        return await asyncio.to_thread(func, *args)
+    except doc_tools.ConversionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Free tool failed")
+        raise HTTPException(status_code=500, detail="That did not work. Please try a different file.")
+
+
+@app.post("/tools/merge-pdf")
+async def tools_merge_pdf(request: Request, files: List[UploadFile] = File(...)):
+    _tools_check_rate(request)
+    if len(files) > doc_tools.MAX_MERGE_FILES:
+        raise HTTPException(status_code=422, detail=f"You can merge up to {doc_tools.MAX_MERGE_FILES} files at a time.")
+    blobs = []
+    total = 0
+    for upload in files:
+        raw = await _tools_read(request, upload)
+        total += len(raw)
+        if total > TOOLS_MAX_UPLOAD_BYTES * 3:
+            raise HTTPException(status_code=413, detail="Those files add up to more than 45 MB. Merge fewer files at a time.")
+        blobs.append((upload.filename or "document.pdf", raw))
+    name, content_type, data = await _tools_run(doc_tools.merge_pdfs, blobs)
+    return _tools_download(name, content_type, data)
+
+
+@app.post("/tools/split-pdf")
+async def tools_split_pdf(request: Request, file: UploadFile = File(...), mode: str = Form("ranges"), pages: str = Form("")):
+    _tools_check_rate(request)
+    raw = await _tools_read(request, file)
+    mode = mode if mode in ("ranges", "extract", "each") else "ranges"
+    name, content_type, data = await _tools_run(doc_tools.split_pdf, file.filename or "document.pdf", raw, mode, pages)
+    return _tools_download(name, content_type, data)
+
+
+@app.post("/tools/compress-pdf")
+async def tools_compress_pdf(request: Request, file: UploadFile = File(...), level: str = Form("recommended")):
+    _tools_check_rate(request)
+    raw = await _tools_read(request, file)
+    name, content_type, data, original = await _tools_run(doc_tools.compress_pdf, file.filename or "document.pdf", raw, level)
+    return _tools_download(name, content_type, data, {"X-Original-Size": str(original), "X-Result-Size": str(len(data))})
+
+
+TOOLS_MAX_AUDIO_BYTES = 40 * 1024 * 1024
+
+
+@app.post("/tools/convert-audio")
+async def tools_convert_audio(request: Request, file: UploadFile = File(...), target: str = Form("mp3"), bitrate: str = Form("96"), mono: str = Form("")):
+    _tools_check_rate(request)
+    raw = await _tools_read(request, file, TOOLS_MAX_AUDIO_BYTES)
+    async with _tools_audio_slots:
+        name, content_type, data = await _tools_run(doc_tools.audio_convert, file.filename or "audio", raw, target, bitrate, mono.lower() in ("1", "true", "on", "yes"))
+    return _tools_download(name, content_type, data, {"X-Original-Size": str(len(raw)), "X-Result-Size": str(len(data))})
+
+
+_tools_audio_slots = asyncio.Semaphore(2)
 
 
 # ---------------------------------------------------------------------------
