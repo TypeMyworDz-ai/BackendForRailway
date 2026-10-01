@@ -389,11 +389,10 @@ ASK_MODEL_CATALOGUE = [
         "id": "deepseek-v4-flash",
         "provider": "deepseek",
         "label": "DeepSeek V4 Flash",
-        "blurb": "A very low-cost model for quick questions and summaries. Text only.",
+        "blurb": "Our most economical model. Good for everyday questions, summaries and long transcripts. Pictures are read by ChatGPT Luna automatically.",
         "tier": "standard",
         "credits": 1,
         "transcript_only": False,
-        "text_only": True,
     },
     # Mistral is wired up and working, but their free tier rejects calls from
     # this server's address with "Invalid API Key" even though the same key
@@ -478,7 +477,14 @@ ASK_MODEL_ALIASES = {
     "gemini-3.6-flash": "gemini-3.8-flash",
 }
 
-ASK_DEFAULT_MODEL = "gpt-5.6-luna"
+# DeepSeek Flash is the cheapest capable model we offer (about $0.18 in and
+# $0.73 out per million tokens on a weekly average, against $0.20 and $1.20 for
+# ChatGPT Luna). If it is unavailable for any reason the call quietly falls
+# back to ChatGPT Luna, so a client never sees a failure because of it.
+ASK_DEFAULT_MODEL = "deepseek-v4-flash"
+ASK_LUNA_MODEL = "gpt-5.6-luna"
+# Used for questions inside a transcript when the client has not chosen a model.
+ASK_TRANSCRIPT_DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
 # A safe fallback for each provider, used if the default is somehow missing.
 ASK_FALLBACK_MODEL = "claude-haiku-4-5-20251001"
@@ -568,7 +574,7 @@ def ask_models_locked_for(user_plan: str, user_email: str = "", has_transcript: 
     return out
 
 
-def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_transcript: bool = True, has_credits: bool = False):
+def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_transcript: bool = True, has_credits: bool = False, in_transcript_default: bool = False):
     """Turn a requested model id into (model_id, provider), safely.
 
     An unknown id, or one the caller's plan does not include, quietly falls
@@ -577,7 +583,7 @@ def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_
     """
     allowed = ask_models_for(user_plan, user_email, has_transcript, has_credits)
     if not allowed:
-        return ASK_DEFAULT_MODEL, "openai"
+        return ASK_LUNA_MODEL, "openai"
     wanted = (requested or "").strip()
     wanted = ASK_MODEL_ALIASES.get(wanted, wanted)
     for m in allowed:
@@ -588,7 +594,10 @@ def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_
         for m in allowed:
             if m["provider"] == wanted:
                 return m["id"], m["provider"]
-    for want in (ASK_DEFAULT_MODEL, ASK_FALLBACK_MODEL):
+    wants = (ASK_DEFAULT_MODEL, ASK_LUNA_MODEL, ASK_FALLBACK_MODEL)
+    if in_transcript_default and not wanted:
+        wants = (ASK_TRANSCRIPT_DEFAULT_MODEL,) + wants
+    for want in wants:
         for m in allowed:
             if m["id"] == want:
                 return m["id"], m["provider"]
@@ -4182,6 +4191,9 @@ OPENAI_FORMAT_ENDPOINTS = {
 }
 
 
+_DEEPSEEK_DOWN_UNTIL = [0.0]
+
+
 def _ask_openai_format(provider, model_id, system_prompt, turns, question, images, max_tokens):
     """Call OpenAI or Mistral and return the answer text."""
     url, get_key = OPENAI_FORMAT_ENDPOINTS[provider]
@@ -4189,8 +4201,11 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
     if not key:
         raise HTTPException(status_code=503, detail=f"{TYPEMYWORDZ_AI_NAME} is not connected to that model right now.")
 
-    if provider == "deepseek" and images:
-        raise HTTPException(status_code=400, detail="This model reads text only. Choose another model in Settings to work with images.")
+    if provider == "deepseek":
+        # Pictures go to ChatGPT Luna. So does everything while DeepSeek is
+        # unavailable (for example an empty balance), so clients see no error.
+        if images or time.time() < _DEEPSEEK_DOWN_UNTIL[0]:
+            return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens)
     content = []
     for img in images:
         content.append({
@@ -4205,6 +4220,12 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
     messages.append({"role": "user", "content": content})
 
     payload = {"model": model_id, "messages": messages}
+    if provider == "deepseek":
+        # The retired v4 names are still accepted, but the current name is
+        # deepseek-flash. Reasoning is switched off: its tokens are billed as
+        # output and a chat answer does not need them.
+        payload["model"] = "deepseek-flash"
+        payload["thinking"] = {"type": "disabled"}
     if provider == "openai":
         # These models count reasoning tokens against the output budget, so
         # keep reasoning light for chat and give the answer room to finish.
@@ -4221,6 +4242,9 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
     )
     if r.status_code != 200:
         logger.error(f"{provider} returned {r.status_code}: {r.text[:400]}")
+        if provider == "deepseek":
+            _DEEPSEEK_DOWN_UNTIL[0] = time.time() + 300
+            return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens)
         raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
     data = r.json()
     choice = (data.get("choices") or [{}])[0]
@@ -4981,8 +5005,12 @@ async def ai_ask(
         ASK_SYSTEM_PROMPT_TRANSCRIPT if has_transcript else ASK_SYSTEM_PROMPT_GENERAL
     )
     chosen_model, chosen_provider = resolve_ask_model(
-        model or provider, user_plan, user_email, has_transcript
+        model or provider, user_plan, user_email, has_transcript, in_transcript_default=has_transcript
     )
+    # DeepSeek is used for text. A question with pictures goes to ChatGPT Luna
+    # instead, rather than being refused.
+    if chosen_provider == "deepseek" and images:
+        chosen_model, chosen_provider = resolve_ask_model(ASK_LUNA_MODEL, user_plan, user_email, has_transcript)
     # Only the admin's own pinned thread sends extra standing instructions
     # (the editable guidelines). Everyone else's field is ignored.
     if system_extra and system_extra.strip() and is_admin_user(user_email):
