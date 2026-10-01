@@ -23,7 +23,7 @@ class ModelsAndAudioTests(unittest.TestCase):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         wanted_funcs = {"_human_audio_response", "_ask_provider_ready", "ask_models_for", "resolve_ask_model"}
-        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS"}
+        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS"}
         body = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
@@ -57,6 +57,21 @@ class ModelsAndAudioTests(unittest.TestCase):
         try:
             ids = [m["id"] for m in self.ns["ask_models_for"]("Monthly Plan", "a@b.c", True, True)]
             self.assertIn("deepseek-v4-flash", ids)
+        finally:
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+
+    def test_defaults_with_and_without_deepseek(self):
+        import os
+        resolve = self.ns["resolve_ask_model"]
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+        self.assertEqual(resolve("", "Monthly Plan", "a@b.c", False, True)[0], "gpt-5.6-luna")
+        os.environ["DEEPSEEK_API_KEY"] = "x"
+        try:
+            self.assertEqual(resolve("", "Monthly Plan", "a@b.c", False, True)[0], "deepseek-v4-flash")
+            self.assertEqual(resolve("", "One-Week Plan", "a@b.c", True, True)[0], "deepseek-v4-flash")
+            # Questions inside a transcript default to Gemini, but a chosen model wins.
+            self.assertEqual(resolve("", "One-Week Plan", "a@b.c", True, True, True)[0], "gemini-3.1-flash-lite")
+            self.assertEqual(resolve("gpt-5.6-luna", "One-Week Plan", "a@b.c", True, True, True)[0], "gpt-5.6-luna")
         finally:
             os.environ.pop("DEEPSEEK_API_KEY", None)
 
