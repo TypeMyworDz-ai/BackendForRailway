@@ -33,6 +33,10 @@ class ReviewHelpers(unittest.TestCase):
         out = NS["_review_enforce_indent"]("First para.\n\nHEADING\n\nSecond para.", src)
         self.assertEqual(out, "\tFirst para.\n\n\nHEADING\n\n\tSecond para.".replace("\n\n\nHEADING", "\n\nHEADING"))
 
+    def test_indent_applied_even_when_parts_lost_tabs(self):
+        out = NS["_review_enforce_indent"]("First para.\n\nSecond para.\n\nClient spellings: Ann.", ["First para.\n\nSecond para."])
+        self.assertEqual(out, "\tFirst para.\n\n\tSecond para.\n\nClient spellings: Ann.")
+
     def test_split(self):
         text, data = NS["_review_split_output"]('<<<TRANSCRIPT>>>\n\tHello.  World.\n<<<NOTES>>>\n{"summary": "ok"}')
         self.assertEqual(text, "\tHello.  World.")
