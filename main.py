@@ -5916,71 +5916,9 @@ async def send_welcome_email(payload: WelcomeEmailRequest):
 
 @app.get("/health")
 async def health_check():
-    logger.info("Health check endpoint called")
-    
-    try:
-        import psutil
-        memory_info = psutil.virtual_memory()
-        cpu_percent = psutil.cpu_percent(interval=1)
-        
-        health_data = {
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "system": {
-                "memory_percent": memory_info.percent,
-                "cpu_percent": cpu_percent,
-                "available_ram_gb": round(memory_info.available / (1024**3), 2)
-            },
-            "application": {
-                "total_jobs": len(jobs),
-                "active_background_tasks": len(active_background_tasks),
-                "cancellation_flags": len(cancellation_flags),
-                "jobs_by_status": {
-                    status: len([j for j in jobs.values() if j["status"] == status])
-                    for status in ["processing", "completed", "failed", "cancelled"]
-                }
-            },
-            "integrations": {
-                "assemblyai_configured": bool(ASSEMBLYAI_API_KEY),
-                "anthropic_configured": bool(ANTHROPIC_API_KEY),
-                "openai_configured": bool(OPENAI_API_KEY),
-                "openai_whisper_service_configured": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
-                "google_gemini_configured": bool(GEMINI_API_KEY),
-                "deepgram_service_configured": bool(DEEPGRAM_SERVICE_RAILWAY_URL)
-            },
-            "transcription_logic": {
-                "free_user_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "three_day_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "one_week_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "monthly_plan_transcription": f"Primary={TYPEMYWORDZ2_NAME} → Fallback1={TYPEMYWORDZ1_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-                "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
-                "deepgram_tester_transcription": f"Primary=Deepgram → Fallback=OpenAI for {DEEPGRAM_TESTER_EMAIL}",
-                "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
-                "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
-                "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
-                "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
-                "openai_whisper": f"TypeMyworDz2 (OpenAI Whisper-1)",
-                "deepgram": f"Deepgram",
-                "anthropic_ai": f"TypeMyworDz AI (Anthropic Claude)",
-                "google_gemini_ai": "Google Gemini - Available for ALL paid AI users",
-                "admin_emails": ADMIN_EMAILS,
-                "openai_tester_email": OPENAI_TESTER_EMAIL,
-                "deepgram_tester_email": DEEPGRAM_TESTER_EMAIL
-            }
-        }
-        
-        return health_data
-        
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {
-            "status": "unhealthy",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+    # Keep the public platform probe deliberately minimal. Detailed diagnostics
+    # belong in authenticated operator logs, never in an unauthenticated route.
+    return {"status": "healthy"}
 
 logger.info("=== FASTAPI APPLICATION SETUP COMPLETE ===")
 
