@@ -48,3 +48,23 @@ class ReviewHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AiAgentCatalog(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
+        tree = __import__("ast").parse(source)
+        node = next(n for n in tree.body if isinstance(n, __import__("ast").Assign) and any(getattr(t, "id", None) == "HUMAN_AI_AGENTS" for t in n.targets))
+        cls.agents = __import__("ast").literal_eval(node.value)
+
+    def test_three_agents_have_requested_model_pairs(self):
+        self.assertEqual(set(self.agents), {"general-gpt", "template-claude", "pdf-gemini"})
+        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-terra", "gpt-5.6-sol"])
+        self.assertEqual(self.agents["template-claude"]["models"], ["claude-opus-5-5", "claude-sonnet-5-5"])
+        self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
+
+    def test_agents_are_internal_not_email_accounts(self):
+        for agent in self.agents.values():
+            self.assertNotIn("email", agent)
+            self.assertNotIn("password", agent)
+
