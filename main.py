@@ -37,7 +37,7 @@ import httpx
 from docx import Document
 from docx.shared import Inches
 from io import BytesIO
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 import re
 import anthropic
 import doc_tools
@@ -5557,6 +5557,51 @@ async def traffic_event(payload: TrafficEventRequest):
     return {"recorded": True}
 
 
+def _increment_recorder_download_clicks():
+    """Count Windows-recorder download-link clicks without storing visitor data."""
+    if not db:
+        return None
+    ref = db.collection("public_metrics").document("recorder_downloads")
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def increment(tx):
+        snapshot = ref.get(transaction=tx)
+        current = snapshot.to_dict() if snapshot.exists else {}
+        count = _int(current.get("clicks")) + 1
+        tx.set(ref, {"clicks": count, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        return count
+
+    return increment(transaction)
+
+
+@app.get("/tools/recorder-download", include_in_schema=False)
+async def recorder_download_redirect():
+    """Count an outbound download click, then redirect to the public Windows file."""
+    if db:
+        try:
+            await asyncio.to_thread(_increment_recorder_download_clicks)
+        except Exception:
+            logger.exception("Recorder download click could not be counted")
+    return RedirectResponse(
+        "https://typemywordz.ai/downloads/TypeMyworDz-Recorder.exe",
+        status_code=302,
+    )
+
+
+@app.get("/api/admin/metrics/recorder-downloads")
+async def admin_recorder_download_metrics(request: Request):
+    """Return the private total of recorder download-link clicks to admins only."""
+    _require_admin(request)
+    if not db:
+        return {"clicks": 0, "available": False}
+    snapshot = await asyncio.to_thread(
+        db.collection("public_metrics").document("recorder_downloads").get
+    )
+    data = snapshot.to_dict() if snapshot.exists else {}
+    return {"clicks": _int((data or {}).get("clicks")), "available": True}
+
+
 @app.get("/api/admin/traffic")
 async def admin_traffic(request: Request):
     """Return recent traffic telemetry for the protected admin dashboard."""
@@ -6200,7 +6245,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
                     "pending": item.get("status") != "submitted",
                     # Workers are anonymous to each other; "Worker 2" is enough
                     # to show where one person's part ends and another begins.
-                    "author_label": f"Worker {author_numbers.get(str(item.get('worker_uid') or ''), 0)}" if item.get("worker_uid") else "",
+                    "author_label": (f"AI draft: {item.get('ai_agent_name')}" if item.get("ai_agent_id") else (f"Worker {author_numbers.get(str(item.get('worker_uid') or ''), 0)}" if item.get("worker_uid") else "")),
                     "transcript": (item.get("transcript") or "") if item.get("status") == "submitted" else "",
                     "transcript_html": (item.get("transcript_html") or "") if item.get("status") == "submitted" else "",
                     "final_attachment": _human_public(item.get("final_attachment") or {}) if item.get("final_attachment") and item.get("status") == "submitted" else None,
@@ -6248,7 +6293,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("proofreader_payout_status", None)
         out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
-        for key in ("ai_drafts", "ai_review", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings"):
+        for key in ("ai_drafts", "ai_review", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings"):
             out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
@@ -7727,6 +7772,11 @@ async def human_admin_list_pdf_jobs(request: Request):
             "page_count": image.get("page_count") or 1, "status": item.get("status") or "approved",
             "worker_name": item.get("worker_name") or "", "worker_email": item.get("worker_email") or "",
             "worker_uid": item.get("worker_uid") or "",
+            "ai_agent_status": item.get("ai_agent_status") or "",
+            "ai_agent_name": item.get("ai_agent_name") or "",
+            "ai_agent_error": item.get("ai_agent_error") or "",
+            "ai_agent_segment_id": next((str(part.get("id") or "") for part in (item.get("segments") or []) if part.get("ai_agent_id") == "pdf-gemini"), ""),
+            "ai_agent_model_ids": item.get("ai_agent_model_ids") or [],
             "reference_files": len(item.get("instruction_attachments") or []),
             "deadline_at": _human_iso(item.get("deadlineAt")),
             "worker_amount_kes": int(item.get("worker_amount_kes") or 0),
@@ -9972,6 +10022,317 @@ async def admin_workers(request: Request):
     return {"workers": rows, "min_claim_rating": MIN_HUMAN_WORKER_RATING, "min_proofread_rating": MIN_PROOFREADER_RATING}
 
 
+# Internal AI workers are workflow identities, not Firebase users. They have
+# no sign-in, mailbox, payout profile, or client-facing permissions.
+HUMAN_AI_AGENTS = {
+    "general-gpt": {
+        "id": "general-gpt", "name": "General Transcription Agent",
+        "display": "GPT Terra + GPT Sol", "job_types": ["audio"],
+        "models": ["gpt-5.6-terra", "gpt-5.6-sol"],
+    },
+    "template-claude": {
+        "id": "template-claude", "name": "Template Transcription Agent",
+        "display": "Claude Opus + Claude Sonnet", "job_types": ["audio"],
+        "models": ["claude-opus-5-5", "claude-sonnet-5-5"],
+    },
+    "pdf-gemini": {
+        "id": "pdf-gemini", "name": "PDF and Image Agent",
+        "display": "Gemini 3.8 Flash", "job_types": ["pdf_job"],
+        "models": ["gemini-3.8-flash"],
+    },
+}
+
+
+@app.get("/human-transcription/admin/ai-agents")
+async def human_admin_ai_agents(request: Request):
+    _require_human_job_admin(request)
+    return {"agents": list(HUMAN_AI_AGENTS.values()), "human_proofreading_required": True}
+
+
+def _human_ai_agent_system(agent_id, stage, guidelines, context):
+    agent = HUMAN_AI_AGENTS[agent_id]
+    template_note = (
+        "The job includes or is assigned a client template. Follow its field order, exact labels, "
+        "boilerplate and layout instructions. Do not invent missing dictated content."
+        if agent_id == "template-claude" else ""
+    )
+    return (
+        f"You are {agent['name']}, an internal first-draft transcription agent for TypeMyworDz. "
+        "Your output is a private draft that MUST be proofread by an approved human before it can be released.\n"
+        "Preserve the audio's exact meaning, wording, word order, grammar, pronouns and awkward phrasing. "
+        "Do not paraphrase, summarize, polish, infer, or add content. Correct only clear recognition errors and apply the supplied formatting rules.\n"
+        "Use straight ASCII quotes and apostrophes. Put a real tab at the beginning of each body paragraph, "
+        "two spaces after sentence-ending punctuation, blank lines between paragraphs, and keep headings and the spellings section flush left.\n"
+        f"{template_note}\n"
+        f"PASS: {stage}. Return only the final transcript text; no explanation or wrapper.\n\n"
+        f"TYPEMYWORDZ GUIDELINES:\n{guidelines[:60000]}\n\n"
+        f"JOB NOTES AND REFERENCE FILES:\n{context[:50000]}"
+    )
+
+
+async def _human_ai_transcribe_audio(job_id, job, segment):
+    meta = job.get("audio") or {}
+    path = meta.get("storage_path")
+    bucket = _human_bucket()
+    if not path or bucket is None:
+        raise RuntimeError("The source audio is not available in private storage.")
+    blob = bucket.blob(path)
+    if not await asyncio.to_thread(blob.exists):
+        raise RuntimeError("The source audio is no longer available.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    suffix = str(meta.get("name") or "").rsplit(".", 1)[-1].lower()
+    fmt = suffix if suffix in {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac"} else None
+    source = await asyncio.to_thread(lambda: AudioSegment.from_file(BytesIO(raw), format=fmt))
+    if segment:
+        start_ms = max(0, int(float(segment.get("start_seconds") or 0) * 1000))
+        end_ms = min(len(source), int(float(segment.get("end_seconds") or len(source) / 1000) * 1000))
+        source = source[start_ms:end_ms]
+    if len(source) <= 0:
+        raise RuntimeError("The selected audio part is empty.")
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
+            tmp_path = handle.name
+        await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
+        result = await transcribe_with_assemblyai(
+            tmp_path, "en", False, ["universal-3-5-pro", "universal-2"],
+            f"ai-agent-{job_id}-{segment.get('id') if segment else 'main'}",
+        )
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    text = str(result.get("transcription") or result.get("transcript") or result.get("text") or "").strip()
+    if result.get("status") != "completed" or not text:
+        raise RuntimeError("AssemblyAI did not return a complete audio transcript.")
+    return text, len(source) / 1000.0
+
+
+async def _human_ai_agent_research(raw_text, context):
+    prompt = (
+        "Below is a dictated transcript. Identify proper nouns and specialist terms: people, agencies, "
+        "organizations, programs, companies, places, street addresses, citations, and unusual medical or legal terms. "
+        "Use the job context and client spellings as authoritative. Search the web only for terms not already spelled by the client. "
+        "Return one line per term: written form | verified spelling | what it is | confidence yes/no. Do not rewrite the transcript.\n\n"
+        f"JOB CONTEXT:\n{str(context or '')[:8000]}\n\nTRANSCRIPT:\n{str(raw_text or '')[:60000]}"
+    )
+    try:
+        return await asyncio.to_thread(_gemini_research_blocking, prompt)
+    except Exception as exc:
+        logger.warning("AI agent proper-noun research could not complete: %s", exc)
+        return ""
+
+
+async def _human_ai_agent_generate(job_id, job, segment, agent_id):
+    agent = HUMAN_AI_AGENTS[agent_id]
+    guidelines = await _admin_guidelines_text()
+    context = await _human_review_context(job_id, job)
+    system = _human_ai_agent_system(agent_id, "transcription and formatting", guidelines, context)
+    if agent_id == "pdf-gemini":
+        image = job.get("pdf_image") or {}
+        path = image.get("storage_path")
+        bucket = _human_bucket()
+        if not path or bucket is None:
+            raise RuntimeError("The source image is not available in private storage.")
+        blob = bucket.blob(path)
+        if not await asyncio.to_thread(blob.exists):
+            raise RuntimeError("The source image is no longer available.")
+        raw = await asyncio.to_thread(blob.download_as_bytes)
+        media_type = str(image.get("content_type") or "image/jpeg")
+        images = [{"media_type": media_type, "data": base64.b64encode(raw).decode("ascii")}]
+        question = (
+            "Transcribe all readable text from the attached page/image exactly. Preserve names, numbers, "
+            "punctuation, paragraph breaks, headings, tables and form fields as faithfully as possible. "
+            "If a word cannot be read confidently, mark it [unclear] rather than guess. "
+            "This is a draft for mandatory human proofreading."
+        )
+        answer = await asyncio.to_thread(
+            _ask_gemini, "gemini-3.8-flash", system, [], question, images, 16000
+        )
+        draft = str(answer or "").strip()
+        research = await _human_ai_agent_research(draft, context)
+        if research:
+            checked_system = system + "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
+            checked = await asyncio.to_thread(
+                _run_ask_model, "gemini-3.8-flash", "gemini", checked_system, 
+                "Review the first transcription against the attached image. Correct only clear OCR/spelling/formatting mistakes supported by the image or research. Keep every word otherwise.\n\nDRAFT TRANSCRIPTION:\n" + draft[:250000], 16000,
+            )
+            draft = str(checked or draft).strip()
+        return draft, 0.0, agent["models"]
+
+    raw_text, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment)
+    research = await _human_ai_agent_research(raw_text, context)
+    if research:
+        system += "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
+    if agent_id == "general-gpt":
+        first_provider, first_model = "openai", "gpt-5.6-terra"
+        second_provider, second_model = "openai", "gpt-5.6-sol"
+    else:
+        first_provider, first_model = "claude", "claude-opus-5-5"
+        second_provider, second_model = "claude", "claude-sonnet-5-5"
+    first = await asyncio.to_thread(
+        _run_ask_model, first_model, first_provider, system,
+        "Format this speech-to-text transcript, preserving the dictated wording and applying the supplied guidelines.\n\n"
+        "SOURCE TRANSCRIPT:\n" + raw_text[:350000], 16000,
+    )
+    second_system = _human_ai_agent_system(agent_id, "independent accuracy check", guidelines, context)
+    second = await asyncio.to_thread(
+        _run_ask_model, second_model, second_provider, second_system,
+        "Compare the source transcript and formatted draft. Correct only clear recognition, spelling, or formatting errors supported by the source. Do not rewrite, paraphrase, or add content. Return the complete corrected transcript only.\n\n"
+        "SOURCE TRANSCRIPT:\n" + raw_text[:250000] + "\n\nFORMATTED DRAFT TO CHECK:\n" + str(first or "")[:250000], 16000,
+    )
+    answer = str(second or first or "").strip()
+    return answer, audio_seconds, agent["models"]
+
+
+async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
+    """Run the agent after the admin receives an immediate queued response."""
+    agent = HUMAN_AI_AGENTS[agent_id]
+    ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    started = time.time()
+    try:
+        snap = await asyncio.to_thread(ref.get)
+        job = snap.to_dict() if snap.exists else None
+        if not job:
+            raise RuntimeError("The job was removed before the AI draft began.")
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        segment = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
+        if not segment:
+            raise RuntimeError("The assigned part was not found.")
+        if segment.get("ai_agent_run_id") != run_id:
+            raise RuntimeError("This AI run is no longer the active assignment.")
+        segment.update({"ai_agent_status": "processing"})
+        await asyncio.to_thread(ref.update, {"segments": segments, "ai_agent_status": "processing", "updatedAt": firestore.SERVER_TIMESTAMP})
+        answer, audio_seconds, model_ids = await _human_ai_agent_generate(job_id, job, segment, agent_id)
+        if not answer:
+            raise RuntimeError("The AI agent returned an empty draft.")
+        answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
+        clean_html = _sanitize_editor_html(_review_text_to_html(answer))
+        snap = await asyncio.to_thread(ref.get)
+        current = snap.to_dict() if snap.exists else None
+        if not current:
+            raise RuntimeError("The job was removed before the draft could be saved.")
+        current_segments = [dict(item or {}) for item in (current.get("segments") or [])]
+        target = next((item for item in current_segments if str(item.get("id") or "") == segment_id), None)
+        if not target or target.get("ai_agent_run_id") != run_id:
+            raise RuntimeError("This AI run is no longer the active assignment.")
+        target.update({
+            "status": "submitted", "transcript": answer[:1000000],
+            "transcript_html": clean_html, "submittedAt": datetime.now(),
+            "workerCompletedAt": datetime.now(), "ai_agent_status": "submitted",
+            "ai_agent_model_ids": model_ids, "ai_agent_audio_seconds": int(audio_seconds),
+            "ai_agent_elapsed_seconds": int(time.time() - started),
+        })
+        parent_status = _human_split_parent_status(current, current_segments)
+        await asyncio.to_thread(ref.update, {
+            "segments": current_segments, "split_mode": "multi", "status": parent_status,
+            "ai_agent_status": "submitted", "ai_agent_name": agent["name"],
+            "ai_agent_model_ids": model_ids, "ai_agent_completedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {
+            "status": "submitted", "model_ids": model_ids, "audio_seconds": int(audio_seconds),
+            "elapsed_seconds": int(time.time() - started), "completedAt": firestore.SERVER_TIMESTAMP,
+        })
+        await _notify_human_admins(
+            f"human-ai-agent-submitted:{run_id}", "job_submitted", "AI first draft ready for proofreading",
+            f"{agent['name']} finished a draft. Assign an approved human proofreader before releasing the work.",
+            route="human_ops", job_id=job_id, requires_action=True,
+        )
+    except Exception as exc:
+        logger.exception("Human AI agent %s failed on job %s", agent_id, job_id)
+        try:
+            snap = await asyncio.to_thread(ref.get)
+            current = snap.to_dict() if snap.exists else None
+            if current:
+                current_segments = [dict(item or {}) for item in (current.get("segments") or [])]
+                target = next((item for item in current_segments if str(item.get("id") or "") == segment_id), None)
+                if target and target.get("ai_agent_run_id") == run_id:
+                    target.update({"status": "available", "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500]})
+                    status = _human_split_parent_status(current, current_segments)
+                    await asyncio.to_thread(ref.update, {
+                        "segments": current_segments, "split_mode": "multi", "status": status,
+                        "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500],
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    })
+            await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {
+                "status": "failed", "error": str(exc)[:500], "elapsed_seconds": int(time.time() - started),
+                "completedAt": firestore.SERVER_TIMESTAMP,
+            })
+            await _notify_human_admins(
+                f"human-ai-agent-failed:{run_id}", "job_submitted", "AI first draft needs attention",
+                f"{agent['name']} could not finish the draft. It remains available for retry or human assignment.",
+                route="human_ops", job_id=job_id, requires_action=True,
+            )
+        except Exception:
+            logger.exception("Could not save AI-agent failure status for job %s", job_id)
+
+
+@app.post("/human-transcription/jobs/{job_id}/ai-agent/assign")
+async def human_admin_assign_ai_agent(job_id: str, request: Request, background_tasks: BackgroundTasks):
+    _require_human_job_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    agent_id = str((payload or {}).get("agent_id") or "").strip()
+    agent = HUMAN_AI_AGENTS.get(agent_id)
+    if not agent:
+        raise HTTPException(status_code=400, detail="Choose one of the three approved AI agents.")
+    job = await _human_job(job_id)
+    is_pdf = str(job.get("job_type") or "").lower() == "pdf_job"
+    if is_pdf != (agent_id == "pdf-gemini"):
+        raise HTTPException(status_code=409, detail="Gemini is reserved for PDF/image jobs; the GPT and Claude agents are for audio jobs.")
+    if not is_pdf and not (job.get("audio") or {}).get("storage_path"):
+        raise HTTPException(status_code=409, detail="This job has no source audio for an AI transcription draft.")
+    segments = [dict(item or {}) for item in (job.get("segments") or [])]
+    segment_id = str((payload or {}).get("segment_id") or "").strip()
+    if _human_is_split_job(job):
+        if not segment_id:
+            raise HTTPException(status_code=400, detail="Choose an available part for the AI agent.")
+        target = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
+        if not target or target.get("status") not in {"available", "approved"} or target.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="That part is no longer available for an AI draft.")
+    else:
+        if job.get("status") != "approved" or job.get("worker_uid"):
+            raise HTTPException(status_code=409, detail="Only an approved, unassigned job can be sent to an AI agent.")
+        segment_id = "ai-agent-" + uuid.uuid4().hex[:12]
+        target = {
+            "id": segment_id, "label": "AI first draft", "index": 1,
+            "start_seconds": 0, "end_seconds": float(job.get("seconds") or 0),
+            "minutes": int(job.get("minutes") or 0), "status": "available",
+            "worker_uid": None, "worker_email": None,
+        }
+        segments.append(target)
+    if target.get("ai_agent_status") == "queued" or target.get("ai_agent_status") == "processing":
+        raise HTTPException(status_code=409, detail="This part already has an AI draft in progress.")
+    run_id = uuid.uuid4().hex
+    target.update({
+        "status": "in_progress", "worker_uid": None, "worker_email": None,
+        "worker_name": agent["name"], "ai_agent_id": agent_id,
+        "ai_agent_name": agent["name"], "ai_agent_status": "queued",
+        "ai_agent_model_ids": agent["models"], "ai_agent_run_id": run_id,
+        "assignedAt": datetime.now(), "deadlineAt": None, "tat_seconds": None,
+    })
+    parent_status = _human_split_parent_status(job, segments)
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "segments": segments, "split_mode": "multi", "status": parent_status,
+        "assigned_worker_uids": list(job.get("assigned_worker_uids") or []),
+        "ai_agent_status": "queued", "ai_agent_id": agent_id,
+        "ai_agent_name": agent["name"], "ai_agent_model_ids": agent["models"],
+        "ai_agent_run_id": run_id, "ai_agent_error": "", "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
+    await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).set, {
+        "run_id": run_id, "job_id": job_id, "segment_id": segment_id,
+        "agent_id": agent_id, "agent_name": agent["name"], "model_ids": agent["models"],
+        "status": "queued", "createdAt": firestore.SERVER_TIMESTAMP,
+    })
+    background_tasks.add_task(_human_run_ai_agent, job_id, segment_id, agent_id, run_id)
+    return {"status": "queued", "job_id": job_id, "segment_id": segment_id, "agent": agent, "human_proofreading_required": True}
+
+
 @app.post("/human-transcription/jobs/{job_id}/ai-draft")
 async def human_worker_ai_draft(job_id: str, request: Request):
     """An AI first draft for the audio a worker has been assigned.
@@ -11594,7 +11955,8 @@ FORMAT_SYSTEM_PROMPT = (
 async def format_transcript_with_guidelines(request: Request):
     decoded = _verified_user(request)
     email = (decoded.get("email") or "").strip().lower()
-    if email != PDF_JOB_ADMIN_EMAIL:
+    allowed_formatters = {PDF_JOB_ADMIN_EMAIL, "typemywordz@gmail.com", "gracenyaitara@gmail.com"}
+    if email not in allowed_formatters:
         raise HTTPException(status_code=403, detail="This option is not available on your account.")
     payload = await request.json()
     text = str((payload or {}).get("text") or "").strip()
