@@ -1,4 +1,5 @@
 import ast
+import asyncio
 import math
 import re
 import unittest
@@ -138,4 +139,16 @@ class AiAgentCatalog(unittest.TestCase):
         for agent in self.agents.values():
             self.assertNotIn("email", agent)
             self.assertNotIn("password", agent)
+
+
+class HealthEndpointPrivacy(unittest.TestCase):
+    def test_public_health_endpoint_returns_status_only(self):
+        source_path = Path(__file__).resolve().parents[1].joinpath("main.py")
+        tree = ast.parse(source_path.read_text())
+        function = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "health_check")
+        function.decorator_list = []
+        isolated = ast.Module(body=[function], type_ignores=[])
+        namespace = {}
+        exec(compile(isolated, str(source_path), "exec"), namespace)
+        self.assertEqual(asyncio.run(namespace["health_check"]()), {"status": "healthy"})
 
