@@ -188,11 +188,62 @@ class AiModelRouting(unittest.TestCase):
 
     def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_call_model_chain", "_human_worker_ai_draft_system"}.issubset(formatter_calls))
+        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system"}.issubset(formatter_calls))
+        call_lines = {node.func.id: node.lineno for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertLess(call_lines["_human_ai_agent_research"], call_lines["_human_call_model_chain"])
+        model_call = next(node for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain")
+        self.assertTrue(any(keyword.arg == "response_validator" for keyword in model_call.keywords))
         route = self.functions["human_worker_ai_draft"]
         call_lines = {node.func.id: node.lineno for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertLess(call_lines["_human_worker_format_ai_draft"], call_lines["charge_credits"])
-        self.assertIn('"format_version": 2', self.source)
+        self.assertIn('"format_version": 3', self.source)
+
+    def test_worker_draft_prompt_requires_research_notes_and_handles_clear_speaker_corrections(self):
+        function = self.functions["_human_worker_ai_draft_system"]
+        prompt_text = "".join(node.value for node in ast.walk(function) if isinstance(node, ast.Constant) and isinstance(node.value, str))
+        self.assertIn("Research Notes:", prompt_text)
+        self.assertIn("I searched:", prompt_text)
+        self.assertIn("Dublin Granville-East Dublin Granville Children's Close To Home.", prompt_text)
+        self.assertIn("East Dublin Granville Children's Close To Home.", prompt_text)
+        self.assertIn("Do not remove ordinary repetition", prompt_text)
+
+    def test_research_notes_are_suppressed_without_verified_google_search_metadata(self):
+        class QuietLogger:
+            def warning(self, *args, **kwargs):
+                pass
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def json(self):
+                return self.payload
+
+        class FakeRequests:
+            response = Response({"candidates": [{"content": {"parts": [{"text": "A likely result."}]}}]})
+
+            @classmethod
+            def post(cls, *args, **kwargs):
+                return cls.response
+
+        function = self.functions["_gemini_research_blocking"]
+        namespace = {"GEMINI_API_KEY": "test-key", "requests": FakeRequests, "logger": QuietLogger()}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
+        self.assertEqual(namespace["_gemini_research_blocking"]("prompt"), "NO_SEARCHED_TERMS")
+
+        FakeRequests.response = Response({"candidates": [{
+            "content": {"parts": [{"text": "Summit Psych | Summit Psych | provider | yes"}]},
+            "groundingMetadata": {
+                "webSearchQueries": ["Summit Psych Ohio provider"],
+                "groundingChunks": [{"web": {"title": "Summit Psych", "uri": "https://example.test"}}],
+            },
+        }]})
+        grounded = namespace["_gemini_research_blocking"]("prompt")
+        self.assertIn("ACTUAL GOOGLE SEARCH QUERIES:\n- Summit Psych Ohio provider", grounded)
+        self.assertIn("ACTUAL SEARCH SOURCES:\n- Summit Psych: https://example.test", grounded)
 
     def test_fallback_runs_only_after_failure_or_unusable_response(self):
         class QuietLogger:
