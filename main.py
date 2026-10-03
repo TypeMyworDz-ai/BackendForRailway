@@ -39,6 +39,7 @@ from docx.shared import Inches
 from io import BytesIO
 from fastapi.responses import StreamingResponse, RedirectResponse
 import re
+from copy import deepcopy
 import anthropic
 import doc_tools
 
@@ -6157,6 +6158,9 @@ def _human_public_for(data, actor_role, actor_uid=""):
     """
     data = data or {}
     out = _human_public(data)
+    if actor_role != "admin":
+        for key in ("ai_agent_docx", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "ai_agent_scope"):
+            out.pop(key, None)
     pdf_image = out.get("pdf_image") or {}
     if pdf_image:
         out["pdf_image"] = {key: pdf_image[key] for key in ("name", "content_type", "size", "source_filename", "page_number", "page_count") if key in pdf_image}
@@ -6181,6 +6185,8 @@ def _human_public_for(data, actor_role, actor_uid=""):
 
     if actor_role == "worker":
         out["my_job_ratings"] = _human_worker_feedback(data, actor_uid)
+        for key in ("ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "ai_agent_docx", "ai_agent_scope"):
+            out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
         out.pop("admin_feedback", None)
@@ -6243,7 +6249,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
                 for index, item in enumerate(segments)
             ]
         if assignment is not None:
-            for key in ("worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason", "workerPaymentStatus", "workerPaidAt", "payout_status", "payout_period_id"):
+            for key in ("worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason", "workerPaymentStatus", "workerPaidAt", "payout_status", "payout_period_id", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_status", "ai_agent_error", "ai_agent_docx", "ai_agent_scope"):
                 assignment.pop(key, None)
             assignment = _human_public(assignment)
             out["worker_assignment"] = assignment
@@ -6283,7 +6289,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("proofreader_payout_status", None)
         out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
-        for key in ("ai_drafts", "ai_review", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "proofreader_use_combined_transcript"):
+        for key in ("ai_drafts", "ai_review", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "ai_agent_docx", "ai_agent_scope", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "proofreader_use_combined_transcript"):
             out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
@@ -6407,6 +6413,257 @@ def _human_store_raw_bytes(job_id: str, filename: str, raw: bytes, content_type:
     return {"name": filename or safe_name, "storage_path": path, "content_type": content_type or "application/octet-stream", "size": len(raw)}
 
 
+def _human_template_attachment(job):
+    """Select the one job-attached DOCX template; never guess between files."""
+    attachments = list((job or {}).get("instruction_attachments") or [])
+    candidates = []
+    explicit = []
+    for index, raw_meta in enumerate(attachments):
+        meta = raw_meta or {}
+        name = str(meta.get("name") or "")
+        content_type = str(meta.get("content_type") or "").lower()
+        if not (name.lower().endswith(".docx") or "wordprocessingml.document" in content_type):
+            continue
+        candidates.append((index, meta))
+        marker = str(meta.get("purpose") or meta.get("role") or "").strip().lower()
+        if meta.get("is_template") is True or marker in {"template", "job_template", "letter_template"}:
+            explicit.append((index, meta))
+    if len(explicit) == 1:
+        return explicit[0]
+    if len(explicit) > 1 or len(candidates) > 1:
+        raise ValueError("More than one Word document is attached. Mark the intended template or leave only one .docx attached so the agent cannot choose the wrong file.")
+    if not candidates:
+        raise ValueError("Attach the template for this job as a .docx file before assigning the template-aware agent.")
+    return candidates[0]
+
+
+async def _human_template_docx_bytes(job_id, job):
+    try:
+        _index, meta = _human_template_attachment(job)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    path = str(meta.get("storage_path") or "")
+    if not path or not path.startswith(f"human-workflow/{job_id}/instructions/"):
+        raise HTTPException(status_code=409, detail="The attached Word template is not in this job's private reference storage.")
+    if int(meta.get("size") or 0) > 25000000:
+        raise HTTPException(status_code=413, detail="The attached Word template is larger than the 25 MB rendering limit.")
+    bucket = _human_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Private file storage is not ready yet. Please try again shortly.")
+    blob = bucket.blob(path)
+    if not await asyncio.to_thread(blob.exists):
+        raise HTTPException(status_code=404, detail="The Word template attached to this job could not be found.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    if not raw or len(raw) > 25000000:
+        raise HTTPException(status_code=413, detail="The attached Word template is empty or larger than the 25 MB rendering limit.")
+    return meta, raw
+
+
+def _human_template_docx_profile(raw):
+    """Describe the actual job template's paragraph styles for the agent and renderer."""
+    from docx.oxml.ns import qn
+
+    document = Document(BytesIO(raw))
+    if document.tables:
+        raise ValueError("This Word template uses tables. The safe first release supports paragraph-based DOCX templates; no draft was assigned or changed.")
+    body = document.element.body
+    for child in body.iterchildren():
+        if child.tag not in {qn("w:p"), qn("w:sectPr")}:
+            raise ValueError("This Word template contains a layout element the renderer cannot safely preserve yet. Use a paragraph-based .docx template instead.")
+    rows = []
+    for index, paragraph in enumerate(document.paragraphs):
+        if paragraph._p.xpath(".//w:drawing") or paragraph._p.xpath(".//w:pict") or paragraph._p.xpath(".//w:object") or paragraph._p.xpath(".//w:hyperlink") or paragraph._p.xpath(".//w:fldSimple") or paragraph._p.xpath(".//w:instrText") or paragraph._p.xpath(".//w:br"):
+            raise ValueError("This Word template contains an embedded object, link, field or manual page/line break in its body. The renderer will not remove it; use a paragraph-based template without those elements.")
+        if paragraph._p.pPr is not None and paragraph._p.pPr.find(qn("w:sectPr")) is not None:
+            raise ValueError("This Word template has multiple section breaks. The renderer cannot preserve them safely yet.")
+        text = str(paragraph.text or "")
+        if not text.strip():
+            continue
+        fmt = paragraph.paragraph_format
+        alignment = {None: "template default", 0: "left", 1: "center", 2: "right", 3: "justified"}.get(paragraph.alignment, "template default")
+        def inches(value):
+            return "default" if value is None else f"{float(value.inches):.2f} in"
+        runs = [run for run in paragraph.runs if run.text]
+        sample_run = runs[0] if runs else None
+        font_name = (sample_run.font.name if sample_run else None) or "style inherited"
+        font_size = sample_run.font.size.pt if sample_run and sample_run.font.size else None
+        run_marks = []
+        if sample_run and sample_run.bold:
+            run_marks.append("bold")
+        if sample_run and sample_run.italic:
+            run_marks.append("italic")
+        if sample_run and sample_run.underline:
+            run_marks.append("underlined")
+        rows.append(
+            f"P{index}: style={paragraph.style.name if paragraph.style else 'Normal'}; alignment={alignment}; "
+            f"left-indent={inches(fmt.left_indent)}; first-line-indent={inches(fmt.first_line_indent)}; "
+            f"spacing-before={fmt.space_before.pt if fmt.space_before else 0}pt; "
+            f"spacing-after={fmt.space_after.pt if fmt.space_after else 0}pt; "
+            f"line-spacing={fmt.line_spacing}; font={font_name}{f' {font_size:g}pt' if font_size else ''}; "
+            f"marks={','.join(run_marks) or 'plain'}; sample={text[:220]!r}"
+        )
+    if not rows:
+        raise ValueError("The attached Word template has no readable paragraphs.")
+    section = document.sections[0]
+    page = section.page_width, section.page_height
+    margins = section.top_margin, section.right_margin, section.bottom_margin, section.left_margin
+    page_line = (
+        f"Page size: {page[0].inches:.2f} x {page[1].inches:.2f} inches; "
+        f"margins top/right/bottom/left: " + "/".join(f"{value.inches:.2f} in" for value in margins)
+    )
+    return page_line + "\n" + "\n".join(rows)
+
+
+def _human_template_line_kind(text):
+    value = str(text or "")
+    stripped = value.strip()
+    if not stripped:
+        return "blank"
+    if stripped.startswith("[") or stripped.lower().startswith(("client spellings:", "my spellings:", "i searched:", "research notes:")):
+        return "flush"
+    if re.match(r"^\s*\d+[.)]\s", value):
+        return "numbered"
+    if len(stripped) <= 100 and any(char.isalpha() for char in stripped) and stripped.isupper():
+        return "heading"
+    if re.match(r"^(date|re|dear|file no\.?|claim date|email|cc|enclosures)\b", stripped, re.IGNORECASE):
+        return "label"
+    return "body"
+
+
+def _human_template_source_kind(paragraph):
+    text = str(paragraph.text or "")
+    stripped = text.strip()
+    if not stripped:
+        return "blank"
+    if len(stripped) <= 100 and any(char.isalpha() for char in stripped) and stripped.isupper():
+        return "heading"
+    if re.match(r"^(date|re|dear|file no\.?|claim date|email|cc|enclosures)\b", stripped, re.IGNORECASE):
+        return "label"
+    fmt = paragraph.paragraph_format
+    if text.startswith("\t") or (fmt.first_line_indent is not None and fmt.first_line_indent.inches > 0):
+        return "body"
+    return "flush"
+
+
+def _human_template_render_docx(template_bytes, draft_text):
+    """Replace template copy with the private draft while retaining its Word layout and styles."""
+    from docx.oxml import OxmlElement
+    from docx.text.paragraph import Paragraph
+
+    _human_template_docx_profile(template_bytes)
+    document = Document(BytesIO(template_bytes))
+    if document.tables:
+        raise ValueError("This Word template uses tables. It was not modified; use a paragraph-based .docx template.")
+    body = document.element.body
+    source_paragraphs = list(document.paragraphs)
+    for paragraph in source_paragraphs:
+        if paragraph._p.xpath(".//w:drawing") or paragraph._p.xpath(".//w:pict") or paragraph._p.xpath(".//w:object"):
+            raise ValueError("This Word template contains an embedded body object and cannot be safely rewritten.")
+    if not source_paragraphs:
+        raise ValueError("The attached Word template has no paragraphs to format the draft.")
+
+    source_texts = [str(paragraph.text or "") for paragraph in source_paragraphs]
+    source_kinds = [_human_template_source_kind(paragraph) for paragraph in source_paragraphs]
+    body_sources = [
+        paragraph for paragraph, kind in zip(source_paragraphs, source_kinds)
+        if kind == "body" and str(paragraph.text or "").strip()
+    ]
+    if not body_sources:
+        body_sources = [paragraph for paragraph in source_paragraphs if str(paragraph.text or "").strip()]
+    if not body_sources:
+        raise ValueError("The attached Word template has no usable paragraph styles.")
+    default_source = max(body_sources, key=lambda paragraph: len(paragraph.text or ""))
+
+    def choose_source(line):
+        kind = _human_template_line_kind(line)
+        if kind == "blank":
+            return next((paragraph for paragraph, source_kind in zip(source_paragraphs, source_kinds) if source_kind == "blank"), default_source)
+        output = str(line or "").strip().casefold()
+        label_match = re.match(r"^(date|re|dear|file no\.?|claim date|email|cc|enclosures)\b", output)
+        best = None
+        best_score = -100
+        for paragraph, source_kind in zip(source_paragraphs, source_kinds):
+            sample = str(paragraph.text or "").strip().casefold()
+            score = 0
+            if source_kind == kind:
+                score += 4
+            elif kind in {"label", "flush"} and source_kind == "flush":
+                score += 1
+            if label_match and sample.startswith(label_match.group(1)):
+                score += 12
+            if output and sample and (output.startswith(sample[: min(len(sample), 12)]) or sample.startswith(output[: min(len(output), 12)])):
+                score += 3
+            if kind == "body":
+                if paragraph.paragraph_format.first_line_indent is not None and paragraph.paragraph_format.first_line_indent.inches > 0:
+                    score += 2
+                if str(paragraph.text or "").startswith("\t"):
+                    score += 2
+                score += min(len(sample), 500) / 500
+            if kind == "heading" and paragraph.alignment == 1:
+                score += 2
+            if score > best_score:
+                best, best_score = paragraph, score
+        if kind == "body" and best_score < 4:
+            return default_source
+        return best or default_source
+
+    def add_styled_run(paragraph, text, source_run=None):
+        if not text:
+            return
+        run = paragraph.add_run()
+        if source_run is not None and source_run._r.rPr is not None:
+            run._r.insert(0, deepcopy(source_run._r.rPr))
+        run.text = text
+
+    normalized = str(draft_text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    lines = normalized.split("\n") if normalized else [""]
+    for paragraph in source_paragraphs:
+        body.remove(paragraph._p)
+
+    for line in lines:
+        source = choose_source(line)
+        rendered_line = line
+        source_format = source.paragraph_format
+        has_template_indent = bool(
+            (source_format.left_indent is not None and source_format.left_indent.inches > 0)
+            or (source_format.first_line_indent is not None and source_format.first_line_indent.inches > 0)
+        )
+        if _human_template_line_kind(line) == "body" and line.startswith("\t") and has_template_indent:
+            rendered_line = line[1:]
+        new_p = OxmlElement("w:p")
+        if source._p.pPr is not None:
+            new_p.append(deepcopy(source._p.pPr))
+        insert_at = len(body) - (1 if body.sectPr is not None else 0)
+        body.insert(insert_at, new_p)
+        target = Paragraph(new_p, document._body)
+        if not rendered_line:
+            continue
+        source_runs = [run for run in source.runs if run.text]
+        source_text = "".join(run.text for run in source_runs)
+        prefix_len = 0
+        while prefix_len < min(len(source_text), len(rendered_line)) and source_text[prefix_len] == rendered_line[prefix_len]:
+            prefix_len += 1
+        if prefix_len and source_runs:
+            consumed = 0
+            boundary_run = source_runs[-1]
+            for source_run in source_runs:
+                take = min(len(source_run.text or ""), prefix_len - consumed)
+                if take > 0:
+                    add_styled_run(target, rendered_line[consumed:consumed + take], source_run)
+                    consumed += take
+                if consumed >= prefix_len:
+                    boundary_run = source_run
+                    break
+            if prefix_len < len(rendered_line):
+                add_styled_run(target, rendered_line[prefix_len:], boundary_run)
+        else:
+            add_styled_run(target, rendered_line, source_runs[0] if source_runs else None)
+
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
 async def _human_reclaim_expired_job(job_id: str, job: dict):
     """A worker's TAT deadline passed before they submitted. Take the job
     back from them and return it to the admin queue as "approved" so it can
@@ -6453,6 +6710,20 @@ async def _human_reclaim_expired_job(job_id: str, job: dict):
 def _human_is_split_job(job):
     job = job or {}
     return str(job.get("split_mode") or "").strip().lower() in {"dual", "multi"} and bool(job.get("segments"))
+
+
+def _human_whole_job_ai_takeover_allowed(job):
+    job = job or {}
+    segments = [item or {} for item in (job.get("segments") or [])]
+    return bool(
+        _human_is_split_job(job)
+        and not job.get("worker_uid")
+        and not job.get("proofreader_uid")
+        and not list(job.get("assigned_worker_uids") or [])
+        and job.get("proofreader_status") not in {"assigned", "in_progress", "submitted"}
+        and segments
+        and all(not item.get("worker_uid") and item.get("status") in {"available", "approved"} for item in segments)
+    )
 
 
 def _human_split_parent_status(job, segments=None):
@@ -9529,6 +9800,33 @@ async def human_instruction_attachment(job_id: str, attachment_index: int, reque
     )
 
 
+@app.get("/human-transcription/admin/jobs/{job_id}/ai-agent/template-docx")
+async def human_admin_ai_agent_template_docx(job_id: str, request: Request):
+    _require_admin(request)
+    job = await _human_job(job_id)
+    if job.get("ai_agent_id") != "template-claude" or job.get("ai_agent_status") != "submitted":
+        raise HTTPException(status_code=404, detail="A finished template-agent Word draft is not available for this job.")
+    meta = job.get("ai_agent_docx") or {}
+    path = str(meta.get("storage_path") or "")
+    if not path or not path.startswith(f"human-workflow/{job_id}/ai-drafts/"):
+        raise HTTPException(status_code=404, detail="The private Word draft is not available.")
+    bucket = _human_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Private file storage is not ready yet. Please try again shortly.")
+    blob = bucket.blob(path)
+    if not await asyncio.to_thread(blob.exists):
+        raise HTTPException(status_code=404, detail="The private Word draft could not be found.")
+    raw = await asyncio.to_thread(blob.download_as_bytes)
+    if not raw:
+        raise HTTPException(status_code=404, detail="The private Word draft is empty.")
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "formatted-draft.docx")) or "formatted-draft.docx"
+    return Response(
+        content=raw,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "private, no-store"},
+    )
+
+
 def _human_segment_for_download(job, actor, segment_id):
     segment = next((dict(item or {}) for item in (job.get("segments") or []) if item.get("id") == segment_id), None)
     if not segment:
@@ -10115,8 +10413,7 @@ async def human_admin_ai_agents(request: Request):
 def _human_ai_agent_system(agent_id, stage, guidelines, context):
     agent = HUMAN_AI_AGENTS[agent_id]
     template_note = (
-        "The job includes or is assigned a client template. Follow its field order, exact labels, "
-        "boilerplate and layout instructions. Do not invent missing dictated content."
+        "Use the .docx attached to this specific job as the only output template. Follow its field order, exact labels, boilerplate, tabs, indentation, headings and layout notes. A layout profile from that file is included in the job context. Do not use a hard-coded template or invent missing dictated content."
         if agent_id == "template-claude" else ""
     )
     return (
@@ -10245,7 +10542,7 @@ async def _human_ai_agent_research(raw_text, context):
         return ""
 
 
-async def _human_ai_agent_generate(job_id, job, segment, agent_id):
+async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_profile=""):
     agent = HUMAN_AI_AGENTS[agent_id]
     guidelines = await _admin_guidelines_text()
     context_data = await _human_review_context(job_id, job)
@@ -10253,6 +10550,8 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id):
     reference_images = context_data["images"]
     if context_data["issues"]:
         context += "\n\nREFERENCE FILE ALERTS (do not guess at unreadable reference content):\n" + "\n".join(context_data["issues"])
+    if template_profile:
+        context += "\n\nLAYOUT PROFILE FROM THIS JOB'S ATTACHED WORD TEMPLATE:\n" + str(template_profile)[:24000]
     system = _human_ai_agent_system(agent_id, "transcription and formatting", guidelines, context)
     if agent_id == "pdf-gemini":
         image = job.get("pdf_image") or {}
@@ -10323,10 +10622,23 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             raise RuntimeError("This AI run is no longer the active assignment.")
         segment.update({"ai_agent_status": "processing"})
         await asyncio.to_thread(ref.update, {"segments": segments, "ai_agent_status": "processing", "updatedAt": firestore.SERVER_TIMESTAMP})
-        answer, audio_seconds, model_ids = await _human_ai_agent_generate(job_id, job, segment, agent_id)
+        template_bytes = None
+        template_profile = ""
+        template_docx_meta = None
+        if agent_id == "template-claude":
+            _template_meta, template_bytes = await _human_template_docx_bytes(job_id, job)
+            template_profile = await asyncio.to_thread(_human_template_docx_profile, template_bytes)
+        answer, audio_seconds, model_ids = await _human_ai_agent_generate(job_id, job, segment, agent_id, template_profile)
         if not answer:
             raise RuntimeError("The AI agent returned an empty draft.")
         answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
+        if template_bytes:
+            rendered_docx = await asyncio.to_thread(_human_template_render_docx, template_bytes, answer)
+            template_basename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(str(job.get("job_name") or job.get("title") or "transcript")))[:120].strip("._-") or "transcript"
+            template_docx_meta = await asyncio.to_thread(
+                _human_store_raw_bytes, job_id, f"{template_basename}-formatted-draft.docx", rendered_docx,
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "ai-drafts",
+            )
         clean_html = _sanitize_editor_html(_review_text_to_html(answer))
         snap = await asyncio.to_thread(ref.get)
         current = snap.to_dict() if snap.exists else None
@@ -10348,6 +10660,7 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             "segments": current_segments, "split_mode": "multi", "status": parent_status,
             "ai_agent_status": "submitted", "ai_agent_name": agent["name"],
             "ai_agent_model_ids": model_ids, "ai_agent_completedAt": firestore.SERVER_TIMESTAMP,
+            "ai_agent_docx": template_docx_meta if template_docx_meta else firestore.DELETE_FIELD,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
         await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {
@@ -10366,15 +10679,32 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             current = snap.to_dict() if snap.exists else None
             if current:
                 current_segments = [dict(item or {}) for item in (current.get("segments") or [])]
-                target = next((item for item in current_segments if str(item.get("id") or "") == segment_id), None)
-                if target and target.get("ai_agent_run_id") == run_id:
-                    target.update({"status": "available", "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500]})
-                    status = _human_split_parent_status(current, current_segments)
-                    await asyncio.to_thread(ref.update, {
-                        "segments": current_segments, "split_mode": "multi", "status": status,
-                        "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500],
-                        "updatedAt": firestore.SERVER_TIMESTAMP,
-                    })
+                if current.get("ai_agent_run_id") == run_id and current.get("ai_agent_scope") == "whole_job":
+                    restored_segments = [dict(item or {}) for item in (current.get("ai_agent_paused_segments") or [])]
+                    if restored_segments:
+                        await asyncio.to_thread(ref.update, {
+                            "segments": restored_segments,
+                            "split_mode": current.get("ai_agent_previous_split_mode") or "multi",
+                            "status": current.get("ai_agent_previous_status") or _human_split_parent_status(current, restored_segments),
+                            "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500],
+                            "ai_agent_docx": firestore.DELETE_FIELD,
+                            "ai_agent_paused_segments": firestore.DELETE_FIELD,
+                            "ai_agent_previous_split_mode": firestore.DELETE_FIELD,
+                            "ai_agent_previous_status": firestore.DELETE_FIELD,
+                            "ai_agent_scope": firestore.DELETE_FIELD,
+                            "updatedAt": firestore.SERVER_TIMESTAMP,
+                        })
+                else:
+                    target = next((item for item in current_segments if str(item.get("id") or "") == segment_id), None)
+                    if target and target.get("ai_agent_run_id") == run_id:
+                        target.update({"status": "available", "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500]})
+                        status = _human_split_parent_status(current, current_segments)
+                        await asyncio.to_thread(ref.update, {
+                            "segments": current_segments, "split_mode": "multi", "status": status,
+                            "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500],
+                            "ai_agent_docx": firestore.DELETE_FIELD,
+                            "updatedAt": firestore.SERVER_TIMESTAMP,
+                        })
             await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {
                 "status": "failed", "error": str(exc)[:500], "elapsed_seconds": int(time.time() - started),
                 "completedAt": firestore.SERVER_TIMESTAMP,
@@ -10405,11 +10735,35 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         raise HTTPException(status_code=409, detail="Gemini is reserved for PDF/image jobs; the GPT and Claude agents are for audio jobs.")
     if not is_pdf and not (job.get("audio") or {}).get("storage_path"):
         raise HTTPException(status_code=409, detail="This job has no source audio for an AI transcription draft.")
+    if agent_id == "template-claude":
+        _template_meta, template_raw = await _human_template_docx_bytes(job_id, job)
+        try:
+            await asyncio.to_thread(_human_template_docx_profile, template_raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    split_job = _human_is_split_job(job)
+    whole_job_requested = split_job and bool((payload or {}).get("whole_job"))
+    paused_segments = None
+    previous_split_mode = str(job.get("split_mode") or "multi")
+    previous_status = str(job.get("status") or "split_assigned")
     segments = [dict(item or {}) for item in (job.get("segments") or [])]
     segment_id = str((payload or {}).get("segment_id") or "").strip()
-    if _human_is_split_job(job):
+    if whole_job_requested:
+        if not _human_whole_job_ai_takeover_allowed(job):
+            raise HTTPException(status_code=409, detail="Whole-job takeover is only available before any part is claimed or submitted. Existing worker and proofreader work was not changed.")
+        paused_segments = [dict(item or {}) for item in segments]
+        segment_id = "ai-agent-whole-" + uuid.uuid4().hex[:12]
+        target = {
+            "id": segment_id, "label": "Part 1", "index": 1,
+            "start_seconds": 0, "end_seconds": float(job.get("seconds") or 0),
+            "minutes": int(job.get("minutes") or 0), "status": "available",
+            "worker_uid": None, "worker_email": None,
+        }
+        segments = [target]
+    elif split_job:
         if not segment_id:
-            raise HTTPException(status_code=400, detail="Choose an available part for the AI agent.")
+            raise HTTPException(status_code=400, detail="Choose an available part or choose whole-job takeover.")
         target = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
         if not target or target.get("status") not in {"available", "approved"} or target.get("worker_uid"):
             raise HTTPException(status_code=409, detail="That part is no longer available for an AI draft.")
@@ -10418,7 +10772,7 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             raise HTTPException(status_code=409, detail="Only an approved, unassigned job can be sent to an AI agent.")
         segment_id = "ai-agent-" + uuid.uuid4().hex[:12]
         target = {
-            "id": segment_id, "label": "AI first draft", "index": 1,
+            "id": segment_id, "label": "Part 1", "index": 1,
             "start_seconds": 0, "end_seconds": float(job.get("seconds") or 0),
             "minutes": int(job.get("minutes") or 0), "status": "available",
             "worker_uid": None, "worker_email": None,
@@ -10429,22 +10783,59 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
     run_id = uuid.uuid4().hex
     target.update({
         "status": "in_progress", "worker_uid": None, "worker_email": None,
-        "worker_name": agent["name"], "ai_agent_id": agent_id,
+        "worker_name": "Worker 1", "ai_agent_id": agent_id,
         "ai_agent_name": agent["name"], "ai_agent_status": "queued",
         "ai_agent_model_ids": agent["models"], "ai_agent_run_id": run_id,
         "assignedAt": datetime.now(), "deadlineAt": None, "tat_seconds": None,
     })
     parent_status = _human_split_parent_status(job, segments)
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-        "segments": segments, "split_mode": "multi", "status": parent_status,
+    updates = {
+        "segments": segments, "split_mode": previous_split_mode if whole_job_requested else "multi", "status": parent_status,
         "assigned_worker_uids": list(job.get("assigned_worker_uids") or []),
         "ai_agent_status": "queued", "ai_agent_id": agent_id,
         "ai_agent_name": agent["name"], "ai_agent_model_ids": agent["models"],
-        "ai_agent_run_id": run_id, "ai_agent_error": "", "updatedAt": firestore.SERVER_TIMESTAMP,
-    })
+        "ai_agent_run_id": run_id, "ai_agent_error": "", "ai_agent_docx": firestore.DELETE_FIELD,
+        "ai_agent_scope": "whole_job" if whole_job_requested else ("part" if split_job else "single_job"),
+        "ai_agent_paused_segments": paused_segments if whole_job_requested else firestore.DELETE_FIELD,
+        "ai_agent_previous_split_mode": previous_split_mode if whole_job_requested else firestore.DELETE_FIELD,
+        "ai_agent_previous_status": previous_status if whole_job_requested else firestore.DELETE_FIELD,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    if whole_job_requested:
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def assign_whole_job_ai(tx):
+            snapshot = job_ref.get(transaction=tx)
+            if not snapshot.exists:
+                raise HTTPException(status_code=404, detail="This job is no longer available.")
+            current = snapshot.to_dict() or {}
+            if not _human_whole_job_ai_takeover_allowed(current):
+                raise HTTPException(status_code=409, detail="A worker claimed or submitted a part before takeover completed. No work was changed.")
+            current_segments = [dict(item or {}) for item in (current.get("segments") or [])]
+            current_target = dict(target)
+            current_target["end_seconds"] = float(current.get("seconds") or 0)
+            current_target["minutes"] = int(current.get("minutes") or 0)
+            current_updates = {
+                **updates,
+                "segments": [current_target],
+                "split_mode": str(current.get("split_mode") or "multi"),
+                "status": _human_split_parent_status(current, [current_target]),
+                "assigned_worker_uids": list(current.get("assigned_worker_uids") or []),
+                "ai_agent_paused_segments": current_segments,
+                "ai_agent_previous_split_mode": str(current.get("split_mode") or "multi"),
+                "ai_agent_previous_status": str(current.get("status") or "split_assigned"),
+            }
+            tx.update(job_ref, current_updates)
+
+        await asyncio.to_thread(assign_whole_job_ai, transaction)
+    else:
+        await asyncio.to_thread(job_ref.update, updates)
     await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).set, {
         "run_id": run_id, "job_id": job_id, "segment_id": segment_id,
         "agent_id": agent_id, "agent_name": agent["name"], "model_ids": agent["models"],
+        "scope": "whole_job" if whole_job_requested else ("part" if split_job else "single_job"),
         "status": "queued", "createdAt": firestore.SERVER_TIMESTAMP,
     })
     background_tasks.add_task(_human_run_ai_agent, job_id, segment_id, agent_id, run_id)
