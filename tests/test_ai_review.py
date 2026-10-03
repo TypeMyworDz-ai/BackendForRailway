@@ -3,7 +3,11 @@ import asyncio
 import math
 import re
 import unittest
+from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
+from docx import Document
+from docx.shared import Inches, Pt
 
 
 def _load():
@@ -96,6 +100,143 @@ class ProofreaderLabelSerialization(unittest.TestCase):
         serializer = source[source.index("def _human_public_for("):source.index("def _human_available_public_for(")]
         self.assertIn('"author_label": f"Worker {index + 1}"', serializer)
         self.assertNotIn("AI draft:", serializer)
+
+
+class WholeJobAiTakeover(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source_path = Path(__file__).resolve().parents[1].joinpath("main.py")
+        cls.source = source_path.read_text()
+        tree = ast.parse(cls.source)
+        names = {"_human_is_split_job", "_human_whole_job_ai_takeover_allowed"}
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        cls.helpers = {}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source_path), "exec"), cls.helpers)
+        cls.routes = {node.name: node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)}
+
+    def test_takeover_is_allowed_only_before_any_part_or_proofreader_starts(self):
+        allowed = self.helpers["_human_whole_job_ai_takeover_allowed"]
+        base = {"split_mode": "dual", "status": "split_assigned", "segments": [
+            {"id": "a", "status": "available"}, {"id": "b", "status": "approved"},
+        ]}
+        self.assertTrue(allowed(base))
+        claimed = {**base, "segments": [dict(base["segments"][0]), {"id": "b", "status": "in_progress", "worker_uid": "worker-2"}]}
+        self.assertFalse(allowed(claimed))
+        submitted = {**base, "segments": [dict(base["segments"][0]), {"id": "b", "status": "submitted"}]}
+        self.assertFalse(allowed(submitted))
+        proofreader = {**base, "proofreader_status": "assigned"}
+        self.assertFalse(allowed(proofreader))
+        self.assertFalse(allowed({"split_mode": "single", "segments": base["segments"]}))
+
+    def test_route_stores_paused_parts_and_restores_them_on_failure(self):
+        route_source = ast.unparse(self.routes["human_admin_assign_ai_agent"])
+        runner_source = ast.unparse(self.routes["_human_run_ai_agent"])
+        self.assertIn("_require_admin", route_source)
+        self.assertIn("_human_whole_job_ai_takeover_allowed", route_source)
+        self.assertIn("ai_agent_paused_segments", route_source)
+        self.assertIn("ai_agent_previous_split_mode", route_source)
+        self.assertIn("ai_agent_paused_segments", runner_source)
+        self.assertIn("restored_segments", runner_source)
+        self.assertIn("firestore.DELETE_FIELD", runner_source)
+
+    def test_worker_and_client_serialization_redacts_agent_identity(self):
+        serializer = self.source[self.source.index("def _human_public_for("):self.source.index("def _human_available_public_for(")]
+        self.assertIn('"ai_agent_name"', serializer)
+        self.assertIn('"ai_agent_model_ids"', serializer)
+        self.assertIn('"ai_agent_docx"', serializer)
+        self.assertIn('"author_label": f"Worker {index + 1}"', serializer)
+
+
+class TemplateDocxRendering(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source_path = Path(__file__).resolve().parents[1].joinpath("main.py")
+        tree = ast.parse(source_path.read_text())
+        names = {"_human_template_attachment", "_human_template_docx_profile", "_human_template_line_kind", "_human_template_source_kind", "_human_template_render_docx"}
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        cls.helpers = {"Document": Document, "BytesIO": BytesIO, "deepcopy": deepcopy, "re": re}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(source_path), "exec"), cls.helpers)
+
+    def test_template_selection_never_guesses_between_word_files(self):
+        choose = self.helpers["_human_template_attachment"]
+        selected = choose({"instruction_attachments": [{"name": "notes.pdf"}, {"name": "letter.docx", "storage_path": "one"}]})
+        self.assertEqual(selected[1]["storage_path"], "one")
+        with self.assertRaisesRegex(ValueError, "More than one Word document"):
+            choose({"instruction_attachments": [{"name": "one.docx"}, {"name": "two.docx"}]})
+        selected = choose({"instruction_attachments": [
+            {"name": "one.docx"}, {"name": "two.docx", "purpose": "template"},
+        ]})
+        self.assertEqual(selected[1]["name"], "two.docx")
+
+    def test_render_keeps_the_attached_template_page_and_paragraph_formatting(self):
+        template = Document()
+        section = template.sections[0]
+        section.page_width, section.page_height = Inches(8.5), Inches(11)
+        section.top_margin = section.bottom_margin = section.left_margin = section.right_margin = Inches(1)
+        template.styles["Normal"].font.name = "Times New Roman"
+        template.styles["Normal"].font.size = Pt(12)
+        heading = template.add_paragraph()
+        heading.alignment = 1
+        heading.add_run("EXAMPLE TITLE").bold = True
+        template.add_paragraph()
+        body = template.add_paragraph()
+        body.paragraph_format.line_spacing = 1
+        body.paragraph_format.space_before = Pt(0)
+        body.paragraph_format.space_after = Pt(0)
+        body.add_run("\tExample body placeholder.")
+        template.add_paragraph("Client spellings: Example.")
+        original = BytesIO()
+        template.save(original)
+
+        profile = self.helpers["_human_template_docx_profile"](original.getvalue())
+        result_bytes = self.helpers["_human_template_render_docx"](
+            original.getvalue(), "EXAMPLE TITLE\n\n\tBody paragraph.\n\nClient spellings: Jon."
+        )
+        result = Document(BytesIO(result_bytes))
+        self.assertIn("Page size: 8.50 x 11.00 inches", profile)
+        self.assertEqual([paragraph.text for paragraph in result.paragraphs], ["EXAMPLE TITLE", "", "\tBody paragraph.", "", "Client spellings: Jon."])
+        self.assertEqual(result.sections[0].top_margin, section.top_margin)
+        self.assertEqual(result.sections[0].page_width, section.page_width)
+        self.assertEqual(result.styles["Normal"].font.name, "Times New Roman")
+        self.assertEqual(result.styles["Normal"].font.size, Pt(12))
+        self.assertEqual(result.paragraphs[0].alignment, 1)
+        self.assertTrue(result.paragraphs[0].runs[0].bold)
+        self.assertEqual(result.paragraphs[2].paragraph_format.line_spacing, 1)
+        self.assertEqual(result.paragraphs[2].paragraph_format.space_after, Pt(0))
+
+    def test_template_indent_is_not_doubled_with_default_transcript_tabs(self):
+        template = Document()
+        body = template.add_paragraph("Original body paragraph.")
+        body.paragraph_format.first_line_indent = Inches(0.5)
+        original = BytesIO()
+        template.save(original)
+        result_bytes = self.helpers["_human_template_render_docx"](original.getvalue(), "\tReplacement body paragraph.")
+        result = Document(BytesIO(result_bytes))
+        self.assertEqual(result.paragraphs[0].text, "Replacement body paragraph.")
+        self.assertEqual(result.paragraphs[0].paragraph_format.first_line_indent, Inches(0.5))
+
+    def test_table_templates_fail_closed_without_creating_a_misleading_docx(self):
+        template = Document()
+        template.add_table(rows=1, cols=1).cell(0, 0).text = "Name:"
+        output = BytesIO()
+        template.save(output)
+        with self.assertRaisesRegex(ValueError, "uses tables"):
+            self.helpers["_human_template_docx_profile"](output.getvalue())
+        with self.assertRaisesRegex(ValueError, "uses tables"):
+            self.helpers["_human_template_render_docx"](output.getvalue(), "Draft text")
+
+    def test_assignment_uses_the_job_template_and_only_full_admin_can_download(self):
+        source_path = Path(__file__).resolve().parents[1].joinpath("main.py")
+        routes = {node.name: node for node in ast.parse(source_path.read_text()).body if isinstance(node, ast.AsyncFunctionDef)}
+        assignment = ast.unparse(routes["human_admin_assign_ai_agent"])
+        runner = ast.unparse(routes["_human_run_ai_agent"])
+        download = ast.unparse(routes["human_admin_ai_agent_template_docx"])
+        self.assertIn("_human_template_docx_bytes", assignment)
+        self.assertIn("_human_template_docx_profile", assignment)
+        self.assertIn("_human_template_render_docx", runner)
+        self.assertIn("_human_store_raw_bytes", runner)
+        self.assertIn("_require_admin", download)
+        self.assertIn("human-workflow/{job_id}/ai-drafts/", download)
 
 
 class AiAgentAuthorization(unittest.TestCase):
