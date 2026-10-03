@@ -131,8 +131,9 @@ class AiAgentCatalog(unittest.TestCase):
 
     def test_three_agents_have_requested_model_pairs(self):
         self.assertEqual(set(self.agents), {"general-gpt", "template-claude", "pdf-gemini"})
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-terra", "gpt-5.6-sol"])
-        self.assertEqual(self.agents["template-claude"]["models"], ["claude-opus-5-5", "claude-sonnet-5-5"])
+        expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
+        self.assertEqual(self.agents["general-gpt"]["models"], expected_audio_models)
+        self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
 
     def test_agents_are_internal_not_email_accounts(self):
@@ -151,4 +152,89 @@ class HealthEndpointPrivacy(unittest.TestCase):
         namespace = {}
         exec(compile(isolated, str(source_path), "exec"), namespace)
         self.assertEqual(asyncio.run(namespace["health_check"]()), {"status": "healthy"})
+
+
+class AiModelRouting(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source_path = Path(__file__).resolve().parents[1].joinpath("main.py")
+        cls.source = source_path.read_text(encoding="utf-8")
+        cls.tree = ast.parse(cls.source)
+        cls.functions = {
+            node.name: node for node in cls.tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        cls.assignments = {
+            target.id: ast.literal_eval(node.value)
+            for node in cls.tree.body if isinstance(node, ast.Assign)
+            for target in node.targets if isinstance(target, ast.Name)
+            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN"}
+        }
+
+    def test_requested_model_chains_are_primary_then_fallback(self):
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
+        self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("gemini-3.8-flash", "gemini")))
+
+    def test_ai_review_and_both_agent_passes_use_fallback_chain(self):
+        review_calls = [node for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
+        self.assertEqual(len(review_calls), 1)
+        self.assertTrue(any(isinstance(arg, ast.Name) and arg.id == "AI_REVIEW_MODEL_CHAIN" for arg in review_calls[0].args))
+        self.assertTrue(any(keyword.arg == "response_validator" and isinstance(keyword.value, ast.Name) and keyword.value.id == "_review_validate_output" for keyword in review_calls[0].keywords))
+        self.assertNotIn("resolve_ask_model", {node.func.id for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
+        agent_calls = [node for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
+        self.assertEqual(len(agent_calls), 2)
+        self.assertTrue(all(any(isinstance(arg, ast.Name) and arg.id == "HUMAN_AUDIO_AGENT_MODEL_CHAIN" for arg in call.args) for call in agent_calls))
+
+    def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
+        formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_call_model_chain", "_human_worker_ai_draft_system"}.issubset(formatter_calls))
+        route = self.functions["human_worker_ai_draft"]
+        call_lines = {node.func.id: node.lineno for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertLess(call_lines["_human_worker_format_ai_draft"], call_lines["charge_credits"])
+        self.assertIn('"format_version": 2', self.source)
+
+    def test_fallback_runs_only_after_failure_or_unusable_response(self):
+        class QuietLogger:
+            def warning(self, *args, **kwargs):
+                pass
+
+        function = self.functions["_human_call_model_chain"]
+        namespace = {"asyncio": asyncio, "logger": QuietLogger()}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
+        calls = []
+
+        def fake_run(model_id, provider, system_prompt, question, images, max_tokens):
+            calls.append((model_id, provider))
+            return "" if model_id == "primary" else "formatted transcript"
+
+        namespace["_run_ask_model_with_images"] = fake_run
+        answer, used = asyncio.run(namespace["_human_call_model_chain"](
+            (("primary", "claude"), ("backup", "openai")), "system", "question"
+        ))
+        self.assertEqual(answer, "formatted transcript")
+        self.assertEqual(used, "backup")
+        self.assertEqual(calls, [("primary", "claude"), ("backup", "openai")])
+
+        calls.clear()
+        namespace["_run_ask_model_with_images"] = lambda model_id, *args: calls.append(model_id) or ("malformed" if model_id == "primary" else "valid transcript")
+
+        def validate_transcript(answer):
+            if answer != "valid transcript":
+                raise ValueError("invalid transcript response")
+
+        answer, used = asyncio.run(namespace["_human_call_model_chain"](
+            (("primary", "claude"), ("backup", "openai")), "system", "question",
+            response_validator=validate_transcript,
+        ))
+        self.assertEqual((answer, used), ("valid transcript", "backup"))
+        self.assertEqual(calls, ["primary", "backup"])
+
+        calls.clear()
+        namespace["_run_ask_model_with_images"] = lambda *args: calls.append(args[0]) or "primary response"
+        answer, used = asyncio.run(namespace["_human_call_model_chain"](
+            (("primary", "claude"), ("backup", "openai")), "system", "question"
+        ))
+        self.assertEqual((answer, used), ("primary response", "primary"))
+        self.assertEqual(calls, ["primary"])
 
