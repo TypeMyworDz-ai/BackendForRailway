@@ -452,3 +452,83 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual((answer, used), ("primary response", "primary"))
         self.assertEqual(calls, ["primary"])
 
+
+class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source_path = Path(__file__).resolve().parents[1].joinpath("main.py")
+        cls.source = source_path.read_text(encoding="utf-8")
+        cls.tree = ast.parse(cls.source)
+        cls.functions = {
+            node.name: node for node in cls.tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        agent_node = next(
+            node for node in cls.tree.body if isinstance(node, ast.Assign)
+            and any(getattr(target, "id", None) == "HUMAN_AI_AGENTS" for target in node.targets)
+        )
+        namespace = {"os": __import__("os"), "HUMAN_AI_AGENTS": ast.literal_eval(agent_node.value), "__file__": str(source_path)}
+        selected = [
+            cls.functions["_human_template_agent_guidelines"],
+            cls.functions["_human_ai_agent_system"],
+        ]
+        exec(compile(ast.Module(body=selected, type_ignores=[]), str(source_path), "exec"), namespace)
+        cls.helpers = namespace
+
+    def test_full_template_rule_file_is_loaded_and_uses_researched_label(self):
+        rules = self.helpers["_human_template_agent_guidelines"]()
+        for phrase in (
+            "Children Services", "walk-through", "Client spellings:", "My spellings:",
+            "I researched:", "Research Notes:", "Jeremy, J-E-R-A-M-I-E",
+            "TEMPLATE_JOB_BLOCKED_LETTER", "Never insert `[dictation ends here]`",
+            "Quantifying numbers", "5'10\"", "straight ASCII",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, rules)
+        self.assertNotIn("I searched:", rules)
+
+    def test_template_prompt_contains_permanent_and_current_job_rules(self):
+        prompt = self.helpers["_human_ai_agent_system"](
+            "template-claude", "transcription and formatting", "older general instructions", "job files",
+            "Keep client-confirmed name spellings and preserve dictated paragraphing.",
+        )
+        self.assertIn("PERMANENT TEMPLATE-JOB GUIDELINES", prompt)
+        self.assertIn("I researched:", prompt)
+        self.assertIn("never `I searched:`", prompt)
+        self.assertIn("Below are text-specific guidelines", prompt)
+        self.assertIn("Keep client-confirmed name spellings", prompt)
+        self.assertIn("job files", prompt)
+        self.assertIn("TEMPLATE_JOB_BLOCKED_LETTER", prompt)
+
+    def test_other_agent_prompt_does_not_receive_template_rules(self):
+        prompt = self.helpers["_human_ai_agent_system"](
+            "general-gpt", "transcription and formatting", "general instructions", "job files",
+        )
+        self.assertNotIn("PERMANENT TEMPLATE-JOB GUIDELINES", prompt)
+        self.assertNotIn("CURRENT JOB TEMPLATE-SPECIFIC GUIDELINES", prompt)
+
+    def test_current_job_notes_and_uploaded_references_are_saved_privately_per_run(self):
+        assign = ast.unparse(next(node for node in self.tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_assign_ai_agent"))
+        runner = ast.unparse(self.functions["_human_run_ai_agent"])
+        generate = ast.unparse(self.functions["_human_ai_agent_generate"])
+        context = ast.unparse(self.functions["_human_review_context"])
+        self.assertIn("request.form()", assign)
+        self.assertIn("job_specific_guidelines", assign)
+        self.assertIn("reference_files", assign)
+        self.assertIn("template_reference_files", assign)
+        self.assertIn("ai-agent-runs/", assign)
+        self.assertIn("run_snapshot", runner)
+        self.assertIn("template_job_guidelines", runner)
+        self.assertIn("private_reference_files", runner)
+        self.assertIn("private_attachments=private_reference_files", generate)
+        self.assertIn("human-workflow/{job_id}/ai-agent-runs/", context)
+        self.assertIn("TEMPLATE_JOB_BLOCKED_LETTER", runner)
+
+    def test_template_agent_never_adds_dictation_ending_marker_to_parts(self):
+        prompt = self.helpers["_human_ai_agent_system"](
+            "template-claude", "transcription and formatting", "", "", "",
+        )
+        self.assertIn("never add the marker `[dictation ends here]`", prompt)
+        worker_prompt = ast.unparse(self.functions["_human_worker_ai_draft_system"])
+        self.assertIn("Never add `[dictation ends here]`", worker_prompt)
+
