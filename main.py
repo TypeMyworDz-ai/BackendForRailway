@@ -10158,6 +10158,32 @@ def _human_worker_ai_draft_system(guidelines, context):
     )
 
 
+def _human_ai_pair_asr_transcripts(assembly_result, deepgram_result):
+    """Require two completed, non-empty ASR transcripts for agent comparison."""
+    transcripts = {}
+    missing = []
+    for provider, result in (("AssemblyAI", assembly_result), ("Deepgram", deepgram_result)):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, Exception):
+            missing.append(provider)
+            continue
+        if not isinstance(result, dict) or str(result.get("status") or "").casefold() != "completed":
+            missing.append(provider)
+            continue
+        text = str(result.get("transcription") or result.get("transcript") or result.get("text") or "").strip()
+        if not text:
+            missing.append(provider)
+            continue
+        transcripts[provider] = text
+    if missing:
+        raise RuntimeError(
+            "Both AssemblyAI and Deepgram transcripts are required for AI-agent comparison. "
+            f"Unavailable: {', '.join(missing)}."
+        )
+    return transcripts
+
+
 async def _human_ai_transcribe_audio(job_id, job, segment):
     meta = job.get("audio") or {}
     path = meta.get("storage_path")
@@ -10182,20 +10208,22 @@ async def _human_ai_transcribe_audio(job_id, job, segment):
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
             tmp_path = handle.name
         await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
-        result = await transcribe_with_assemblyai(
-            tmp_path, "en", False, ["universal-3-5-pro", "universal-2"],
-            f"ai-agent-{job_id}-{segment.get('id') if segment else 'main'}",
+        agent_audio_id = f"ai-agent-{job_id}-{segment.get('id') if segment else 'main'}"
+        assembly_result, deepgram_result = await asyncio.gather(
+            transcribe_with_assemblyai(
+                tmp_path, "en", False, ["universal-3-5-pro", "universal-2"], agent_audio_id,
+            ),
+            transcribe_with_deepgram(tmp_path, "en", False, agent_audio_id),
+            return_exceptions=True,
         )
+        transcripts = _human_ai_pair_asr_transcripts(assembly_result, deepgram_result)
     finally:
         if tmp_path:
             try:
                 os.remove(tmp_path)
             except OSError:
                 pass
-    text = str(result.get("transcription") or result.get("transcript") or result.get("text") or "").strip()
-    if result.get("status") != "completed" or not text:
-        raise RuntimeError("AssemblyAI did not return a complete audio transcript.")
-    return text, len(source) / 1000.0
+    return transcripts, len(source) / 1000.0
 
 
 async def _human_ai_agent_research(raw_text, context):
@@ -10258,20 +10286,21 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id):
             draft = str(checked or draft).strip()
         return draft, 0.0, agent["models"]
 
-    raw_text, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment)
+    asr_transcripts, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment)
+    raw_text = "\n\n".join(f"{provider.upper()} TRANSCRIPT:\n{text}" for provider, text in asr_transcripts.items())
     research = await _human_ai_agent_research(raw_text, context)
     if research:
         system += "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
     first, _first_model = await _human_call_model_chain(
         HUMAN_AUDIO_AGENT_MODEL_CHAIN, system,
-        "Format this speech-to-text transcript, preserving the dictated wording and applying the supplied job notes, reference images and guidelines. The source of the words is the audio transcript below; use attached images only as job references.\n\n"
-        "SOURCE TRANSCRIPT:\n" + raw_text[:350000], reference_images, 16000,
+        "Compare the independent AssemblyAI and Deepgram transcripts below before formatting. Use agreement as strong evidence; when they differ, resolve only what is supported by the transcript evidence and job references. Do not invent words, smooth awkward phrasing, or combine alternatives. Preserve the dictated wording and order, and apply the supplied job notes, reference images, and guidelines. The transcripts are text evidence from the same audio; use attached images only as job references. Return only the formatted transcript.\n\n"
+        "SOURCE TRANSCRIPTS:\n" + raw_text[:350000], reference_images, 16000,
     )
     second_system = _human_ai_agent_system(agent_id, "independent accuracy check", guidelines, context)
     answer, _second_model = await _human_call_model_chain(
         HUMAN_AUDIO_AGENT_MODEL_CHAIN, second_system,
-        "Compare the source transcript and formatted draft. Use attached images as job references only. Correct only clear recognition, spelling, or formatting errors supported by the source. Do not rewrite, paraphrase, or add content. Return the complete corrected transcript only.\n\n"
-        "SOURCE TRANSCRIPT:\n" + raw_text[:250000] + "\n\nFORMATTED DRAFT TO CHECK:\n" + first[:250000], reference_images, 16000,
+        "Compare both source transcripts against the formatted draft. Use attached images as job references only. Correct only clear recognition, spelling, or formatting errors supported by the source transcripts or job references. Do not rewrite, paraphrase, or add content. Return the complete corrected transcript only.\n\n"
+        "SOURCE TRANSCRIPTS:\n" + raw_text[:250000] + "\n\nFORMATTED DRAFT TO CHECK:\n" + first[:250000], reference_images, 16000,
     )
     return answer, audio_seconds, agent["models"]
 
@@ -10450,7 +10479,9 @@ async def _human_worker_format_ai_draft(job_id, job, transcript):
         + research_context + "\n\nSOURCE TRANSCRIPT:\n" + str(transcript or "")[:350000],
         context_data["images"], 16000, response_validator=research_validator,
     )
-    return answer
+    answer = re.sub(r"\n{3,}", "\n\n", str(answer or "").strip())
+    answer = _review_normalise_sentence_spacing(answer)
+    return _review_enforce_indent(answer, [transcript])
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-draft")
@@ -10485,7 +10516,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
         key = "main"
     existing = (job.get("ai_drafts") or {}).get(key)
     if existing and existing.get("worker_uid") == uid and existing.get("text"):
-        if existing.get("format_version") == 3:
+        if existing.get("format_version") == 4:
             return {"draft": existing.get("text"), "already_generated": True, "credits_charged": 0}
         try:
             formatted = await _human_worker_format_ai_draft(job_id, job, existing.get("text"))
@@ -10493,7 +10524,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
             logger.warning("Legacy AI draft formatting failed for %s: %s", job_id, exc)
             raise HTTPException(status_code=502, detail="Your saved draft could not be formatted right now. You have not been charged. Please try again.")
         upgraded = dict(existing)
-        upgraded.update({"text": formatted[:400000], "format_version": 3, "formattedAt": datetime.now().isoformat()})
+        upgraded.update({"text": formatted[:400000], "format_version": 4, "formattedAt": datetime.now().isoformat()})
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
             f"ai_drafts.{key}": upgraded, "updatedAt": firestore.SERVER_TIMESTAMP,
         })
@@ -10551,7 +10582,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
         raise HTTPException(status_code=502, detail="The AI transcript could not be formatted. You have not been charged. Please try again.")
     charge = await charge_credits(uid, email, cost, "worker AI draft", usage_category="worker_ai_draft")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-        f"ai_drafts.{key}": {"text": formatted_text[:400000], "worker_uid": uid, "credits": charge.get("charged", cost), "createdAt": datetime.now().isoformat(), "format_version": 3},
+        f"ai_drafts.{key}": {"text": formatted_text[:400000], "worker_uid": uid, "credits": charge.get("charged", cost), "createdAt": datetime.now().isoformat(), "format_version": 4},
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
     return {"draft": formatted_text, "already_generated": False, "credits_charged": charge.get("charged", cost), "credits_remaining": charge.get("remaining")}
