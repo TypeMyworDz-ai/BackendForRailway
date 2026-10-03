@@ -176,6 +176,28 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("gemini-3.8-flash", "gemini")))
 
+    def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
+        transcriber = self.functions["_human_ai_transcribe_audio"]
+        calls = {node.func.id for node in ast.walk(transcriber) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertTrue({"transcribe_with_assemblyai", "transcribe_with_deepgram", "_human_ai_pair_asr_transcripts"}.issubset(calls))
+        self.assertTrue(any(
+            isinstance(node.func, ast.Attribute) and node.func.attr == "gather"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "asyncio"
+            for node in ast.walk(transcriber) if isinstance(node, ast.Call)
+        ))
+        agent_source = "".join(node.value for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Constant) and isinstance(node.value, str))
+        self.assertIn("Compare the independent AssemblyAI and Deepgram transcripts", agent_source)
+        self.assertIn("Compare both source transcripts", agent_source)
+
+        helper = self.functions["_human_ai_pair_asr_transcripts"]
+        namespace = {"asyncio": asyncio}
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), "main.py", "exec"), namespace)
+        pair = namespace["_human_ai_pair_asr_transcripts"]
+        result = pair({"status": "completed", "transcription": "Assembly words."}, {"status": "completed", "transcript": "Deepgram words."})
+        self.assertEqual(result, {"AssemblyAI": "Assembly words.", "Deepgram": "Deepgram words."})
+        with self.assertRaisesRegex(RuntimeError, "Both AssemblyAI and Deepgram"):
+            pair({"status": "completed", "transcription": "Assembly words."}, {"status": "failed"})
+
     def test_ai_review_and_both_agent_passes_use_fallback_chain(self):
         review_calls = [node for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
         self.assertEqual(len(review_calls), 1)
@@ -188,7 +210,7 @@ class AiModelRouting(unittest.TestCase):
 
     def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system"}.issubset(formatter_calls))
+        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent"}.issubset(formatter_calls))
         call_lines = {node.func.id: node.lineno for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertLess(call_lines["_human_ai_agent_research"], call_lines["_human_call_model_chain"])
         model_call = next(node for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain")
@@ -196,7 +218,7 @@ class AiModelRouting(unittest.TestCase):
         route = self.functions["human_worker_ai_draft"]
         call_lines = {node.func.id: node.lineno for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertLess(call_lines["_human_worker_format_ai_draft"], call_lines["charge_credits"])
-        self.assertIn('"format_version": 3', self.source)
+        self.assertIn('"format_version": 4', self.source)
 
     def test_worker_draft_prompt_requires_research_notes_and_handles_clear_speaker_corrections(self):
         function = self.functions["_human_worker_ai_draft_system"]
