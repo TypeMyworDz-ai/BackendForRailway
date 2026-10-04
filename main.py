@@ -293,6 +293,17 @@ def _require_admin(request: Request) -> dict:
         raise HTTPException(status_code=403, detail="Admin access is required.")
     return decoded
 
+# This grant is limited to queuing AI-agent jobs; it does not grant app-wide admin access.
+def _require_ai_agent_assignment(request: Request) -> dict:
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    allowed_emails = {item.lower() for item in ADMIN_EMAILS}
+    allowed_emails.add("info@typemywordz.ai")
+    if email not in allowed_emails:
+        raise HTTPException(status_code=403, detail="AI-agent assignment access is required.")
+    return decoded
+
+
 
 def _read_admin_users_snapshot():
     if not db:
@@ -10777,7 +10788,7 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
 
 @app.post("/human-transcription/jobs/{job_id}/ai-agent/assign")
 async def human_admin_assign_ai_agent(job_id: str, request: Request, background_tasks: BackgroundTasks):
-    _require_admin(request)
+    _require_ai_agent_assignment(request)
     template_reference_uploads = []
     try:
         if "multipart/form-data" in str(request.headers.get("content-type") or "").lower():
