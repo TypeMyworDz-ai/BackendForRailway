@@ -10588,6 +10588,9 @@ Marc:<tab>Sounds like a plna.
 
 HOW TO READ A SCREENSHOT (applies to every Text Messages job, with or without special instructions):
 - Blue/green bubbles on the right are sent by the phone's owner. Grey bubbles on the left are from the other person. The contact name or number shown at the top of the screen labels the grey bubbles. If the owner's name is not given, label them Person 1 (and an unnamed contact Person 2). If names or numbers are supplied in the job instructions, use those.
+- NEVER label the phone's owner "You", "Me" or "I". The owner is always Person 1 unless the job instructions give a name or number for them. A contact's own name or number (from the top of the screen or the instructions) labels their bubbles; if the contact has no name or number, label them Person 2.
+- Keep one label per person for the whole job. Every message paragraph begins with its label, a colon and a real tab.
+- System or event lines that are not messages (for example "Sam set the username @sam", "Missed call") are typed exactly as shown on their own paragraph with no label.
 - Put each date/time stamp (for example "Today 12:32 PM") on its own line, in bold and square brackets, exactly as the screenshot shows it, before the messages it applies to.
 - Each message is one paragraph: the label, a colon, a real tab, then the message text. Do not indent the paragraph itself.
 - A tapback appears as a small bubble on the corner of a message: put its notation at the start of that message's text, then two spaces, then the message.
