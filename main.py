@@ -6169,7 +6169,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
     """
     data = data or {}
     out = _human_public(data)
-    if actor_role != "admin":
+    if actor_role not in {"admin", "human_ops_admin"}:
         for key in ("ai_agent_docx", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "ai_agent_scope"):
             out.pop(key, None)
     pdf_image = out.get("pdf_image") or {}
@@ -9813,7 +9813,7 @@ async def human_instruction_attachment(job_id: str, attachment_index: int, reque
 
 @app.get("/human-transcription/admin/jobs/{job_id}/ai-agent/template-docx")
 async def human_admin_ai_agent_template_docx(job_id: str, request: Request):
-    _require_admin(request)
+    _require_ai_agent_assignment(request)
     job = await _human_job(job_id)
     if job.get("ai_agent_id") != "template-claude" or job.get("ai_agent_status") != "submitted":
         raise HTTPException(status_code=404, detail="A finished template-agent Word draft is not available for this job.")
@@ -10417,7 +10417,7 @@ HUMAN_AI_AGENTS = {
 
 @app.get("/human-transcription/admin/ai-agents")
 async def human_admin_ai_agents(request: Request):
-    _require_admin(request)
+    _require_ai_agent_assignment(request)
     return {"agents": list(HUMAN_AI_AGENTS.values()), "human_proofreading_required": True}
 
 
