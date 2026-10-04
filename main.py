@@ -6049,6 +6049,7 @@ PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com"}
 HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
 TEXT_MESSAGES_DEFAULT_INSTRUCTION = "Text Messages job: transcribe the screenshot following the Text Messages guidelines."
 PDF_JOB_WORKER_PAY_KES = 100
+PDF_JOB_REVIEW_PAY_KES_PER_PAGE = 50
 PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PDF_JOB_MAX_PAGES_PER_FILE = 100
 PDF_JOB_MAX_IMAGES_PER_BATCH = 200
@@ -7200,7 +7201,7 @@ def _human_assign_whole_job_transaction(job_id, actor):
             raise HTTPException(status_code=409, detail="Only an approved job that nobody has claimed can be assigned as a whole job.")
         now = datetime.now()
         if str(job.get("job_type") or "").strip().lower() == "pdf_job":
-            tat_seconds = PDF_JOB_TAT_SECONDS
+            tat_seconds = int(job.get("tat_seconds") or PDF_JOB_TAT_SECONDS) if job.get("pdf_review") else PDF_JOB_TAT_SECONDS
         else:
             tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
         deadline = now + timedelta(seconds=tat_seconds)
@@ -8040,6 +8041,127 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
         raise HTTPException(status_code=500, detail="The PDF Jobs upload could not be completed. Please retry the batch.") from exc
 
 
+def _pdf_page_has_text(item):
+    for part in (item.get("segments") or []):
+        if (part or {}).get("status") == "submitted" and str((part or {}).get("transcript") or "").strip():
+            return True
+    return bool(str(item.get("transcript") or "").strip() or (item.get("final_attachment") or {}).get("storage_path"))
+
+
+async def _pdf_page_draft_text(item):
+    """The best typed text for one page job: AI/worker segment, typed transcript, then the attached Word file."""
+    texts = [str((part or {}).get("transcript") or "").strip() for part in (item.get("segments") or []) if (part or {}).get("status") == "submitted"]
+    texts = [text for text in texts if text]
+    if texts:
+        return "\n\n".join(texts)
+    typed = str(item.get("transcript") or "").strip()
+    if typed:
+        return typed
+    attachment = item.get("final_attachment") or {}
+    bucket = _human_bucket()
+    if attachment.get("storage_path") and bucket is not None:
+        try:
+            raw = await asyncio.to_thread(bucket.blob(attachment["storage_path"]).download_as_bytes)
+            read = read_attachment(str(attachment.get("name") or "file"), raw)
+            if read.get("kind") == "text":
+                return str(read.get("text") or "").strip()
+        except Exception as exc:
+            logger.warning("Could not read an attached page file for a whole-file review: %s", exc)
+    return ""
+
+
+@app.post("/human-transcription/admin/pdf-jobs/file-review")
+async def human_admin_create_file_review(request: Request):
+    """Combine every finished page of one PDF/Text Messages file into one whole-file review job."""
+    actor = await _human_actor(request)
+    if str(actor.get("email") or "").lower() not in PDF_JOB_ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Whole-file review is available only to the admin team.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    payload = await request.json()
+    ids = list(dict.fromkeys(str(item) for item in ((payload or {}).get("job_ids") or [])))[:60]
+    if len(ids) < 2:
+        raise HTTPException(status_code=400, detail="A whole-file review needs a file with at least two pages.")
+    pages = []
+    for job_id in ids:
+        pages.append((job_id, await _human_job(job_id)))
+    first = pages[0][1]
+    category = str(first.get("job_category") or "pdf")
+    batch = str(first.get("pdf_batch_id") or "")
+    for job_id, item in pages:
+        same_file = (str(item.get("pdf_batch_id") or "") == batch) and (batch or (item.get("pdf_image") or {}).get("source_filename") == (first.get("pdf_image") or {}).get("source_filename"))
+        if str(item.get("job_type") or "").lower() != "pdf_job" or item.get("pdf_review") or not same_file or str(item.get("job_category") or "pdf") != category:
+            raise HTTPException(status_code=409, detail="Every page must come from the same uploaded file.")
+    pages.sort(key=lambda entry: int(((entry[1].get("pdf_image") or {}).get("page_number")) or 0))
+    review_key = ",".join(job_id for job_id, _ in pages)
+    existing = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("pdf_review_key", "==", review_key)).limit(1).stream()))
+    if existing:
+        raise HTTPException(status_code=409, detail="A whole-file review job already exists for this file.")
+    page_texts, missing = [], []
+    for job_id, item in pages:
+        text = await _pdf_page_draft_text(item)
+        if not text:
+            missing.append(str(((item.get("pdf_image") or {}).get("page_number")) or "?"))
+        page_texts.append(text)
+    if missing:
+        raise HTTPException(status_code=409, detail="These pages have no transcript yet: " + ", ".join(missing) + ". Finish every page before starting the whole-file review.")
+    source_name = str((first.get("pdf_image") or {}).get("source_filename") or "file")
+    new_id = uuid.uuid4().hex
+    bucket = _human_bucket()
+    stored_paths = []
+    try:
+        page_metas = []
+        for index, (job_id, item) in enumerate(pages, start=1):
+            image = item.get("pdf_image") or {}
+            raw = await asyncio.to_thread(bucket.blob(image["storage_path"]).download_as_bytes)
+            meta = await asyncio.to_thread(_human_store_raw_bytes, new_id, image.get("name") or f"page-{index}.jpg", raw, image.get("content_type") or "image/jpeg", "pdf")
+            stored_paths.append(meta["storage_path"])
+            meta.update({"source_filename": source_name, "page_number": index, "page_count": len(pages)})
+            page_metas.append(meta)
+        reference_meta = []
+        for ref_meta in (first.get("instruction_attachments") or []):
+            ref_raw = await asyncio.to_thread(bucket.blob(ref_meta["storage_path"]).download_as_bytes)
+            copy = await asyncio.to_thread(_human_store_raw_bytes, new_id, ref_meta.get("name") or "reference", ref_raw, ref_meta.get("content_type") or "application/octet-stream", "instructions")
+            stored_paths.append(copy["storage_path"])
+            reference_meta.append(copy)
+        is_text_messages = category == "text_messages"
+        combined = "\n\n".join(text for text in page_texts if text)
+        pay = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * len(pages)
+        tat_seconds = max(PDF_JOB_TAT_SECONDS, len(pages) * 5 * 60)
+        now = firestore.SERVER_TIMESTAMP
+        job = {
+            "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job",
+            "job_category": category, "pdf_batch_id": "review-" + (batch or new_id), "status": "approved",
+            "pdf_review": {"source_job_ids": [job_id for job_id, _ in pages], "page_count": len(pages), "page_texts": page_texts, "source_filename": source_name},
+            "pdf_review_key": review_key,
+            "tat_seconds": tat_seconds, "instruction_attachments": reference_meta, "createdAt": now, "updatedAt": now,
+            "seconds": 180, "minutes": 1, "turnaround": "standard", "difficulty": "standard",
+            "service": "text_messages_review" if is_text_messages else "pdf_review", "formatting": "standard",
+            "timestamps": False, "speakers": "1", "speaker_labels": False,
+            "instructions": str(first.get("instructions") or "") + "\n\nWHOLE-FILE REVIEW: the text below was assembled from the finished pages. Check it against every page image and all guidelines and instructions, correct any errors, make names, labels and formatting consistent across the whole file, then submit the complete final transcript.",
+            "pdf_image": {**page_metas[0], "name": f"Whole-file review - {source_name}"}, "pdf_images": page_metas, "audio": None,
+            "quote_credits": 0,
+            "quote": {"credits": 0, "minutes": 1, "transcriber_payout_kes_per_minute": pay, "worker_fixed_amount_kes": pay},
+            "worker_uid": None, "worker_email": None, "worker_name": None, "worker_minutes": 1, "worker_amount_kes": None,
+            "worker_gross_amount_kes": None, "worker_deduction_kes": 0, "worker_deduction_reason": "",
+            "payout_status": None, "payout_period_id": None, "workerPaymentStatus": None,
+            "assigned_worker_uids": [], "transcript": combined[:1000000], "transcript_html": _sanitize_editor_html(_review_text_to_html(combined[:1000000])),
+            "worker_notes": "", "final_attachment": None, "client_uid": None, "client_email": "",
+        }
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(new_id).set, job)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        for path in stored_paths:
+            try:
+                await asyncio.to_thread(bucket.blob(path).delete)
+            except Exception:
+                pass
+        logger.exception("Whole-file review could not be created")
+        raise HTTPException(status_code=500, detail="The whole-file review could not be created. Please try again.") from exc
+    return {"job_id": new_id, "pages": len(pages), "worker_pay_kes": pay, "tat_minutes": tat_seconds // 60}
+
+
 @app.get("/human-transcription/admin/pdf-jobs")
 async def human_admin_list_pdf_jobs(request: Request):
     actor = await _human_actor(request)
@@ -8063,6 +8185,8 @@ async def human_admin_list_pdf_jobs(request: Request):
             "ai_agent_error": item.get("ai_agent_error") or "",
             "ai_agent_segment_id": next((str(part.get("id") or "") for part in (item.get("segments") or []) if part.get("ai_agent_id") in HUMAN_IMAGE_AGENT_IDS), ""),
             "category": item.get("job_category") or "pdf", "batch_id": item.get("pdf_batch_id") or "",
+            "has_text": bool(_pdf_page_has_text(item)), "is_review": bool(item.get("pdf_review")),
+            "review_of": list((item.get("pdf_review") or {}).get("source_job_ids") or []),
             "ai_agent_model_ids": item.get("ai_agent_model_ids") or [],
             "reference_files": len(item.get("instruction_attachments") or []),
             "deadline_at": _human_iso(item.get("deadlineAt")),
@@ -9331,6 +9455,8 @@ async def human_worker_submit(
     minutes = int(job.get("minutes") or quote.get("minutes") or 0)
     rate = PDF_JOB_WORKER_PAY_KES if is_pdf_job else int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
     worker_amount_kes = PDF_JOB_WORKER_PAY_KES if is_pdf_job else max(0, minutes * rate)
+    if is_pdf_job and job.get("pdf_review"):
+        worker_amount_kes = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * max(1, int((job.get("pdf_review") or {}).get("page_count") or 1))
     updates = {
         "status": "submitted",
         "transcript": transcript_text[:1000000],
@@ -9945,7 +10071,7 @@ def _human_worker_split_mp3_bytes(clipped):
 
 
 @app.get("/human-transcription/jobs/{job_id}/image")
-async def human_pdf_job_image(job_id: str, request: Request):
+async def human_pdf_job_image(job_id: str, request: Request, page: int = 1):
     actor = await _human_actor(request)
     if actor.get("role") not in {"admin", "worker"}:
         raise HTTPException(status_code=403, detail="Only the admin team and assigned worker can view this image.")
@@ -9954,6 +10080,9 @@ async def human_pdf_job_image(job_id: str, request: Request):
         raise HTTPException(status_code=404, detail="This job does not contain an image.")
     await _human_assert_access(job, actor)
     meta = job.get("pdf_image") or {}
+    page_metas = job.get("pdf_images") or []
+    if page_metas and 1 <= int(page) <= len(page_metas):
+        meta = page_metas[int(page) - 1] or meta
     path = meta.get("storage_path")
     bucket = _human_bucket()
     if not path or bucket is None:
@@ -10456,6 +10585,16 @@ Person 1:<tab>[tapback \u2013 heart]  Btw I am cooking dinner tonight!  [Deliver
 Marc:<tab>Sounds like a plna.
 
 (In the example, <tab> means a real tab character. Keep misspellings such as "plna" exactly as shown on screen.)
+
+HOW TO READ A SCREENSHOT (applies to every Text Messages job, with or without special instructions):
+- Blue/green bubbles on the right are sent by the phone's owner. Grey bubbles on the left are from the other person. The contact name or number shown at the top of the screen labels the grey bubbles. If the owner's name is not given, label them Person 1 (and an unnamed contact Person 2). If names or numbers are supplied in the job instructions, use those.
+- Put each date/time stamp (for example "Today 12:32 PM") on its own line, in bold and square brackets, exactly as the screenshot shows it, before the messages it applies to.
+- Each message is one paragraph: the label, a colon, a real tab, then the message text. Do not indent the paragraph itself.
+- A tapback appears as a small bubble on the corner of a message: put its notation at the start of that message's text, then two spaces, then the message.
+- Delivered/Read notes under a message go at the end of that message in square brackets, for example [Delivered].
+- An emoji that is not on a standard keyboard is written [emoji] where it appears. A picture sent in the conversation is [image] unless it contains words, in which case type the words.
+- Ignore the phone's status bar, battery, keyboard, input box and the contact's profile picture.
+- Keep every misspelling, abbreviation and punctuation mark exactly as shown. Never fix or complete anything. Use two spaces after sentence-ending punctuation.
 """.replace("\\u2013", "\u2013")
 
 
@@ -10468,6 +10607,7 @@ def _human_text_messages_system(guidelines, context):
         "RULE ORDER: the Text Messages guidelines below and the JOB INSTRUCTIONS / REFERENCE FILES (which include any notes and attached documents from the admin) come first; "
         "the general TypeMyworDz guidelines apply only where they do not conflict. Use a real tab character between a speaker label and the message, and do not indent the start of a message paragraph with a tab. "
         "Use two spaces after sentence-ending punctuation unless the job instructions say otherwise. "
+        "The Text Messages guidelines are permanent: apply them to EVERY job even when no special instructions were supplied. The last attached image of each request may be a worked example screenshot; its correct transcription is the Example transcription in the guidelines. "
         "Do not add a spellings section, research notes or commentary. Return only the transcript text.\n\n"
         f"{HUMAN_TEXT_MESSAGES_GUIDELINES}\n"
         f"GENERAL TYPEMYWORDZ GUIDELINES:\n{guidelines[:40000]}\n\n"
@@ -10640,7 +10780,128 @@ async def _human_ai_agent_research(raw_text, context):
         return ""
 
 
-async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_profile="", job_specific_guidelines="", private_reference_files=None):
+async def _human_image_review_draft(job, agent_id, system, reference_images):
+    """AI reviewer: reads every page image plus the per-page drafts and returns one checked, combined transcript."""
+    review = job.get("pdf_review") or {}
+    bucket = _human_bucket()
+    metas = job.get("pdf_images") or [job.get("pdf_image") or {}]
+    images = []
+    for meta in metas:
+        path = (meta or {}).get("storage_path")
+        if not path or bucket is None:
+            raise RuntimeError("A page image is not available in private storage.")
+        raw = await asyncio.to_thread(bucket.blob(path).download_as_bytes)
+        images.append({"media_type": str(meta.get("content_type") or "image/jpeg"), "data": base64.b64encode(raw).decode("ascii")})
+    is_text = agent_id == "text-messages-gemini"
+    example_images = _human_text_messages_example_images() if is_text else []
+    page_texts = list(review.get("page_texts") or [])
+    drafts = "\n\n".join(f"=== DRAFT OF PAGE {index} ===\n{text}" for index, text in enumerate(page_texts, start=1))
+    question = (
+        f"You are the whole-file reviewer. The first {len(images)} attached images are the original pages of one job, in order. "
+        + ("The remaining attached images are reference material and a worked example from the guidelines (do not transcribe those). " if (reference_images or example_images) else "")
+        + "Below are the existing per-page drafts written by workers or AI. Produce the single final combined transcript for the whole file. "
+        "Check every page against its image and against ALL guidelines and instructions, fix every error (wrong words, missed messages, wrong labels, timestamps, tapbacks, [emoji]/[image] notation, spacing), "
+        "and make names, speaker labels and formatting consistent from the first page to the last. "
+        "If the very same message clearly appears twice only because two consecutive screenshots overlap, include it once. Do not add commentary or page markers; return only the final transcript.\n\n"
+        + drafts[:300000]
+        + (_human_text_messages_reminder(bool(example_images)) if is_text else "")
+    )
+    chain = HUMAN_TEXT_MESSAGES_MODEL_CHAIN
+    async with _IMAGE_AGENT_SEMAPHORE:
+        answer, model_used = await _human_call_model_chain(chain, system, question, images + list(reference_images or []) + example_images, 32000)
+    return str(answer or "").strip(), [model_used]
+
+
+def _human_text_messages_example_images():
+    try:
+        from text_messages_example import EXAMPLE_IMAGE_B64
+        return [{"media_type": "image/jpeg", "data": EXAMPLE_IMAGE_B64}]
+    except Exception:
+        return []
+
+
+def _human_text_messages_reminder(has_example):
+    return (
+        "\n\nREMINDER: the permanent Text Messages guidelines in the system instructions apply to this job even if no special instructions were supplied. "
+        "Each message is its own paragraph: label, colon, real tab, text. Date/time stamps are bold and in brackets on their own line (wrap them in double asterisks). Use [emoji], [image] and tapback notations as defined."
+        + (" The LAST attached image is only the worked example from the guidelines, not part of this job; do not transcribe it." if has_example else "")
+    )
+
+
+_IMAGE_BATCH_FUTURES = {}
+
+
+async def _human_image_batch_compute(system, agent_id, job_ids, reference_images):
+    bucket = _human_bucket()
+    if bucket is None:
+        raise RuntimeError("Private storage is unavailable.")
+    pages = []
+    for job_id in job_ids:
+        snap = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+        data = snap.to_dict() or {}
+        image = data.get("pdf_image") or {}
+        path = image.get("storage_path")
+        if not path:
+            raise RuntimeError("A page image is missing.")
+        raw = await asyncio.to_thread(bucket.blob(path).download_as_bytes)
+        pages.append({"id": job_id, "raw": raw, "media_type": str(image.get("content_type") or "image/jpeg")})
+    is_text = agent_id == "text-messages-gemini"
+    chain = HUMAN_TEXT_MESSAGES_MODEL_CHAIN if is_text else (("gemini-3.8-flash", "gemini"),)
+    example_images = _human_text_messages_example_images() if is_text else []
+    chunks, current, size = [], [], 0
+    for page in pages:
+        if current and (len(current) >= 12 or size + len(page["raw"]) > 12 * 1024 * 1024):
+            chunks.append(current)
+            current, size = [], 0
+        current.append(page)
+        size += len(page["raw"])
+    if current:
+        chunks.append(current)
+    results = {}
+    for chunk in chunks:
+        images = [{"media_type": item["media_type"], "data": base64.b64encode(item["raw"]).decode("ascii")} for item in chunk]
+        extra = len(reference_images or []) + len(example_images)
+        question = (
+            f"The first {len(chunk)} attached images are consecutive pages/screenshots of ONE job, in order. "
+            + ("The remaining attached images are reference material" + (" and a worked example from the guidelines (do not transcribe those)." if example_images else " (do not transcribe those).") if extra else "")
+            + "\nTranscribe every page following all instructions and guidelines in the system instructions. Because the pages belong together, keep names, labels and style consistent from page to page. "
+            "Start each page's transcription with a line containing exactly =====PAGE n===== (n = 1 for the first page of this request, 2 for the second, and so on), and put nothing else on that line. "
+            "Do not add commentary. If a word cannot be read confidently, write [unclear]."
+            + (_human_text_messages_reminder(bool(example_images)) if is_text else "")
+        )
+        async with _IMAGE_AGENT_SEMAPHORE:
+            answer, _model = await _human_call_model_chain(chain, system, question, images + list(reference_images or []) + example_images, 24000)
+        pieces = re.split(r"^[ \t]*=====PAGE (\d+)=====[ \t]*$", str(answer or ""), flags=re.MULTILINE)
+        found = {}
+        for index in range(1, len(pieces) - 1, 2):
+            found[int(pieces[index])] = pieces[index + 1].strip()
+        for position, page in enumerate(chunk, start=1):
+            if position not in found:
+                raise ValueError("The whole-file draft did not cover every page.")
+            results[page["id"]] = found[position]
+    return results
+
+
+async def _human_image_batch_drafts(system, agent_id, job_ids, reference_images):
+    """One model call per group of pages; every page job reads its own share of the result."""
+    key = agent_id + ":" + ",".join(job_ids)
+    future = _IMAGE_BATCH_FUTURES.get(key)
+    if future is None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        _IMAGE_BATCH_FUTURES[key] = future
+        try:
+            future.set_result(await _human_image_batch_compute(system, agent_id, job_ids, reference_images))
+            loop.call_later(900, lambda: _IMAGE_BATCH_FUTURES.pop(key, None))
+        except Exception as exc:
+            _IMAGE_BATCH_FUTURES.pop(key, None)
+            future.set_exception(exc)
+            future.exception()
+            raise
+    return await future
+
+
+async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_profile="", job_specific_guidelines="", private_reference_files=None, batch_job_ids=None):
     agent = HUMAN_AI_AGENTS[agent_id]
     guidelines = await _admin_guidelines_text()
     template_agent = agent_id == "template-claude"
@@ -10655,6 +10916,9 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         system = _human_text_messages_system(guidelines, context)
     else:
         system = _human_ai_agent_system(agent_id, "transcription and formatting", guidelines, context, job_specific_guidelines)
+    if agent_id in HUMAN_IMAGE_AGENT_IDS and job.get("pdf_review"):
+        review_text, review_models = await _human_image_review_draft(job, agent_id, system, reference_images)
+        return review_text, 0.0, review_models
     if agent_id in HUMAN_IMAGE_AGENT_IDS:
         image = job.get("pdf_image") or {}
         path = image.get("storage_path")
@@ -10673,9 +10937,17 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
                 "Transcribe it following the Text Messages guidelines and every instruction in JOB INSTRUCTIONS AND REFERENCE FILES. "
                 "If a word cannot be read confidently, write [unclear]. Return only the transcript."
             )
+            if len(batch_job_ids or []) > 1:
+                try:
+                    batch_texts = await _human_image_batch_drafts(system, agent_id, batch_job_ids, reference_images)
+                    if str(batch_texts.get(job_id) or "").strip():
+                        return str(batch_texts[job_id]).strip(), 0.0, agent["models"]
+                except Exception as exc:
+                    logger.warning("Whole-file AI run for %s failed; drafting this page on its own: %s", job_id, exc)
+            example_images = _human_text_messages_example_images()
             async with _IMAGE_AGENT_SEMAPHORE:
                 text_draft, text_model = await _human_call_model_chain(
-                    HUMAN_TEXT_MESSAGES_MODEL_CHAIN, system, text_question, images, 16000,
+                    HUMAN_TEXT_MESSAGES_MODEL_CHAIN, system, text_question + _human_text_messages_reminder(bool(example_images)), images + example_images, 16000,
                 )
             return str(text_draft or "").strip(), 0.0, [text_model] if isinstance(text_model, str) else agent["models"]
         question = (
@@ -10685,6 +10957,13 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Follow every instruction in the job notes and reference files in the context above; they take priority over these defaults. "
             "This is a draft for mandatory human proofreading."
         )
+        if len(batch_job_ids or []) > 1:
+            try:
+                batch_texts = await _human_image_batch_drafts(system, agent_id, batch_job_ids, reference_images)
+                if str(batch_texts.get(job_id) or "").strip():
+                    return str(batch_texts[job_id]).strip(), 0.0, agent["models"]
+            except Exception as exc:
+                logger.warning("Whole-file AI run for %s failed; drafting this page on its own: %s", job_id, exc)
         async with _IMAGE_AGENT_SEMAPHORE:
             answer = await asyncio.to_thread(
                 _ask_gemini, "gemini-3.8-flash", system, [], question, images, 16000
@@ -10770,12 +11049,14 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             job_id, job, segment, agent_id, template_profile,
             job_specific_guidelines=job_specific_guidelines,
             private_reference_files=private_reference_files,
+            batch_job_ids=list(run_data.get("batch_job_ids") or []),
         )
         if agent_id == "template-claude" and str(answer or "").strip() == "TEMPLATE_JOB_BLOCKED_LETTER":
             raise RuntimeError("The template agent identified this as letter/correspondence and did not format it. The original parts remain available for review.")
         if not answer:
             raise RuntimeError("The AI agent returned an empty draft.")
         if agent_id == "text-messages-gemini":
+            answer = re.sub(r"<tab>|\[tab\]", "\t", str(answer), flags=re.IGNORECASE)
             answer = _review_normalise_sentence_spacing(answer)
         else:
             answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
@@ -10928,6 +11209,23 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         raise HTTPException(status_code=409, detail="The image agents are reserved for PDF and Text Messages jobs; the GPT and Claude agents are for audio jobs.")
     if not is_pdf and not (job.get("audio") or {}).get("storage_path"):
         raise HTTPException(status_code=409, detail="This job has no source audio for an AI transcription draft.")
+    batch_job_ids = []
+    requested_batch = (payload or {}).get("batch_job_ids")
+    if is_pdf and isinstance(requested_batch, list) and len(requested_batch) > 1:
+        wanted = list(dict.fromkeys(str(item) for item in requested_batch))[:200]
+        if job_id not in wanted:
+            raise HTTPException(status_code=400, detail="The whole-file list must include this page.")
+        ordered = []
+        for other_id in wanted:
+            other = job if other_id == job_id else await _human_job(other_id)
+            same_file = (
+                str(other.get("pdf_batch_id") or "") == str(job.get("pdf_batch_id") or "")
+                and (str(job.get("pdf_batch_id") or "") or (other.get("pdf_image") or {}).get("source_filename") == (job.get("pdf_image") or {}).get("source_filename"))
+            )
+            if str(other.get("job_type") or "").lower() != "pdf_job" or not same_file or str(other.get("job_category") or "pdf") != str(job.get("job_category") or "pdf"):
+                raise HTTPException(status_code=409, detail="Every page in a whole-file assignment must come from the same uploaded file.")
+            ordered.append((int((other.get("pdf_image") or {}).get("page_number") or 0), other_id))
+        batch_job_ids = [item[1] for item in sorted(ordered)]
     if agent_id == "template-claude":
         _template_meta, template_raw = await _human_template_docx_bytes(job_id, job)
         try:
@@ -11009,6 +11307,7 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             "run_id": run_id, "job_id": job_id, "segment_id": segment_id,
             "agent_id": agent_id, "agent_name": agent["name"], "model_ids": agent["models"],
             "scope": "whole_job" if whole_job_requested else ("part" if split_job else "single_job"),
+            "batch_job_ids": batch_job_ids,
             "template_job_guidelines": job_specific_guidelines if agent_id == "template-claude" else "",
             "template_reference_files": stored_template_reference_files if agent_id == "template-claude" else [],
             "status": "queued", "createdAt": firestore.SERVER_TIMESTAMP,
