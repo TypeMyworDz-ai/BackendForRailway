@@ -6045,6 +6045,9 @@ HUMAN_JOB_COLLECTION = "human_jobs"
 HUMAN_WORKER_CLAIM_COLLECTION = "human_worker_claims"
 HUMAN_AVAILABLE_SLICE_MINUTES = 5
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
+PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com"}
+HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
+TEXT_MESSAGES_DEFAULT_INSTRUCTION = "Text Messages job: transcribe the screenshot following the Text Messages guidelines."
 PDF_JOB_WORKER_PAY_KES = 100
 PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PDF_JOB_MAX_PAGES_PER_FILE = 100
@@ -6052,7 +6055,7 @@ PDF_JOB_MAX_IMAGES_PER_BATCH = 200
 PDF_JOB_TAT_SECONDS = 20 * 60
 PDF_JOB_DEFAULT_INSTRUCTION = "Always use Gemini for image transcription"
 PDF_JOB_WORD_EXTENSIONS = (".docx", ".doc", ".rtf", ".odt")
-PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
+PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "jpg", "jpeg", "png", "webp", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
 HUMAN_JOB_STATUSES = {
     "pending_admin",
     "approved",
@@ -7943,10 +7946,11 @@ def _pdf_job_images_from_upload(filename, raw):
 
 
 @app.post("/human-transcription/admin/pdf-jobs")
-async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] = File(...), attachments: List[UploadFile] = File(default=[]), instructions: str = Form("")):
+async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] = File(...), attachments: List[UploadFile] = File(default=[]), instructions: str = Form(""), category: str = Form("pdf")):
     actor = await _human_actor(request)
-    if actor.get("email") != PDF_JOB_ADMIN_EMAIL:
-        raise HTTPException(status_code=403, detail=f"PDF Jobs upload is available only to {PDF_JOB_ADMIN_EMAIL}.")
+    if str(actor.get("email") or "").lower() not in PDF_JOB_ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="PDF Jobs and Text Messages upload is available only to the admin team.")
+    is_text_messages = str(category or "pdf").strip().lower() == "text_messages"
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     if not files:
@@ -7958,7 +7962,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
     for extra in [item for item in (attachments or []) if getattr(item, "filename", "")][:6]:
         extra_name = os.path.basename(extra.filename or "reference")[:180]
         if doc_tools.file_extension(extra_name) not in PDF_JOB_ATTACHMENT_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"{extra_name} is not a supported reference file. Use PDF, Word or audio.")
+            raise HTTPException(status_code=400, detail=f"{extra_name} is not a supported reference file. Use PDF, Word, text, image or audio files.")
         extra_raw = await extra.read(PDF_JOB_MAX_UPLOAD_BYTES + 1)
         if not extra_raw:
             raise HTTPException(status_code=400, detail=f"{extra_name} is empty.")
@@ -7966,7 +7970,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             raise HTTPException(status_code=413, detail=f"{extra_name} is larger than 25 MB.")
         extra_files.append((extra_name, extra_raw, extra.content_type or "application/octet-stream"))
     admin_note = str(instructions or "").strip()[:4000]
-    job_instructions = PDF_JOB_DEFAULT_INSTRUCTION + (f"\n\n{admin_note}" if admin_note else "")
+    job_instructions = (TEXT_MESSAGES_DEFAULT_INSTRUCTION if is_text_messages else PDF_JOB_DEFAULT_INSTRUCTION) + (f"\n\n{admin_note}" if admin_note else "")
 
     async def rollback():
         bucket = _human_bucket()
@@ -7991,6 +7995,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             if len(raw) > PDF_JOB_MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=413, detail=f"{upload.filename} is larger than 25 MB.")
             rendered_images = await asyncio.to_thread(_pdf_job_images_from_upload, upload.filename, raw)
+            batch_id = uuid.uuid4().hex
             image_count += len(rendered_images)
             if image_count > PDF_JOB_MAX_IMAGES_PER_BATCH:
                 raise HTTPException(status_code=413, detail=f"A single upload batch can contain up to {PDF_JOB_MAX_IMAGES_PER_BATCH} image pages.")
@@ -8006,11 +8011,11 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                     reference_meta.append(meta)
                 now = firestore.SERVER_TIMESTAMP
                 job = {
-                    "job_type": "pdf_job", "source_type": "pdf_job", "status": "approved",
+                    "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf", "pdf_batch_id": batch_id, "status": "approved",
                     "tat_seconds": PDF_JOB_TAT_SECONDS, "instruction_attachments": reference_meta,
                     "createdAt": now, "updatedAt": now,
                     "seconds": 180, "minutes": 1,
-                    "turnaround": "standard", "difficulty": "standard", "service": "pdf_transcription", "formatting": "standard",
+                    "turnaround": "standard", "difficulty": "standard", "service": "text_messages_transcription" if is_text_messages else "pdf_transcription", "formatting": "standard",
                     "timestamps": False, "speakers": "1", "speaker_labels": False,
                     "instructions": job_instructions,
                     "pdf_image": image_meta, "audio": None,
@@ -8038,8 +8043,8 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
 @app.get("/human-transcription/admin/pdf-jobs")
 async def human_admin_list_pdf_jobs(request: Request):
     actor = await _human_actor(request)
-    if actor.get("email") != PDF_JOB_ADMIN_EMAIL:
-        raise HTTPException(status_code=403, detail=f"PDF Jobs are available only to {PDF_JOB_ADMIN_EMAIL}.")
+    if str(actor.get("email") or "").lower() not in PDF_JOB_ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="PDF Jobs and Text Messages are available only to the admin team.")
     if not db:
         return {"jobs": []}
     snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("job_type", "==", "pdf_job")).stream()))
@@ -8056,7 +8061,8 @@ async def human_admin_list_pdf_jobs(request: Request):
             "ai_agent_status": item.get("ai_agent_status") or "",
             "ai_agent_name": item.get("ai_agent_name") or "",
             "ai_agent_error": item.get("ai_agent_error") or "",
-            "ai_agent_segment_id": next((str(part.get("id") or "") for part in (item.get("segments") or []) if part.get("ai_agent_id") == "pdf-gemini"), ""),
+            "ai_agent_segment_id": next((str(part.get("id") or "") for part in (item.get("segments") or []) if part.get("ai_agent_id") in HUMAN_IMAGE_AGENT_IDS), ""),
+            "category": item.get("job_category") or "pdf", "batch_id": item.get("pdf_batch_id") or "",
             "ai_agent_model_ids": item.get("ai_agent_model_ids") or [],
             "reference_files": len(item.get("instruction_attachments") or []),
             "deadline_at": _human_iso(item.get("deadlineAt")),
@@ -10412,7 +10418,61 @@ HUMAN_AI_AGENTS = {
         "display": "Gemini 3.8 Flash", "job_types": ["pdf_job"],
         "models": ["gemini-3.8-flash"],
     },
+    "text-messages-gemini": {
+        "id": "text-messages-gemini", "name": "Text Messages Agent",
+        "display": "Gemini 3.8 Flash + Claude Opus 5.5 fallback", "job_types": ["pdf_job"],
+        "models": ["gemini-3.8-flash", "claude-opus-5-5"],
+    },
 }
+HUMAN_TEXT_MESSAGES_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-opus-5-5", "claude"))
+_IMAGE_AGENT_SEMAPHORE = asyncio.Semaphore(4)
+
+HUMAN_TEXT_MESSAGES_GUIDELINES = """TEXT MESSAGES GUIDELINES (these apply ONLY to Text Messages jobs)
+
+Clients upload photos/screenshots of text message conversations. These jobs come in as PDFs/images, and most default rules for PDF jobs still apply.
+
+1. Format text messages as a new paragraph for each message.
+2. If a contact name or phone number is provided, label each paragraph with that contact name, followed by a colon, and then hit the tab key before typing the text. If no contact names/phone numbers are provided, use Person 1 and Person 2.
+3. Keep all text exactly as shown in the text messages, including misspellings, typos, etc.
+4. Include dates and times of messages in bold and brackets, for example **[Today 12:32 PM]** (wrap each date/time stamp in double asterisks so it can be set in bold).
+5. EMOJIS: For emoji symbols that do not appear on a standard keyboard, use the notation [emoji] in their place.
+6. TAPBACKS: If a message is "liked" or otherwise reacted to (called a tapback), use these notations:
+   Heart = [tapback \u2013 heart]
+   Thumbs Up = [tapback \u2013 thumbs up]
+   Thumbs Down = [tapback \u2013 thumbs down]
+   Laughter = [tapback \u2013 laughter]
+   Exclamation = [tapback \u2013 exclamation mark]
+   Question Mark = [tapback \u2013 question mark]
+7. INSERTED IMAGES: If the text message contains an inserted image: if the image is a photograph of a person, thing, etc., just type [image]. If the image contains words, type the words.
+
+Example transcription:
+**[Today 12:32 PM]**
+Person 1:<tab>Hey, how's your day going?  [emoji]
+Marc:<tab>Pretty good.  I'm at work.  How are you?
+Person 1:<tab>[tapback \u2013 thumbs up]  Just heading home.  See ya soon! I was thinking of stopping by Shannon's house on the way home.  Is that okay with you?
+Marc:<tab>That's fine.  But please hurry, I need to leave at 2:30 for my meeting. [emoji]
+Person 1:<tab>I'll definitely be home by then.  Thank you!  I will text as soon as I'm on my way.
+Person 1:<tab>[tapback \u2013 heart]  Btw I am cooking dinner tonight!  [Delivered]
+Marc:<tab>Sounds like a plna.
+
+(In the example, <tab> means a real tab character. Keep misspellings such as "plna" exactly as shown on screen.)
+""".replace("\\u2013", "\u2013")
+
+
+def _human_text_messages_system(guidelines, context):
+    return (
+        "You are the Text Messages Agent, an internal first-draft transcription agent for TypeMyworDz. "
+        "Your output is a private draft that MUST be proofread by a human before release.\n"
+        "You are given a screenshot or photo of a text message conversation. Transcribe it faithfully. "
+        "Do not paraphrase, summarize, correct or add content. Keep misspellings and typos exactly as shown.\n"
+        "RULE ORDER: the Text Messages guidelines below and the JOB INSTRUCTIONS / REFERENCE FILES (which include any notes and attached documents from the admin) come first; "
+        "the general TypeMyworDz guidelines apply only where they do not conflict. Use a real tab character between a speaker label and the message, and do not indent the start of a message paragraph with a tab. "
+        "Use two spaces after sentence-ending punctuation unless the job instructions say otherwise. "
+        "Do not add a spellings section, research notes or commentary. Return only the transcript text.\n\n"
+        f"{HUMAN_TEXT_MESSAGES_GUIDELINES}\n"
+        f"GENERAL TYPEMYWORDZ GUIDELINES:\n{guidelines[:40000]}\n\n"
+        f"JOB INSTRUCTIONS AND REFERENCE FILES:\n{context[:50000]}"
+    )
 
 
 @app.get("/human-transcription/admin/ai-agents")
@@ -10591,8 +10651,11 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         context += "\n\nREFERENCE FILE ALERTS (do not guess at unreadable reference content):\n" + "\n".join(context_data["issues"])
     if template_profile:
         context += "\n\nLAYOUT PROFILE FROM THIS JOB'S ATTACHED WORD TEMPLATE:\n" + str(template_profile)[:24000]
-    system = _human_ai_agent_system(agent_id, "transcription and formatting", guidelines, context, job_specific_guidelines)
-    if agent_id == "pdf-gemini":
+    if agent_id == "text-messages-gemini":
+        system = _human_text_messages_system(guidelines, context)
+    else:
+        system = _human_ai_agent_system(agent_id, "transcription and formatting", guidelines, context, job_specific_guidelines)
+    if agent_id in HUMAN_IMAGE_AGENT_IDS:
         image = job.get("pdf_image") or {}
         path = image.get("storage_path")
         bucket = _human_bucket()
@@ -10604,15 +10667,28 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         raw = await asyncio.to_thread(blob.download_as_bytes)
         media_type = str(image.get("content_type") or "image/jpeg")
         images = [{"media_type": media_type, "data": base64.b64encode(raw).decode("ascii")}] + reference_images
+        if agent_id == "text-messages-gemini":
+            text_question = (
+                "The first attached image is the text message screenshot to transcribe. Any other images are reference material only. "
+                "Transcribe it following the Text Messages guidelines and every instruction in JOB INSTRUCTIONS AND REFERENCE FILES. "
+                "If a word cannot be read confidently, write [unclear]. Return only the transcript."
+            )
+            async with _IMAGE_AGENT_SEMAPHORE:
+                text_draft, text_model = await _human_call_model_chain(
+                    HUMAN_TEXT_MESSAGES_MODEL_CHAIN, system, text_question, images, 16000,
+                )
+            return str(text_draft or "").strip(), 0.0, [text_model] if isinstance(text_model, str) else agent["models"]
         question = (
             "Transcribe all readable text from the attached page/image exactly. Preserve names, numbers, "
             "punctuation, paragraph breaks, headings, tables and form fields as faithfully as possible. "
             "If a word cannot be read confidently, mark it [unclear] rather than guess. "
+            "Follow every instruction in the job notes and reference files in the context above; they take priority over these defaults. "
             "This is a draft for mandatory human proofreading."
         )
-        answer = await asyncio.to_thread(
-            _ask_gemini, "gemini-3.8-flash", system, [], question, images, 16000
-        )
+        async with _IMAGE_AGENT_SEMAPHORE:
+            answer = await asyncio.to_thread(
+                _ask_gemini, "gemini-3.8-flash", system, [], question, images, 16000
+            )
         draft = str(answer or "").strip()
         research = await _human_ai_agent_research(draft, context)
         if research:
@@ -10699,7 +10775,10 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             raise RuntimeError("The template agent identified this as letter/correspondence and did not format it. The original parts remain available for review.")
         if not answer:
             raise RuntimeError("The AI agent returned an empty draft.")
-        answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
+        if agent_id == "text-messages-gemini":
+            answer = _review_normalise_sentence_spacing(answer)
+        else:
+            answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
         if template_bytes:
             rendered_docx = await asyncio.to_thread(_human_template_render_docx, template_bytes, answer)
             template_basename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(str(job.get("job_name") or job.get("title") or "transcript")))[:120].strip("._-") or "transcript"
@@ -10707,7 +10786,11 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
                 _human_store_raw_bytes, job_id, f"{template_basename}-formatted-draft.docx", rendered_docx,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "ai-drafts",
             )
-        clean_html = _sanitize_editor_html(_review_text_to_html(answer))
+        if agent_id == "text-messages-gemini":
+            clean_html = _sanitize_editor_html(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _review_text_to_html(answer)))
+            answer = answer.replace("**", "")
+        else:
+            clean_html = _sanitize_editor_html(_review_text_to_html(answer))
         snap = await asyncio.to_thread(ref.get)
         current = snap.to_dict() if snap.exists else None
         if not current:
@@ -10837,8 +10920,12 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             private_template_uploads.append({"name": name, "raw": raw, "content_type": upload.content_type or "application/octet-stream"})
     job = await _human_job(job_id)
     is_pdf = str(job.get("job_type") or "").lower() == "pdf_job"
-    if is_pdf != (agent_id == "pdf-gemini"):
-        raise HTTPException(status_code=409, detail="Gemini is reserved for PDF/image jobs; the GPT and Claude agents are for audio jobs.")
+    if is_pdf:
+        expected_agent = "text-messages-gemini" if str(job.get("job_category") or "") == "text_messages" else "pdf-gemini"
+        if agent_id != expected_agent:
+            raise HTTPException(status_code=409, detail="Text Messages jobs use the Text Messages Agent; other image jobs use the PDF and Image Agent.")
+    elif agent_id in HUMAN_IMAGE_AGENT_IDS:
+        raise HTTPException(status_code=409, detail="The image agents are reserved for PDF and Text Messages jobs; the GPT and Claude agents are for audio jobs.")
     if not is_pdf and not (job.get("audio") or {}).get("storage_path"):
         raise HTTPException(status_code=409, detail="This job has no source audio for an AI transcription draft.")
     if agent_id == "template-claude":
@@ -11296,6 +11383,9 @@ def _human_review_spelling_notes(parts):
     return "\n\n".join(blocks)
 
 
+_INSTRUCTION_AUDIO_TYPES = {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "mp4": "audio/mp4", "ogg": "audio/ogg", "webm": "audio/webm", "aac": "audio/aac", "flac": "audio/flac"}
+
+
 async def _human_review_context(job_id, job, private_attachments=None):
     """Job instructions, notes, reference files and cross-part spelling evidence."""
     notes = []
@@ -11371,6 +11461,27 @@ async def _human_review_context(job_id, job, private_attachments=None):
                 attachment_issues.append(f"Reference file {name} is missing from private storage.")
                 continue
             raw = await asyncio.to_thread(blob.download_as_bytes)
+            audio_mime = _INSTRUCTION_AUDIO_TYPES.get(_file_ext(name))
+            if audio_mime:
+                if len(raw) > 18 * 1024 * 1024:
+                    attachment_issues.append(f"Spoken-instruction file {name} is larger than 18 MB and could not be listened to.")
+                    continue
+                try:
+                    spoken = await asyncio.to_thread(
+                        _ask_gemini, "gemini-3.8-flash",
+                        "You transcribe spoken instructions word for word. Return only the transcript.", [],
+                        "Transcribe this audio exactly. These are instructions for a transcription job.",
+                        [{"media_type": audio_mime, "data": base64.b64encode(raw).decode("ascii")}], 8000,
+                    )
+                    spoken = str(spoken or "").strip()
+                    if spoken:
+                        files.append(f"{label} \"{name}\" (spoken instructions, transcribed):\n{spoken[:30000]}")
+                    else:
+                        attachment_issues.append(f"Spoken-instruction file {name} could not be understood.")
+                except Exception as exc:
+                    logger.warning("Could not transcribe spoken instruction file %s for %s: %s", name, job_id, exc)
+                    attachment_issues.append(f"Spoken-instruction file {name} could not be listened to.")
+                continue
             read = read_attachment(name, raw)
             if read.get("kind") == "text":
                 files.append(f"{label} \"{name}\":\n{read['text'][:30000]}")
