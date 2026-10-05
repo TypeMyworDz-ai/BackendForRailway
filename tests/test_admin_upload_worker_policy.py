@@ -1,9 +1,13 @@
 """Synthetic-only regression checks for admin Human Work uploads and safeguards."""
 import ast
+import asyncio
 import hashlib
 import re
 import unittest
+from io import BytesIO
 from datetime import datetime, time as datetime_time, timedelta, timezone
+from PIL import Image
+import pypdfium2 as pdfium
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -98,6 +102,8 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertTrue(scheduled(datetime(2026, 10, 5, 15, 0, tzinfo=zone)))
         self.assertTrue(scheduled(datetime(2026, 10, 5, 19, 59, tzinfo=zone)))
         self.assertFalse(scheduled(datetime(2026, 10, 5, 20, 0, tzinfo=zone)))
+        self.assertFalse(scheduled(datetime(2026, 10, 10, 16, 0, tzinfo=zone)))
+        self.assertFalse(scheduled(datetime(2026, 10, 11, 16, 0, tzinfo=zone)))
 
     def test_admin_call_in_allows_clocked_in_worker_to_claim_after_shift(self):
         status_payload = self.namespace["_human_shift_status_payload"]
@@ -112,12 +118,26 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         clocked_out = status_payload("worker-1", profile, shift, now)
         self.assertFalse(clocked_out["can_claim"])
 
-    def test_assigned_work_must_be_clocked_in_before_start_or_first_submission(self):
+    def test_assigned_work_can_start_and_submit_after_shift_while_clocked_in(self):
         start = ast.unparse(self.functions["human_worker_start"])
         submit = ast.unparse(self.functions["human_worker_submit"])
-        self.assertIn("_human_shift_assert_can_claim", start)
-        self.assertGreaterEqual(submit.count("_human_shift_assert_can_claim"), 4)
+        self.assertGreaterEqual(start.count("_human_shift_assert_can_start_assigned"), 3)
+        self.assertGreaterEqual(submit.count("_human_shift_assert_can_start_assigned"), 4)
+        self.assertNotIn("_human_shift_assert_can_claim", start)
+        self.assertNotIn("_human_shift_assert_can_claim", submit)
         self.assertIn("Finish your active job before clocking out.", ast.unparse(self.functions["human_worker_shift_clock_out"]))
+
+    def test_overtime_admin_assignment_routes_check_live_worker_presence(self):
+        for name in ("human_admin_assign", "human_admin_assign_whole", "human_admin_assign_proofreader"):
+            with self.subTest(route=name):
+                source = ast.unparse(self.functions[name])
+                self.assertIn("_human_require_worker_online_for_overtime", source)
+
+    def test_main_admin_only_shift_attendance_and_call_in_routes(self):
+        for name in ("human_admin_shift_attendance", "human_admin_shift_call_in"):
+            with self.subTest(route=name):
+                self.assertIn("_require_human_shift_admin", ast.unparse(self.functions[name]))
+        self.assertIn('HUMAN_SHIFT_ADMIN_EMAIL = "typemywordz@gmail.com"', self.source)
 
     def test_whole_file_review_collapses_exact_duplicate_pages_only_once(self):
         collapse = self.namespace["_human_collapse_duplicate_image_page_blocks"]
@@ -168,6 +188,256 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertIn("Run the AI reviewer", review)
         self.assertIn("Apply the AI-reviewed transcript", review)
         self.assertIn("Choose an AI reviewer or assign a human reviewer", review)
+
+
+class ShiftAuthorizationRules(unittest.TestCase):
+    def test_main_admin_guard_and_after_shift_assigned_start_gate(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        shift = {"clockedInAt": "2026-10-05T15:00:00+03:00"}
+        async def reconcile(_uid, profile):
+            return profile
+        async def current_record(_uid):
+            return None, shift
+        def status_payload(*_args):
+            return {"online": not bool(shift.get("clockedOutAt")), "scheduled_now": False}
+
+        namespace = {
+            "HTTPException": RequestError,
+            "Request": object,
+            "HUMAN_SHIFT_ADMIN_EMAIL": "typemywordz@gmail.com",
+            "_verified_user": lambda request: request,
+            "_human_shift_reconcile": reconcile,
+            "_human_shift_current_record": current_record,
+            "_human_shift_status_payload": status_payload,
+            "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
+            "_human_shift_is_scheduled": lambda _now=None: False,
+            "_load_profile": lambda _uid: None,
+        }
+        exec(compile(ast.Module(body=[functions["_require_human_shift_admin"], functions["_human_shift_assert_can_start_assigned"], functions["_human_require_worker_online_for_overtime"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        self.assertEqual(namespace["_require_human_shift_admin"]({"email": "typemywordz@gmail.com"}), {"email": "typemywordz@gmail.com"})
+        with self.assertRaises(RequestError):
+            namespace["_require_human_shift_admin"]({"email": "info@typemywordz.ai"})
+
+        actor = {"uid": "worker-1", "profile": {"workerApproved": True}}
+        result = asyncio.run(namespace["_human_shift_assert_can_start_assigned"](actor))
+        self.assertFalse(result["scheduled_now"])
+        shift["clockedOutAt"] = "2026-10-05T20:30:00+03:00"
+        with self.assertRaisesRegex(RequestError, "Clock in before starting"):
+            asyncio.run(namespace["_human_shift_assert_can_start_assigned"](actor))
+
+    def test_overtime_assignment_requires_online_presence(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        helper = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_human_require_worker_online_for_overtime")
+
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        async def current_record(_uid, _now=None):
+            return None, {}
+        def payload(*_args):
+            return {"online": online}
+        async def load_profile(_uid):
+            return {"workerApproved": True}
+        async def run_case(online_now):
+            nonlocal online
+            online = online_now
+            return await namespace["_human_require_worker_online_for_overtime"]("worker-1", {"workerApproved": True})
+
+        online = False
+        namespace = {
+            "datetime": datetime, "ZoneInfo": ZoneInfo, "HUMAN_SHIFT_TIMEZONE": ZoneInfo("Africa/Nairobi"),
+            "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
+            "_human_shift_is_scheduled": lambda _now=None: False,
+            "_human_shift_current_record": current_record, "_human_shift_status_payload": payload,
+            "_load_profile": load_profile, "HTTPException": RequestError,
+        }
+        exec(compile(ast.Module(body=[helper], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        with self.assertRaisesRegex(RequestError, "only to a worker who is clocked in and online"):
+            asyncio.run(run_case(False))
+        self.assertTrue(asyncio.run(run_case(True)))
+
+
+class WeekendShiftReconciliation(unittest.TestCase):
+    def test_weekends_are_skipped_without_adding_missed_shifts(self):
+        class Snapshot:
+            def __init__(self, value):
+                self.value = value
+                self.exists = value is not None
+
+            def to_dict(self):
+                return dict(self.value or {})
+
+        class Document:
+            def __init__(self, records, key):
+                self.records = records
+                self.key = key
+
+            def get(self):
+                return Snapshot(self.records.get(self.key))
+
+            def set(self, data, merge=False):
+                current = dict(self.records.get(self.key) or {}) if merge else {}
+                current.update(data)
+                self.records[self.key] = current
+
+        class Collection:
+            def __init__(self):
+                self.records = {}
+
+            def document(self, key):
+                return Document(self.records, key)
+
+        class Database:
+            def __init__(self):
+                self.collections = {}
+
+            def collection(self, name):
+                return self.collections.setdefault(name, Collection())
+
+        class Firestore:
+            SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
+
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)}
+        helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_human_shift_doc_id")
+        db = Database()
+
+        async def unused_archive(_uid):
+            return None
+
+        namespace = {
+            "asyncio": asyncio, "datetime": datetime, "timedelta": timedelta,
+            "HUMAN_SHIFT_TIMEZONE": ZoneInfo("Africa/Nairobi"),
+            "HUMAN_SHIFT_END": datetime_time(20, 0),
+            "HUMAN_SHIFT_WARNING_MISSES": 5, "HUMAN_SHIFT_LOCKOUT_MISSES": 6,
+            "HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS": 11,
+            "HUMAN_SHIFT_COLLECTION": "human_shifts", "firestore": Firestore,
+            "_human_worker_retraining_updates": lambda *_args: {},
+            "_human_archive_retraining_attempts": unused_archive,
+            "db": db, "logger": _FakeLogger(),
+        }
+        exec(compile(ast.Module(body=[helper, functions["_human_shift_reconcile"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        profile = {
+            "workerApproved": True, "humanShiftLastEvaluatedDate": "2026-10-02",
+            "humanShiftMissesConsecutive": 4,
+        }
+        now = datetime(2026, 10, 5, 20, 0, tzinfo=ZoneInfo("Africa/Nairobi"))
+        updated = asyncio.run(namespace["_human_shift_reconcile"]("worker-1", profile, now))
+        self.assertEqual(updated["humanShiftMissesConsecutive"], 5)
+        self.assertEqual(updated["humanShiftLastEvaluatedDate"], "2026-10-05")
+        shift_records = db.collections["human_shifts"].records
+        self.assertEqual(set(shift_records), {"worker-1_2026-10-05"})
+
+
+class PdfBatchDownloadTests(unittest.TestCase):
+    def test_private_page_images_are_combined_into_pdf_in_page_order(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_download_pdf_batch")
+        route.decorator_list = []
+
+        class Snapshot:
+            def __init__(self, job_id, data):
+                self.id = job_id
+                self.data = data
+
+            def to_dict(self):
+                return dict(self.data)
+
+        class Query:
+            def __init__(self, snapshots):
+                self.snapshots = snapshots
+
+            def where(self, **_kwargs):
+                return self
+
+            def stream(self):
+                return iter(self.snapshots)
+
+        class Database:
+            def __init__(self, snapshots):
+                self.snapshots = snapshots
+
+            def collection(self, _name):
+                return Query(self.snapshots)
+
+        class Blob:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def download_as_bytes(self):
+                return self.raw
+
+        class Bucket:
+            def __init__(self, files):
+                self.files = files
+
+            def blob(self, path):
+                return Blob(self.files[path])
+
+        class HttpError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        class TestResponse:
+            def __init__(self, content, media_type, headers):
+                self.body = content
+                self.media_type = media_type
+                self.headers = headers
+
+        def png(color):
+            handle = BytesIO()
+            Image.new("RGB", (16, 16), color).save(handle, format="PNG")
+            return handle.getvalue()
+
+        red, blue = png((240, 10, 10)), png((10, 10, 240))
+        job_two = {"job_type": "pdf_job", "pdf_batch_id": "batch-a", "pdf_image": {
+            "page_number": 2, "source_filename": "source.docx", "storage_path": "human-workflow/job-2/pdf/page-2.jpg",
+        }}
+        job_one = {"job_type": "pdf_job", "pdf_batch_id": "batch-a", "pdf_image": {
+            "page_number": 1, "source_filename": "source.docx", "storage_path": "human-workflow/job-1/pdf/page-1.jpg",
+        }}
+        snapshots = [Snapshot("job-2", job_two), Snapshot("job-1", job_one)]
+        files = {job_two["pdf_image"]["storage_path"]: blue, job_one["pdf_image"]["storage_path"]: red}
+        email = "typemywordz@gmail.com"
+
+        async def actor(_request):
+            return {"email": email}
+
+        namespace = {
+            "asyncio": asyncio, "BytesIO": BytesIO, "Image": Image, "Response": TestResponse,
+            "HTTPException": HttpError, "Request": object, "FieldFilter": lambda *args: args,
+            "HUMAN_JOB_COLLECTION": "human_jobs", "PDF_JOB_ADMIN_EMAILS": {"typemywordz@gmail.com", "info@typemywordz.ai"},
+            "db": Database(snapshots), "_human_actor": actor, "_human_bucket": lambda: Bucket(files),
+            "os": __import__("os"), "re": re, "logger": _FakeLogger(),
+        }
+        exec(compile(ast.Module(body=[route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        response = asyncio.run(namespace["human_admin_download_pdf_batch"]("batch-a", object()))
+        self.assertEqual(response.media_type, "application/pdf")
+        document = pdfium.PdfDocument(response.body)
+        self.assertEqual(len(document), 2)
+        first = document[0].render(scale=0.5).to_pil().convert("RGB")
+        second = document[1].render(scale=0.5).to_pil().convert("RGB")
+        self.assertGreater(first.getpixel((first.width // 2, first.height // 2))[0], first.getpixel((first.width // 2, first.height // 2))[2])
+        self.assertGreater(second.getpixel((second.width // 2, second.height // 2))[2], second.getpixel((second.width // 2, second.height // 2))[0])
+        document.close()
+        email = "subadmin@example.com"
+        with self.assertRaises(HttpError):
+            asyncio.run(namespace["human_admin_download_pdf_batch"]("batch-a", object()))
 
 
 if __name__ == "__main__":

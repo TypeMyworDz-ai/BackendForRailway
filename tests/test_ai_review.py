@@ -276,7 +276,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
-        self.assertEqual(self.agents["general-gpt"]["models"], expected_audio_models)
+        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
         self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
@@ -314,13 +314,14 @@ class AiModelRouting(unittest.TestCase):
             target.id: ast.literal_eval(node.value)
             for node in cls.tree.body if isinstance(node, ast.Assign)
             for target in node.targets if isinstance(target, ast.Name)
-            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN"}
+            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN"}
         }
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("claude-opus-5-5", "claude")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("deepseek-v4-flash", "deepseek")))
 
     def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
@@ -351,11 +352,16 @@ class AiModelRouting(unittest.TestCase):
         self.assertTrue(any(keyword.arg == "response_validator" and isinstance(keyword.value, ast.Name) and keyword.value.id == "_review_validate_output" for keyword in review_calls[0].keywords))
         self.assertNotIn("resolve_ask_model", {node.func.id for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
         agent_calls = [node for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
-        audio_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_AUDIO_AGENT_MODEL_CHAIN" for arg in call.args)]
+        audio_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "audio_agent_chain" for arg in call.args)]
         image_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_TEXT_MESSAGES_MODEL_CHAIN" for arg in call.args)]
+        agent_source = ast.unparse(self.functions["_human_ai_agent_generate"])
         self.assertEqual(len(audio_calls), 2)
         self.assertEqual(len(image_calls), 1)
         self.assertEqual(len(agent_calls), 3)
+        self.assertIn("HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == 'general-gpt'", agent_source)
+        self.assertIn("AI_REVIEW_MODEL_CHAIN if job.get('pdf_review')", ast.unparse(self.functions["_human_image_review_draft"]))
+        letter_review = ast.unparse(self.functions["_human_run_letter_ai_review"])
+        self.assertIn("AI_REVIEW_MODEL_CHAIN", letter_review)
 
     def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
@@ -367,7 +373,7 @@ class AiModelRouting(unittest.TestCase):
         route = self.functions["human_worker_ai_draft"]
         call_lines = {node.func.id: node.lineno for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertLess(call_lines["_human_worker_format_ai_draft"], call_lines["charge_credits"])
-        self.assertIn('"format_version": 4', self.source)
+        self.assertIn('"format_version": 5', self.source)
 
     def test_worker_draft_prompt_requires_research_notes_and_handles_clear_speaker_corrections(self):
         function = self.functions["_human_worker_ai_draft_system"]
@@ -377,6 +383,9 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Dublin Granville-East Dublin Granville Children's Close To Home.", prompt_text)
         self.assertIn("East Dublin Granville Children's Close To Home.", prompt_text)
         self.assertIn("Do not remove ordinary repetition", prompt_text)
+        self.assertIn("non-semantic spoken fillers such as `um`, `uh`, or `you know`", prompt_text)
+        self.assertIn("only if that name or term was actually spoken", prompt_text)
+        self.assertIn("Use quotation marks only when quotation was dictated or to mark actual reported speech", prompt_text)
 
     def test_research_notes_are_suppressed_without_verified_google_search_metadata(self):
         class QuietLogger:
