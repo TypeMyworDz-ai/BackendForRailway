@@ -10848,31 +10848,39 @@ async def _human_ai_agent_research(raw_text, context):
 
 
 def _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts=None):
-    """Remove repeated page output when exact duplicate source images caused it."""
+    """Remove exact repeated page-sized transcript blocks, including byte-different duplicate images."""
     text = str(answer or "").strip()
-    duplicate_count = len(page_image_hashes) - len(set(page_image_hashes))
-    if duplicate_count <= 0 or not text:
+    if not text:
         return text
 
     def normalize(value):
-        return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+        value = re.sub(r"[\u200b-\u200f\u2060\ufeff]", "", str(value or ""))
+        value = re.sub(r"\*\*|__", "", value)
+        return re.sub(r"\s+", " ", value).strip().casefold()
 
     duplicate_draft_lines = []
     first_page_by_image = {}
+    first_page_by_draft = {}
     for index, image_hash in enumerate(page_image_hashes):
-        previous_index = first_page_by_image.get(image_hash)
-        if previous_index is None:
-            first_page_by_image[image_hash] = index
-            continue
-        source_text = page_texts[previous_index] if previous_index < len(page_texts or []) else ""
+        source_text = page_texts[index] if index < len(page_texts or []) else ""
         signature = [normalize(line) for line in str(source_text or "").splitlines() if normalize(line)]
-        if signature:
-            duplicate_draft_lines.append(signature)
+        draft_key = "\n".join(signature)
+        previous_index = first_page_by_image.get(image_hash) if image_hash else None
+        if previous_index is None and draft_key:
+            previous_index = first_page_by_draft.get(draft_key)
+        if previous_index is not None:
+            previous_text = page_texts[previous_index] if previous_index < len(page_texts or []) else ""
+            previous_signature = [normalize(line) for line in str(previous_text or "").splitlines() if normalize(line)]
+            if previous_signature:
+                duplicate_draft_lines.append(previous_signature)
+        else:
+            if image_hash:
+                first_page_by_image[image_hash] = index
+            if draft_key:
+                first_page_by_draft[draft_key] = index
 
     removed = 0
     for signature in duplicate_draft_lines:
-        if removed >= duplicate_count:
-            break
         lines = text.splitlines(keepends=True)
         nonempty = [(index, normalize(line)) for index, line in enumerate(lines) if normalize(line)]
         matches = []
@@ -10893,23 +10901,24 @@ def _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
         removed += 1
 
-    if removed < duplicate_count:
-        blocks = [block.strip() for block in re.split(r"\r?\n(?:[ \t]*\r?\n)+", text) if block.strip()]
-        seen = set()
-        kept = []
-        for block in blocks:
-            key = normalize(block)
-            if key and key in seen and len(key) >= 120 and removed < duplicate_count:
-                removed += 1
-                continue
-            kept.append(block)
-            if key:
-                seen.add(key)
-        if len(kept) < len(blocks):
-            text = "\n\n".join(kept).strip()
+    # The reviewer can render or re-encode identical images differently. Independently
+    # collapse exact repeated long blocks so a repeated page never doubles the transcript.
+    blocks = [block.strip() for block in re.split(r"\r?\n(?:[ \t]*\r?\n)+", text) if block.strip()]
+    seen = set()
+    kept = []
+    for block in blocks:
+        key = normalize(block)
+        if key and key in seen and len(key) >= 120:
+            removed += 1
+            continue
+        kept.append(block)
+        if key:
+            seen.add(key)
+    if len(kept) < len(blocks):
+        text = "\n\n".join(kept).strip()
 
     if removed:
-        logger.info("Removed %s repeated transcript block(s) for exact duplicate image page(s)", removed)
+        logger.info("Removed %s repeated page-sized transcript block(s) in whole-file review", removed)
     return text
 
 
