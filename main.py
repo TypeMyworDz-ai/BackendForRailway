@@ -8158,9 +8158,11 @@ async def human_admin_create_file_review(request: Request):
     stored_paths = []
     try:
         page_metas = []
+        page_image_hashes = []
         for index, (job_id, item) in enumerate(pages, start=1):
             image = item.get("pdf_image") or {}
             raw = await asyncio.to_thread(bucket.blob(image["storage_path"]).download_as_bytes)
+            page_image_hashes.append(hashlib.sha256(raw).hexdigest())
             meta = await asyncio.to_thread(_human_store_raw_bytes, new_id, image.get("name") or f"page-{index}.jpg", raw, image.get("content_type") or "image/jpeg", "pdf")
             stored_paths.append(meta["storage_path"])
             meta.update({"source_filename": source_name, "page_number": index, "page_count": len(pages)})
@@ -8173,6 +8175,7 @@ async def human_admin_create_file_review(request: Request):
             reference_meta.append(copy)
         is_text_messages = category == "text_messages"
         combined = "\n\n".join(text for text in page_texts if text)
+        combined = _human_collapse_duplicate_image_page_blocks(combined, page_image_hashes, page_texts)
         pay = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * len(pages)
         tat_seconds = max(PDF_JOB_TAT_SECONDS, len(pages) * 5 * 60)
         now = firestore.SERVER_TIMESTAMP
@@ -11272,13 +11275,17 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             "ai_agent_elapsed_seconds": int(time.time() - started),
         })
         parent_status = _human_split_parent_status(current, current_segments)
-        await asyncio.to_thread(ref.update, {
+        job_updates = {
             "segments": current_segments, "split_mode": "multi", "status": parent_status,
             "ai_agent_status": "submitted", "ai_agent_name": agent["name"],
             "ai_agent_model_ids": model_ids, "ai_agent_completedAt": firestore.SERVER_TIMESTAMP,
             "ai_agent_docx": template_docx_meta if template_docx_meta else firestore.DELETE_FIELD,
             "updatedAt": firestore.SERVER_TIMESTAMP,
-        })
+        }
+        if current.get("pdf_review"):
+            job_updates["transcript"] = answer[:1000000]
+            job_updates["transcript_html"] = clean_html
+        await asyncio.to_thread(ref.update, job_updates)
         await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {
             "status": "submitted", "model_ids": model_ids, "audio_seconds": int(audio_seconds),
             "elapsed_seconds": int(time.time() - started), "completedAt": firestore.SERVER_TIMESTAMP,
