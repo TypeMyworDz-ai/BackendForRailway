@@ -6091,11 +6091,26 @@ async def admin_adjust_credits(payload: AdminCreditAdjustmentRequest, request: R
 # released it after the client's approval.
 HUMAN_JOB_COLLECTION = "human_jobs"
 HUMAN_WORKER_CLAIM_COLLECTION = "human_worker_claims"
+HUMAN_WORKER_ITEM_CLAIM_COLLECTION = "human_worker_item_claims"
+HUMAN_WORKER_DEADLINE_EVENT_COLLECTION = "human_worker_deadline_events"
+HUMAN_WORKER_MAX_CLAIMS_PER_ITEM = 2
+HUMAN_WORKER_DEADLINE_WARNING_RETURNS = 10
+HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS = 11
 HUMAN_AVAILABLE_SLICE_MINUTES = 5
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
 PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com"}
 HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
 TEXT_MESSAGES_DEFAULT_INSTRUCTION = "Text Messages job: transcribe the screenshot following the Text Messages guidelines."
+GENERAL_JOB_DEFAULT_INSTRUCTION = (
+    "GENERAL JOB RULES (always apply): Preserve the speaker's words, meaning, order, grammar, and awkward phrasing; do not paraphrase or summarize. "
+    "Follow dictated paragraph and line breaks, the TypeMyworDz human-work guidelines, and any job-specific notes or attachments. "
+    "Use client-provided spellings as authoritative, research unsupplied proper nouns when needed, and do not add information."
+)
+TEMPLATE_JOB_DEFAULT_INSTRUCTION = (
+    "TEMPLATE JOB RULES (always apply): Transcribe the complete recording and format it in the supplied job-specific Word template. "
+    "Preserve dictated wording and order; do not paraphrase, omit template fields, invent content, or substitute another template. "
+    "Follow the attached template, job-specific notes, and TypeMyworDz human-work guidelines. Letter correspondence belongs in Letter Jobs."
+)
 PDF_JOB_WORKER_PAY_KES = 100
 PDF_JOB_REVIEW_PAY_KES_PER_PAGE = 50
 PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -6399,8 +6414,9 @@ def _human_public_for(data, actor_role, actor_uid=""):
     return out
 
 
-def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full_job, can_claim, claim_block_reason):
+def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full_job, can_claim, claim_block_reason, claim_attempt_counts=None):
     """Expose only claim-list metadata until the worker owns the job or part."""
+    claim_attempt_counts = claim_attempt_counts or {}
     public_item = _human_public_for(data, "worker", actor_uid)
     audio_meta = public_item.get("audio") or {}
     public_item["audio"] = {key: audio_meta[key] for key in ("name", "content_type", "size") if key in audio_meta}
@@ -6416,10 +6432,26 @@ def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full
     public_item.pop("worker_email", None)
     public_item.pop("worker_name", None)
     public_item.pop("last_auto_reassigned_worker_name", None)
+    for part in claimable_parts:
+        item_key = _human_claim_item_key(data.get("id") or "", part.get("id") or "")
+        used = int(claim_attempt_counts.get(item_key) or 0)
+        part["claim_attempt_count"] = used
+        part["can_claim"] = bool(can_claim and used < HUMAN_WORKER_MAX_CLAIMS_PER_ITEM)
+        part["claim_block_reason"] = (
+            "You have already successfully claimed this job part twice."
+            if used >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM else claim_block_reason
+        )
+    whole_key = _human_claim_item_key(data.get("id") or "", "")
+    whole_used = int(claim_attempt_counts.get(whole_key) or 0)
     public_item["claimable_parts"] = claimable_parts
     public_item["claimable_full_job"] = claimable_full_job
-    public_item["can_claim"] = can_claim
-    public_item["claim_block_reason"] = claim_block_reason
+    public_item["claim_attempt_count"] = whole_used if claimable_full_job else 0
+    public_item["max_claims_per_item"] = HUMAN_WORKER_MAX_CLAIMS_PER_ITEM
+    public_item["can_claim"] = bool(can_claim and (not claimable_full_job or whole_used < HUMAN_WORKER_MAX_CLAIMS_PER_ITEM))
+    public_item["claim_block_reason"] = (
+        "You have already successfully claimed this job twice."
+        if claimable_full_job and whole_used >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM else claim_block_reason
+    )
     return public_item
 
 
@@ -6809,47 +6841,256 @@ def _human_worker_audio_cache_key(storage_path, size=0, segment_id="", start_sec
     return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:20]
 
 
-async def _human_reclaim_expired_job(job_id: str, job: dict):
-    """A worker's TAT deadline passed before they submitted. Take the job
-    back from them and return it to the admin queue as "approved" so it can
-    be reassigned, exactly like a fresh, unassigned approved job."""
-    worker_name = job.get("worker_name") or job.get("worker_email") or "the previous worker"
-    now = datetime.now()
-    updates = {
-        "status": "approved",
-        "worker_uid": None,
-        "worker_email": None,
-        "worker_name": None,
-        "assignedAt": None,
-        "deadlineAt": None,
-        "tat_seconds": None,
-        "auto_reassigned_count": int(job.get("auto_reassigned_count") or 0) + 1,
-        "last_auto_reassigned_at": now,
-        "last_auto_reassigned_worker_name": worker_name,
+def _human_deadline_event_id(job_id, role, item_id, assignment_token, qualification_cycle="initial"):
+    raw = "|".join((str(job_id or ""), str(role or ""), str(item_id or ""), str(assignment_token or ""), str(qualification_cycle or "initial")))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _human_deadline_assignment_token(item):
+    item = item or {}
+    return _human_iso(item.get("assignedAt")) or _human_iso(item.get("deadlineAt")) or "missing-assignment-time"
+
+
+def _human_worker_retraining_updates(profile, deadline_return_count, now):
+    profile = profile or {}
+    if deadline_return_count < HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS or profile.get("workerApproved") is not True:
+        return {}
+    levels = list(range(1, len(TRAINING_LEVELS) + 1))
+    return {
+        "role": "trainee",
+        "workerApproved": False,
+        "trainingRoomAccess": True,
+        "trainingStatus": "active",
+        "traineeStatus": "enrolled",
+        "trainingLevel": 1,
+        "trainingSubmissions": {str(level): "redo_requested" for level in levels},
+        "trainingRedoLevels": levels,
+        "trainingRedoMessage": "Your available-work access is paused after repeated missed deadlines. Please retake the six Training Room modules and typing practice; your prior training and payout history remain on record.",
+        "trainingRedoInvitedAt": now,
+        "worker_retraining_required": True,
+        "worker_retraining_required_at": now,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
-    try:
-        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
-    except Exception as exc:
-        logger.warning("Could not auto-reclaim expired human job %s: %s", job_id, exc)
+
+
+async def _human_archive_retraining_attempts(worker_uid):
+    """Move each saved module into redo mode without losing its prior attempt."""
+    if not db or not worker_uid:
+        return
+    for level in range(1, len(TRAINING_LEVELS) + 1):
+        ref = db.collection("training_submissions").document(f"{worker_uid}-{level}")
+        try:
+            snapshot = await asyncio.to_thread(ref.get)
+            previous = snapshot.to_dict() if snapshot.exists else {}
+            history = list(previous.get("previous_attempts") or [])
+            if str(previous.get("status") or "").lower() == "submitted":
+                history.append({
+                    "transcript": previous.get("transcript") or "",
+                    "notes": previous.get("notes") or "",
+                    "answers": previous.get("answers") or {},
+                    "archivedAt": datetime.now().isoformat(),
+                })
+            await asyncio.to_thread(ref.set, {
+                "uid": worker_uid, "level": level, "status": "redo_requested",
+                "previous_attempts": history[-10:], "redoRequestedAt": previous.get("redoRequestedAt") or datetime.now().isoformat(),
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+        except Exception as exc:
+            logger.warning("Could not reset Training Room module %s for worker %s: %s", level, worker_uid, exc)
+
+
+async def _human_reclaim_expired_job(job_id: str, job: dict, split_expected=None):
+    """Return expired work once, count each worker deadline event once, and apply lockout at 11."""
+    if not db or not job:
         return job
-    worker_uid = str(job.get("worker_uid") or "")
-    assignment_token = _human_iso(job.get("assignedAt")) or now.isoformat()
-    if worker_uid:
-        await _human_release_worker_claim(worker_uid, job_id, "", "transcriber")
-        await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
-        await _create_user_notification(
-            worker_uid, f"human-expired:{job_id}:main:{assignment_token}", "assignment_taken_back",
-            "A Human Work deadline passed", "This job returned to the queue after its deadline.",
-            route="human_worker", job_id=job_id, target_id=job_id,
+    now = datetime.now()
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def reclaim(tx):
+        snapshot = job_ref.get(transaction=tx)
+        if not snapshot.exists:
+            return {"changed": False, "job": job, "events": [], "locked_workers": []}
+        current = snapshot.to_dict() or {}
+        is_split = _human_is_split_job(current)
+        if split_expected is not None and bool(split_expected) != is_split:
+            current["id"] = job_id
+            return {"changed": False, "job": current, "events": [], "locked_workers": []}
+
+        expired = []
+        if is_split:
+            segments = [dict(item or {}) for item in (current.get("segments") or [])]
+            for part in segments:
+                if part.get("status") not in {"assigned", "in_progress"}:
+                    continue
+                deadline = _as_dt(part.get("deadlineAt"))
+                if deadline and now > deadline:
+                    expired.append({
+                        "worker_uid": str(part.get("worker_uid") or ""), "role": "transcriber",
+                        "item_id": str(part.get("id") or ""), "label": str(part.get("label") or "job part"),
+                        "assignment_token": _human_deadline_assignment_token(part),
+                    })
+            proofreader_status = current.get("proofreader_status")
+            proofreader_deadline = _as_dt(current.get("proofreader_deadlineAt"))
+            if proofreader_status in {"assigned", "in_progress"} and proofreader_deadline and now > proofreader_deadline:
+                expired.append({
+                    "worker_uid": str(current.get("proofreader_uid") or ""), "role": "proofreader",
+                    "item_id": "proofreader", "label": "proofreading",
+                    "assignment_token": _human_deadline_assignment_token({"assignedAt": current.get("proofreader_assignedAt"), "deadlineAt": current.get("proofreader_deadlineAt")}),
+                })
+        else:
+            if current.get("status") not in {"assigned", "in_progress"}:
+                current["id"] = job_id
+                return {"changed": False, "job": current, "events": [], "locked_workers": []}
+            deadline = _as_dt(current.get("deadlineAt"))
+            if not deadline or now <= deadline:
+                current["id"] = job_id
+                return {"changed": False, "job": current, "events": [], "locked_workers": []}
+            expired.append({
+                "worker_uid": str(current.get("worker_uid") or ""), "role": "transcriber",
+                "item_id": "main", "label": "the complete job",
+                "assignment_token": _human_deadline_assignment_token(current),
+            })
+        if not expired:
+            current["id"] = job_id
+            return {"changed": False, "job": current, "events": [], "locked_workers": []}
+
+        worker_uids = list(dict.fromkeys(entry["worker_uid"] for entry in expired if entry.get("worker_uid")))
+        user_refs = {uid: db.collection("users").document(uid) for uid in worker_uids}
+        user_snapshots = {uid: user_refs[uid].get(transaction=tx) for uid in worker_uids}
+        profiles = {uid: (user_snapshots[uid].to_dict() if user_snapshots[uid].exists else {}) for uid in worker_uids}
+        event_rows = []
+        for entry in expired:
+            profile = profiles.get(entry.get("worker_uid"), {})
+            cycle = str(profile.get("worker_qualification_cycle") or "initial")
+            event_id = _human_deadline_event_id(job_id, entry["role"], entry["item_id"], entry["assignment_token"], cycle)
+            event_ref = db.collection(HUMAN_WORKER_DEADLINE_EVENT_COLLECTION).document(event_id)
+            event_snapshot = event_ref.get(transaction=tx)
+            event_rows.append((entry, cycle, event_id, event_ref, event_snapshot.exists))
+
+        new_events = []
+        worker_increments = {}
+        for entry, cycle, event_id, event_ref, exists in event_rows:
+            if exists:
+                continue
+            event_data = {
+                "job_id": job_id, "worker_uid": entry.get("worker_uid") or "", "role": entry["role"],
+                "item_id": entry["item_id"], "label": entry["label"],
+                "assignment_token": entry["assignment_token"], "qualification_cycle": cycle,
+                "createdAt": now,
+            }
+            new_events.append((entry, event_ref, event_data, event_id))
+            if entry.get("worker_uid"):
+                worker_increments[entry["worker_uid"]] = worker_increments.get(entry["worker_uid"], 0) + 1
+
+        if is_split:
+            segments = [dict(item or {}) for item in (current.get("segments") or [])]
+            expired_lookup = {(entry["role"], entry["item_id"], entry["assignment_token"]) for entry in expired}
+            for part in segments:
+                token = _human_deadline_assignment_token(part)
+                if ("transcriber", str(part.get("id") or ""), token) not in expired_lookup:
+                    continue
+                previous = part.get("worker_name") or part.get("worker_email") or "the previous worker"
+                part.update({
+                    "status": "available", "worker_uid": None, "worker_email": None, "worker_name": None,
+                    "assignedAt": None, "deadlineAt": None, "tat_seconds": None,
+                    "auto_reassigned_count": int(part.get("auto_reassigned_count") or 0) + 1,
+                    "last_auto_reassigned_at": now, "last_auto_reassigned_worker_name": previous,
+                })
+            proofreader_expired = any(entry["role"] == "proofreader" for entry in expired)
+            current.update({
+                "segments": segments,
+                "assigned_worker_uids": list(dict.fromkeys(
+                    [str(part.get("worker_uid")) for part in segments if part.get("worker_uid")]
+                    + ([str(current.get("proofreader_uid"))] if current.get("proofreader_status") in {"assigned", "in_progress"} and current.get("proofreader_uid") and not proofreader_expired else [])
+                )),
+            })
+            if proofreader_expired:
+                current.update({
+                    "proofreader_status": "available", "proofreader_uid": None, "proofreader_email": None,
+                    "proofreader_name": None, "proofreader_deadlineAt": None, "proofreader_tat_seconds": None,
+                })
+            if current.get("proofreader_status") in {"assigned", "in_progress"}:
+                current["status"] = "proofreading_assigned"
+            elif all(part.get("status") == "submitted" for part in segments):
+                current["status"] = "proofreading_available"
+            else:
+                current["status"] = "split_assigned"
+            updates = {
+                "segments": segments, "assigned_worker_uids": current["assigned_worker_uids"],
+                "status": current["status"], "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+            if proofreader_expired:
+                updates.update({key: current.get(key) for key in (
+                    "proofreader_status", "proofreader_uid", "proofreader_email", "proofreader_name",
+                    "proofreader_deadlineAt", "proofreader_tat_seconds",
+                )})
+        else:
+            previous = current.get("worker_name") or current.get("worker_email") or "the previous worker"
+            current.update({
+                "status": "approved", "worker_uid": None, "worker_email": None, "worker_name": None,
+                "assignedAt": None, "deadlineAt": None, "tat_seconds": None,
+                "auto_reassigned_count": int(current.get("auto_reassigned_count") or 0) + 1,
+                "last_auto_reassigned_at": now, "last_auto_reassigned_worker_name": previous,
+            })
+            updates = {key: current.get(key) for key in (
+                "status", "worker_uid", "worker_email", "worker_name", "assignedAt", "deadlineAt", "tat_seconds",
+                "auto_reassigned_count", "last_auto_reassigned_at", "last_auto_reassigned_worker_name",
+            )}
+            updates["updatedAt"] = firestore.SERVER_TIMESTAMP
+
+        tx.update(job_ref, updates)
+        locked_workers = []
+        for uid, increment in worker_increments.items():
+            profile = profiles.get(uid) or {}
+            next_count = max(0, int(profile.get("deadline_return_count") or 0)) + increment
+            profile_updates = {"deadline_return_count": next_count, "updatedAt": firestore.SERVER_TIMESTAMP}
+            lockout = _human_worker_retraining_updates(profile, next_count, now)
+            if lockout:
+                profile_updates.update(lockout)
+                locked_workers.append(uid)
+            tx.set(user_refs[uid], profile_updates, merge=True)
+        for _entry, event_ref, event_data, _event_id in new_events:
+            tx.set(event_ref, event_data)
+
+        current["id"] = job_id
+        public_events = [
+            {**event_data, "event_id": event_id}
+            for _entry, _event_ref, event_data, event_id in new_events
+        ]
+        return {"changed": True, "job": current, "events": public_events, "locked_workers": locked_workers}
+
+    try:
+        result = await asyncio.to_thread(reclaim, transaction)
+    except Exception as exc:
+        logger.warning("Could not transactionally return expired Human Work %s: %s", job_id, exc)
+        return job
+    for uid in result.get("locked_workers") or []:
+        await _human_archive_retraining_attempts(uid)
+    for event in result.get("events") or []:
+        worker_uid = str(event.get("worker_uid") or "")
+        role = str(event.get("role") or "transcriber")
+        item_id = str(event.get("item_id") or "")
+        assignment_token = str(event.get("assignment_token") or "")
+        label = str(event.get("label") or "job part")
+        if worker_uid:
+            claim_role = "proofreader" if role == "proofreader" else "transcriber"
+            claim_segment = "proofreader" if role == "proofreader" else ("" if item_id == "main" else item_id)
+            await _human_release_worker_claim(worker_uid, job_id, claim_segment, claim_role)
+            await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+            notification_role = "main" if item_id == "main" else role
+            await _create_user_notification(
+                worker_uid, f"human-expired:{job_id}:{notification_role}:{item_id}:{assignment_token}", "assignment_taken_back",
+                "A Human Work deadline passed", f"Your {label} returned to the queue after its deadline.",
+                route="human_worker", job_id=job_id, target_id=job_id,
+            )
+        await _notify_human_admins(
+            f"human-returned-to-queue:{job_id}:{role}:{item_id}:{assignment_token}", "returned_to_queue",
+            "Human Work returned to the queue", f"A {label} deadline passed. Review and reassign this step.",
+            route="human_ops", job_id=job_id, requires_action=True, target_id=item_id,
         )
-    await _notify_human_admins(
-        f"human-returned-to-queue:{job_id}:main:{assignment_token}", "returned_to_queue", "A Human Work job returned to the queue",
-        "A worker deadline passed. Review and reassign the job.", route="human_ops", job_id=job_id, requires_action=True,
-    )
-    job = dict(job)
-    job.update(updates)
-    return job
+    return result.get("job") or job
 
 
 def _human_is_split_job(job):
@@ -7033,6 +7274,15 @@ async def _human_release_worker_claim(worker_uid, job_id, segment_id="", role="t
     await asyncio.to_thread(release_if_current, transaction)
 
 
+def _human_claim_item_key(job_id, segment_id=""):
+    return f"{str(job_id or '').strip()}|{str(segment_id or '').strip() or 'whole'}"
+
+
+def _human_claim_attempt_document_id(worker_uid, qualification_cycle, item_key):
+    value = "|".join((str(worker_uid or ""), str(qualification_cycle or "initial"), str(item_key or "")))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supervised_starter=False):
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
@@ -7048,8 +7298,11 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
         if not job_snapshot.exists:
             raise HTTPException(status_code=404, detail="This job is no longer available.")
         job = job_snapshot.to_dict() or {}
-        if str(job.get("job_type") or "").strip().lower() == "pdf_job":
-            raise HTTPException(status_code=403, detail="PDF jobs are assigned by an admin.")
+        job_type = str(job.get("job_type") or "").strip().lower()
+        if job_type == "letter_job":
+            raise HTTPException(status_code=403, detail="Letter Jobs are assigned by an admin as one complete job.")
+        if job_type == "pdf_job" and job.get("admin_uploaded") is not True:
+            raise HTTPException(status_code=403, detail="This PDF job is assigned by an admin.")
         worker_snapshot = worker_ref.get(transaction=tx)
         worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
         if worker_profile.get("workerApproved") is not True:
@@ -7084,6 +7337,16 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
                 raise HTTPException(status_code=409, detail="Another worker has already claimed that part.")
             if any(item.get("worker_uid") == worker_uid and item.get("status") in {"assigned", "in_progress"} for item in segments):
                 raise HTTPException(status_code=409, detail="Finish your current part of this job before claiming another.")
+            cycle_id = worker_profile.get("worker_qualification_cycle") or "initial"
+            item_key = _human_claim_item_key(job_id, segment_id)
+            attempt_ref = db.collection(HUMAN_WORKER_ITEM_CLAIM_COLLECTION).document(
+                _human_claim_attempt_document_id(worker_uid, cycle_id, item_key)
+            )
+            attempt_snapshot = attempt_ref.get(transaction=tx)
+            attempt_data = attempt_snapshot.to_dict() if attempt_snapshot.exists else {}
+            claim_count = int(attempt_data.get("claim_count") or 0)
+            if claim_count >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM:
+                raise HTTPException(status_code=409, detail="You have already successfully claimed this job part twice. Choose another available part.")
             seconds = max(0.0, float(target.get("end_seconds") or 0) - float(target.get("start_seconds") or 0))
             tat_seconds = human_tat_seconds(seconds)
             deadline = now + timedelta(seconds=tat_seconds)
@@ -7106,13 +7369,28 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             }
             tx.update(job_ref, updates)
+            tx.set(attempt_ref, {
+                "worker_uid": worker_uid, "qualification_cycle": str(cycle_id), "item_key": item_key,
+                "job_id": job_id, "segment_id": segment_id, "claim_count": claim_count + 1,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
             tx.set(claim_ref, {"worker_uid": worker_uid, "job_id": job_id, "segment_id": segment_id, "role": "transcriber", "status": "active", "assignedAt": now, "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
-            return {"job_id": job_id, "segment_id": segment_id, "label": target.get("label") or "your assigned part", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
+            return {"job_id": job_id, "segment_id": segment_id, "claim_count": claim_count + 1, "label": target.get("label") or "your assigned part", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
 
         if segment_id:
             raise HTTPException(status_code=400, detail="This job does not have claimable parts.")
         if job.get("status") != "approved" or job.get("worker_uid"):
             raise HTTPException(status_code=409, detail="Another worker has already claimed this job.")
+        cycle_id = worker_profile.get("worker_qualification_cycle") or "initial"
+        item_key = _human_claim_item_key(job_id, "")
+        attempt_ref = db.collection(HUMAN_WORKER_ITEM_CLAIM_COLLECTION).document(
+            _human_claim_attempt_document_id(worker_uid, cycle_id, item_key)
+        )
+        attempt_snapshot = attempt_ref.get(transaction=tx)
+        attempt_data = attempt_snapshot.to_dict() if attempt_snapshot.exists else {}
+        claim_count = int(attempt_data.get("claim_count") or 0)
+        if claim_count >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM:
+            raise HTTPException(status_code=409, detail="You have already successfully claimed this job twice. Choose another available job.")
         tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
         deadline = now + timedelta(seconds=tat_seconds)
         tx.update(job_ref, {
@@ -7122,8 +7400,13 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
             "assignedAt": now, "deadlineAt": deadline, "tat_seconds": tat_seconds,
             "assigned_worker_uids": [worker_uid], "updatedAt": firestore.SERVER_TIMESTAMP,
         })
+        tx.set(attempt_ref, {
+            "worker_uid": worker_uid, "qualification_cycle": str(cycle_id), "item_key": item_key,
+            "job_id": job_id, "segment_id": "", "claim_count": claim_count + 1,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
         tx.set(claim_ref, {"worker_uid": worker_uid, "job_id": job_id, "segment_id": "", "role": "transcriber", "status": "active", "assignedAt": now, "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
-        return {"job_id": job_id, "segment_id": "", "label": "your transcription job", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
+        return {"job_id": job_id, "segment_id": "", "claim_count": claim_count + 1, "label": "your transcription job", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
 
     return claim(transaction)
 
@@ -7354,94 +7637,17 @@ def _human_assign_whole_job_transaction(job_id, actor):
 
 
 async def _human_check_expiry(job_id: str, job: dict):
-    """Return expired work to the admin queue without taking live work away."""
+    """Return expired work once without double-counting concurrent page reads."""
     if not db or not job:
         return job
-    now = datetime.now()
-    original_job = dict(job)
     if _human_is_split_job(job):
-        segments = [dict(item or {}) for item in (job.get("segments") or [])]
-        expired_assignments = []
-        changed = False
-        for item in segments:
-            if item.get("status") not in ("assigned", "in_progress"):
-                continue
-            deadline = _as_dt(item.get("deadlineAt"))
-            if not deadline or now <= deadline:
-                continue
-            assignment_token = _human_iso(item.get("assignedAt")) or now.isoformat()
-            expired_assignments.append((str(item.get("worker_uid") or ""), "part", str(item.get("id") or ""), item.get("label") or "job part", assignment_token))
-            previous = item.get("worker_name") or item.get("worker_email") or "the previous worker"
-            item.update({
-                "status": "available",
-                "worker_uid": None,
-                "worker_email": None,
-                "worker_name": None,
-                "assignedAt": None,
-                "deadlineAt": None,
-                "tat_seconds": None,
-                "auto_reassigned_count": int(item.get("auto_reassigned_count") or 0) + 1,
-                "last_auto_reassigned_at": now,
-                "last_auto_reassigned_worker_name": previous,
-            })
-            changed = True
-        proofreader_status = job.get("proofreader_status")
-        proofreader_deadline = _as_dt(job.get("proofreader_deadlineAt"))
-        if proofreader_status in ("assigned", "in_progress") and proofreader_deadline and now > proofreader_deadline:
-            assignment_token = _human_iso(job.get("proofreader_assignedAt")) or now.isoformat()
-            expired_assignments.append((str(job.get("proofreader_uid") or ""), "proofreader", "proofreader", "proofreading", assignment_token))
-            job = dict(job)
-            job.update({"proofreader_status": "available", "proofreader_uid": None, "proofreader_email": None, "proofreader_name": None, "proofreader_deadlineAt": None, "proofreader_tat_seconds": None})
-            changed = True
-        if changed:
-            job = dict(job)
-            job["segments"] = segments
-            job["assigned_worker_uids"] = list(dict.fromkeys(item.get("worker_uid") for item in segments if item.get("worker_uid")))
-            if job.get("proofreader_status") in ("assigned", "in_progress"):
-                job["status"] = "proofreading_assigned"
-            elif all(item.get("status") == "submitted" for item in segments):
-                job["status"] = "proofreading_available"
-            else:
-                job["status"] = "split_assigned"
-            try:
-                await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-                    "segments": segments,
-                    "assigned_worker_uids": job["assigned_worker_uids"],
-                    "proofreader_uid": job.get("proofreader_uid"),
-                    "proofreader_email": job.get("proofreader_email"),
-                    "proofreader_name": job.get("proofreader_name"),
-                    "proofreader_status": job.get("proofreader_status"),
-                    "proofreader_deadlineAt": job.get("proofreader_deadlineAt"),
-                    "proofreader_tat_seconds": job.get("proofreader_tat_seconds"),
-                    "status": job["status"],
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                })
-            except Exception as exc:
-                logger.warning("Could not update split-job expiry for %s: %s", job_id, exc)
-                return original_job
-            for worker_uid, role, assignment_id, label, assignment_token in expired_assignments:
-                if worker_uid:
-                    claim_role = "proofreader" if role == "proofreader" else "transcriber"
-                    claim_segment = "proofreader" if role == "proofreader" else assignment_id
-                    await _human_release_worker_claim(worker_uid, job_id, claim_segment, claim_role)
-                    await _update_user_notification_states(worker_uid, job_id=job_id, kinds={"assignment"}, read=True, completed=True)
-                    await _create_user_notification(
-                        worker_uid, f"human-expired:{job_id}:{role}:{assignment_id}:{assignment_token}", "assignment_taken_back",
-                        "A Human Work deadline passed", f"Your {label} returned to the queue after its deadline.",
-                        route="human_worker", job_id=job_id, target_id=job_id,
-                    )
-                await _notify_human_admins(
-                    f"human-returned-to-queue:{job_id}:{role}:{assignment_id}:{assignment_token}", "returned_to_queue",
-                    "Human Work returned to the queue", f"A {label} deadline passed. Review and reassign this step.",
-                    route="human_ops", job_id=job_id, requires_action=True, target_id=assignment_id,
-                )
-        return job
+        return await _human_reclaim_expired_job(job_id, job, split_expected=True)
     if job.get("status") not in ("assigned", "in_progress"):
         return job
     deadline = _as_dt(job.get("deadlineAt"))
-    if not deadline or now <= deadline:
+    if not deadline or datetime.now() <= deadline:
         return job
-    return await _human_reclaim_expired_job(job_id, job)
+    return await _human_reclaim_expired_job(job_id, job, split_expected=False)
 
 
 async def _human_job(job_id: str):
@@ -7910,19 +8116,48 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     worker_available = (actor.get("profile") or {}).get("is_available", True) is not False
     worker_rating_summary = {"average": None, "count": 0}
     worker_meets_rating = False
+    worker_deadline_return_count = 0
+    worker_claim_attempt_counts = {}
     if actor["role"] == "worker":
-        worker_rating_summary = await _human_worker_rating_summary(actor["uid"], actor.get("profile") or {})
+        profile = actor.get("profile") or {}
+        worker_deadline_return_count = max(0, int(profile.get("deadline_return_count") or 0))
+        worker_rating_summary = await _human_worker_rating_summary(actor["uid"], profile)
         worker_meets_rating = (
             worker_rating_summary["average"] is not None
             and worker_rating_summary["average"] >= MIN_HUMAN_WORKER_RATING
         )
     if available_scope:
+        qualification_cycle = str((actor.get("profile") or {}).get("worker_qualification_cycle") or "initial")
+        attempt_rows = await asyncio.to_thread(lambda: list(
+            db.collection(HUMAN_WORKER_ITEM_CLAIM_COLLECTION)
+            .where(filter=FieldFilter("worker_uid", "==", actor["uid"]))
+            .stream()
+        ))
+        for attempt in attempt_rows:
+            attempt_data = attempt.to_dict() or {}
+            if str(attempt_data.get("qualification_cycle") or "initial") != qualification_cycle:
+                continue
+            item_key = str(attempt_data.get("item_key") or "")
+            if item_key:
+                worker_claim_attempt_counts[item_key] = max(0, int(attempt_data.get("claim_count") or 0))
         snapshots_by_id = {}
         for status in ("approved", "split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"):
             rows = await asyncio.to_thread(lambda status=status: list(ref.where(filter=FieldFilter("status", "==", status)).stream()))
             snapshots_by_id.update({snapshot.id: snapshot for snapshot in rows})
         snapshots = list(snapshots_by_id.values())
         worker_active_assignment = await _human_worker_has_active_assignment(actor["uid"])
+        # Expiry processing above can itself trigger the eleventh missed-deadline
+        # return. Re-read the profile before exposing any Available Jobs rows.
+        refreshed_profile = await _load_profile(actor["uid"])
+        refreshed_profile = refreshed_profile or {}
+        if refreshed_profile.get("workerApproved") is not True:
+            raise HTTPException(
+                status_code=403,
+                detail="Your available-work access is paused. Please continue in the Training Room.",
+            )
+        actor["profile"] = refreshed_profile
+        worker_available = refreshed_profile.get("is_available", True) is not False
+        worker_deadline_return_count = max(0, int(refreshed_profile.get("deadline_return_count") or 0))
         worker_can_claim = worker_meets_rating and worker_available and not worker_active_assignment
         if not worker_meets_rating:
             average = worker_rating_summary["average"]
@@ -7936,6 +8171,11 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         elif worker_active_assignment:
             claim_block_reason = "Finish your current assignment before claiming another."
     elif scope == "available":
+        if (actor.get("profile") or {}).get("worker_retraining_required") is True:
+            raise HTTPException(
+                status_code=403,
+                detail="Your available-work access is paused. Please continue in the Training Room.",
+            )
         raise HTTPException(status_code=403, detail="Only approved workers can view available Human Work.")
     elif scope == "admin" and actor["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required to view the Human Work queue.")
@@ -7964,6 +8204,11 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         item["id"] = snap.id
         item = await _human_check_expiry(snap.id, item)
         if available_scope:
+            item_type = str(item.get("job_type") or "").strip().lower()
+            if item_type == "letter_job":
+                continue
+            if item_type == "pdf_job" and (item.get("admin_uploaded") is not True or item.get("pdf_review")):
+                continue
             if _human_is_split_job(item):
                 if item.get("status") not in {"split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"}:
                     continue
@@ -7978,15 +8223,13 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
             else:
                 if item.get("status") != "approved":
                     continue
-                if str(item.get("job_type") or "").strip().lower() == "pdf_job":
-                    continue
                 claimable_parts = []
                 claimable_full_job = True
             # A worker can assess the listing but cannot read client files or
             # the AI draft until the claim transaction assigns the work.
             public_item = _human_available_public_for(
                 item, actor.get("uid") or "", claimable_parts, claimable_full_job,
-                worker_can_claim, claim_block_reason,
+                worker_can_claim, claim_block_reason, worker_claim_attempt_counts,
             )
             jobs.append(public_item)
             continue
@@ -8001,6 +8244,17 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
             if scope != "finished" and current_status not in active:
                 continue
         jobs.append(_human_public_for(item, view_role, actor.get("uid") or ""))
+    if actor["role"] == "worker":
+        # The assigned/finished views also run expiry checks while serializing
+        # jobs. Do not return a worker board if one of those checks caused lockout.
+        latest_profile = await _load_profile(actor["uid"])
+        latest_profile = latest_profile or {}
+        if latest_profile.get("workerApproved") is not True:
+            raise HTTPException(
+                status_code=403,
+                detail="Your available-work access is paused. Please continue in the Training Room.",
+            )
+        worker_deadline_return_count = max(0, int(latest_profile.get("deadline_return_count") or 0))
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     response = {"jobs": jobs}
     if actor["role"] == "worker":
@@ -8010,6 +8264,8 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         response["worker_available"] = worker_available
         response["worker_can_claim"] = worker_can_claim
         response["worker_claim_block_reason"] = claim_block_reason
+        response["worker_deadline_return_count"] = worker_deadline_return_count
+        response["worker_deadline_warning"] = worker_deadline_return_count >= HUMAN_WORKER_DEADLINE_WARNING_RETURNS
     return response
 
 
@@ -8142,7 +8398,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                     reference_meta.append(meta)
                 now = firestore.SERVER_TIMESTAMP
                 job = {
-                    "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf", "pdf_batch_id": batch_id, "status": "approved",
+                    "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf", "pdf_batch_id": batch_id, "status": "approved", "admin_uploaded": True,
                     "tat_seconds": PDF_JOB_TAT_SECONDS, "instruction_attachments": reference_meta,
                     "createdAt": now, "updatedAt": now,
                     "seconds": 180, "minutes": 1,
@@ -8161,6 +8417,10 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                 }
                 await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, job)
                 created_jobs.append(job_id)
+                asyncio.create_task(_notify_available_workers(
+                    job_id, "New Text Messages work is available" if is_text_messages else "New PDF image work is available",
+                    "An admin-uploaded image is open on the Available Jobs board.",
+                ))
         return {"created_count": len(created_jobs), "jobs": created_jobs, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
     except HTTPException:
         await rollback()
@@ -8392,7 +8652,7 @@ async def human_admin_create_letter_job(
         now = firestore.SERVER_TIMESTAMP
         job = {
             "client_uid": actor["uid"], "client_email": email,
-            "status": "approved", "createdAt": now, "updatedAt": now,
+            "status": "approved", "createdAt": now, "updatedAt": now, "admin_uploaded": True,
             "job_name": safe_title, "job_type": "letter_job", "source_type": "letter_job", "job_category": "letter",
             "seconds": duration, "minutes": quote["minutes"], "turnaround": "standard", "difficulty": "standard",
             "service": "standard", "formatting": "standard", "timestamps": False, "speakers": "1-2",
@@ -8432,6 +8692,160 @@ async def human_admin_create_letter_job(
                     await asyncio.to_thread(bucket.blob(path).delete)
                 except Exception:
                     logger.warning("Could not clean up failed Letter Job upload %s", path)
+        raise
+
+
+@app.post("/human-transcription/admin/audio-jobs")
+async def human_admin_create_audio_job(
+    request: Request,
+    audio: UploadFile = File(...),
+    attachments: List[UploadFile] = File(default=[]),
+    template_file: Optional[UploadFile] = File(default=None),
+    instructions: str = Form(""),
+    title: str = Form(""),
+    seconds: float = Form(0),
+    category: str = Form("general"),
+):
+    """Create internal General or Template work, immediately available to eligible workers."""
+    actor = await _human_actor(request)
+    if str(actor.get("email") or "").strip().lower() not in LETTER_JOB_ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="General Jobs and Template Jobs are available only to the admin team.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    job_category = str(category or "general").strip().lower()
+    if job_category not in {"general", "template"}:
+        raise HTTPException(status_code=400, detail="Choose General Jobs or Template Jobs.")
+    template_name = os.path.basename(getattr(template_file, "filename", "") or "")
+    template_raw = b""
+    if job_category == "template":
+        if not template_name or os.path.splitext(template_name)[1].lower() != ".docx":
+            raise HTTPException(status_code=400, detail="A Template Job requires exactly one job-specific .docx template.")
+        template_raw = await template_file.read(MAX_ATTACHMENT_BYTES + 1)
+        if not template_raw:
+            raise HTTPException(status_code=400, detail="The job-specific .docx template is empty.")
+        if len(template_raw) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail="The job-specific .docx template is larger than 20 MB.")
+        try:
+            await asyncio.to_thread(_human_template_docx_profile, template_raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif template_name:
+        raise HTTPException(status_code=400, detail="Only Template Jobs accept a job-specific .docx template.")
+    if not audio or not audio.filename:
+        raise HTTPException(status_code=400, detail="Choose the complete recording for this job.")
+    if os.path.splitext(audio.filename)[1].lower().lstrip(".") not in LETTER_AUDIO_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Use a supported audio/video recording such as MP3, WAV, M4A, MP4, or WebM.")
+    try:
+        duration = float(seconds or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if not math.isfinite(duration) or duration <= 0:
+        raise HTTPException(status_code=400, detail="Enter the recording length in seconds.")
+    max_reference_count = 5 if job_category == "template" else 6
+    if len([item for item in (attachments or []) if getattr(item, "filename", "")]) > max_reference_count:
+        raise HTTPException(status_code=413, detail=f"Attach no more than {max_reference_count} supporting reference files.")
+
+    note = str(instructions or "").strip()
+    if len(note) > 12000:
+        raise HTTPException(status_code=413, detail="Job-specific instructions must be 12,000 characters or fewer.")
+    default_instruction = GENERAL_JOB_DEFAULT_INSTRUCTION if job_category == "general" else TEMPLATE_JOB_DEFAULT_INSTRUCTION
+    job_instructions = default_instruction + (f"\n\nADMIN JOB NOTES:\n{note}" if note else "")
+    raw_references = []
+    total_reference_bytes = len(template_raw)
+    for upload in [item for item in (attachments or []) if getattr(item, "filename", "")]:
+        name = os.path.basename(upload.filename or "reference")[:180]
+        if doc_tools.file_extension(name) not in PDF_JOB_ATTACHMENT_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"{name} is not a supported reference file. Use PDF, Word, text, image or audio files.")
+        raw = await upload.read(MAX_ATTACHMENT_BYTES + 1)
+        if not raw:
+            raise HTTPException(status_code=400, detail=f"{name} is empty.")
+        if len(raw) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail=f"{name} is larger than 20 MB.")
+        total_reference_bytes += len(raw)
+        if total_reference_bytes > 50000000:
+            raise HTTPException(status_code=413, detail="Job reference files may total no more than 50 MB.")
+        raw_references.append((upload, name, raw))
+    transcriber_rate = await _get_human_transcriber_rate()
+    quote = human_credit_quote(duration, transcriber_rate_kes=transcriber_rate)
+    quote = {
+        "credits": 0,
+        "minutes": int(quote.get("minutes") or max(1, math.ceil(duration / 60))),
+        "transcriber_payout_kes_per_minute": int(quote.get("transcriber_payout_kes_per_minute") or transcriber_rate),
+    }
+    job_id = uuid.uuid4().hex
+    stored_paths = []
+    try:
+        audio_meta = await _human_store_upload(job_id, audio, "audio")
+        stored_paths.append(audio_meta["storage_path"])
+        attachment_meta = []
+        if template_file and template_name:
+            await template_file.seek(0)
+            template_meta = await _human_store_upload(job_id, template_file, "instructions")
+            template_meta.update({"is_template": True, "purpose": "template"})
+            attachment_meta.append(template_meta)
+            if template_meta.get("storage_path"):
+                stored_paths.append(template_meta["storage_path"])
+        for upload, _name, _raw in raw_references:
+            await upload.seek(0)
+            meta = await _human_store_upload(job_id, upload, "instructions")
+            attachment_meta.append(meta)
+            if meta and meta.get("storage_path"):
+                stored_paths.append(meta["storage_path"])
+        now = firestore.SERVER_TIMESTAMP
+        base_job = {
+            "client_uid": None, "client_email": "", "created_by_uid": actor["uid"],
+            "created_by_email": str(actor.get("email") or "").strip().lower(),
+            "admin_uploaded": True, "source_type": "admin_upload", "job_category": job_category,
+            "job_type": "general_job" if job_category == "general" else "template_job",
+            "job_name": str(title or "").strip()[:180] or os.path.basename(audio.filename or f"{job_category.title()} Job"),
+            "status": "approved", "createdAt": now, "approvedAt": now, "updatedAt": now,
+            "seconds": duration, "minutes": quote["minutes"], "turnaround": "standard", "difficulty": "standard",
+            "service": f"{job_category}_transcription", "formatting": "template" if job_category == "template" else "standard",
+            "timestamps": False, "speakers": "1-2", "speaker_labels": False,
+            "instructions": job_instructions, "audio": audio_meta, "instruction_attachments": attachment_meta,
+            "quote_credits": 0, "credits_charged": 0, "quote": quote,
+            "worker_uid": None, "worker_email": None, "worker_name": None,
+            "transcript": "", "transcript_html": "", "worker_notes": "", "final_attachment": None,
+            "admin_feedback": "", "worker_rating": None, "releasedAt": None,
+            "assignedAt": None, "deadlineAt": None, "tat_seconds": None,
+            "auto_reassigned_count": 0, "last_auto_reassigned_at": None, "last_auto_reassigned_worker_name": None,
+            "workerCompletedAt": None, "worker_minutes": None, "worker_amount_kes": None,
+            "payout_status": None, "payout_period_id": None, "workerPaymentStatus": None, "workerPaidAt": None,
+            "split_mode": "single", "segments": [], "assigned_worker_uids": [],
+            "proofreader_uid": None, "proofreader_email": None, "proofreader_name": None, "proofreader_status": None,
+            "proofreader_deadlineAt": None, "proofreader_tat_seconds": None,
+            "proofreader_completedAt": None, "proofreader_minutes": None, "proofreader_amount_kes": None,
+            "proofreader_payout_status": None, "proofreader_payout_period_id": None,
+        }
+        try:
+            segments = _human_build_available_segments(base_job, datetime.now())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        base_job["segments"] = segments
+        base_job["split_mode"] = "multi" if segments else "single"
+        base_job["status"] = "split_assigned" if segments else "approved"
+        job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+        await asyncio.to_thread(job_ref.set, base_job)
+        saved_snapshot = await asyncio.to_thread(job_ref.get)
+        saved_job = saved_snapshot.to_dict() or base_job
+        saved_job["id"] = job_id
+        asyncio.create_task(_notify_available_workers(
+            job_id, "New General Work is available" if job_category == "general" else "New Template Work is available",
+            "An admin-uploaded recording is open on the Available Jobs board.",
+        ))
+        return {"job": _human_public_for(saved_job, "admin", actor.get("uid") or ""), "parts_count": len(segments), "worker_pay_kes_per_minute": quote["transcriber_payout_kes_per_minute"]}
+    except Exception:
+        bucket = _human_bucket()
+        if bucket:
+            for path in stored_paths:
+                try:
+                    await asyncio.to_thread(bucket.blob(path).delete)
+                except Exception:
+                    logger.warning("Could not clean up failed admin audio upload %s", path)
+        try:
+            await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).delete)
+        except Exception:
+            pass
         raise
 
 
@@ -9780,11 +10194,17 @@ async def human_admin_review(job_id: str, request: Request):
             if worker_uid in rated_parts:
                 continue
             ratings_by_worker[worker_uid] = rating
-    is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
-    is_letter_job = str(job.get("job_type") or "").strip().lower() == "letter_job"
+    job_type = str(job.get("job_type") or "").strip().lower()
+    is_pdf_job = job_type == "pdf_job"
+    is_letter_job = job_type == "letter_job"
+    if job.get("admin_uploaded") is True and job_type in {"general_job", "template_job"}:
+        if not str((job.get("ai_review") or {}).get("combined_text") or "").strip():
+            raise HTTPException(status_code=409, detail="Run the AI review on the submitted General or Template Job before approving internal work.")
+        if job.get("ai_review_applied") is not True:
+            raise HTTPException(status_code=409, detail="Apply the AI-reviewed transcript before approving this internal job.")
     if is_letter_job and job.get("letter_ai_review_status") != "completed":
         raise HTTPException(status_code=409, detail="The Letter Job must finish its AI document review before admin approval.")
-    internal_release = is_pdf_job or is_letter_job
+    internal_release = is_pdf_job or is_letter_job or job.get("admin_uploaded") is True
     review_status = "released" if internal_release else "client_review"
     updates = {
         "status": review_status,
@@ -10842,12 +11262,12 @@ WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("gemini-3.8-flash
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Claude Opus 5.5 + GPT-5.6 Sol fallback", "job_types": ["audio"],
+        "display": "Claude Opus 5.5 + GPT-5.6 Sol fallback", "job_types": ["audio", "general_job"],
         "models": ["claude-opus-5-5", "gpt-5.6-sol"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
-        "display": "Claude Opus 5.5 + GPT-5.6 Sol fallback", "job_types": ["audio"],
+        "display": "Claude Opus 5.5 + GPT-5.6 Sol fallback", "job_types": ["audio", "template_job"],
         "models": ["claude-opus-5-5", "gpt-5.6-sol"],
     },
     "letter-opus": {
@@ -10992,6 +11412,12 @@ def _human_ai_agent_system(agent_id, stage, guidelines, context, job_specific_gu
         if is_template_agent else
         "Use worker Research Notes and I researched entries to standardise researched proper nouns unless a client spelling conflicts."
     )
+    agent_job_rules = (
+        globals().get("GENERAL_JOB_DEFAULT_INSTRUCTION", "")
+        if agent_id == "general-gpt" else
+        globals().get("TEMPLATE_JOB_DEFAULT_INSTRUCTION", "")
+        if agent_id == "template-claude" else ""
+    )
     return (
         f"You are {agent['name']}, an internal first-draft transcription agent for TypeMyworDz. "
         "Your output is a private draft that MUST be proofread by an approved human before it can be released.\n"
@@ -11003,7 +11429,8 @@ def _human_ai_agent_system(agent_id, stage, guidelines, context, job_specific_gu
         "two spaces after sentence-ending punctuation, blank lines between paragraphs, and keep headings and the spellings section flush left.\n"
         f"{template_note}\n{template_priority}{letter_template_note}\n"
         f"PASS: {stage}. Return only the final transcript text; no explanation or wrapper.\n\n"
-        f"TYPEMYWORDZ GUIDELINES:\n{guidelines[:60000]}\n\n"
+        + (f"PERMANENT JOB-TYPE RULES (always apply):\n{agent_job_rules}\n\n" if agent_job_rules else "")
+        + f"TYPEMYWORDZ GUIDELINES:\n{guidelines[:60000]}\n\n"
         + (f"PERMANENT TEMPLATE-JOB GUIDELINES (always apply to this agent):\n{permanent_template_guidelines[:60000]}\n\n" if is_template_agent else "")
         + (f"PERMANENT LETTER-JOB GUIDELINES (these override any general instruction that says not to format letters):\n{permanent_letter_guidelines[:30000]}\n\n" if is_letter_agent else "")
         + ("CURRENT JOB TEMPLATE-SPECIFIC GUIDELINES (highest formatting priority for this job where applicable):\n"
@@ -11685,6 +12112,10 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             private_template_uploads.append({"name": name, "raw": raw, "content_type": upload.content_type or "application/octet-stream"})
     job = await _human_job(job_id)
     job_type = str(job.get("job_type") or "").strip().lower()
+    if job.get("admin_uploaded") is True:
+        expected_agent = {"general_job": "general-gpt", "template_job": "template-claude"}.get(job_type)
+        if expected_agent and agent_id != expected_agent:
+            raise HTTPException(status_code=409, detail="Choose the dedicated AI agent configured for this admin-uploaded job type.")
     if job_type == "letter_job" or agent_id == "letter-opus":
         if job_type != "letter_job" or agent_id != "letter-opus":
             raise HTTPException(status_code=409, detail="The Letter Agent is reserved for Letter Jobs and cannot use the generic segment-assignment path.")
@@ -13076,7 +13507,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
         "models_used": list(dict.fromkeys(models_used)),
         "createdAt": datetime.now().isoformat(),
     }
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"ai_review": saved, "updatedAt": firestore.SERVER_TIMESTAMP})
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"ai_review": saved, "ai_review_applied": False, "updatedAt": firestore.SERVER_TIMESTAMP})
     return {"ai_review": saved}
 
 
@@ -13095,7 +13526,9 @@ async def human_admin_apply_ai_review(job_id: str, request: Request):
         if job.get("status") != "submitted":
             raise HTTPException(status_code=409, detail="This job has already moved past admin review.")
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-            "transcript": review.get("combined_text"), "transcript_html": html, "ai_combined": True, "updatedAt": firestore.SERVER_TIMESTAMP,
+            "transcript": review.get("combined_text"), "transcript_html": html, "ai_combined": True,
+            "ai_review_applied": True, "ai_review_appliedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
         })
         return {"status": "submitted", "job_id": job_id}
     segments = job.get("segments") or []
@@ -13105,7 +13538,8 @@ async def human_admin_apply_ai_review(job_id: str, request: Request):
         raise HTTPException(status_code=409, detail="A proofreader is working on this job. Take it back first.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
         "status": "submitted", "transcript": review.get("combined_text"), "transcript_html": html,
-        "ai_combined": True, "proofreader_status": "skipped",
+        "ai_combined": True, "ai_review_applied": True, "ai_review_appliedAt": firestore.SERVER_TIMESTAMP,
+        "proofreader_status": "skipped",
         "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
     })
     return {"status": "submitted", "job_id": job_id}
@@ -13163,6 +13597,8 @@ async def _advance_legacy_training_progress(uid, profile):
 @app.get("/human-transcription/trainee/status")
 async def trainee_status(request: Request):
     actor = await _trainee_actor(request)
+    if (actor.get("profile") or {}).get("worker_retraining_required") is True:
+        await _human_archive_retraining_attempts(actor["uid"])
     profile = await _advance_legacy_training_progress(actor["uid"], actor["profile"])
     actor["profile"] = profile
     results = await _load_training_submissions(actor["uid"])
@@ -13362,7 +13798,12 @@ async def admin_trainee_decision(uid: str, request: Request):
         final_transcript = str((results.get(str(len(TRAINING_LEVELS))) or {}).get("transcript") or "").strip()
         if not complete or not final_transcript:
             raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
-        updates.update({"role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed", "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP, "trainingRedoLevels": [], "trainingRedoMessage": ""})
+        updates.update({
+            "role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed",
+            "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP,
+            "trainingRedoLevels": [], "trainingRedoMessage": "", "worker_retraining_required": False,
+            "deadline_return_count": 0, "worker_qualification_cycle": uuid.uuid4().hex,
+        })
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     return {"status": "updated", "uid": uid, "decision": decision}
 
