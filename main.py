@@ -11238,6 +11238,10 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
         if agent_id == "text-messages-gemini":
             answer = re.sub(r"<tab>|\[tab\]", "\t", str(answer), flags=re.IGNORECASE)
             answer = _review_normalise_sentence_spacing(answer)
+            if job.get("pdf_review"):
+                answer = _human_collapse_duplicate_image_page_blocks(
+                    answer, [], (job.get("pdf_review") or {}).get("page_texts")
+                )
         else:
             answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
         if template_bytes:
