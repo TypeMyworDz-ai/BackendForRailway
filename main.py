@@ -10848,47 +10848,68 @@ async def _human_ai_agent_research(raw_text, context):
 
 
 def _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts=None):
-    """Remove a repeated full transcript block when exact duplicate source pages caused it."""
+    """Remove repeated page output when exact duplicate source images caused it."""
     text = str(answer or "").strip()
     duplicate_count = len(page_image_hashes) - len(set(page_image_hashes))
     if duplicate_count <= 0 or not text:
         return text
 
-    def normalize(block):
-        return re.sub(r"\s+", " ", str(block or "")).strip().casefold()
+    def normalize(value):
+        return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
 
-    duplicate_draft_signatures = set()
+    duplicate_draft_lines = []
     first_page_by_image = {}
     for index, image_hash in enumerate(page_image_hashes):
         previous_index = first_page_by_image.get(image_hash)
         if previous_index is None:
             first_page_by_image[image_hash] = index
             continue
-        current_text = normalize(page_texts[index]) if index < len(page_texts or []) else ""
-        previous_text = normalize(page_texts[previous_index]) if previous_index < len(page_texts or []) else ""
-        if current_text and current_text == previous_text:
-            duplicate_draft_signatures.add(current_text)
+        source_text = page_texts[previous_index] if previous_index < len(page_texts or []) else ""
+        signature = [normalize(line) for line in str(source_text or "").splitlines() if normalize(line)]
+        if signature:
+            duplicate_draft_lines.append(signature)
 
-    blocks = [block.strip() for block in re.split(r"\r?\n(?:[ \t]*\r?\n)+", text) if block.strip()]
-    if len(blocks) < 2:
-        return text
-
-    seen = set()
-    kept = []
     removed = 0
-    for block in blocks:
-        key = normalize(block)
-        is_full_duplicate_page = key in duplicate_draft_signatures or len(key) >= 120
-        if key and key in seen and is_full_duplicate_page and removed < duplicate_count:
-            removed += 1
+    for signature in duplicate_draft_lines:
+        if removed >= duplicate_count:
+            break
+        lines = text.splitlines(keepends=True)
+        nonempty = [(index, normalize(line)) for index, line in enumerate(lines) if normalize(line)]
+        matches = []
+        start = 0
+        while start + len(signature) <= len(nonempty):
+            chunk = nonempty[start:start + len(signature)]
+            if [line for _, line in chunk] == signature:
+                matches.append((chunk[0][0], chunk[-1][0]))
+                start += len(signature)
+            else:
+                start += 1
+        if len(matches) < 2:
             continue
-        kept.append(block)
-        if key:
-            seen.add(key)
+        start_line, end_line = matches[1]
+        start_char = sum(len(line) for line in lines[:start_line])
+        end_char = sum(len(line) for line in lines[:end_line + 1])
+        text = text[:start_char] + text[end_char:]
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+        removed += 1
+
+    if removed < duplicate_count:
+        blocks = [block.strip() for block in re.split(r"\r?\n(?:[ \t]*\r?\n)+", text) if block.strip()]
+        seen = set()
+        kept = []
+        for block in blocks:
+            key = normalize(block)
+            if key and key in seen and len(key) >= 120 and removed < duplicate_count:
+                removed += 1
+                continue
+            kept.append(block)
+            if key:
+                seen.add(key)
+        if len(kept) < len(blocks):
+            text = "\n\n".join(kept).strip()
 
     if removed:
         logger.info("Removed %s repeated transcript block(s) for exact duplicate image page(s)", removed)
-        return "\n\n".join(kept).strip()
     return text
 
 
@@ -10944,8 +10965,7 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
             response_validator=_human_text_messages_output_validator if is_text else None,
             model_options={"thinking_level": "low", "auto_continue": True} if is_text else None,
         )
-    if is_text:
-        answer = _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts)
+    answer = _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts)
     return str(answer or "").strip(), [model_used]
 
 
