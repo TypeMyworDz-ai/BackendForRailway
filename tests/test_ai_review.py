@@ -270,12 +270,16 @@ class AiAgentCatalog(unittest.TestCase):
         node = next(n for n in tree.body if isinstance(n, __import__("ast").Assign) and any(getattr(t, "id", None) == "HUMAN_AI_AGENTS" for t in n.targets))
         cls.agents = __import__("ast").literal_eval(node.value)
 
-    def test_three_agents_have_requested_model_pairs(self):
-        self.assertEqual(set(self.agents), {"general-gpt", "template-claude", "pdf-gemini"})
+    def test_agent_catalog_and_requested_model_pairs(self):
+        self.assertEqual(set(self.agents), {
+            "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
+        })
         expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
         self.assertEqual(self.agents["general-gpt"]["models"], expected_audio_models)
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
+        self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
+        self.assertEqual(self.agents["letter-opus"]["models"], expected_audio_models)
 
     def test_agents_are_internal_not_email_accounts(self):
         for agent in self.agents.values():
