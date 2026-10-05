@@ -1545,6 +1545,14 @@ def _require_human_job_admin(request: Request) -> dict:
     return decoded
 
 
+def _require_human_shift_admin(request: Request) -> dict:
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    if email != HUMAN_SHIFT_ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Shift attendance is available only to the main admin.")
+    return decoded
+
+
 async def _load_profile(user_id: str):
     if not db or not user_id:
         return None
@@ -6099,11 +6107,12 @@ HUMAN_WORKER_DEADLINE_WARNING_RETURNS = 10
 HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS = 11
 HUMAN_AVAILABLE_SLICE_MINUTES = 5
 
-# Human Work runs a daily evening shift in East Africa Time. Attendance is
-# recorded per scheduled shift; call-ins authorize self-claims outside it.
+# Human Work's regular weekday shift runs 3:00–8:00 p.m. East Africa Time.
+# Attendance is recorded per scheduled weekday; call-ins authorize overtime.
 HUMAN_SHIFT_TIMEZONE = ZoneInfo("Africa/Nairobi")
 HUMAN_SHIFT_START = datetime_time(15, 0)
 HUMAN_SHIFT_END = datetime_time(20, 0)
+HUMAN_SHIFT_ADMIN_EMAIL = "typemywordz@gmail.com"
 HUMAN_SHIFT_WARNING_MISSES = 5
 HUMAN_SHIFT_LOCKOUT_MISSES = 6
 HUMAN_SHIFT_ONLINE_TTL_SECONDS = 150
@@ -6938,8 +6947,9 @@ def _human_shift_parse_datetime(value):
 
 def _human_shift_is_scheduled(now=None):
     now = now or _human_shift_local_now()
-    local_time = now.astimezone(HUMAN_SHIFT_TIMEZONE).timetz().replace(tzinfo=None)
-    return HUMAN_SHIFT_START <= local_time < HUMAN_SHIFT_END
+    local_now = now.astimezone(HUMAN_SHIFT_TIMEZONE)
+    local_time = local_now.timetz().replace(tzinfo=None)
+    return local_now.weekday() < 5 and HUMAN_SHIFT_START <= local_time < HUMAN_SHIFT_END
 
 
 def _human_shift_call_in_active(profile, now=None):
@@ -6984,6 +6994,12 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
     shift_ref = db.collection(HUMAN_SHIFT_COLLECTION)
     current_date = first_date
     while current_date <= through:
+        if current_date.weekday() >= 5:
+            # Saturday and Sunday are not scheduled shifts and must not increase
+            # consecutive missed-shift counts. Still advance the checkpoint.
+            profile["humanShiftLastEvaluatedDate"] = current_date.isoformat()
+            current_date += timedelta(days=1)
+            continue
         shift_id = _human_shift_doc_id(uid, current_date.isoformat())
         shift_snapshot = await asyncio.to_thread(shift_ref.document(shift_id).get)
         shift = shift_snapshot.to_dict() if shift_snapshot.exists else {}
@@ -7050,7 +7066,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         status = "called_in_not_clocked_in"
     elif scheduled:
         status = "not_arrived"
-    elif local_now.timetz().replace(tzinfo=None) >= HUMAN_SHIFT_END:
+    elif local_now.weekday() < 5 and local_now.timetz().replace(tzinfo=None) >= HUMAN_SHIFT_END:
         status = "missed"
     else:
         status = "off_shift"
@@ -7064,11 +7080,15 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
     elif status in {"online", "clocked_in_idle"} and not scheduled and not active_call_in:
         message = "Your shift has ended. Finish any assigned work before clocking out; new work cannot be claimed now."
     elif status == "clocked_out":
-        message = "You are clocked out for today. Your next regular shift begins at 3:00 p.m. Kenya time."
+        message = "You are clocked out for today. Regular shifts run Monday to Friday, 3:00 p.m. to 8:00 p.m. Kenya time."
     elif status == "missed":
-        message = "Today's shift has ended. Clock in during your next shift, or when an admin calls you in."
+        message = "Today's shift has ended. Clock in during the next weekday shift, or after an admin calls you in."
     elif status == "off_shift":
-        message = "Regular shifts run daily from 3:00 p.m. to 8:00 p.m. Kenya time."
+        message = (
+            "There are no regular shifts on weekends. The next shift is Monday to Friday, 3:00 p.m. to 8:00 p.m. Kenya time."
+            if local_now.weekday() >= 5 else
+            "Regular shifts run Monday to Friday, 3:00 p.m. to 8:00 p.m. Kenya time."
+        )
     else:
         message = "You are on shift and can claim available work."
     return {
@@ -7095,6 +7115,39 @@ async def _human_shift_assert_can_claim(actor):
         raise HTTPException(status_code=403, detail=payload["message"])
     actor["profile"] = profile
     return payload
+
+
+async def _human_shift_assert_can_start_assigned(actor):
+    """Let a clocked-in worker finish admin-assigned work after shift end."""
+    profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {})
+    if profile.get("workerApproved") is not True or profile.get("worker_retraining_required") is True:
+        raise HTTPException(status_code=403, detail="Your work access is paused. Please continue in the Training Room.")
+    _, shift = await _human_shift_current_record(actor["uid"])
+    if not shift.get("clockedInAt") or shift.get("clockedOutAt"):
+        raise HTTPException(
+            status_code=403,
+            detail="Clock in before starting your assigned work. Outside regular hours, an admin must call you in first.",
+        )
+    actor["profile"] = profile
+    return _human_shift_status_payload(actor["uid"], profile, shift)
+
+
+async def _human_require_worker_online_for_overtime(worker_uid, profile=None, now=None):
+    """Outside weekday shift hours, direct admin assignment requires live presence."""
+    now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    profile = profile or await _load_profile(worker_uid) or {}
+    if profile.get("workerApproved") is not True:
+        raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    if _human_shift_is_scheduled(now):
+        return True
+    _, shift = await _human_shift_current_record(worker_uid, now)
+    status = _human_shift_status_payload(worker_uid, profile, shift, now)
+    if not status.get("online"):
+        raise HTTPException(
+            status_code=409,
+            detail="Outside regular shift hours, assign work only to a worker who is clocked in and online in the Work Room.",
+        )
+    return True
 
 
 @app.get("/human-transcription/worker/shift")
@@ -7170,7 +7223,7 @@ async def human_worker_shift_clock_out(request: Request):
 
 @app.get("/human-transcription/admin/shifts")
 async def human_admin_shift_attendance(request: Request):
-    _require_human_job_admin(request)
+    _require_human_shift_admin(request)
     snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
     retraining_snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("worker_retraining_required", "==", True)).stream()))
     profiles_by_uid = {snapshot.id: snapshot.to_dict() or {} for snapshot in snapshots}
@@ -7198,14 +7251,15 @@ async def human_admin_shift_attendance(request: Request):
     workers.sort(key=lambda item: (order.get(item["status"], 9), item["name"].lower()))
     return {
         "workers": workers, "date": now.date().isoformat(), "timezone": "Africa/Nairobi",
-        "shift_start": "15:00", "shift_end": "20:00", "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
+        "shift_start": "15:00", "shift_end": "20:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "scheduled_now": _human_shift_is_scheduled(now), "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
         "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
     }
 
 
 @app.post("/human-transcription/admin/workers/{uid}/shift-call-in")
 async def human_admin_shift_call_in(uid: str, request: Request):
-    _require_human_job_admin(request)
+    _require_human_shift_admin(request)
     profile = await _load_profile(uid)
     if not profile or profile.get("workerApproved") is not True:
         raise HTTPException(status_code=404, detail="That approved worker was not found.")
@@ -8943,6 +8997,64 @@ async def human_admin_list_pdf_jobs(request: Request):
     return {"jobs": jobs[:500], "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
 
 
+@app.get("/human-transcription/admin/pdf-jobs/batches/{batch_id}/download")
+async def human_admin_download_pdf_batch(batch_id: str, request: Request):
+    """Build one ordered PDF from the privately stored source pages in an upload batch."""
+    actor = await _human_actor(request)
+    if str(actor.get("email") or "").strip().lower() not in PDF_JOB_ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="PDF batch downloads are available only to the admin team.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    snapshots = await asyncio.to_thread(lambda: list(
+        db.collection(HUMAN_JOB_COLLECTION)
+        .where(filter=FieldFilter("pdf_batch_id", "==", str(batch_id)[:120]))
+        .stream()
+    ))
+    pages = [(snap.id, snap.to_dict() or {}) for snap in snapshots]
+    pages = [(job_id, job) for job_id, job in pages if job.get("job_type") == "pdf_job" and not job.get("pdf_review")]
+    if not pages:
+        raise HTTPException(status_code=404, detail="The uploaded source file was not found.")
+    pages.sort(key=lambda item: int(((item[1].get("pdf_image") or {}).get("page_number")) or 0))
+    source_names = {str((job.get("pdf_image") or {}).get("source_filename") or "") for _, job in pages}
+    if len(source_names) != 1 or len(pages) > 100:
+        raise HTTPException(status_code=409, detail="The source pages could not be safely combined into one file.")
+    bucket = _human_bucket()
+    if bucket is None:
+        raise HTTPException(status_code=503, detail="Private file storage is not ready yet.")
+    page_images = []
+    try:
+        for job_id, job in pages:
+            meta = job.get("pdf_image") or {}
+            path = str(meta.get("storage_path") or "")
+            if not path.startswith(f"human-workflow/{job_id}/pdf/"):
+                raise HTTPException(status_code=403, detail="A source image does not belong to this upload batch.")
+            raw = await asyncio.to_thread(bucket.blob(path).download_as_bytes)
+            with Image.open(BytesIO(raw)) as image:
+                image.load()
+                page_images.append(image.convert("RGB"))
+        if not page_images:
+            raise HTTPException(status_code=404, detail="No source pages were available to combine.")
+        output = BytesIO()
+        page_images[0].save(output, format="PDF", save_all=True, append_images=page_images[1:], resolution=150)
+        filename = os.path.splitext(os.path.basename(next(iter(source_names)) or "source-file"))[0]
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._-") or "source-file"
+        return Response(
+            content=output.getvalue(), media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"', "Cache-Control": "private, no-store"},
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not create admin PDF download for batch %s", batch_id)
+        raise HTTPException(status_code=500, detail="The source pages could not be combined into a PDF.") from exc
+    finally:
+        for image in page_images:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+
 @app.post("/human-transcription/admin/letter-jobs")
 async def human_admin_create_letter_job(
     request: Request,
@@ -9440,8 +9552,9 @@ async def human_worker_payment_history(request: Request):
 async def human_list_workers(request: Request):
     _require_human_job_admin(request)
     if not db:
-        return {"workers": []}
+        return {"workers": [], "scheduled_now": _human_shift_is_scheduled()}
     workers = []
+    now = _human_shift_local_now()
     for snap in await asyncio.to_thread(lambda: list(db.collection("users").stream())):
         data = snap.to_dict() or {}
         role = str(data.get("role") or data.get("user_type") or "").strip().lower()
@@ -9453,8 +9566,13 @@ async def human_list_workers(request: Request):
             rating = await _human_worker_rating_summary(snap.id, data)
         except Exception:
             rating = {"average": None, "count": 0}
+        _, shift = await _human_shift_current_record(snap.id, now)
+        shift_status = _human_shift_status_payload(snap.id, data, shift, now)
         workers.append({
             "uid": data.get("uid") or snap.id,
+            "online": bool(shift_status.get("online")),
+            "clocked_in": bool(shift_status.get("clocked_in")),
+            "shift_status": shift_status.get("status"),
             "email": data.get("email") or "",
             "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
             "role": role or "worker",
@@ -9464,7 +9582,10 @@ async def human_list_workers(request: Request):
             "rating_count": rating.get("count") or 0,
             "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
-    return {"workers": workers}
+    return {
+        "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
+        "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
+    }
 
 
 @app.get("/human-transcription/worker/availability")
@@ -9982,6 +10103,7 @@ async def human_admin_assign(job_id: str, request: Request):
     worker_profile = await _load_profile(worker_uid)
     if not worker_profile or worker_profile.get("workerApproved") is not True:
         raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    await _human_require_worker_online_for_overtime(worker_uid, worker_profile)
     if worker_profile.get("is_available", True) is False:
         raise HTTPException(status_code=409, detail="This worker is marked unavailable for new work.")
     worker_rating = await _human_worker_rating_summary(worker_uid, worker_profile)
@@ -10029,6 +10151,7 @@ async def human_admin_assign_whole(job_id: str, request: Request):
     worker_profile = await _load_profile(worker_uid)
     if not worker_profile or worker_profile.get("workerApproved") is not True:
         raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    await _human_require_worker_online_for_overtime(worker_uid, worker_profile)
     if job.get("pdf_review"):
         reviewer_rating = await _human_worker_rating_summary(worker_uid, worker_profile)
         if reviewer_rating["average"] is None or reviewer_rating["average"] < MIN_PROOFREADER_RATING:
@@ -10115,6 +10238,7 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
     if not worker_uid:
         raise HTTPException(status_code=400, detail="Choose an approved proofreader first.")
     proofreader_profile = await _load_profile(worker_uid) or {}
+    await _human_require_worker_online_for_overtime(worker_uid, proofreader_profile)
     proofreader_rating = await _human_worker_rating_summary(worker_uid, proofreader_profile)
     if proofreader_rating["average"] is None or proofreader_rating["average"] < MIN_PROOFREADER_RATING:
         raise HTTPException(status_code=409, detail="Only workers rated 4.5/5 or higher can proofread.")
@@ -10380,14 +10504,14 @@ async def human_worker_start(job_id: str, request: Request):
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
             if target.get("status") == "assigned":
-                await _human_shift_assert_can_claim(actor)
+                await _human_shift_assert_can_start_assigned(actor)
             target["status"] = "in_progress"
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": _human_split_parent_status(job, segments), "updatedAt": firestore.SERVER_TIMESTAMP})
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "segment_id": target.get("id")}
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
             if job.get("proofreader_status") == "assigned":
-                await _human_shift_assert_can_claim(actor)
+                await _human_shift_assert_can_start_assigned(actor)
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"proofreader_status": "in_progress", "status": "proofreading_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "role": "proofreader"}
@@ -10397,7 +10521,7 @@ async def human_worker_start(job_id: str, request: Request):
     if job.get("status") not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="This job is not ready to start.")
     if job.get("status") == "assigned":
-        await _human_shift_assert_can_claim(actor)
+        await _human_shift_assert_can_start_assigned(actor)
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
     await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
     return {"status": "in_progress", "job_id": job_id}
@@ -10442,7 +10566,7 @@ async def human_worker_submit(
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
             if target.get("status") == "assigned":
-                await _human_shift_assert_can_claim(actor)
+                await _human_shift_assert_can_start_assigned(actor)
             final_attachment = target.get("final_attachment")
             if attachment and attachment.filename:
                 final_attachment = await _human_store_upload(job_id, attachment, f"final-{target.get('id')}")
@@ -10480,7 +10604,7 @@ async def human_worker_submit(
 
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
             if job.get("proofreader_status") == "assigned":
-                await _human_shift_assert_can_claim(actor)
+                await _human_shift_assert_can_start_assigned(actor)
             final_attachment = job.get("final_attachment")
             if attachment and attachment.filename:
                 final_attachment = await _human_store_upload(job_id, attachment, "final")
@@ -10515,7 +10639,7 @@ async def human_worker_submit(
 
     if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
         if job.get("proofreader_status") == "assigned":
-            await _human_shift_assert_can_claim(actor)
+            await _human_shift_assert_can_start_assigned(actor)
         if not transcript_text and not (attachment and attachment.filename):
             raise HTTPException(status_code=400, detail="Submit the reviewed transcript or attach the checked Word document.")
         final_attachment = job.get("final_attachment")
@@ -10551,7 +10675,7 @@ async def human_worker_submit(
     if job.get("worker_uid") != actor["uid"]:
         raise HTTPException(status_code=403, detail="You do not have access to this job.")
     if job.get("status") == "assigned":
-        await _human_shift_assert_can_claim(actor)
+        await _human_shift_assert_can_start_assigned(actor)
     transcript_text = str(transcript or "").strip()
     final_attachment = job.get("final_attachment")
     if attachment and attachment.filename:
@@ -11697,15 +11821,16 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai"))
+AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai"))
-WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("gemini-3.8-flash", "gemini"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-opus-5-5", "claude"))
+WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("deepseek-v4-flash", "deepseek"))
 
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Claude Opus 5.5 + GPT-5.6 Sol fallback", "job_types": ["audio", "general_job"],
-        "models": ["claude-opus-5-5", "gpt-5.6-sol"],
+        "display": "Gemini 3.8 Flash + Claude Opus 5.5 fallback", "job_types": ["audio", "general_job"],
+        "models": ["gemini-3.8-flash", "claude-opus-5-5"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -11891,6 +12016,9 @@ def _human_worker_ai_draft_system(guidelines, context):
         "Remove an abandoned spoken phrase only when the speaker immediately and unequivocally corrects that same phrase or entity; keep only the corrected wording in that case. "
         "Example: 'She stated that she is at the Dublin Granville-East Dublin Granville Children's Close To Home.' becomes 'She stated that she is at the East Dublin Granville Children's Close To Home.' "
         "Do not remove ordinary repetition, awkward wording, or ambiguous alternatives. Never add `[dictation ends here]` when formatting an individual part or slice of a larger job; leave the recorded ending for the human proofreader to assess.\n"
+        "Remove unmistakable non-semantic spoken fillers such as `um`, `uh`, or `you know` only when they are genuinely filler sounds; preserve the same words when they carry meaning. Do not remove meaningful phrases or rewrite the surrounding sentence.\n"
+        "List a client-supplied spelling under `Client spellings:` only if that name or term was actually spoken in this source audio/transcript. A spelling supplied in notes or references but never used in the recording must not be added to the transcript or closing list.\n"
+        "Use quotation marks only when quotation was dictated or to mark actual reported speech. Never add decorative quotes or wrap arbitrary terms, labels, or phrases in quotes. Preserve dictated quotation wording exactly. Use straight ASCII quotation marks.\n"
         "When this job's WEB SEARCH RESULTS list researched terms, include those exact researched terms in the closing `I researched:` list, on the same paragraph as `Client spellings:` and `My spellings:`. Never use the legacy `I searched:` label. "
         "After that closing spellings paragraph, add a separate `Research Notes:` section with one concise line per researched term explaining what it refers to and why it fits the transcript context. "
         "Only include terms explicitly present in WEB SEARCH RESULTS; never claim a search or invent research notes. If no search results are supplied, omit `I researched:` and `Research Notes:`. Research can verify spelling/context but must not replace the dictated entity with an official variant or add undictated words.\n"
@@ -12111,7 +12239,7 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
         + drafts[:300000]
         + (_human_text_messages_reminder(bool(example_images)) if is_text else "")
     )
-    chain = HUMAN_TEXT_MESSAGES_MODEL_CHAIN
+    chain = AI_REVIEW_MODEL_CHAIN if job.get("pdf_review") else HUMAN_TEXT_MESSAGES_MODEL_CHAIN
     async with _IMAGE_AGENT_SEMAPHORE:
         answer, model_used = await _human_call_model_chain(
             chain, system, question, images + list(reference_images or []) + example_images,
@@ -12335,8 +12463,9 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Compare both independent transcripts; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPTS:\n" + raw_text[:350000]
         )
+    audio_agent_chain = HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
     first, _first_model = await _human_call_model_chain(
-        HUMAN_AUDIO_AGENT_MODEL_CHAIN, system, first_question, reference_images, 16000,
+        audio_agent_chain, system, first_question, reference_images, 16000,
         response_validator=template_research_validator,
     )
     if agent_id == "template-claude" and str(first or "").strip() == "TEMPLATE_JOB_BLOCKED_LETTER":
@@ -12354,7 +12483,7 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "SOURCE TRANSCRIPTS:\n" + raw_text[:250000] + "\n\nLETTER DRAFT:\n" + first[:250000]
         )
     answer, _second_model = await _human_call_model_chain(
-        HUMAN_AUDIO_AGENT_MODEL_CHAIN, second_system, second_question, reference_images, 16000,
+        audio_agent_chain, second_system, second_question, reference_images, 16000,
         response_validator=template_research_validator,
     )
     return answer, audio_seconds, agent["models"]
@@ -12798,7 +12927,7 @@ async def _human_run_letter_ai_review(job_id):
             f"SUBMITTED WORD DOCUMENT TEXT:\n{letter_text[:250000]}"
         )
         reviewed_text, model_used = await _human_call_model_chain(
-            HUMAN_AUDIO_AGENT_MODEL_CHAIN, system, question, context_data["images"], 16000,
+            AI_REVIEW_MODEL_CHAIN, system, question, context_data["images"], 16000,
             response_validator=validate_research,
         )
         reviewed_text = re.sub(r"\n{3,}", "\n\n", _review_normalise_sentence_spacing(str(reviewed_text or "").strip()))
@@ -13049,7 +13178,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
         key = "main"
     existing = (job.get("ai_drafts") or {}).get(key)
     if existing and existing.get("worker_uid") == uid and existing.get("text"):
-        if existing.get("format_version") == 4:
+        if existing.get("format_version") == 5:
             return {"draft": existing.get("text"), "already_generated": True, "credits_charged": 0}
         try:
             formatted = await _human_worker_format_ai_draft(job_id, job, existing.get("text"))
@@ -13057,7 +13186,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
             logger.warning("Legacy AI draft formatting failed for %s: %s", job_id, exc)
             raise HTTPException(status_code=502, detail="Your saved draft could not be formatted right now. You have not been charged. Please try again.")
         upgraded = dict(existing)
-        upgraded.update({"text": formatted[:400000], "format_version": 4, "formattedAt": datetime.now().isoformat()})
+        upgraded.update({"text": formatted[:400000], "format_version": 5, "formattedAt": datetime.now().isoformat()})
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
             f"ai_drafts.{key}": upgraded, "updatedAt": firestore.SERVER_TIMESTAMP,
         })
@@ -13115,7 +13244,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
         raise HTTPException(status_code=502, detail="The AI transcript could not be formatted. You have not been charged. Please try again.")
     charge = await charge_credits(uid, email, cost, "worker AI draft", usage_category="worker_ai_draft")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-        f"ai_drafts.{key}": {"text": formatted_text[:400000], "worker_uid": uid, "credits": charge.get("charged", cost), "createdAt": datetime.now().isoformat(), "format_version": 4},
+        f"ai_drafts.{key}": {"text": formatted_text[:400000], "worker_uid": uid, "credits": charge.get("charged", cost), "createdAt": datetime.now().isoformat(), "format_version": 5},
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
     return {"draft": formatted_text, "already_generated": False, "credits_charged": charge.get("charged", cost), "credits_remaining": charge.get("remaining")}
@@ -15061,20 +15190,28 @@ async def human_admin_dismiss_proofreader_rating(job_id: str, request: Request):
 
 @app.get("/human-transcription/admin/worker-options")
 async def human_admin_worker_options(request: Request):
-    """Approved workers an admin can pick from, reachable by the PDF Jobs admin too."""
+    """Approved workers and live presence for assignment controls."""
     _require_human_job_admin(request)
     snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
     workers = []
+    now = _human_shift_local_now()
     for snap in snapshots:
         data = snap.to_dict() or {}
         rating = await _human_worker_rating_summary(snap.id, data)
+        _, shift = await _human_shift_current_record(snap.id, now)
+        shift_status = _human_shift_status_payload(snap.id, data, shift, now)
         workers.append({
             "uid": snap.id, "name": data.get("name") or data.get("displayName") or data.get("email") or "Worker",
             "email": data.get("email") or "", "available": data.get("is_available", True) is not False,
+            "online": bool(shift_status.get("online")), "clocked_in": bool(shift_status.get("clocked_in")),
+            "shift_status": shift_status.get("status"),
             "rating": rating.get("average"), "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
     workers.sort(key=lambda item: str(item["name"]).lower())
-    return {"workers": workers}
+    return {
+        "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
+        "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
+    }
 
 
 # ---------------------------------------------------------------------------
