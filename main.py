@@ -10847,6 +10847,51 @@ async def _human_ai_agent_research(raw_text, context):
         return ""
 
 
+def _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts=None):
+    """Remove a repeated full transcript block when exact duplicate source pages caused it."""
+    text = str(answer or "").strip()
+    duplicate_count = len(page_image_hashes) - len(set(page_image_hashes))
+    if duplicate_count <= 0 or not text:
+        return text
+
+    def normalize(block):
+        return re.sub(r"\s+", " ", str(block or "")).strip().casefold()
+
+    duplicate_draft_signatures = set()
+    first_page_by_image = {}
+    for index, image_hash in enumerate(page_image_hashes):
+        previous_index = first_page_by_image.get(image_hash)
+        if previous_index is None:
+            first_page_by_image[image_hash] = index
+            continue
+        current_text = normalize(page_texts[index]) if index < len(page_texts or []) else ""
+        previous_text = normalize(page_texts[previous_index]) if previous_index < len(page_texts or []) else ""
+        if current_text and current_text == previous_text:
+            duplicate_draft_signatures.add(current_text)
+
+    blocks = [block.strip() for block in re.split(r"\r?\n(?:[ \t]*\r?\n)+", text) if block.strip()]
+    if len(blocks) < 2:
+        return text
+
+    seen = set()
+    kept = []
+    removed = 0
+    for block in blocks:
+        key = normalize(block)
+        is_full_duplicate_page = key in duplicate_draft_signatures or len(key) >= 120
+        if key and key in seen and is_full_duplicate_page and removed < duplicate_count:
+            removed += 1
+            continue
+        kept.append(block)
+        if key:
+            seen.add(key)
+
+    if removed:
+        logger.info("Removed %s repeated transcript block(s) for exact duplicate image page(s)", removed)
+        return "\n\n".join(kept).strip()
+    return text
+
+
 async def _human_image_review_draft(job, agent_id, system, reference_images):
     """AI reviewer: reads every page image plus the per-page drafts and returns one checked, combined transcript."""
     review = job.get("pdf_review") or {}
@@ -10899,6 +10944,8 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
             response_validator=_human_text_messages_output_validator if is_text else None,
             model_options={"thinking_level": "low", "auto_continue": True} if is_text else None,
         )
+    if is_text:
+        answer = _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts)
     return str(answer or "").strip(), [model_used]
 
 
