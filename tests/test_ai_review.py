@@ -56,7 +56,8 @@ class ReviewHelpers(unittest.TestCase):
         ])
         self.assertIn("Part 1: Jon", notes)
         self.assertIn("Part 3: John", notes)
-        self.assertIn("searched terms: Summit Psych", notes)
+        self.assertIn("WORKER-REPORTED SEARCH TERMS FROM ALL PARTS", notes)
+        self.assertIn("Part 3: Summit Psych", notes)
         self.assertIn("provider named in the recording", notes)
         self.assertNotIn("Renee", notes)
 
@@ -131,7 +132,7 @@ class WholeJobAiTakeover(unittest.TestCase):
     def test_route_stores_paused_parts_and_restores_them_on_failure(self):
         route_source = ast.unparse(self.routes["human_admin_assign_ai_agent"])
         runner_source = ast.unparse(self.routes["_human_run_ai_agent"])
-        self.assertIn("_require_admin", route_source)
+        self.assertIn("_require_ai_agent_assignment", route_source)
         self.assertIn("_human_whole_job_ai_takeover_allowed", route_source)
         self.assertIn("ai_agent_paused_segments", route_source)
         self.assertIn("ai_agent_previous_split_mode", route_source)
@@ -235,7 +236,7 @@ class TemplateDocxRendering(unittest.TestCase):
         self.assertIn("_human_template_docx_profile", assignment)
         self.assertIn("_human_template_render_docx", runner)
         self.assertIn("_human_store_raw_bytes", runner)
-        self.assertIn("_require_admin", download)
+        self.assertIn("_require_ai_agent_assignment", download)
         self.assertIn("human-workflow/{job_id}/ai-drafts/", download)
 
 
@@ -255,7 +256,7 @@ class AiAgentAuthorization(unittest.TestCase):
                     node.func.id for node in ast.walk(self.functions[name])
                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 }
-                self.assertIn("_require_admin", calls)
+                self.assertIn("_require_ai_agent_assignment", calls)
                 self.assertNotIn("_require_human_job_admin", calls)
 
 
@@ -350,8 +351,11 @@ class AiModelRouting(unittest.TestCase):
         self.assertTrue(any(keyword.arg == "response_validator" and isinstance(keyword.value, ast.Name) and keyword.value.id == "_review_validate_output" for keyword in review_calls[0].keywords))
         self.assertNotIn("resolve_ask_model", {node.func.id for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
         agent_calls = [node for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
-        self.assertEqual(len(agent_calls), 2)
-        self.assertTrue(all(any(isinstance(arg, ast.Name) and arg.id == "HUMAN_AUDIO_AGENT_MODEL_CHAIN" for arg in call.args) for call in agent_calls))
+        audio_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_AUDIO_AGENT_MODEL_CHAIN" for arg in call.args)]
+        image_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_TEXT_MESSAGES_MODEL_CHAIN" for arg in call.args)]
+        self.assertEqual(len(audio_calls), 2)
+        self.assertEqual(len(image_calls), 1)
+        self.assertEqual(len(agent_calls), 3)
 
     def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
@@ -422,7 +426,7 @@ class AiModelRouting(unittest.TestCase):
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
         calls = []
 
-        def fake_run(model_id, provider, system_prompt, question, images, max_tokens):
+        def fake_run(model_id, provider, system_prompt, question, images, max_tokens, model_options=None):
             calls.append((model_id, provider))
             return "" if model_id == "primary" else "formatted transcript"
 

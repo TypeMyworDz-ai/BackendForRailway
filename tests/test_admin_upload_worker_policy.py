@@ -1,9 +1,11 @@
 """Synthetic-only regression checks for admin Human Work uploads and safeguards."""
 import ast
 import hashlib
+import re
 import unittest
-from datetime import datetime
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
@@ -11,6 +13,11 @@ MAIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
 
 class _FakeFirestore:
     SERVER_TIMESTAMP = "SERVER_TIMESTAMP"
+
+
+class _FakeLogger:
+    def info(self, *args, **kwargs):
+        pass
 
 
 class AdminUploadWorkerPolicyTests(unittest.TestCase):
@@ -22,9 +29,22 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
             node.name: node for node in cls.tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        timezone_nairobi = ZoneInfo("Africa/Nairobi")
         cls.namespace = {
             "hashlib": hashlib,
+            "re": re,
+            "logger": _FakeLogger(),
             "datetime": datetime,
+            "datetime_time": datetime_time,
+            "timedelta": timedelta,
+            "timezone": timezone,
+            "ZoneInfo": ZoneInfo,
+            "HUMAN_SHIFT_TIMEZONE": timezone_nairobi,
+            "HUMAN_SHIFT_START": datetime_time(15, 0),
+            "HUMAN_SHIFT_END": datetime_time(20, 0),
+            "HUMAN_SHIFT_WARNING_MISSES": 5,
+            "HUMAN_SHIFT_ONLINE_TTL_SECONDS": 150,
+            "HUMAN_SHIFT_CALL_TTL_HOURS": 4,
             "firestore": _FakeFirestore,
             "HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS": 11,
             "TRAINING_LEVELS": [{"level": level} for level in range(1, 7)],
@@ -32,6 +52,9 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         wanted = [
             "_human_claim_item_key", "_human_claim_attempt_document_id",
             "_human_deadline_event_id", "_human_worker_retraining_updates",
+            "_human_shift_parse_datetime", "_human_shift_is_scheduled",
+            "_human_shift_call_in_active", "_human_shift_status_payload",
+            "_human_collapse_duplicate_image_page_blocks",
         ]
         exec(compile(ast.Module(body=[cls.functions[name] for name in wanted], type_ignores=[]), str(MAIN_PATH), "exec"), cls.namespace)
 
@@ -68,6 +91,43 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertNotIn("trainingPaymentStatus", updates)
         self.assertTrue(updates["worker_retraining_required"])
 
+    def test_shift_window_uses_nairobi_time_and_excludes_8pm(self):
+        scheduled = self.namespace["_human_shift_is_scheduled"]
+        zone = self.namespace["HUMAN_SHIFT_TIMEZONE"]
+        self.assertFalse(scheduled(datetime(2026, 10, 5, 14, 59, tzinfo=zone)))
+        self.assertTrue(scheduled(datetime(2026, 10, 5, 15, 0, tzinfo=zone)))
+        self.assertTrue(scheduled(datetime(2026, 10, 5, 19, 59, tzinfo=zone)))
+        self.assertFalse(scheduled(datetime(2026, 10, 5, 20, 0, tzinfo=zone)))
+
+    def test_admin_call_in_allows_clocked_in_worker_to_claim_after_shift(self):
+        status_payload = self.namespace["_human_shift_status_payload"]
+        zone = self.namespace["HUMAN_SHIFT_TIMEZONE"]
+        now = datetime(2026, 10, 5, 20, 15, tzinfo=zone)
+        profile = {"workerApproved": True, "humanShiftCallInExpiresAt": "2026-10-06T00:00:00+03:00"}
+        shift = {"clockedInAt": "2026-10-05T20:05:00+03:00", "lastPresenceAt": "2026-10-05T20:14:00+03:00"}
+        called_in = status_payload("worker-1", profile, shift, now)
+        self.assertTrue(called_in["can_claim"])
+        self.assertTrue(called_in["call_in_active"])
+        shift["clockedOutAt"] = "2026-10-05T20:10:00+03:00"
+        clocked_out = status_payload("worker-1", profile, shift, now)
+        self.assertFalse(clocked_out["can_claim"])
+
+    def test_assigned_work_must_be_clocked_in_before_start_or_first_submission(self):
+        start = ast.unparse(self.functions["human_worker_start"])
+        submit = ast.unparse(self.functions["human_worker_submit"])
+        self.assertIn("_human_shift_assert_can_claim", start)
+        self.assertGreaterEqual(submit.count("_human_shift_assert_can_claim"), 4)
+        self.assertIn("Finish your active job before clocking out.", ast.unparse(self.functions["human_worker_shift_clock_out"]))
+
+    def test_whole_file_review_collapses_exact_duplicate_pages_only_once(self):
+        collapse = self.namespace["_human_collapse_duplicate_image_page_blocks"]
+        pages = ["Hello there.\nHow can I help?", "Hello there.\nHow can I help?"]
+        answer = "Hello there.\nHow can I help?\n\nHello there.\nHow can I help?"
+        self.assertEqual(collapse(answer, ["same-image", "same-image"], pages), "Hello there.\nHow can I help?")
+        prompt = ast.unparse(self.functions["_human_image_review_draft"])
+        self.assertIn("adjacent overlapping screenshots must appear exactly once", prompt)
+        self.assertIn("do not remove a repeated message that is visibly repeated within the original conversation itself", prompt)
+
     def test_admin_audio_upload_is_internal_and_directly_available(self):
         route = self.functions["human_admin_create_audio_job"]
         text = ast.unparse(route)
@@ -97,12 +157,17 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertIn("'admin_uploaded': True", create_audio)
         self.assertIn("'quote_credits': 0", create_audio)
 
-    def test_general_template_internal_review_requires_ai_review_to_be_applied(self):
+    def test_audio_jobs_require_a_completed_ai_or_human_review_before_admin_approval(self):
         review = ast.unparse(self.functions["human_admin_review"])
-        self.assertIn("'general_job', 'template_job'", review)
+        self.assertIn("not is_pdf_job", review)
+        self.assertIn("not is_letter_job", review)
+        self.assertIn("reviewer_choice == 'human'", review)
+        self.assertIn("proofreader_status", review)
+        self.assertIn("reviewer_choice == 'ai'", review)
         self.assertIn("ai_review_applied", review)
-        self.assertIn("Run the AI review", review)
+        self.assertIn("Run the AI reviewer", review)
         self.assertIn("Apply the AI-reviewed transcript", review)
+        self.assertIn("Choose an AI reviewer or assign a human reviewer", review)
 
 
 if __name__ == "__main__":

@@ -115,7 +115,7 @@ class LetterJobTests(unittest.TestCase):
     def test_letter_submission_and_review_are_server_gated(self):
         self.assertIn('Attach the finished Word document (.docx) before submitting a Letter Job.', self.source)
         self.assertIn('Letter Jobs must remain one complete, unsplit assignment.', self.source)
-        self.assertIn('The Letter Job must finish its AI document review before admin approval.', self.source)
+        self.assertIn('Choose the AI Letter Reviewer or assign a human reviewer before final admin approval.', self.source)
         self.assertIn('Assign this complete Letter Job from the Letter Jobs section', self.source)
 
 
