@@ -34,6 +34,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
             "_human_build_available_segments",
             "_human_claim_is_active",
             "_human_available_public_for",
+            "_human_claim_item_key",
             "_human_job_worker_uids",
             "_human_worker_rating_for_job",
             "_human_worker_rating_summary_from_jobs",
@@ -59,6 +60,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                 if isinstance(target, ast.Name) and target.id in {
                     "TRAINEE_PRICE_USD", "TRAINEE_MIN_WPM", "FREE_TRIAL_CREDITS", "REFILL_DAYS",
                     "HUMAN_AVAILABLE_SLICE_MINUTES", "MIN_HUMAN_WORKER_RATING",
+                    "HUMAN_WORKER_MAX_CLAIMS_PER_ITEM",
                     "HUMAN_LEGACY_STANDARD_PAYOUT_KES", "HUMAN_PROOFREADING_PAYOUT_KES",
                     "PDF_JOB_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE", "PDF_JOB_WORD_EXTENSIONS",
                     "PLAN_CREDITS"
@@ -67,6 +69,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         cls.namespace = {
             **constants,
             "math": math,
+            "hashlib": __import__("hashlib"),
             "os": os,
             "re": re,
             "datetime": datetime,
@@ -167,7 +170,9 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         self.assertEqual(result["proofreader_parts"], [])
         for private_field in ("worker_assignment", "segments", "assigned_worker_uids", "worker_uid", "worker_email", "worker_name", "last_auto_reassigned_worker_name"):
             self.assertNotIn(private_field, result)
-        self.assertEqual(result["claimable_parts"], [{"id": "part_1", "label": "Part 1"}])
+        self.assertEqual(result["claimable_parts"][0]["id"], "part_1")
+        self.assertEqual(result["claimable_parts"][0]["claim_attempt_count"], 0)
+        self.assertFalse(result["claimable_parts"][0]["can_claim"])
         self.assertFalse(result["can_claim"])
         self.assertEqual(result["claim_block_reason"], "Finish your current assignment first.")
 
@@ -241,7 +246,14 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                 item.func.id for item in ast.walk(node)
                 if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)
             }
-            self.assertIn("_human_release_worker_claim", calls, node.name)
+            if node.name == "_human_check_expiry":
+                self.assertIn("_human_reclaim_expired_job", calls, node.name)
+            else:
+                self.assertIn("_human_release_worker_claim", calls, node.name)
+        reclaim = next(item for item in self.tree.body if isinstance(item, ast.AsyncFunctionDef) and item.name == "_human_reclaim_expired_job")
+        reclaim_calls = {item.func.id for item in ast.walk(reclaim) if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)}
+        self.assertIn("_human_release_worker_claim", reclaim_calls)
+        self.assertIn("_human_deadline_event_id", reclaim_calls)
 
     def test_pdf_pages_and_images_become_single_normalized_image_jobs(self):
         writer = PdfWriter()
