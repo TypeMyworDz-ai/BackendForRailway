@@ -17,7 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as datetime_time, timezone
+from zoneinfo import ZoneInfo
 import requests
 from pydub import AudioSegment
 import pypdfium2 as pdfium
@@ -6097,6 +6098,17 @@ HUMAN_WORKER_MAX_CLAIMS_PER_ITEM = 2
 HUMAN_WORKER_DEADLINE_WARNING_RETURNS = 10
 HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS = 11
 HUMAN_AVAILABLE_SLICE_MINUTES = 5
+
+# Human Work runs a daily evening shift in East Africa Time. Attendance is
+# recorded per scheduled shift; call-ins authorize self-claims outside it.
+HUMAN_SHIFT_TIMEZONE = ZoneInfo("Africa/Nairobi")
+HUMAN_SHIFT_START = datetime_time(15, 0)
+HUMAN_SHIFT_END = datetime_time(20, 0)
+HUMAN_SHIFT_WARNING_MISSES = 5
+HUMAN_SHIFT_LOCKOUT_MISSES = 6
+HUMAN_SHIFT_ONLINE_TTL_SECONDS = 150
+HUMAN_SHIFT_CALL_TTL_HOURS = 4
+HUMAN_SHIFT_COLLECTION = "human_worker_shifts"
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
 PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com"}
 HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
@@ -6117,6 +6129,15 @@ PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PDF_JOB_MAX_PAGES_PER_FILE = 100
 PDF_JOB_MAX_IMAGES_PER_BATCH = 200
 PDF_JOB_TAT_SECONDS = 20 * 60
+
+
+def human_image_tat_seconds(image_count=1):
+    """Every PDF/image page receives a full 20-minute worker TAT."""
+    try:
+        count = max(1, int(image_count or 1))
+    except (TypeError, ValueError):
+        count = 1
+    return count * PDF_JOB_TAT_SECONDS
 PDF_JOB_DEFAULT_INSTRUCTION = "Always use Gemini for image transcription"
 PDF_JOB_WORD_EXTENSIONS = (".docx", ".doc", ".rtf", ".odt")
 PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "jpg", "jpeg", "png", "webp", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
@@ -6899,6 +6920,312 @@ async def _human_archive_retraining_attempts(worker_uid):
             logger.warning("Could not reset Training Room module %s for worker %s: %s", level, worker_uid, exc)
 
 
+def _human_shift_local_now():
+    return datetime.now(HUMAN_SHIFT_TIMEZONE)
+
+
+def _human_shift_parse_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(HUMAN_SHIFT_TIMEZONE)
+    except (TypeError, ValueError):
+        return None
+
+
+def _human_shift_is_scheduled(now=None):
+    now = now or _human_shift_local_now()
+    local_time = now.astimezone(HUMAN_SHIFT_TIMEZONE).timetz().replace(tzinfo=None)
+    return HUMAN_SHIFT_START <= local_time < HUMAN_SHIFT_END
+
+
+def _human_shift_call_in_active(profile, now=None):
+    now = now or _human_shift_local_now()
+    expiry = _human_shift_parse_datetime((profile or {}).get("humanShiftCallInExpiresAt"))
+    return bool(expiry and expiry > now.astimezone(HUMAN_SHIFT_TIMEZONE))
+
+
+def _human_shift_doc_id(uid, shift_date):
+    return f"{uid}_{shift_date}"
+
+
+async def _human_shift_reconcile(uid, profile=None, now=None):
+    """Record each completed daily shift once and return the latest worker profile."""
+    if not db or not uid:
+        return dict(profile or {})
+    profile = dict(profile if profile is not None else (await _load_profile(uid) or {}))
+    if profile.get("workerApproved") is not True:
+        return profile
+    local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    through = local_now.date() if local_now.timetz().replace(tzinfo=None) >= HUMAN_SHIFT_END else local_now.date() - timedelta(days=1)
+    last_evaluated = str(profile.get("humanShiftLastEvaluatedDate") or "").strip()
+    if not last_evaluated:
+        # Start attendance tracking with the first observed date; do not backdate
+        # absences for shifts that happened before this feature was enabled.
+        profile["humanShiftLastEvaluatedDate"] = through.isoformat()
+        await asyncio.to_thread(db.collection("users").document(uid).set, {
+            "humanShiftLastEvaluatedDate": through.isoformat(),
+            "humanShiftTrackingStartedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return profile
+    try:
+        first_date = datetime.strptime(last_evaluated[:10], "%Y-%m-%d").date() + timedelta(days=1)
+    except ValueError:
+        first_date = through
+    if first_date > through:
+        return profile
+
+    user_ref = db.collection("users").document(uid)
+    consecutive = max(0, int(profile.get("humanShiftMissesConsecutive") or 0))
+    locked = False
+    shift_ref = db.collection(HUMAN_SHIFT_COLLECTION)
+    current_date = first_date
+    while current_date <= through:
+        shift_id = _human_shift_doc_id(uid, current_date.isoformat())
+        shift_snapshot = await asyncio.to_thread(shift_ref.document(shift_id).get)
+        shift = shift_snapshot.to_dict() if shift_snapshot.exists else {}
+        attended = bool(shift.get("clockedInAt"))
+        if attended:
+            consecutive = 0
+            status = "attended"
+        else:
+            consecutive += 1
+            status = "missed"
+        await asyncio.to_thread(shift_ref.document(shift_id).set, {
+            "uid": uid, "shift_date": current_date.isoformat(), "status": status,
+            "missed_consecutive_after": consecutive,
+            "evaluatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        profile["humanShiftMissesConsecutive"] = consecutive
+        profile["humanShiftLastEvaluatedDate"] = current_date.isoformat()
+        profile["humanShiftWarning"] = consecutive >= HUMAN_SHIFT_WARNING_MISSES
+        if consecutive >= HUMAN_SHIFT_LOCKOUT_MISSES:
+            retraining = _human_worker_retraining_updates(profile, HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS, local_now)
+            if retraining:
+                retraining["trainingRedoMessage"] = (
+                    "Your work access is paused after six consecutive missed shifts. Please retake the Training Room modules and typing practice. "
+                    "Your earlier training and payout history are preserved, and you do not need to pay for training again."
+                )
+                retraining["humanShiftMissesConsecutive"] = consecutive
+                retraining["humanShiftLastEvaluatedDate"] = current_date.isoformat()
+                retraining["humanShiftWarning"] = True
+                retraining["humanShiftLockoutAt"] = firestore.SERVER_TIMESTAMP
+                await asyncio.to_thread(user_ref.set, retraining, merge=True)
+                profile.update({key: value for key, value in retraining.items() if key != "updatedAt"})
+                await _human_archive_retraining_attempts(uid)
+                locked = True
+                break
+        current_date += timedelta(days=1)
+    await asyncio.to_thread(user_ref.set, {
+        "humanShiftMissesConsecutive": consecutive,
+        "humanShiftLastEvaluatedDate": profile.get("humanShiftLastEvaluatedDate"),
+        "humanShiftWarning": consecutive >= HUMAN_SHIFT_WARNING_MISSES,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return profile
+
+
+async def _human_shift_current_record(uid, now=None):
+    local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    ref = db.collection(HUMAN_SHIFT_COLLECTION).document(_human_shift_doc_id(uid, local_now.date().isoformat()))
+    snapshot = await asyncio.to_thread(ref.get)
+    return ref, snapshot.to_dict() if snapshot.exists else {}
+
+
+def _human_shift_status_payload(uid, profile, shift, now=None):
+    local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    active_call_in = _human_shift_call_in_active(profile, local_now)
+    scheduled = _human_shift_is_scheduled(local_now)
+    clocked_in = bool(shift.get("clockedInAt") and not shift.get("clockedOutAt"))
+    presence = _human_shift_parse_datetime(shift.get("lastPresenceAt"))
+    is_online = bool(clocked_in and presence and (local_now - presence).total_seconds() <= HUMAN_SHIFT_ONLINE_TTL_SECONDS)
+    if shift.get("clockedOutAt"):
+        status = "clocked_out"
+    elif clocked_in:
+        status = "online" if is_online else "clocked_in_idle"
+    elif active_call_in:
+        status = "called_in_not_clocked_in"
+    elif scheduled:
+        status = "not_arrived"
+    elif local_now.timetz().replace(tzinfo=None) >= HUMAN_SHIFT_END:
+        status = "missed"
+    else:
+        status = "off_shift"
+    approved = (profile or {}).get("workerApproved") is True
+    can_clock_in = approved and not clocked_in and not shift.get("clockedOutAt") and (scheduled or active_call_in)
+    can_claim = approved and clocked_in and (scheduled or active_call_in) and (profile or {}).get("worker_retraining_required") is not True
+    if status == "called_in_not_clocked_in":
+        message = "An admin has called you in. Clock in before claiming work."
+    elif status == "not_arrived":
+        message = "Your shift is open. Clock in before claiming work."
+    elif status in {"online", "clocked_in_idle"} and not scheduled and not active_call_in:
+        message = "Your shift has ended. Finish any assigned work before clocking out; new work cannot be claimed now."
+    elif status == "clocked_out":
+        message = "You are clocked out for today. Your next regular shift begins at 3:00 p.m. Kenya time."
+    elif status == "missed":
+        message = "Today's shift has ended. Clock in during your next shift, or when an admin calls you in."
+    elif status == "off_shift":
+        message = "Regular shifts run daily from 3:00 p.m. to 8:00 p.m. Kenya time."
+    else:
+        message = "You are on shift and can claim available work."
+    return {
+        "uid": uid, "date": local_now.date().isoformat(), "status": status,
+        "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
+        "scheduled_now": scheduled, "call_in_active": active_call_in,
+        "clocked_in": clocked_in, "online": is_online,
+        "clocked_in_at": shift.get("clockedInAt") or "", "clocked_out_at": shift.get("clockedOutAt") or "",
+        "last_presence_at": shift.get("lastPresenceAt") or "",
+        "can_clock_in": can_clock_in, "can_claim": can_claim,
+        "misses_consecutive": max(0, int((profile or {}).get("humanShiftMissesConsecutive") or 0)),
+        "warning": bool((profile or {}).get("humanShiftWarning")),
+        "message": message,
+    }
+
+
+async def _human_shift_assert_can_claim(actor):
+    profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {})
+    if profile.get("workerApproved") is not True or profile.get("worker_retraining_required") is True:
+        raise HTTPException(status_code=403, detail="Your work access is paused. Please continue in the Training Room.")
+    _, shift = await _human_shift_current_record(actor["uid"])
+    payload = _human_shift_status_payload(actor["uid"], profile, shift)
+    if not payload["can_claim"]:
+        raise HTTPException(status_code=403, detail=payload["message"])
+    actor["profile"] = profile
+    return payload
+
+
+@app.get("/human-transcription/worker/shift")
+async def human_worker_shift_status(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required to view shift status.")
+    profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {})
+    _, shift = await _human_shift_current_record(actor["uid"])
+    result = _human_shift_status_payload(actor["uid"], profile, shift)
+    result["has_active_assignment"] = await _human_worker_has_active_assignment(actor["uid"])
+    return result
+
+
+@app.post("/human-transcription/worker/shift/clock-in")
+async def human_worker_shift_clock_in(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required to clock in.")
+    profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {})
+    if profile.get("workerApproved") is not True or profile.get("worker_retraining_required") is True:
+        raise HTTPException(status_code=403, detail="Your work access is paused. Please continue in the Training Room.")
+    local_now = _human_shift_local_now()
+    active_call_in = _human_shift_call_in_active(profile, local_now)
+    if not _human_shift_is_scheduled(local_now) and not active_call_in:
+        raise HTTPException(status_code=403, detail="You can clock in outside regular shift hours only after an admin calls you in.")
+    ref, shift = await _human_shift_current_record(actor["uid"], local_now)
+    if shift.get("clockedOutAt"):
+        raise HTTPException(status_code=409, detail="You have already clocked out for today's shift.")
+    if not shift.get("clockedInAt"):
+        await asyncio.to_thread(ref.set, {
+            "uid": actor["uid"], "email": actor.get("email") or "",
+            "shift_date": local_now.date().isoformat(), "status": "clocked_in",
+            "clockedInAt": local_now.isoformat(), "lastPresenceAt": local_now.isoformat(),
+            "call_in": active_call_in, "missed_consecutive_after": None,
+        }, merge=True)
+        shift.update({"clockedInAt": local_now.isoformat(), "lastPresenceAt": local_now.isoformat(), "status": "clocked_in"})
+    return _human_shift_status_payload(actor["uid"], profile, shift, local_now)
+
+
+@app.post("/human-transcription/worker/shift/presence")
+async def human_worker_shift_presence(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    now = _human_shift_local_now()
+    ref, shift = await _human_shift_current_record(actor["uid"], now)
+    if not shift.get("clockedInAt") or shift.get("clockedOutAt"):
+        raise HTTPException(status_code=409, detail="Clock in before updating your shift status.")
+    await asyncio.to_thread(ref.set, {"lastPresenceAt": now.isoformat(), "status": "clocked_in"}, merge=True)
+    shift["lastPresenceAt"] = now.isoformat()
+    shift["clockedOutAt"] = None
+    profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {}, now)
+    return _human_shift_status_payload(actor["uid"], profile, shift, now)
+
+
+@app.post("/human-transcription/worker/shift/clock-out")
+async def human_worker_shift_clock_out(request: Request):
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Approved worker access is required to clock out.")
+    ref, shift = await _human_shift_current_record(actor["uid"])
+    if not shift.get("clockedInAt") or shift.get("clockedOutAt"):
+        raise HTTPException(status_code=409, detail="You are not clocked in for the current shift.")
+    if await _human_worker_has_active_assignment(actor["uid"]):
+        raise HTTPException(status_code=409, detail="Finish your active job before clocking out.")
+    now = _human_shift_local_now()
+    await asyncio.to_thread(ref.set, {"status": "clocked_out", "clockedOutAt": now.isoformat()}, merge=True)
+    shift.update({"status": "clocked_out", "clockedOutAt": now.isoformat()})
+    profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {}, now)
+    return _human_shift_status_payload(actor["uid"], profile, shift, now)
+
+
+@app.get("/human-transcription/admin/shifts")
+async def human_admin_shift_attendance(request: Request):
+    _require_human_job_admin(request)
+    snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
+    retraining_snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("worker_retraining_required", "==", True)).stream()))
+    profiles_by_uid = {snapshot.id: snapshot.to_dict() or {} for snapshot in snapshots}
+    for snapshot in retraining_snapshots:
+        profile = snapshot.to_dict() or {}
+        if profile.get("humanShiftLockoutAt"):
+            profiles_by_uid.setdefault(snapshot.id, profile)
+    now = _human_shift_local_now()
+    workers = []
+    for uid, profile in profiles_by_uid.items():
+        if profile.get("workerApproved") is True:
+            profile = await _human_shift_reconcile(uid, profile, now)
+        profile = await _admin_fill_identity(uid, profile)
+        _, shift = await _human_shift_current_record(uid, now)
+        row = _human_shift_status_payload(uid, profile, shift, now)
+        if profile.get("workerApproved") is not True:
+            row.update({"status": "retraining", "online": False, "can_clock_in": False, "can_claim": False, "message": "This worker has returned to the Training Room for shift retraining."})
+        row.update({
+            "name": profile.get("name") or profile.get("displayName") or profile.get("email") or "Worker",
+            "email": profile.get("email") or "", "rating": profile.get("workerRating"),
+            "call_in_expires_at": profile.get("humanShiftCallInExpiresAt") or "",
+        })
+        workers.append(row)
+    order = {"online": 0, "clocked_in_idle": 1, "called_in_not_clocked_in": 2, "not_arrived": 3, "missed": 4, "clocked_out": 5, "off_shift": 6}
+    workers.sort(key=lambda item: (order.get(item["status"], 9), item["name"].lower()))
+    return {
+        "workers": workers, "date": now.date().isoformat(), "timezone": "Africa/Nairobi",
+        "shift_start": "15:00", "shift_end": "20:00", "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
+        "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
+    }
+
+
+@app.post("/human-transcription/admin/workers/{uid}/shift-call-in")
+async def human_admin_shift_call_in(uid: str, request: Request):
+    _require_human_job_admin(request)
+    profile = await _load_profile(uid)
+    if not profile or profile.get("workerApproved") is not True:
+        raise HTTPException(status_code=404, detail="That approved worker was not found.")
+    payload = await request.json()
+    reason = str((payload or {}).get("reason") or "Admin call-in").strip()[:500]
+    now = _human_shift_local_now()
+    expires = now + timedelta(hours=HUMAN_SHIFT_CALL_TTL_HOURS)
+    await asyncio.to_thread(db.collection("users").document(uid).set, {
+        "humanShiftCallInAt": now.isoformat(), "humanShiftCallInExpiresAt": expires.isoformat(),
+        "humanShiftCallInBy": (await _human_actor(request)).get("email") or "admin",
+        "humanShiftCallInReason": reason, "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    await _create_user_notification(
+        uid, f"human-shift-callin:{now.date().isoformat()}:{uuid.uuid4().hex[:10]}", "shift_call_in",
+        "Admin called you in", "Clock in to claim work. This call-in is available for four hours.",
+        route="human_worker",
+    )
+    return {"status": "called_in", "uid": uid, "expires_at": expires.isoformat(), "reason": reason}
+
+
 async def _human_reclaim_expired_job(job_id: str, job: dict, split_expected=None):
     """Return expired work once, count each worker deadline event once, and apply lockout at 11."""
     if not db or not job:
@@ -7391,7 +7718,11 @@ def _human_claim_assignment_transaction(job_id, actor, segment_id="", allow_supe
         claim_count = int(attempt_data.get("claim_count") or 0)
         if claim_count >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM:
             raise HTTPException(status_code=409, detail="You have already successfully claimed this job twice. Choose another available job.")
-        tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
+        tat_seconds = (
+            human_image_tat_seconds((job.get("pdf_review") or {}).get("page_count") or 1)
+            if job_type == "pdf_job"
+            else human_tat_seconds(float(job.get("seconds") or 0))
+        )
         deadline = now + timedelta(seconds=tat_seconds)
         tx.update(job_ref, {
             "status": "assigned", "worker_uid": worker_uid,
@@ -7445,8 +7776,15 @@ def _human_assign_proofreader_transaction(
             old_job = old_snapshot.to_dict() if old_snapshot and old_snapshot.exists else None
             if _human_claim_is_active(old_job, worker_uid, current_claim):
                 raise HTTPException(status_code=409, detail="This worker must finish their current assignment before proofreading another job.")
-        if not _human_is_split_job(job) or not any((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
-            raise HTTPException(status_code=409, detail="At least one transcription part must be submitted before assigning a proofreader.")
+        if _human_is_split_job(job):
+            if not any((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+                raise HTTPException(status_code=409, detail="At least one transcription part must be submitted before assigning a proofreader.")
+        else:
+            is_image_review = str(job.get("job_type") or "").strip().lower() == "pdf_job" and bool(job.get("pdf_review"))
+            reviewable_status = job.get("status") in {"submitted", "client_review", "client_approved"} or (is_image_review and job.get("status") == "approved")
+            has_review_material = bool(str(job.get("transcript") or "").strip() or (job.get("final_attachment") or {}).get("storage_path") or is_image_review)
+            if not reviewable_status or not has_review_material:
+                raise HTTPException(status_code=409, detail="Submit the complete job before assigning a human reviewer.")
         if job.get("proofreader_status") in {"assigned", "in_progress"}:
             raise HTTPException(status_code=409, detail="A proofreader is already working on this job. Take back that assignment before changing it.")
         now = datetime.now()
@@ -7460,6 +7798,7 @@ def _human_assign_proofreader_transaction(
             "proofreader_email": str(worker.get("worker_email") or "").strip().lower(),
             "proofreader_name": str(worker.get("worker_name") or "").strip(),
             "proofreader_status": "assigned",
+            "reviewer_choice": "human", "reviewer_status": "assigned",
             "proofreader_assignedAt": now,
             "proofreader_deadlineAt": deadline,
             "proofreader_tat_seconds": tat_seconds,
@@ -7614,11 +7953,12 @@ def _human_assign_whole_job_transaction(job_id, actor):
             raise HTTPException(status_code=409, detail="Only an approved job that nobody has claimed can be assigned as a whole job.")
         now = datetime.now()
         if str(job.get("job_type") or "").strip().lower() == "pdf_job":
-            tat_seconds = int(job.get("tat_seconds") or PDF_JOB_TAT_SECONDS) if job.get("pdf_review") else PDF_JOB_TAT_SECONDS
+            image_count = (job.get("pdf_review") or {}).get("page_count") or 1
+            tat_seconds = human_image_tat_seconds(image_count)
         else:
             tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
         deadline = now + timedelta(seconds=tat_seconds)
-        tx.update(job_ref, {
+        updates = {
             "status": "assigned",
             "segments": [],
             "split_mode": "single",
@@ -7629,7 +7969,10 @@ def _human_assign_whole_job_transaction(job_id, actor):
             "assigned_worker_uids": [worker_uid],
             "whole_job_assignment": True,
             "updatedAt": firestore.SERVER_TIMESTAMP,
-        })
+        }
+        if job.get("pdf_review"):
+            updates.update({"reviewer_choice": "human", "reviewer_status": "assigned"})
+        tx.update(job_ref, updates)
         tx.set(claim_ref, {"worker_uid": worker_uid, "job_id": job_id, "segment_id": "", "role": "transcriber", "status": "active", "assignedAt": now, "deadlineAt": deadline, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
         return {"job_id": job_id, "segment_id": "", "label": "your whole transcription job", "status": "assigned", "tat_seconds": tat_seconds, "assignedAt": now}
 
@@ -8118,6 +8461,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     worker_meets_rating = False
     worker_deadline_return_count = 0
     worker_claim_attempt_counts = {}
+    worker_shift_status = None
     if actor["role"] == "worker":
         profile = actor.get("profile") or {}
         worker_deadline_return_count = max(0, int(profile.get("deadline_return_count") or 0))
@@ -8155,10 +8499,13 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
                 status_code=403,
                 detail="Your available-work access is paused. Please continue in the Training Room.",
             )
+        refreshed_profile = await _human_shift_reconcile(actor["uid"], refreshed_profile)
         actor["profile"] = refreshed_profile
         worker_available = refreshed_profile.get("is_available", True) is not False
         worker_deadline_return_count = max(0, int(refreshed_profile.get("deadline_return_count") or 0))
-        worker_can_claim = worker_meets_rating and worker_available and not worker_active_assignment
+        _, current_shift = await _human_shift_current_record(actor["uid"])
+        worker_shift_status = _human_shift_status_payload(actor["uid"], refreshed_profile, current_shift)
+        worker_can_claim = worker_meets_rating and worker_available and not worker_active_assignment and worker_shift_status["can_claim"]
         if not worker_meets_rating:
             average = worker_rating_summary["average"]
             claim_block_reason = (
@@ -8170,6 +8517,8 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
             claim_block_reason = "Your account is marked unavailable. Change your availability before claiming work."
         elif worker_active_assignment:
             claim_block_reason = "Finish your current assignment before claiming another."
+        elif worker_shift_status and not worker_shift_status.get("can_claim"):
+            claim_block_reason = worker_shift_status.get("message") or "Clock in during your shift before claiming work."
     elif scope == "available":
         if (actor.get("profile") or {}).get("worker_retraining_required") is True:
             raise HTTPException(
@@ -8248,13 +8597,16 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         # The assigned/finished views also run expiry checks while serializing
         # jobs. Do not return a worker board if one of those checks caused lockout.
         latest_profile = await _load_profile(actor["uid"])
-        latest_profile = latest_profile or {}
+        latest_profile = await _human_shift_reconcile(actor["uid"], latest_profile or {})
         if latest_profile.get("workerApproved") is not True:
             raise HTTPException(
                 status_code=403,
                 detail="Your available-work access is paused. Please continue in the Training Room.",
             )
         worker_deadline_return_count = max(0, int(latest_profile.get("deadline_return_count") or 0))
+        if worker_shift_status is None:
+            _, current_shift = await _human_shift_current_record(actor["uid"])
+            worker_shift_status = _human_shift_status_payload(actor["uid"], latest_profile, current_shift)
     jobs.sort(key=lambda item: str(item.get("createdAt") or ""), reverse=True)
     response = {"jobs": jobs}
     if actor["role"] == "worker":
@@ -8266,6 +8618,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         response["worker_claim_block_reason"] = claim_block_reason
         response["worker_deadline_return_count"] = worker_deadline_return_count
         response["worker_deadline_warning"] = worker_deadline_return_count >= HUMAN_WORKER_DEADLINE_WARNING_RETURNS
+        response["worker_shift_status"] = worker_shift_status
     return response
 
 
@@ -8399,7 +8752,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                 now = firestore.SERVER_TIMESTAMP
                 job = {
                     "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf", "pdf_batch_id": batch_id, "status": "approved", "admin_uploaded": True,
-                    "tat_seconds": PDF_JOB_TAT_SECONDS, "instruction_attachments": reference_meta,
+                    "tat_seconds": human_image_tat_seconds(1), "instruction_attachments": reference_meta,
                     "createdAt": now, "updatedAt": now,
                     "seconds": 180, "minutes": 1,
                     "turnaround": "standard", "difficulty": "standard", "service": "text_messages_transcription" if is_text_messages else "pdf_transcription", "formatting": "standard",
@@ -8470,8 +8823,8 @@ async def human_admin_create_file_review(request: Request):
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     payload = await request.json()
     ids = list(dict.fromkeys(str(item) for item in ((payload or {}).get("job_ids") or [])))[:60]
-    if len(ids) < 2:
-        raise HTTPException(status_code=400, detail="A whole-file review needs a file with at least two pages.")
+    if not ids:
+        raise HTTPException(status_code=400, detail="Choose at least one completed image job for review.")
     pages = []
     for job_id in ids:
         pages.append((job_id, await _human_job(job_id)))
@@ -8520,7 +8873,7 @@ async def human_admin_create_file_review(request: Request):
         combined = "\n\n".join(text for text in page_texts if text)
         combined = _human_collapse_duplicate_image_page_blocks(combined, page_image_hashes, page_texts)
         pay = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * len(pages)
-        tat_seconds = max(PDF_JOB_TAT_SECONDS, len(pages) * 5 * 60)
+        tat_seconds = human_image_tat_seconds(len(pages))
         now = firestore.SERVER_TIMESTAMP
         job = {
             "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job",
@@ -9528,6 +9881,7 @@ async def human_worker_claim(job_id: str, request: Request):
     rating_summary = await _human_worker_rating_summary(actor["uid"], actor.get("profile") or {})
     if rating_summary["average"] is None or rating_summary["average"] < MIN_HUMAN_WORKER_RATING:
         raise HTTPException(status_code=403, detail="A worker rating of 3.5/5 or higher is required to claim Available Jobs. Contact an admin about a supervised starter assignment.")
+    await _human_shift_assert_can_claim(actor)
     payload = await request.json()
     segment_id = str(payload.get("segment_id") or "").strip()
     await _human_job(job_id)
@@ -9671,10 +10025,14 @@ async def human_admin_assign_whole(job_id: str, request: Request):
     worker_uid = str(payload.get("worker_uid") or "").strip()
     if not worker_uid:
         raise HTTPException(status_code=400, detail="Choose an approved worker for this urgent job.")
-    await _human_job(job_id)
+    job = await _human_job(job_id)
     worker_profile = await _load_profile(worker_uid)
     if not worker_profile or worker_profile.get("workerApproved") is not True:
         raise HTTPException(status_code=403, detail="Approved worker access is required.")
+    if job.get("pdf_review"):
+        reviewer_rating = await _human_worker_rating_summary(worker_uid, worker_profile)
+        if reviewer_rating["average"] is None or reviewer_rating["average"] < MIN_PROOFREADER_RATING:
+            raise HTTPException(status_code=409, detail="A whole-file human reviewer must be rated at least 4.5/5.")
     verified_actor = {
         "uid": worker_uid,
         "email": str(worker_profile.get("email") or payload.get("worker_email") or "").strip().lower(),
@@ -9763,8 +10121,17 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
     if await _human_worker_has_active_assignment(worker_uid):
         raise HTTPException(status_code=409, detail="This worker must finish their current assignment before taking proofreading work.")
     job = await _human_job(job_id)
-    if not _human_is_split_job(job) or not any((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
-        raise HTTPException(status_code=409, detail="At least one transcription part must be submitted before assigning a proofreader.")
+    is_split = _human_is_split_job(job)
+    job_type = str(job.get("job_type") or "").strip().lower()
+    is_image_review = job_type == "pdf_job" and bool(job.get("pdf_review"))
+    if is_split:
+        if not any((item or {}).get("status") == "submitted" for item in (job.get("segments") or [])):
+            raise HTTPException(status_code=409, detail="At least one transcription part must be submitted before assigning a proofreader.")
+    else:
+        reviewable_status = job.get("status") in {"submitted", "client_review", "client_approved"} or (is_image_review and job.get("status") == "approved")
+        has_review_material = bool(str(job.get("transcript") or "").strip() or (job.get("final_attachment") or {}).get("storage_path") or is_image_review)
+        if not reviewable_status or not has_review_material:
+            raise HTTPException(status_code=409, detail="Submit the complete job before assigning a human reviewer.")
     submitted_segment_ids = {
         str((item or {}).get("id") or "")
         for item in (job.get("segments") or [])
@@ -9789,7 +10156,13 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
                 raise HTTPException(status_code=413, detail="The edited transcript parts are too large to save.")
             proofreader_parts_override[segment_id] = {"transcript": part_text, "transcript_html": part_html}
     proofreader_use_combined_transcript = bool(payload.get("proofreader_use_combined_transcript")) and not proofreader_parts_override
-    tat_seconds = human_proofreading_tat_seconds(float(job.get("seconds") or 0))
+    if job_type == "pdf_job":
+        image_count = (job.get("pdf_review") or {}).get("page_count") or 1
+        tat_seconds = human_image_tat_seconds(image_count)
+    elif job_type == "letter_job":
+        tat_seconds = human_tat_seconds(float(job.get("seconds") or 0))
+    else:
+        tat_seconds = human_proofreading_tat_seconds(float(job.get("seconds") or 0))
     worker = {
         "worker_uid": worker_uid,
         "worker_email": payload.get("worker_email"),
@@ -10006,11 +10379,15 @@ async def human_worker_start(job_id: str, request: Request):
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
+            if target.get("status") == "assigned":
+                await _human_shift_assert_can_claim(actor)
             target["status"] = "in_progress"
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "status": _human_split_parent_status(job, segments), "updatedAt": firestore.SERVER_TIMESTAMP})
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "segment_id": target.get("id")}
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
+            if job.get("proofreader_status") == "assigned":
+                await _human_shift_assert_can_claim(actor)
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"proofreader_status": "in_progress", "status": "proofreading_in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             return {"status": "in_progress", "job_id": job_id, "role": "proofreader"}
@@ -10019,6 +10396,8 @@ async def human_worker_start(job_id: str, request: Request):
         raise HTTPException(status_code=403, detail="You do not have access to this job.")
     if job.get("status") not in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="This job is not ready to start.")
+    if job.get("status") == "assigned":
+        await _human_shift_assert_can_claim(actor)
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"status": "in_progress", "updatedAt": firestore.SERVER_TIMESTAMP})
     await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
     return {"status": "in_progress", "job_id": job_id}
@@ -10062,6 +10441,8 @@ async def human_worker_submit(
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
         if target:
+            if target.get("status") == "assigned":
+                await _human_shift_assert_can_claim(actor)
             final_attachment = target.get("final_attachment")
             if attachment and attachment.filename:
                 final_attachment = await _human_store_upload(job_id, attachment, f"final-{target.get('id')}")
@@ -10098,6 +10479,8 @@ async def human_worker_submit(
             return {"status": parent_status, "job_id": job_id, "segment_id": target.get("id")}
 
         if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
+            if job.get("proofreader_status") == "assigned":
+                await _human_shift_assert_can_claim(actor)
             final_attachment = job.get("final_attachment")
             if attachment and attachment.filename:
                 final_attachment = await _human_store_upload(job_id, attachment, "final")
@@ -10113,7 +10496,7 @@ async def human_worker_submit(
                 "transcript_html": clean_html,
                 "final_attachment": final_attachment,
                 "worker_notes": str(notes or "")[:12000],
-                "proofreader_status": "submitted",
+                "proofreader_status": "submitted", "reviewer_status": "completed", "reviewer_choice": "human",
                 "proofreader_completedAt": datetime.now(),
                 "proofreader_minutes": minutes,
                 "proofreader_amount_kes": max(0, minutes * HUMAN_PROOFREADING_PAYOUT_KES),
@@ -10130,8 +10513,45 @@ async def human_worker_submit(
             return {"status": "submitted", "job_id": job_id, "role": "proofreader"}
         raise HTTPException(status_code=409, detail="This assignment is no longer active.")
 
+    if job.get("proofreader_uid") == actor["uid"] and job.get("proofreader_status") in {"assigned", "in_progress"}:
+        if job.get("proofreader_status") == "assigned":
+            await _human_shift_assert_can_claim(actor)
+        if not transcript_text and not (attachment and attachment.filename):
+            raise HTTPException(status_code=400, detail="Submit the reviewed transcript or attach the checked Word document.")
+        final_attachment = job.get("final_attachment")
+        if attachment and attachment.filename:
+            final_attachment = await _human_store_upload(job_id, attachment, "final-proofread")
+        reviewed_transcript = transcript_text or str(job.get("transcript") or "")
+        reviewed_html = clean_html if transcript_text or clean_html else str(job.get("transcript_html") or "")
+        job_type = str(job.get("job_type") or "").strip().lower()
+        minutes = max(1, int(job.get("minutes") or (job.get("quote") or {}).get("minutes") or 1))
+        if job_type == "pdf_job":
+            image_count = (job.get("pdf_review") or {}).get("page_count") or 1
+            proofreader_amount = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * max(1, int(image_count))
+        else:
+            proofreader_amount = max(0, minutes * HUMAN_PROOFREADING_PAYOUT_KES)
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+            "status": "submitted", "transcript": reviewed_transcript[:1000000],
+            "transcript_html": reviewed_html[:1500000], "final_attachment": final_attachment,
+            "worker_notes": str(notes or "")[:12000], "proofreader_status": "submitted",
+            "reviewer_choice": "human", "reviewer_status": "completed",
+            "proofreader_completedAt": firestore.SERVER_TIMESTAMP, "proofreader_minutes": minutes,
+            "proofreader_amount_kes": proofreader_amount, "proofreader_payout_status": "unassigned",
+            "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        await _human_release_worker_claim(actor["uid"], job_id, "proofreader", "proofreader")
+        await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
+        await _notify_human_admins(
+            f"human-reviewer-submitted:{job_id}", "job_submitted", "Human review was submitted",
+            "The assigned human reviewer completed this job. Check the reviewed transcript or Word document before final approval.",
+            route="human_ops", job_id=job_id, requires_action=True,
+        )
+        return {"status": "submitted", "job_id": job_id, "role": "proofreader"}
+
     if job.get("worker_uid") != actor["uid"]:
         raise HTTPException(status_code=403, detail="You do not have access to this job.")
+    if job.get("status") == "assigned":
+        await _human_shift_assert_can_claim(actor)
     transcript_text = str(transcript or "").strip()
     final_attachment = job.get("final_attachment")
     if attachment and attachment.filename:
@@ -10159,11 +10579,14 @@ async def human_worker_submit(
         "worker_gross_amount_kes": worker_amount_kes,
         "payout_status": "unassigned",
     }
+    if is_pdf_job and job.get("pdf_review"):
+        updates.update({"reviewer_choice": "human", "reviewer_status": "completed"})
     if is_letter_job:
-        updates.update({"letter_ai_review_status": "queued", "letter_ai_review_error": ""})
+        updates.update({
+            "letter_ai_review_status": "not_started", "letter_ai_review_error": "",
+            "letter_ai_review_attachment": None, "reviewer_choice": "", "reviewer_status": "not_started",
+        })
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
-    if is_letter_job:
-        background_tasks.add_task(_human_run_letter_ai_review, job_id)
     await _human_release_worker_claim(actor["uid"], job_id, "", "transcriber")
     await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
     await _notify_human_admins(
@@ -10197,13 +10620,31 @@ async def human_admin_review(job_id: str, request: Request):
     job_type = str(job.get("job_type") or "").strip().lower()
     is_pdf_job = job_type == "pdf_job"
     is_letter_job = job_type == "letter_job"
-    if job.get("admin_uploaded") is True and job_type in {"general_job", "template_job"}:
-        if not str((job.get("ai_review") or {}).get("combined_text") or "").strip():
-            raise HTTPException(status_code=409, detail="Run the AI review on the submitted General or Template Job before approving internal work.")
-        if job.get("ai_review_applied") is not True:
-            raise HTTPException(status_code=409, detail="Apply the AI-reviewed transcript before approving this internal job.")
-    if is_letter_job and job.get("letter_ai_review_status") != "completed":
-        raise HTTPException(status_code=409, detail="The Letter Job must finish its AI document review before admin approval.")
+    reviewer_choice = str(job.get("reviewer_choice") or "").strip().lower()
+    if not is_pdf_job and not is_letter_job:
+        if reviewer_choice == "human":
+            if job.get("proofreader_status") != "submitted":
+                raise HTTPException(status_code=409, detail="The assigned human reviewer must submit before final admin approval.")
+        elif reviewer_choice == "ai":
+            if not str((job.get("ai_review") or {}).get("combined_text") or "").strip():
+                raise HTTPException(status_code=409, detail="Run the AI reviewer before final admin approval.")
+            if job.get("ai_review_applied") is not True:
+                raise HTTPException(status_code=409, detail="Apply the AI-reviewed transcript before final admin approval.")
+        else:
+            raise HTTPException(status_code=409, detail="Choose an AI reviewer or assign a human reviewer before final admin approval.")
+    if is_letter_job:
+        if reviewer_choice == "human":
+            if job.get("proofreader_status") != "submitted":
+                raise HTTPException(status_code=409, detail="The assigned human reviewer must submit before the Letter Job can be released.")
+        elif job.get("letter_ai_review_status") != "completed":
+            raise HTTPException(status_code=409, detail="Choose the AI Letter Reviewer or assign a human reviewer before final admin approval.")
+    if is_pdf_job and job.get("pdf_review"):
+        if reviewer_choice == "human":
+            human_review_submitted = job.get("proofreader_status") == "submitted" or (job.get("worker_uid") and job.get("reviewer_status") == "completed")
+            if not human_review_submitted:
+                raise HTTPException(status_code=409, detail="The assigned human reviewer must submit before the image-file review can be completed.")
+        elif reviewer_choice != "ai" or job.get("ai_agent_status") != "submitted":
+            raise HTTPException(status_code=409, detail="Choose the AI reviewer or assign a human reviewer before approving this whole-file review.")
     internal_release = is_pdf_job or is_letter_job or job.get("admin_uploaded") is True
     review_status = "released" if internal_release else "client_review"
     updates = {
@@ -10934,6 +11375,7 @@ TRAINING_GUIDELINES = {
         {"title": "8. Numbers, dates, and times", "body": "Generally spell out single-digit numbers and use numerals for larger numbers. Use numerals for money, years, ages, percentages, measurements, equations, dates, times, telephone numbers, and mixed-number sentences when the context calls for them. Write percent in transcript text unless a client brief says otherwise. Use capitalized AM and PM for times. Formal series remain capitalized, such as Grade 8, Section B, Chapter 1, and Article VI."},
         {"title": "9. Names, research, and consistency", "body": "Research distinctive proper nouns, organisations, places, technical terms, and titles when appropriate. Research verifies spelling and context; it does not authorize changing the speaker's wording or adding information. Keep confirmed spellings consistent throughout the transcript and ask the admin when two possible identities cannot be resolved."},
         {"title": "10. Privacy, review, and delivery", "body": "Treat every recording, transcript, name, and client instruction as confidential. Use approved tools and do not share files casually. Before delivery, check the brief, completeness, speaker turns, timestamps, uncertain passages, names, numbers, punctuation, and formatting from beginning to end. Submit work only when another person can use it without needing to reconstruct what you meant."},
+        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts are scheduled daily from 3:00 p.m. to 8:00 p.m. Kenya time (Africa/Nairobi). Clock in before claiming work and keep your Work Room open while you are on shift. You may claim outside these hours only after an admin calls you in and you clock in. Finish every assigned job before clocking out; you may continue an active assignment after 8:00 p.m., but you cannot claim new work after your shift ends. Five consecutive missed shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
     ],
 }
 
@@ -12003,8 +12445,11 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             "updatedAt": firestore.SERVER_TIMESTAMP,
         }
         if current.get("pdf_review"):
-            job_updates["transcript"] = answer[:1000000]
-            job_updates["transcript_html"] = clean_html
+            job_updates.update({
+                "status": "submitted", "split_mode": "single", "segments": [],
+                "transcript": answer[:1000000], "transcript_html": clean_html,
+                "reviewer_choice": "ai", "reviewer_status": "completed",
+            })
         await asyncio.to_thread(ref.update, job_updates)
         await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {
             "status": "submitted", "model_ids": model_ids, "audio_seconds": int(audio_seconds),
@@ -12022,7 +12467,14 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             current = snap.to_dict() if snap.exists else None
             if current:
                 current_segments = [dict(item or {}) for item in (current.get("segments") or [])]
-                if current.get("ai_agent_run_id") == run_id and current.get("ai_agent_scope") == "whole_job":
+                if current.get("ai_agent_run_id") == run_id and current.get("pdf_review"):
+                    await asyncio.to_thread(ref.update, {
+                        "segments": [], "split_mode": "single", "status": "approved",
+                        "ai_agent_status": "failed", "ai_agent_error": str(exc)[:500],
+                        "reviewer_status": "failed", "ai_agent_docx": firestore.DELETE_FIELD,
+                        "updatedAt": firestore.SERVER_TIMESTAMP,
+                    })
+                elif current.get("ai_agent_run_id") == run_id and current.get("ai_agent_scope") == "whole_job":
                     restored_segments = [dict(item or {}) for item in (current.get("ai_agent_paused_segments") or [])]
                     if restored_segments:
                         await asyncio.to_thread(ref.update, {
@@ -12213,6 +12665,9 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         "ai_agent_previous_status": previous_status if whole_job_requested else firestore.DELETE_FIELD,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
+    if is_pdf and job.get("pdf_review"):
+        updates["reviewer_choice"] = "ai"
+        updates["reviewer_status"] = "queued"
     job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
     stored_template_reference_files = []
     run_ref = db.collection("human_ai_agent_runs").document(run_id)
@@ -12305,7 +12760,7 @@ async def _human_run_letter_ai_review(job_id):
         letter_text = await asyncio.to_thread(_human_letter_docx_text, raw_docx)
         await asyncio.to_thread(job_ref.update, {
             "letter_ai_review_status": "processing", "letter_ai_review_error": "",
-            "letter_ai_review_startedAt": firestore.SERVER_TIMESTAMP,
+            "reviewer_status": "processing", "letter_ai_review_startedAt": firestore.SERVER_TIMESTAMP,
         })
         source_transcripts, _audio_seconds = await _human_ai_transcribe_audio(job_id, job, None)
         source_text = "\n\n".join(f"{provider.upper()} FULL-RECORDING TRANSCRIPT:\n{text}" for provider, text in source_transcripts.items())
@@ -12357,7 +12812,7 @@ async def _human_run_letter_ai_review(job_id):
         )
         await asyncio.to_thread(job_ref.update, {
             "letter_ai_review_status": "completed", "letter_ai_review_error": "",
-            "letter_ai_review_attachment": reviewed_meta,
+            "reviewer_status": "completed", "letter_ai_review_attachment": reviewed_meta,
             "letter_ai_review_model_ids": [model_used] if isinstance(model_used, str) else list(model_used or []),
             "letter_ai_review_completedAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -12366,7 +12821,7 @@ async def _human_run_letter_ai_review(job_id):
         logger.exception("Letter AI review failed for %s", job_id)
         try:
             await asyncio.to_thread(job_ref.update, {
-                "letter_ai_review_status": "failed",
+                "letter_ai_review_status": "failed", "reviewer_status": "failed",
                 "letter_ai_review_error": str(exc)[:800] or "The letter review could not be completed.",
                 "letter_ai_review_failedAt": firestore.SERVER_TIMESTAMP,
                 "updatedAt": firestore.SERVER_TIMESTAMP,
@@ -12411,16 +12866,16 @@ async def _human_run_letter_agent(job_id, run_id):
             "letter_agent_status": "submitted", "letter_agent_error": "",
             "letter_agent_completedAt": firestore.SERVER_TIMESTAMP,
             "letter_agent_audio_seconds": audio_seconds, "letter_agent_model_ids": list(model_ids or []),
-            "letter_ai_review_status": "queued", "letter_ai_review_error": "",
+            "letter_ai_review_status": "not_started", "letter_ai_review_error": "",
+            "letter_ai_review_attachment": None, "reviewer_choice": "", "reviewer_status": "not_started",
             "submittedAt": firestore.SERVER_TIMESTAMP, "workerCompletedAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
         await _notify_human_admins(
             f"letter-agent-submitted:{job_id}:{run_id}", "job_submitted", "Letter Agent draft is ready",
-            "The Letter Agent submitted a Word draft. Its independent review is running; inspect both files before releasing it.",
+            "The Letter Agent submitted a Word draft. Choose the AI reviewer or a human proofreader, then complete the final admin review.",
             route="human_ops", job_id=job_id, requires_action=True,
         )
-        await _human_run_letter_ai_review(job_id)
     except Exception as exc:
         logger.exception("Letter Agent failed for %s", job_id)
         try:
@@ -12492,9 +12947,12 @@ async def human_admin_retry_letter_ai_review(job_id: str, request: Request, back
         raise HTTPException(status_code=409, detail="Only a submitted Letter Job can be reviewed.")
     if not (job.get("final_attachment") or {}).get("storage_path"):
         raise HTTPException(status_code=409, detail="The finished Word document is missing.")
+    if job.get("proofreader_status") in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="A human reviewer is already working on this letter.")
     if job.get("letter_ai_review_status") in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="The letter review is already running.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "reviewer_choice": "ai", "reviewer_status": "queued",
         "letter_ai_review_status": "queued", "letter_ai_review_error": "",
         "letter_ai_review_attachment": None, "updatedAt": firestore.SERVER_TIMESTAMP,
     })
@@ -13319,8 +13777,10 @@ async def human_admin_ai_review(job_id: str, request: Request):
     if actor.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
     job = await _human_job(job_id)
+    if job.get("proofreader_status") in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="A human reviewer is already working on this job.")
     if str(job.get("job_type") or "").lower() == "pdf_job":
-        raise HTTPException(status_code=409, detail="The AI review is for audio jobs.")
+        raise HTTPException(status_code=409, detail="The audio AI review is for audio jobs.")
     if _human_is_split_job(job):
         segments = job.get("segments") or []
         if not all(item.get("status") == "submitted" for item in segments):
@@ -13507,7 +13967,11 @@ async def human_admin_ai_review(job_id: str, request: Request):
         "models_used": list(dict.fromkeys(models_used)),
         "createdAt": datetime.now().isoformat(),
     }
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"ai_review": saved, "ai_review_applied": False, "updatedAt": firestore.SERVER_TIMESTAMP})
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "ai_review": saved, "ai_review_applied": False,
+        "reviewer_choice": "ai", "reviewer_status": "completed",
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
     return {"ai_review": saved}
 
 
@@ -13528,6 +13992,7 @@ async def human_admin_apply_ai_review(job_id: str, request: Request):
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
             "transcript": review.get("combined_text"), "transcript_html": html, "ai_combined": True,
             "ai_review_applied": True, "ai_review_appliedAt": firestore.SERVER_TIMESTAMP,
+            "reviewer_choice": "ai", "reviewer_status": "completed",
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
         return {"status": "submitted", "job_id": job_id}
@@ -13539,6 +14004,7 @@ async def human_admin_apply_ai_review(job_id: str, request: Request):
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
         "status": "submitted", "transcript": review.get("combined_text"), "transcript_html": html,
         "ai_combined": True, "ai_review_applied": True, "ai_review_appliedAt": firestore.SERVER_TIMESTAMP,
+        "reviewer_choice": "ai", "reviewer_status": "completed",
         "proofreader_status": "skipped",
         "submittedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
     })
@@ -13803,6 +14269,9 @@ async def admin_trainee_decision(uid: str, request: Request):
             "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP,
             "trainingRedoLevels": [], "trainingRedoMessage": "", "worker_retraining_required": False,
             "deadline_return_count": 0, "worker_qualification_cycle": uuid.uuid4().hex,
+            "humanShiftMissesConsecutive": 0, "humanShiftWarning": False,
+            "humanShiftLastEvaluatedDate": _human_shift_local_now().date().isoformat(),
+            "humanShiftCallInExpiresAt": "", "humanShiftReinstatedAt": firestore.SERVER_TIMESTAMP,
         })
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     return {"status": "updated", "uid": uid, "decision": decision}
@@ -14598,7 +15067,12 @@ async def human_admin_worker_options(request: Request):
     workers = []
     for snap in snapshots:
         data = snap.to_dict() or {}
-        workers.append({"uid": snap.id, "name": data.get("name") or data.get("displayName") or data.get("email") or "Worker", "email": data.get("email") or "", "available": data.get("is_available", True) is not False})
+        rating = await _human_worker_rating_summary(snap.id, data)
+        workers.append({
+            "uid": snap.id, "name": data.get("name") or data.get("displayName") or data.get("email") or "Worker",
+            "email": data.get("email") or "", "available": data.get("is_available", True) is not False,
+            "rating": rating.get("average"), "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
+        })
     workers.sort(key=lambda item: str(item["name"]).lower())
     return {"workers": workers}
 
