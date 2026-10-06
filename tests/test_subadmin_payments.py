@@ -31,6 +31,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "_human_subadmin_rate_public", "_human_subadmin_parse_rate_update",
             "_human_subadmin_word_count", "_human_subadmin_audio_minutes",
             "_human_subadmin_ai_used", "_human_subadmin_assignment_metadata",
+            "_human_subadmin_submission_actor",
             "_human_subadmin_earning_specs", "_human_admin_finish_job_eligible", "_human_shift_local_now",
             "_human_shift_parse_datetime", "_human_shift_is_scheduled",
             "is_human_subadmin",
@@ -104,6 +105,30 @@ class SubadminPaymentTests(unittest.TestCase):
         self.assertFalse(used(parent, {"status": "submitted", "worker_uid": "worker-1"}))
         self.assertTrue(used(parent, {"status": "submitted", "ai_agent_status": "submitted"}))
         self.assertTrue(used({"ai_review_applied": True}, {"status": "submitted"}))
+
+    def test_submission_attribution_uses_the_assigned_subadmin_or_sole_configured_admin(self):
+        choose_actor = self.namespace["_human_subadmin_submission_actor"]
+        assigned = {
+            "human_work_assigned_by_uid": "subadmin-2",
+            "human_work_assigned_by_email": " INFO@TYPEMYWORDZ.AI ",
+            "human_work_assignedAt": self.shift_time,
+        }
+        self.assertEqual(choose_actor(assigned), {"uid": "subadmin-2", "email": "info@typemywordz.ai"})
+        self.assertEqual(choose_actor({}), {"uid": "", "email": "info@typemywordz.ai"})
+
+    def test_every_human_submit_branch_persists_before_triggering_immediate_accrual(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_worker_submit")
+        source = ast.unparse(route)
+        persistence = "await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update"
+        persist_positions = [index for index in range(len(source)) if source.startswith(persistence, index)]
+        accrual = "await _human_subadmin_accrue_job_earnings"
+        accrual_positions = [index for index in range(len(source)) if source.startswith(accrual, index)]
+        self.assertEqual(len(persist_positions), 4)
+        self.assertEqual(len(accrual_positions), 4)
+        self.assertTrue(all(saved < earned for saved, earned in zip(persist_positions, accrual_positions)))
+        self.assertIn("_human_subadmin_submission_actor", source)
+        self.assertIn("segment_ids", source)
 
     def test_audio_earnings_apply_the_human_and_ai_rates_per_minute(self):
         build = self.namespace["_human_subadmin_earning_specs"]
