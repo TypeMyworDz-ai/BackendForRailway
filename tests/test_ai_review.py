@@ -276,7 +276,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["claude-sonnet-5-5", "gemini-3.8-flash"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-terra", "gemini-3.8-flash"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
         self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
@@ -317,11 +317,22 @@ class AiModelRouting(unittest.TestCase):
             and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN"}
         }
 
+    def test_ai_review_preserves_emphatic_repetition_and_limits_self_corrections(self):
+        node = next(
+            item for item in self.tree.body
+            if isinstance(item, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "_REVIEW_SYSTEM" for target in item.targets)
+        )
+        prompt = ast.literal_eval(node.value)
+        self.assertIn("immediately and unmistakably corrects that same wording", prompt)
+        self.assertIn("very, very hot", prompt)
+        self.assertIn("Never treat emphasis", prompt)
+
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("deepseek-v4-flash", "deepseek")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("deepseek-v4-flash", "deepseek"), ("gemini-3.8-flash", "gemini")))
 
     def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
@@ -362,6 +373,27 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("AI_REVIEW_MODEL_CHAIN if job.get('pdf_review')", ast.unparse(self.functions["_human_image_review_draft"]))
         letter_review = ast.unparse(self.functions["_human_run_letter_ai_review"])
         self.assertIn("AI_REVIEW_MODEL_CHAIN", letter_review)
+
+    def test_letter_research_labels_are_optional_when_results_exist(self):
+        import re
+
+        for owner_name, validator_name in (
+            ("_human_ai_agent_generate", "validate_template_research"),
+            ("_human_run_letter_ai_review", "validate_research"),
+        ):
+            owner = self.functions[owner_name]
+            validator = next(
+                node for node in ast.walk(owner)
+                if isinstance(node, ast.FunctionDef) and node.name == validator_name
+            )
+            namespace = {"re": re, "research": "Verified search result: Example Organization.", "template_agent": False}
+            exec(compile(ast.Module(body=[validator], type_ignores=[]), "main.py", "exec"), namespace)
+            self.assertIsNone(namespace[validator_name]("Dear Client,\n\nThe requested letter text."))
+            empty_namespace = {"re": re, "research": "", "template_agent": False}
+            exec(compile(ast.Module(body=[validator], type_ignores=[]), "main.py", "exec"), empty_namespace)
+            self.assertIsNone(empty_namespace[validator_name]("Dear Client,\n\nThe requested letter text."))
+            with self.assertRaises(ValueError):
+                empty_namespace[validator_name]("Client spellings: A. I researched: Example Organization.")
 
     def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
