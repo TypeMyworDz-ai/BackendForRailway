@@ -31,7 +31,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "_human_subadmin_rate_public", "_human_subadmin_parse_rate_update",
             "_human_subadmin_word_count", "_human_subadmin_audio_minutes",
             "_human_subadmin_ai_used", "_human_subadmin_assignment_metadata",
-            "_human_subadmin_earning_specs", "_human_shift_local_now",
+            "_human_subadmin_earning_specs", "_human_admin_finish_job_eligible", "_human_shift_local_now",
             "_human_shift_parse_datetime", "_human_shift_is_scheduled",
             "is_human_subadmin",
         }
@@ -141,6 +141,37 @@ class SubadminPaymentTests(unittest.TestCase):
         again = build("mixed-job", job, self.subadmin, now=self.shift_time)
         self.assertEqual({row["earning_id"] for row in rows}, {row["earning_id"] for row in again})
 
+    def test_immediate_ai_accrual_can_be_limited_to_the_successful_ai_slice(self):
+        build = self.namespace["_human_subadmin_earning_specs"]
+        job = {
+            "job_type": "general_job", "ai_agent_status": "submitted",
+            "segments": [
+                {"id": "human-part", "status": "submitted", "worker_uid": "worker-1", "minutes": 1, "transcript": "human text"},
+                {"id": "ai-part", "status": "submitted", "ai_agent_status": "submitted", "ai_agent_assigned_by_uid": "subadmin-1", "ai_agent_assigned_by_email": "info@typemywordz.ai", "ai_agent_assignedAt": self.shift_time, "minutes": 2, "transcript": "AI text"},
+            ],
+        }
+        rows = build("mixed-job", job, {}, now=self.shift_time, segment_ids=["ai-part"], ai_only=True)
+        self.assertEqual([row["segment_id"] for row in rows], ["ai-part"])
+        self.assertEqual(rows[0]["category"], "audio_ai")
+        self.assertEqual(build("mixed-job", job, {}, now=self.shift_time, segment_ids=["human-part"], ai_only=True), [])
+
+    def test_admin_finish_requires_all_submitted_parts_and_no_active_proofreader(self):
+        eligible = self.namespace["_human_admin_finish_job_eligible"]
+        job = {
+            "status": "proofreading_available",
+            "segments": [
+                {"id": "part-1", "status": "submitted", "transcript": "First part."},
+                {"id": "part-2", "status": "submitted", "final_attachment": {"storage_path": "private/final.docx"}},
+            ],
+        }
+        self.assertTrue(eligible(job))
+        self.assertFalse(eligible({**job, "proofreader_status": "assigned"}))
+        self.assertFalse(eligible({**job, "proofreader_status": "in_progress"}))
+        self.assertFalse(eligible({**job, "reviewer_status": "processing"}))
+        self.assertFalse(eligible({**job, "segments": [*job["segments"], {"id": "part-3", "status": "in_progress", "transcript": "Not done."}]}))
+        self.assertFalse(eligible({"status": "submitted", "segments": [{"id": "empty", "status": "submitted"}]}))
+        self.assertTrue(eligible({"status": "submitted", "transcript": "Complete transcript."}))
+
     def test_image_earnings_keep_fractional_kes_without_rounding(self):
         build = self.namespace["_human_subadmin_earning_specs"]
         human_job = {
@@ -202,12 +233,27 @@ class SubadminPaymentTests(unittest.TestCase):
             calls = {item.func.id for item in ast.walk(node) if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)}
             self.assertIn("_require_human_subadmin" if name == "human_subadmin_payment_history" else "_require_admin", calls, name)
 
-    def test_successful_review_and_internal_finish_call_idempotent_accrual(self):
+    def test_successful_agent_review_and_finish_paths_call_idempotent_accrual(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
         functions = {node.name: node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)}
-        for name in ("human_admin_review", "human_admin_finish_ai_agent_draft"):
+        for name in (
+            "human_admin_review", "human_admin_finish_ai_agent_draft", "human_admin_finish_job",
+            "human_admin_ai_review", "_human_run_ai_agent", "_human_run_letter_agent", "_human_run_letter_ai_review",
+        ):
             calls = {item.func.id for item in ast.walk(functions[name]) if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)}
             self.assertIn("_human_subadmin_accrue_job_earnings", calls, name)
+
+    def test_generic_finish_route_is_admin_only_and_preserves_client_approval_flow(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_finish_job")
+        route_text = ast.unparse(route)
+        calls = {item.func.id for item in ast.walk(route) if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)}
+        self.assertIn("_require_human_job_admin", calls)
+        self.assertIn("_human_admin_finish_job_eligible", calls)
+        self.assertIn("_human_subadmin_accrue_job_earnings", calls)
+        self.assertIn("client_review", route_text)
+        self.assertIn("released", route_text)
+        self.assertNotIn("charge_credits", route_text)
 
 
 if __name__ == "__main__":
