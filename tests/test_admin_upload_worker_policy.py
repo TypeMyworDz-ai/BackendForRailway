@@ -105,29 +105,37 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertFalse(scheduled(datetime(2026, 10, 10, 16, 0, tzinfo=zone)))
         self.assertFalse(scheduled(datetime(2026, 10, 11, 16, 0, tzinfo=zone)))
 
-    def test_off_shift_self_claim_requires_explicit_opt_in_and_fresh_workroom_presence(self):
+    def test_off_shift_availability_is_presence_only_and_never_enables_self_claims(self):
         status_payload = self.namespace["_human_shift_status_payload"]
         zone = self.namespace["HUMAN_SHIFT_TIMEZONE"]
         now = datetime(2026, 10, 5, 20, 15, tzinfo=zone)
         recent = {"lastPresenceAt": "2026-10-05T20:14:00+03:00"}
-        opted_in = status_payload("worker-1", {"workerApproved": True, "is_available": True}, recent, now)
-        self.assertTrue(opted_in["can_claim"])
-        self.assertTrue(opted_in["off_shift_self_claim"])
-        self.assertTrue(opted_in["workroom_online"])
-        self.assertFalse(opted_in["clocked_in"])
-        self.assertFalse(opted_in["online"], "off-shift presence must not count as attendance or admin overtime eligibility")
+        online = status_payload("worker-1", {"workerApproved": True, "is_available": True}, recent, now)
+        self.assertFalse(online["can_claim"], "online presence is not attendance or permission to claim")
+        self.assertFalse(online["off_shift_self_claim"])
+        self.assertTrue(online["workroom_online"])
+        self.assertTrue(online["online"], "the toggle and fresh heartbeat together make the worker visible online")
+        self.assertFalse(online["clocked_in"])
 
-        opted_out = status_payload("worker-1", {"workerApproved": True, "is_available": False}, recent, now)
-        self.assertFalse(opted_out["can_claim"])
-        self.assertFalse(opted_out["off_shift_self_claim"])
-        missing_preference = status_payload("worker-1", {"workerApproved": True}, recent, now)
-        self.assertFalse(missing_preference["can_claim"], "unset availability is not opt-in")
+        offline = status_payload("worker-1", {"workerApproved": True, "is_available": False}, recent, now)
+        self.assertFalse(offline["can_claim"])
+        self.assertFalse(offline["online"], "turning the toggle off hides online presence even with a fresh heartbeat")
         stale = status_payload("worker-1", {"workerApproved": True, "is_available": True}, {"lastPresenceAt": "2026-10-05T20:10:00+03:00"}, now)
-        self.assertFalse(stale["can_claim"])
+        self.assertFalse(stale["online"], "a stale heartbeat is not online presence")
         called_in = status_payload(
             "worker-1", {"workerApproved": True, "is_available": True, "humanShiftCallInExpiresAt": "2026-10-06T00:00:00+03:00"}, recent, now,
         )
-        self.assertFalse(called_in["off_shift_self_claim"], "admin call-ins use clock-in, not the self-claim path")
+        self.assertFalse(called_in["can_claim"], "an admin call-in still requires clock-in before claiming")
+        self.assertFalse(called_in["off_shift_self_claim"])
+        called_back = status_payload(
+            "worker-1",
+            {"workerApproved": True, "is_available": True, "humanShiftCallInExpiresAt": "2026-10-06T00:00:00+03:00"},
+            {"clockedInAt": "2026-10-05T15:00:00+03:00", "clockedOutAt": "2026-10-05T20:00:00+03:00", **recent},
+            now,
+        )
+        self.assertEqual(called_back["status"], "called_in_not_clocked_in")
+        self.assertTrue(called_back["can_clock_in"], "an active admin call-in permits a new overtime clock-in after clocking out")
+        self.assertFalse(called_back["can_claim"])
 
     def test_scheduled_shift_claim_does_not_require_availability_toggle(self):
         status_payload = self.namespace["_human_shift_status_payload"]
@@ -139,9 +147,9 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertTrue(result["can_claim"])
         self.assertFalse(result["off_shift_self_claim"])
 
-    def test_off_shift_presence_refresh_does_not_record_shift_attendance(self):
+    def test_presence_refresh_never_records_shift_attendance_and_requires_toggle_or_clock_in(self):
         presence = ast.unparse(self.functions["human_worker_shift_presence"])
-        self.assertIn("off_shift_available", presence)
+        self.assertIn("online_toggle", presence)
         self.assertIn("lastPresenceAt", presence)
         self.assertNotIn('updates["clockedInAt"]', presence)
         self.assertNotIn('updates["clockedOutAt"]', presence)
@@ -319,6 +327,53 @@ class ShiftAuthorizationRules(unittest.TestCase):
         ))
         self.assertFalse(permitted_claim["clocked_in"])
 
+    def test_worker_can_reclock_after_admin_calls_them_in_again_after_clocking_out(self):
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class FakeFirestore:
+            DELETE_FIELD = object()
+
+        class ShiftRef:
+            def __init__(self):
+                self.saved = None
+            def set(self, updates, merge=False):
+                self.saved = (updates, merge)
+
+        class FakeApp:
+            def post(self, *_args, **_kwargs):
+                return lambda function: function
+
+        shift_ref = ShiftRef()
+        shift = {"clockedInAt": "2026-10-05T15:00:00+03:00", "clockedOutAt": "2026-10-05T20:00:00+03:00", "sessions": []}
+        async def actor(_request):
+            return {"uid": "worker-1", "email": "worker@example.com", "role": "worker", "profile": {"workerApproved": True}}
+        async def reconcile(_uid, profile):
+            return profile
+        async def current_record(_uid, _now):
+            return shift_ref, dict(shift)
+        def payload(_uid, _profile, current, _now):
+            return {"clocked_in": bool(current.get("clockedInAt") and not current.get("clockedOutAt")), "online": False}
+
+        namespace = {
+            "app": FakeApp(), "asyncio": asyncio, "Request": object, "HTTPException": RequestError,
+            "firestore": FakeFirestore, "_human_actor": actor,
+            "_human_shift_reconcile": reconcile, "_human_shift_call_in_active": lambda *_args: True,
+            "_human_shift_is_scheduled": lambda *_args: False,
+            "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
+            "_human_shift_current_record": current_record, "_human_shift_status_payload": payload,
+        }
+        route = self._functions()["human_worker_shift_clock_in"]
+        exec(compile(ast.Module(body=[route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        result = asyncio.run(namespace["human_worker_shift_clock_in"](object()))
+        saved, merge = shift_ref.saved
+        self.assertTrue(merge)
+        self.assertIs(saved["clockedOutAt"], FakeFirestore.DELETE_FIELD)
+        self.assertTrue(result["clocked_in"])
+
     def test_accepted_after_hours_claim_marker_is_used_for_start_and_submit(self):
         start = ast.unparse(self._functions()["human_worker_start"])
         submit = ast.unparse(self._functions()["human_worker_submit"])
@@ -327,8 +382,9 @@ class ShiftAuthorizationRules(unittest.TestCase):
         self.assertIn("allow_after_hours_self_claim=job.get('after_hours_self_claim') is True", start)
         self.assertIn("allow_after_hours_self_claim=target.get('after_hours_self_claim') is True", submit)
         self.assertIn("allow_after_hours_self_claim=job.get('after_hours_self_claim') is True", submit)
-        self.assertIn("require_availability=claim_window['availability_required']", claim)
-        self.assertIn("after_hours_self_claim=claim_window['off_shift_self_claim']", claim)
+        self.assertIn("require_availability=False", claim)
+        self.assertIn("after_hours_self_claim=False", claim)
+        self.assertIn("_human_shift_assert_can_claim(actor)", claim)
 
     def test_direct_overtime_assignment_does_not_depend_on_self_claim_toggle(self):
         for name in ("human_admin_assign", "human_admin_assign_whole", "human_admin_assign_proofreader"):
@@ -350,15 +406,19 @@ class ShiftAuthorizationRules(unittest.TestCase):
         async def current_record(_uid, _now=None):
             return None, {}
         def payload(*_args):
-            return {"online": online}
+            return {"online": online, "clocked_in": clocked_in, "call_in_active": call_in_active}
         async def load_profile(_uid):
             return {"workerApproved": True}
-        async def run_case(online_now):
-            nonlocal online
+        async def run_case(online_now, clocked_in_now, call_in_now):
+            nonlocal online, clocked_in, call_in_active
             online = online_now
+            clocked_in = clocked_in_now
+            call_in_active = call_in_now
             return await namespace["_human_require_worker_online_for_overtime"]("worker-1", {"workerApproved": True})
 
         online = False
+        clocked_in = False
+        call_in_active = False
         namespace = {
             "datetime": datetime, "ZoneInfo": ZoneInfo, "HUMAN_SHIFT_TIMEZONE": ZoneInfo("Africa/Nairobi"),
             "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
@@ -367,9 +427,13 @@ class ShiftAuthorizationRules(unittest.TestCase):
             "_load_profile": load_profile, "HTTPException": RequestError,
         }
         exec(compile(ast.Module(body=[helper], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
-        with self.assertRaisesRegex(RequestError, "only to a worker who is clocked in and online"):
-            asyncio.run(run_case(False))
-        self.assertTrue(asyncio.run(run_case(True)))
+        with self.assertRaisesRegex(RequestError, "call the worker in"):
+            asyncio.run(run_case(False, True, True))
+        with self.assertRaisesRegex(RequestError, "call the worker in"):
+            asyncio.run(run_case(True, False, True))
+        with self.assertRaisesRegex(RequestError, "call the worker in"):
+            asyncio.run(run_case(True, True, False))
+        self.assertTrue(asyncio.run(run_case(True, True, True)))
 
 
 class WeekendShiftReconciliation(unittest.TestCase):
@@ -541,6 +605,118 @@ class PdfBatchDownloadTests(unittest.TestCase):
         email = "subadmin@example.com"
         with self.assertRaises(HttpError):
             asyncio.run(namespace["human_admin_download_pdf_batch"]("batch-a", object()))
+
+
+class HumanWorkAiBillingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        cls.functions = {
+            node.name: node for node in cls.tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+    def test_each_human_work_ai_agent_or_reviewer_route_charges_before_queueing(self):
+        routes = (
+            "human_admin_assign_ai_agent", "human_admin_assign_letter_agent",
+            "human_admin_retry_letter_ai_review", "human_admin_ai_review",
+        )
+        for name in routes:
+            with self.subTest(route=name):
+                function = self.functions[name]
+                calls = [node for node in ast.walk(function)
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                         and node.func.id == "_human_charge_ai_call"]
+                self.assertEqual(len(calls), 1, f"{name} must charge exactly once")
+                if name != "human_admin_ai_review":
+                    source = ast.unparse(function)
+                    self.assertLess(source.index("_human_charge_ai_call"), source.index("background_tasks.add_task"))
+
+    def test_failed_billing_restores_queued_job_state_before_provider_start(self):
+        generic = ast.unparse(self.functions["human_admin_assign_ai_agent"])
+        letter = ast.unparse(self.functions["human_admin_assign_letter_agent"])
+        letter_review = ast.unparse(self.functions["human_admin_retry_letter_ai_review"])
+        self.assertIn("if job_updated", generic)
+        self.assertIn("restore_updates", generic)
+        self.assertLess(generic.index("_human_charge_ai_call"), generic.index("background_tasks.add_task"))
+        self.assertIn("if queued", letter)
+        self.assertIn("restore_keys", letter)
+        self.assertLess(letter.index("_human_charge_ai_call"), letter.index("background_tasks.add_task"))
+        self.assertIn("review_ref.update", letter_review)
+        self.assertIn("_human_charge_ai_call", letter_review)
+        self.assertLess(letter_review.index("_human_charge_ai_call"), letter_review.index("background_tasks.add_task"))
+
+    def test_internal_finish_and_apply_existing_ai_review_are_not_new_ai_calls(self):
+        for name in ("human_admin_finish_ai_agent_draft", "human_admin_apply_ai_review"):
+            with self.subTest(route=name):
+                source = ast.unparse(self.functions[name])
+                self.assertNotIn("_human_charge_ai_call", source)
+                self.assertNotIn("charge_credits", source)
+
+    def test_ai_call_charge_is_two_credits_and_force_bills_admin_and_subadmin(self):
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        calls = []
+        async def charge(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {"charged": 2, "remaining": 8}
+
+        namespace = {
+            "HUMAN_WORK_AI_CREDIT_COST": 2,
+            "HTTPException": RequestError,
+            "charge_credits": charge,
+        }
+        exec(compile(ast.Module(body=[self.functions["_human_charge_ai_call"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        helper = namespace["_human_charge_ai_call"]
+        for email in ("typemywordz@gmail.com", "info@typemywordz.ai"):
+            result = asyncio.run(helper({"uid": "operator-1", "email": email}, "job-1", "AI reviewer"))
+            self.assertEqual(result, {"credits_deducted": 2, "credits_remaining": 8})
+        self.assertEqual(len(calls), 2)
+        for index, (args, kwargs) in enumerate(calls):
+            self.assertEqual(args[:3], ("operator-1", ("typemywordz@gmail.com", "info@typemywordz.ai")[index], 2))
+            self.assertTrue(str(args[3]).startswith("Human Work AI reviewer"))
+            self.assertEqual(kwargs["usage_category"], "human_work_ai")
+            self.assertTrue(kwargs["force_charge"])
+            self.assertTrue(kwargs["require_saved"])
+
+    def test_insufficient_balance_or_failed_save_prevents_ai_call(self):
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        outcomes = iter([
+            {"charged": 0, "available": 1, "remaining": 1},
+            {"charged": 0, "error": "credit update could not be saved"},
+        ])
+        async def charge(*_args, **_kwargs):
+            return next(outcomes)
+
+        namespace = {
+            "HUMAN_WORK_AI_CREDIT_COST": 2,
+            "HTTPException": RequestError,
+            "charge_credits": charge,
+        }
+        exec(compile(ast.Module(body=[self.functions["_human_charge_ai_call"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        helper = namespace["_human_charge_ai_call"]
+        with self.assertRaises(RequestError) as insufficient:
+            asyncio.run(helper({"uid": "operator-1", "email": "info@typemywordz.ai"}, "job-1", "AI agent"))
+        self.assertEqual(insufficient.exception.status_code, 402)
+        with self.assertRaises(RequestError) as save_failure:
+            asyncio.run(helper({"uid": "operator-1", "email": "info@typemywordz.ai"}, "job-1", "AI agent"))
+        self.assertEqual(save_failure.exception.status_code, 503)
+
+    def test_billable_main_admin_balance_is_verified_and_scoped_to_same_account(self):
+        route = ast.unparse(self.functions["credits_balance"])
+        self.assertIn("if billable_ai_balance", route)
+        self.assertIn("_verified_user(request)", route)
+        self.assertIn("decoded.get('sub')", route)
+        self.assertIn("verified_email != str(user_email", route)
 
 
 if __name__ == "__main__":
