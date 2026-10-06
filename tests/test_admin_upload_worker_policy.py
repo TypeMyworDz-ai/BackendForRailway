@@ -510,10 +510,23 @@ class WeekendShiftReconciliation(unittest.TestCase):
 
 
 class PdfBatchDownloadTests(unittest.TestCase):
+    def test_admin_uploads_share_one_download_batch_across_selected_images(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_create_pdf_jobs")
+        source = ast.unparse(route)
+        self.assertLess(source.index("upload_batch_id = uuid.uuid4().hex"), source.index("for upload in files:"))
+        self.assertIn("pdf_upload_batch_id", source)
+        self.assertIn("pdf_upload_page_number", source)
+        self.assertIn("upload_batch_id", source)
+        rendered_loop = source.index("for rendered in rendered_images:")
+        self.assertLess(source.index("for upload in files:"), rendered_loop)
+        self.assertLess(source.index("upload_page_number += 1", rendered_loop), source.index("pdf_upload_page_number", rendered_loop))
+
     def test_private_page_images_are_combined_into_pdf_in_page_order(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_download_pdf_batch")
+        order_helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_human_pdf_upload_order_key")
         route.decorator_list = []
 
         class Snapshot:
@@ -528,7 +541,10 @@ class PdfBatchDownloadTests(unittest.TestCase):
             def __init__(self, snapshots):
                 self.snapshots = snapshots
 
-            def where(self, **_kwargs):
+            def where(self, **kwargs):
+                field, operator, value = kwargs.get("filter")
+                if operator == "==":
+                    return Query([snap for snap in self.snapshots if (snap.to_dict() or {}).get(field) == value])
                 return self
 
             def stream(self):
@@ -571,13 +587,23 @@ class PdfBatchDownloadTests(unittest.TestCase):
             Image.new("RGB", (16, 16), color).save(handle, format="PNG")
             return handle.getvalue()
 
-        red, blue = png((240, 10, 10)), png((10, 10, 240))
-        job_two = {"job_type": "pdf_job", "pdf_batch_id": "batch-a", "pdf_image": {
-            "page_number": 2, "source_filename": "source.docx", "storage_path": "human-workflow/job-2/pdf/page-2.jpg",
-        }}
-        job_one = {"job_type": "pdf_job", "pdf_batch_id": "batch-a", "pdf_image": {
-            "page_number": 1, "source_filename": "source.docx", "storage_path": "human-workflow/job-1/pdf/page-1.jpg",
-        }}
+        red, blue, green = png((240, 10, 10)), png((10, 10, 240)), png((10, 220, 10))
+        job_two = {
+            "job_type": "pdf_job", "status": "approved", "worker_uid": None,
+            "pdf_batch_id": "source-file-b", "pdf_upload_batch_id": "upload-batch-a",
+            "pdf_upload_batch_name": "conversation.png + 1 more", "pdf_upload_download_name": "conversation-combined",
+            "pdf_upload_page_number": 2, "pdf_image": {
+                "page_number": 1, "source_filename": "follow-up.png", "storage_path": "human-workflow/job-2/pdf/page-1.jpg",
+            },
+        }
+        job_one = {
+            "job_type": "pdf_job", "status": "approved", "worker_uid": None,
+            "pdf_batch_id": "source-file-a", "pdf_upload_batch_id": "upload-batch-a",
+            "pdf_upload_batch_name": "conversation.png + 1 more", "pdf_upload_download_name": "conversation-combined",
+            "pdf_upload_page_number": 1, "pdf_image": {
+                "page_number": 1, "source_filename": "conversation.png", "storage_path": "human-workflow/job-1/pdf/page-1.jpg",
+            },
+        }
         snapshots = [Snapshot("job-2", job_two), Snapshot("job-1", job_one)]
         files = {job_two["pdf_image"]["storage_path"]: blue, job_one["pdf_image"]["storage_path"]: red}
         email = "typemywordz@gmail.com"
@@ -592,9 +618,10 @@ class PdfBatchDownloadTests(unittest.TestCase):
             "db": Database(snapshots), "_human_actor": actor, "_human_bucket": lambda: Bucket(files),
             "os": __import__("os"), "re": re, "logger": _FakeLogger(),
         }
-        exec(compile(ast.Module(body=[route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
-        response = asyncio.run(namespace["human_admin_download_pdf_batch"]("batch-a", object()))
+        exec(compile(ast.Module(body=[order_helper, route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        response = asyncio.run(namespace["human_admin_download_pdf_batch"]("upload-batch-a", object()))
         self.assertEqual(response.media_type, "application/pdf")
+        self.assertIn("conversation-combined.pdf", response.headers["Content-Disposition"])
         document = pdfium.PdfDocument(response.body)
         self.assertEqual(len(document), 2)
         first = document[0].render(scale=0.5).to_pil().convert("RGB")
@@ -602,9 +629,162 @@ class PdfBatchDownloadTests(unittest.TestCase):
         self.assertGreater(first.getpixel((first.width // 2, first.height // 2))[0], first.getpixel((first.width // 2, first.height // 2))[2])
         self.assertGreater(second.getpixel((second.width // 2, second.height // 2))[2], second.getpixel((second.width // 2, second.height // 2))[0])
         document.close()
+        legacy_path = "human-workflow/legacy-job/pdf/legacy.jpg"
+        files[legacy_path] = green
+        legacy_job = {"job_type": "pdf_job", "status": "approved", "pdf_batch_id": "legacy-batch", "pdf_image": {
+            "page_number": 1, "source_filename": "legacy.png", "storage_path": legacy_path,
+        }}
+        namespace["db"] = Database([Snapshot("legacy-job", legacy_job)])
+        legacy_response = asyncio.run(namespace["human_admin_download_pdf_batch"]("legacy-batch", object()))
+        legacy_pdf = pdfium.PdfDocument(legacy_response.body)
+        self.assertEqual(len(legacy_pdf), 1)
+        legacy_pdf.close()
         email = "subadmin@example.com"
         with self.assertRaises(HttpError):
-            asyncio.run(namespace["human_admin_download_pdf_batch"]("batch-a", object()))
+            asyncio.run(namespace["human_admin_download_pdf_batch"]("upload-batch-a", object()))
+
+    def test_order_and_group_helpers_preserve_upload_sequence_across_source_files(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        wanted = {"_human_pdf_upload_order_key", "_human_pdf_same_upload_batch", "_human_pdf_same_source_file"}
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+        namespace = {}
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        first = {"pdf_upload_batch_id": "upload-1", "pdf_upload_page_number": 1, "pdf_batch_id": "file-a", "pdf_image": {"page_number": 1, "source_filename": "first.png"}}
+        second = {"pdf_upload_batch_id": "upload-1", "pdf_upload_page_number": 2, "pdf_batch_id": "file-b", "pdf_image": {"page_number": 1, "source_filename": "second.png"}}
+        other_upload = {"pdf_upload_batch_id": "upload-2", "pdf_upload_page_number": 1, "pdf_batch_id": "file-c", "pdf_image": {"page_number": 1, "source_filename": "first.png"}}
+        unordered = [("second", second), ("first", first)]
+        ordered = sorted(unordered, key=lambda entry: namespace["_human_pdf_upload_order_key"](entry[1], entry[0]))
+        self.assertEqual([job_id for job_id, _ in ordered], ["first", "second"])
+        self.assertTrue(namespace["_human_pdf_same_upload_batch"](first, second))
+        self.assertFalse(namespace["_human_pdf_same_upload_batch"](first, other_upload))
+        self.assertFalse(namespace["_human_pdf_same_source_file"](first, second))
+
+    def test_whole_batch_ai_and_review_use_upload_identity_and_original_order(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)}
+        assignment = ast.unparse(functions["human_admin_assign_ai_agent"])
+        review = ast.unparse(functions["human_admin_create_file_review"])
+        reviewer = ast.unparse(functions["_human_image_review_draft"])
+        for source in (assignment, review):
+            self.assertIn("requested_upload_batch_id", source)
+            self.assertIn("_human_pdf_same_upload_batch", source)
+            self.assertIn("_human_pdf_upload_order_key", source)
+        self.assertIn("'pdf_images'", reviewer)
+        self.assertIn("metas = sorted(metas", reviewer)
+
+    def test_whole_upload_review_stores_images_and_drafts_in_upload_order(self):
+        import uuid
+
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"_human_pdf_upload_order_key", "_human_pdf_same_upload_batch", "_human_pdf_same_source_file"}]
+        route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_create_file_review")
+        route.decorator_list = []
+        jobs = {
+            "image-second": {
+                "job_type": "pdf_job", "job_category": "pdf", "pdf_batch_id": "file-b", "pdf_upload_batch_id": "upload-1",
+                "pdf_upload_batch_name": "first.png + 1 more", "pdf_upload_page_number": 2, "transcript": "Second image text",
+                "pdf_image": {"name": "second.png", "source_filename": "second.png", "page_number": 1, "storage_path": "source/second"},
+            },
+            "image-first": {
+                "job_type": "pdf_job", "job_category": "pdf", "pdf_batch_id": "file-a", "pdf_upload_batch_id": "upload-1",
+                "pdf_upload_batch_name": "first.png + 1 more", "pdf_upload_page_number": 1, "transcript": "First image text",
+                "pdf_image": {"name": "first.png", "source_filename": "first.png", "page_number": 1, "storage_path": "source/first"},
+            },
+        }
+        stored_jobs = {}
+        storage = {"source/first": b"first-image", "source/second": b"second-image"}
+        stored_names = []
+
+        class FakeHttpError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+
+        class FakeQuery:
+            def where(self, **_kwargs):
+                return self
+
+            def limit(self, _limit):
+                return self
+
+            def stream(self):
+                return iter(())
+
+        class FakeDocument:
+            def __init__(self, doc_id):
+                self.doc_id = doc_id
+
+            def set(self, value):
+                stored_jobs[self.doc_id] = value
+
+        class FakeCollection:
+            def where(self, **_kwargs):
+                return FakeQuery()
+
+            def document(self, doc_id):
+                return FakeDocument(doc_id)
+
+        class FakeDatabase:
+            def collection(self, _name):
+                return FakeCollection()
+
+        class FakeBlob:
+            def __init__(self, path):
+                self.path = path
+
+            def download_as_bytes(self):
+                return storage[self.path]
+
+        class FakeBucket:
+            def blob(self, path):
+                return FakeBlob(path)
+
+        class FakeRequest:
+            async def json(self):
+                return {"job_ids": ["image-second", "image-first"], "upload_batch_id": "upload-1"}
+
+        async def actor(_request):
+            return {"email": "typemywordz@gmail.com"}
+
+        async def get_job(job_id):
+            return jobs[job_id]
+
+        async def page_text(item):
+            return item.get("transcript", "")
+
+        def store_bytes(job_id, name, raw, content_type, folder):
+            stored_names.append(name)
+            path = f"human-workflow/{job_id}/{folder}/{name}"
+            storage[path] = raw
+            return {"name": name, "storage_path": path, "content_type": content_type}
+
+        fake_firestore = type("FakeFirestore", (), {"SERVER_TIMESTAMP": "SERVER_TIMESTAMP"})
+        namespace = {
+            "asyncio": asyncio, "uuid": uuid, "hashlib": hashlib, "logger": _FakeLogger(),
+            "HTTPException": FakeHttpError, "Request": object,
+            "PDF_JOB_ADMIN_EMAILS": {"typemywordz@gmail.com", "info@typemywordz.ai"},
+            "HUMAN_JOB_COLLECTION": "human_jobs", "db": FakeDatabase(), "firestore": fake_firestore,
+            "FieldFilter": lambda *args: args, "PDF_JOB_REVIEW_PAY_KES_PER_PAGE": 100,
+            "_human_actor": actor, "_human_job": get_job, "_pdf_page_draft_text": page_text,
+            "_human_bucket": lambda: FakeBucket(), "_human_store_raw_bytes": store_bytes,
+            "_human_pdf_upload_order_key": None, "_human_pdf_same_upload_batch": None,
+            "_human_pdf_same_source_file": None, "_human_collapse_duplicate_image_page_blocks": lambda text, *_args: text,
+            "human_image_tat_seconds": lambda count: count * 60,
+            "_review_text_to_html": lambda text: text, "_sanitize_editor_html": lambda text: text,
+        }
+        namespace["_human_pdf_upload_order_key"] = next(node for node in helpers if node.name == "_human_pdf_upload_order_key")
+        namespace["_human_pdf_same_upload_batch"] = next(node for node in helpers if node.name == "_human_pdf_same_upload_batch")
+        namespace["_human_pdf_same_source_file"] = next(node for node in helpers if node.name == "_human_pdf_same_source_file")
+        exec(compile(ast.Module(body=helpers + [route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        result = asyncio.run(namespace["human_admin_create_file_review"](FakeRequest()))
+        self.assertEqual(result["pages"], 2)
+        self.assertEqual(stored_names, ["first.png", "second.png"])
+        review_job = stored_jobs[result["job_id"]]
+        self.assertEqual(review_job["pdf_review"]["source_job_ids"], ["image-first", "image-second"])
+        self.assertEqual(review_job["pdf_review"]["page_texts"], ["First image text", "Second image text"])
+        self.assertEqual(review_job["pdf_review"]["source_upload_batch_id"], "upload-1")
+        self.assertEqual([image["page_number"] for image in review_job["pdf_images"]], [1, 2])
+        self.assertIn("first.png + 1 more", review_job["pdf_review"]["source_filename"])
 
 
 class HumanWorkAiBillingTests(unittest.TestCase):
