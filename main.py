@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import calendar
 import difflib
+import math
 from html import escape
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Response, Request, Form
@@ -18,7 +19,9 @@ import tempfile
 import uuid
 import secrets
 from datetime import datetime, timedelta, time as datetime_time, timezone
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
+from html import unescape
 import requests
 from pydub import AudioSegment
 import pypdfium2 as pdfium
@@ -1532,6 +1535,14 @@ def is_human_job_admin(user_email: str) -> bool:
     return email in {item.lower() for item in HUMAN_JOB_ADMIN_EMAILS}
 
 
+def is_human_subadmin(user_email: str) -> bool:
+    """True only for Human Work operators who are not full/main admins."""
+    if not user_email:
+        return False
+    email = user_email.strip().lower()
+    return email in {item.strip().lower() for item in HUMAN_JOB_ADMIN_EMAILS} and not is_admin_user(email)
+
+
 def human_job_credits_exempt(user_email: str) -> bool:
     """A human-transcription job is free of charge only when the client on
     that job is a real admin or one of the extra human-job-admin accounts.
@@ -1546,6 +1557,14 @@ def _require_human_job_admin(request: Request) -> dict:
     email = (decoded.get("email") or "").strip().lower()
     if not is_human_job_admin(email):
         raise HTTPException(status_code=403, detail="Admin access is required.")
+    return decoded
+
+
+def _require_human_subadmin(request: Request) -> dict:
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    if not is_human_subadmin(email):
+        raise HTTPException(status_code=403, detail="Sub-admin payment access is required.")
     return decoded
 
 
@@ -8232,6 +8251,244 @@ async def human_expiry_monitor():
 HUMAN_PAYOUT_COLLECTION = "human_worker_payouts"
 HUMAN_EARNING_ARCHIVE_COLLECTION = "human_worker_earnings"
 HUMAN_DEDUCTION_COLLECTION = "human_worker_payment_adjustments"
+HUMAN_SUBADMIN_EARNING_COLLECTION = "human_subadmin_earnings"
+HUMAN_SUBADMIN_PAYOUT_COLLECTION = "human_subadmin_payouts"
+HUMAN_SUBADMIN_RATE_SETTINGS_COLLECTION = "human_subadmin_rate_settings"
+HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT = "default"
+
+
+def _human_subadmin_rate_defaults():
+    # KES is stored in milli-shillings so a tenth of a cent remains exact.
+    # 0.1 KES cent = 0.001 KES = 1 milli-KES per image word.
+    return {
+        "audio_human_kes_per_minute": 10,
+        "audio_ai_kes_per_minute": 20,
+        "image_human_rate_milli_kes_per_word": 1,
+        "image_ai_rate_milli_kes_per_word": 2,
+    }
+
+
+def _human_subadmin_rate_values(raw=None):
+    values = _human_subadmin_rate_defaults()
+    for key in values:
+        try:
+            value = int((raw or {}).get(key, values[key]))
+            if value >= 0:
+                values[key] = value
+        except (TypeError, ValueError):
+            pass
+    return values
+
+
+def _human_subadmin_rate_public(raw=None):
+    values = _human_subadmin_rate_values(raw)
+    return {
+        "audio_human_kes_per_minute": values["audio_human_kes_per_minute"],
+        "audio_ai_kes_per_minute": values["audio_ai_kes_per_minute"],
+        "image_human_cents_per_word": values["image_human_rate_milli_kes_per_word"] / 10,
+        "image_ai_cents_per_word": values["image_ai_rate_milli_kes_per_word"] / 10,
+        "applies_to": "future earnings only",
+    }
+
+
+def _human_subadmin_parse_rate_update(payload):
+    payload = payload or {}
+    result = {}
+    for key in ("audio_human_kes_per_minute", "audio_ai_kes_per_minute"):
+        try:
+            decimal_value = Decimal(str(payload.get(key)))
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("Audio rates must be whole KES amounts per minute.")
+        if not decimal_value.is_finite() or decimal_value != decimal_value.to_integral_value():
+            raise ValueError("Audio rates must be whole KES amounts per minute.")
+        value = int(decimal_value)
+        if value < 0 or value > 10000:
+            raise ValueError("Audio rates must be between KES 0 and KES 10,000 per minute.")
+        result[key] = value
+    for public_key, storage_key in (
+        ("image_human_cents_per_word", "image_human_rate_milli_kes_per_word"),
+        ("image_ai_cents_per_word", "image_ai_rate_milli_kes_per_word"),
+    ):
+        try:
+            decimal_value = Decimal(str(payload.get(public_key)))
+            tenths = decimal_value * Decimal("10")
+        except (InvalidOperation, TypeError, ValueError):
+            raise ValueError("Image rates must be numeric KES cents per word.")
+        if not decimal_value.is_finite() or decimal_value < 0 or decimal_value > Decimal("1000") or tenths != tenths.to_integral_value():
+            raise ValueError("Image rates must be from 0 to 1,000 KES cents per word in 0.1-cent steps.")
+        result[storage_key] = int(tenths)
+    return result
+
+
+def _human_subadmin_word_count(text):
+    plain = unescape(str(text or ""))
+    plain = re.sub(r"<[^>]*>", " ", plain)
+    return len(re.findall(r"(?u)\b[\w]+(?:['’][\w]+)*\b", plain))
+
+
+def _human_subadmin_audio_minutes(job, segment=None):
+    if segment:
+        try:
+            minutes = int(segment.get("minutes") or 0)
+            if minutes > 0:
+                return minutes
+        except (TypeError, ValueError):
+            pass
+        start = segment.get("start_seconds")
+        end = segment.get("end_seconds")
+        try:
+            if start is not None and end is not None and float(end) > float(start):
+                return max(1, int(math.ceil((float(end) - float(start)) / 60.0)))
+        except (TypeError, ValueError):
+            pass
+    quote = job.get("quote") or {}
+    for raw in (segment or {}).get("worker_minutes"), job.get("minutes"), quote.get("minutes"):
+        try:
+            minutes = int(raw or 0)
+            if minutes > 0:
+                return minutes
+        except (TypeError, ValueError):
+            continue
+    for raw_seconds in (segment or {}).get("audio_seconds"), job.get("seconds"), job.get("audio_seconds"), quote.get("seconds"):
+        try:
+            seconds = float(raw_seconds or 0)
+            if seconds > 0:
+                return max(1, int(math.ceil(seconds / 60.0)))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _human_subadmin_ai_used(job, segment=None):
+    job = job or {}
+    if str(job.get("reviewer_choice") or "").lower() == "ai" or job.get("ai_review_applied") is True:
+        return True
+    if segment:
+        segment_status = str(segment.get("ai_agent_status") or "").lower()
+        if segment_status:
+            return segment_status in {"submitted", "completed", "finished"}
+        # A parent job's agent status may describe a different slice, so never
+        # use it to classify a segment without its own AI marker.
+        return False
+    return any(str(job.get(key) or "").lower() in {"submitted", "completed", "finished"} for key in (
+        "ai_agent_status", "letter_agent_status", "letter_ai_review_status",
+    ))
+
+
+def _human_subadmin_assignment_metadata(job, segment=None, ai_used=None):
+    job = job or {}
+    if ai_used is False:
+        prefixes = ("human_work", "proofreader", "worker", "ai_agent", "letter_agent", "ai_review", "letter_ai_review")
+    elif str(job.get("reviewer_choice") or "").lower() == "ai" or job.get("ai_review_applied") is True:
+        prefixes = ("ai_review", "letter_ai_review", "ai_agent", "letter_agent", "human_work", "worker", "proofreader")
+    elif str(job.get("letter_ai_review_status") or "").lower() == "completed":
+        prefixes = ("letter_ai_review", "letter_agent", "ai_agent", "ai_review", "human_work", "worker", "proofreader")
+    else:
+        prefixes = ("ai_agent", "letter_agent", "letter_ai_review", "ai_review", "human_work", "worker", "proofreader")
+    sources = [segment or {}, job]
+    for source in sources:
+        for prefix in prefixes:
+            email = str(source.get(f"{prefix}_assigned_by_email") or "").strip().lower()
+            if email:
+                uid = str(source.get(f"{prefix}_assigned_by_uid") or source.get(f"{prefix}_assigned_by") or "").strip()
+                assigned_at = source.get(f"{prefix}_assignedAt") or source.get(f"{prefix}_assigned_at")
+                return email, uid, assigned_at
+    return "", "", None
+
+
+def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None):
+    """Build one idempotent earning per approved Human Work job or submitted slice."""
+    job = job or {}
+    actor = actor or {}
+    actor_email = str(actor.get("email") or "").strip().lower()
+    actor_uid = str(actor.get("uid") or "").strip()
+    now_local = now or _human_shift_local_now()
+    if isinstance(now_local, str):
+        now_local = _human_shift_parse_datetime(now_local) or _human_shift_local_now()
+    if not getattr(now_local, "tzinfo", None):
+        now_local = now_local.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
+    else:
+        now_local = now_local.astimezone(HUMAN_SHIFT_TIMEZONE)
+    now_naive = now_local.replace(tzinfo=None)
+    rates = _human_subadmin_rate_values(rates)
+    job_type = str(job.get("job_type") or "human_transcription").strip().lower()
+    is_image = job_type == "pdf_job"
+    submitted_segments = [dict(part or {}) for part in (job.get("segments") or []) if str((part or {}).get("status") or "").lower() == "submitted"]
+    image_review_job = is_image and bool(job.get("pdf_review"))
+    items = []
+    parts = [(None, job)] if image_review_job or not submitted_segments else [(part, part) for part in submitted_segments]
+
+    for segment, content in parts:
+        if segment is not None and not str(segment.get("transcript") or segment.get("transcript_html") or "").strip():
+            continue
+        ai_used = _human_subadmin_ai_used(job, segment)
+        if not ai_used:
+            has_human_submission = bool(
+                (segment and (segment.get("worker_uid") or segment.get("workerCompletedAt") or segment.get("proofreader_uid")))
+                or job.get("worker_uid") or job.get("workerCompletedAt") or job.get("proofreader_status") == "submitted"
+            )
+            if not has_human_submission:
+                continue
+        assigned_email, assigned_uid, assigned_at = _human_subadmin_assignment_metadata(job, segment, ai_used=ai_used)
+        # A sub-admin who performed the final review is paid for that work.
+        # If the main admin completes it later, preserve the sub-admin who
+        # launched the AI run during their scheduled shift.
+        if is_human_subadmin(actor_email):
+            beneficiary_email, beneficiary_uid = actor_email, actor_uid
+            assigned_shift = _human_shift_parse_datetime(assigned_at) if ai_used and assigned_email == actor_email else None
+            shift_action_at = assigned_shift or now_local
+        elif is_human_subadmin(assigned_email):
+            beneficiary_email = assigned_email
+            beneficiary_uid = assigned_uid
+            shift_action_at = _human_shift_parse_datetime(assigned_at) or now_local
+        else:
+            continue
+        if not beneficiary_uid or not _human_shift_is_scheduled(shift_action_at):
+            continue
+
+        if is_image:
+            if segment is not None:
+                text = segment.get("transcript") or segment.get("transcript_html") or ""
+            else:
+                text = job.get("transcript") or job.get("transcript_html") or ""
+            quantity = _human_subadmin_word_count(text)
+            measure = "words"
+            rate = rates["image_ai_rate_milli_kes_per_word"] if ai_used else rates["image_human_rate_milli_kes_per_word"]
+            category = "image_ai" if ai_used else "image_human"
+        else:
+            quantity = _human_subadmin_audio_minutes(job, segment)
+            measure = "minutes"
+            rate = (rates["audio_ai_kes_per_minute"] if ai_used else rates["audio_human_kes_per_minute"]) * 1000
+            category = "audio_ai" if ai_used else "audio_human"
+        if quantity <= 0 or rate <= 0:
+            continue
+        segment_id = str((segment or {}).get("id") or "").strip() or None
+        identity = "|".join((beneficiary_uid, str(job_id), segment_id or "job"))
+        earning_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        items.append({
+            "earning_id": earning_id,
+            "subadmin_uid": beneficiary_uid,
+            "subadmin_email": beneficiary_email,
+            "job_id": str(job_id),
+            "job_name": str(job.get("job_name") or job.get("title") or "Human Work")[:240],
+            "job_type": job_type,
+            "job_category": str(job.get("job_category") or job.get("category") or "").strip().lower(),
+            "segment_id": segment_id,
+            "category": category,
+            "work_source": "ai" if ai_used else "human",
+            "measure": measure,
+            "quantity": quantity,
+            "rate_milli_kes_per_unit": rate,
+            "amount_kes_milli": quantity * rate,
+            "completed_at": now_naive,
+            "shift_action_at": shift_action_at,
+            "shift_date": shift_action_at.date().isoformat(),
+            "payout_status": "accruing",
+            "payout_period_id": None,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+    return items
 
 
 def _pay_period_bounds(dt):
@@ -8426,6 +8683,7 @@ async def human_payout_monitor():
     while True:
         try:
             await _close_due_pay_periods()
+            await _human_subadmin_close_due_pay_periods()
         except Exception as exc:
             logger.warning("Human payout monitor iteration failed: %s", exc)
         await asyncio.sleep(900)
@@ -9633,6 +9891,403 @@ async def human_workflow_notifications(request: Request, since: str = ""):
     return {"events": events, "server_time": datetime.now().astimezone().isoformat()}
 
 
+def _human_subadmin_kes(milli_kes):
+    try:
+        return round(int(milli_kes or 0) / 1000.0, 3)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _human_subadmin_public_earning(raw, doc_id=None):
+    item = dict(raw or {})
+    amount_milli = int(item.get("amount_kes_milli") or 0)
+    rate_milli = int(item.get("rate_milli_kes_per_unit") or 0)
+    completed_at = _as_dt(item.get("completed_at")) if item.get("completed_at") else None
+    return {
+        "earning_id": item.get("earning_id") or doc_id,
+        "subadmin_uid": item.get("subadmin_uid"),
+        "subadmin_email": item.get("subadmin_email") or "",
+        "job_id": item.get("job_id"),
+        "job_name": item.get("job_name") or "Human Work",
+        "job_type": item.get("job_type"),
+        "job_category": item.get("job_category") or "",
+        "segment_id": item.get("segment_id"),
+        "category": item.get("category"),
+        "work_source": item.get("work_source"),
+        "measure": item.get("measure"),
+        "quantity": int(item.get("quantity") or 0),
+        "rate_milli_kes_per_unit": rate_milli,
+        "rate_kes_per_unit": _human_subadmin_kes(rate_milli),
+        "amount_kes_milli": amount_milli,
+        "amount_kes": _human_subadmin_kes(amount_milli),
+        "payout_status": item.get("payout_status") or "accruing",
+        "payout_period_id": item.get("payout_period_id"),
+        "shift_date": item.get("shift_date") or (completed_at.date().isoformat() if completed_at else ""),
+        "completed_at": _human_iso(completed_at),
+    }
+
+
+async def _human_subadmin_close_due_pay_periods(now=None):
+    """Create idempotent half-month invoices from ended accrual periods."""
+    if not db:
+        return
+    local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    now_naive = local_now.replace(tzinfo=None)
+    try:
+        snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).stream()))
+    except Exception as exc:
+        logger.warning("Sub-admin pay period close could not list earnings: %s", exc)
+        return
+    groups = {}
+    for snap in snapshots:
+        item = snap.to_dict() or {}
+        if str(item.get("payout_status") or "accruing").lower() != "accruing":
+            continue
+        completed_at = _as_dt(item.get("completed_at")) if item.get("completed_at") else None
+        if not completed_at:
+            continue
+        # Earnings are saved with Nairobi-local wall time for calendar-period
+        # grouping; normalize aware values to that same local calendar first.
+        if getattr(completed_at, "tzinfo", None):
+            completed_at = completed_at.astimezone(HUMAN_SHIFT_TIMEZONE).replace(tzinfo=None)
+        label, start_dt, end_dt = _pay_period_bounds(completed_at)
+        if now_naive <= end_dt:
+            continue
+        uid = str(item.get("subadmin_uid") or "").strip()
+        if not uid:
+            continue
+        key = (uid, label)
+        group = groups.setdefault(key, {
+            "subadmin_uid": uid,
+            "subadmin_email": item.get("subadmin_email") or "",
+            "period_label": label,
+            "period_start": start_dt,
+            "period_end": end_dt,
+            "items": [],
+        })
+        group["items"].append({
+            "earning_id": item.get("earning_id") or snap.id,
+            "job_id": item.get("job_id"),
+            "job_name": item.get("job_name") or "Human Work",
+            "segment_id": item.get("segment_id"),
+            "category": item.get("category"),
+            "work_source": item.get("work_source"),
+            "measure": item.get("measure"),
+            "quantity": int(item.get("quantity") or 0),
+            "rate_milli_kes_per_unit": int(item.get("rate_milli_kes_per_unit") or 0),
+            "amount_kes_milli": int(item.get("amount_kes_milli") or 0),
+            "completed_at": completed_at,
+        })
+
+    for (uid, label), group in groups.items():
+        payout_id = f"{uid}_{label}"
+        payout_ref = db.collection(HUMAN_SUBADMIN_PAYOUT_COLLECTION).document(payout_id)
+        new_items = group["items"]
+
+        @firestore.transactional
+        def merge_invoice(transaction):
+            snapshot = payout_ref.get(transaction=transaction)
+            existing = snapshot.to_dict() if snapshot.exists else {}
+            items = list(existing.get("items") or [])
+            existing_ids = {str(value.get("earning_id") or "") for value in items}
+            items.extend(value for value in new_items if str(value.get("earning_id") or "") not in existing_ids)
+            total_milli = sum(int(value.get("amount_kes_milli") or 0) for value in items)
+            categories = {}
+            for value in items:
+                key = str(value.get("category") or "other")
+                categories[key] = categories.get(key, 0) + int(value.get("amount_kes_milli") or 0)
+            transaction.set(payout_ref, {
+                "subadmin_uid": uid,
+                "subadmin_email": group["subadmin_email"] or existing.get("subadmin_email") or "",
+                "period_label": label,
+                "period_start": group["period_start"],
+                "period_end": group["period_end"],
+                "items": items,
+                "earning_ids": sorted({str(value.get("earning_id") or "") for value in items if value.get("earning_id")}),
+                "job_ids": sorted({str(value.get("job_id") or "") for value in items if value.get("job_id")}),
+                "category_totals_milli_kes": categories,
+                "total_amount_kes_milli": total_milli,
+                "status": existing.get("status") or "pending",
+                "createdAt": existing.get("createdAt") or firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "paidAt": existing.get("paidAt"),
+                "paidBy": existing.get("paidBy"),
+            }, merge=True)
+
+        try:
+            await asyncio.to_thread(lambda: merge_invoice(db.transaction()))
+            for item in new_items:
+                earning_id = item.get("earning_id")
+                if earning_id:
+                    await asyncio.to_thread(
+                        db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(earning_id).set,
+                        {"payout_status": "invoiced", "payout_period_id": label, "updatedAt": firestore.SERVER_TIMESTAMP},
+                        merge=True,
+                    )
+        except Exception as exc:
+            logger.warning("Could not close sub-admin pay period %s: %s", payout_id, exc)
+
+
+async def _human_subadmin_accrue_job_earnings(job_id, job, actor):
+    if not db:
+        return 0
+    job = dict(job or {})
+    assignment_records = [job] + [dict(item or {}) for item in (job.get("segments") or [])]
+    resolved_uids = {}
+    for record in assignment_records:
+        for prefix in ("ai_agent", "ai_review", "letter_agent", "letter_ai_review", "human_work", "worker", "proofreader"):
+            email = str(record.get(f"{prefix}_assigned_by_email") or "").strip().lower()
+            uid = str(record.get(f"{prefix}_assigned_by_uid") or "").strip()
+            if not is_human_subadmin(email) or uid:
+                continue
+            if email not in resolved_uids:
+                try:
+                    resolved_uids[email] = await get_user_profile_by_email_firestore(email) or ""
+                except Exception:
+                    resolved_uids[email] = ""
+            if resolved_uids[email]:
+                record[f"{prefix}_assigned_by_uid"] = str(resolved_uids[email])
+    if len(assignment_records) > 1:
+        job["segments"] = assignment_records[1:]
+    settings_ref = db.collection(HUMAN_SUBADMIN_RATE_SETTINGS_COLLECTION).document(HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT)
+    try:
+        settings_snapshot = await asyncio.to_thread(settings_ref.get)
+        rate_values = _human_subadmin_rate_values(settings_snapshot.to_dict() if settings_snapshot.exists else None)
+    except Exception as exc:
+        logger.warning("Could not load sub-admin pay rates; using defaults: %s", exc)
+        rate_values = _human_subadmin_rate_defaults()
+    specs = _human_subadmin_earning_specs(job_id, job, actor, rates=rate_values)
+    created = 0
+    for item in specs:
+        ref = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(item["earning_id"])
+        try:
+            await asyncio.to_thread(ref.create, item)
+            created += 1
+        except Exception:
+            # A deterministic document ID makes repeated approvals harmless;
+            # only treat the write as a duplicate if the original now exists.
+            try:
+                existing = await asyncio.to_thread(ref.get)
+                if not existing.exists:
+                    logger.exception("Could not save sub-admin earning %s", item["earning_id"])
+            except Exception:
+                logger.exception("Could not verify sub-admin earning %s", item["earning_id"])
+    return created
+
+
+@app.get("/human-transcription/subadmin/payment-history")
+async def human_subadmin_payment_history(request: Request):
+    actor = _require_human_subadmin(request)
+    if not db:
+        return {"earnings": [], "payouts": [], "totals": {"accruing_kes": 0, "pending_kes": 0, "paid_kes": 0}}
+    await _human_subadmin_close_due_pay_periods()
+    uid = str(actor.get("uid") or "")
+    earning_query = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).where(filter=FieldFilter("subadmin_uid", "==", uid))
+    payout_query = db.collection(HUMAN_SUBADMIN_PAYOUT_COLLECTION).where(filter=FieldFilter("subadmin_uid", "==", uid))
+    earnings, payouts = await asyncio.gather(
+        asyncio.to_thread(lambda: list(earning_query.stream())),
+        asyncio.to_thread(lambda: list(payout_query.stream())),
+    )
+    earning_rows = [_human_subadmin_public_earning(snap.to_dict(), snap.id) for snap in earnings]
+    payout_rows = [{
+        "payout_id": snap.id,
+        "period_label": (snap.to_dict() or {}).get("period_label"),
+        "status": (snap.to_dict() or {}).get("status") or "pending",
+        "total_amount_kes": _human_subadmin_kes((snap.to_dict() or {}).get("total_amount_kes_milli")),
+        "category_totals_kes": {key: _human_subadmin_kes(value) for key, value in ((snap.to_dict() or {}).get("category_totals_milli_kes") or {}).items()},
+        "paid_at": _human_iso((snap.to_dict() or {}).get("paidAt")),
+        "items": (snap.to_dict() or {}).get("items") or [],
+    } for snap in payouts]
+    return {
+        "earnings": sorted(earning_rows, key=lambda item: item.get("completed_at") or "", reverse=True),
+        "payouts": sorted(payout_rows, key=lambda item: item.get("period_label") or "", reverse=True),
+        "totals": {
+            "accruing_kes": _human_subadmin_kes(sum(int((snap.to_dict() or {}).get("amount_kes_milli") or 0) for snap in earnings if (snap.to_dict() or {}).get("payout_status") == "accruing")),
+            "pending_kes": sum(item["total_amount_kes"] for item in payout_rows if item["status"] != "paid"),
+            "paid_kes": sum(item["total_amount_kes"] for item in payout_rows if item["status"] == "paid"),
+        },
+    }
+
+
+@app.get("/api/admin/subadmin-rates")
+async def human_admin_get_subadmin_rates(request: Request):
+    _require_admin(request)
+    if not db:
+        return _human_subadmin_rate_public()
+    ref = db.collection(HUMAN_SUBADMIN_RATE_SETTINGS_COLLECTION).document(HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT)
+    snapshot = await asyncio.to_thread(ref.get)
+    return _human_subadmin_rate_public(snapshot.to_dict() if snapshot.exists else None)
+
+
+@app.put("/api/admin/subadmin-rates")
+async def human_admin_update_subadmin_rates(request: Request):
+    admin = _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    try:
+        values = _human_subadmin_parse_rate_update(await request.json())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    ref = db.collection(HUMAN_SUBADMIN_RATE_SETTINGS_COLLECTION).document(HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT)
+    await asyncio.to_thread(ref.set, {
+        **values,
+        "updated_by": str(admin.get("email") or "").strip().lower(),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return _human_subadmin_rate_public(values)
+
+
+@app.get("/api/admin/subadmin-options")
+async def human_admin_subadmin_options(request: Request):
+    _require_admin(request)
+    options = []
+    for email in sorted({str(item or "").strip().lower() for item in HUMAN_JOB_ADMIN_EMAILS if str(item or "").strip()}):
+        if is_admin_user(email):
+            continue
+        try:
+            uid = await get_user_profile_by_email_firestore(email)
+        except Exception:
+            uid = ""
+        if not uid:
+            continue
+        profile = await _load_profile(uid) or {}
+        options.append({
+            "uid": str(uid),
+            "email": email,
+            "name": str(profile.get("name") or profile.get("displayName") or "").strip(),
+        })
+    return {"subadmins": options}
+
+
+@app.get("/api/admin/subadmin-earnings")
+async def human_admin_subadmin_earnings(
+    request: Request,
+    start_date: str = "",
+    end_date: str = "",
+    subadmin_uid: str = "",
+):
+    _require_admin(request)
+    if not db:
+        return {"earnings": [], "daily_totals": [], "totals": {}}
+    await _human_subadmin_close_due_pay_periods()
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+        end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD format.")
+    query = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION)
+    if subadmin_uid:
+        query = query.where(filter=FieldFilter("subadmin_uid", "==", subadmin_uid))
+    snapshots = await asyncio.to_thread(lambda: list(query.stream()))
+    rows = []
+    daily = {}
+    totals = {"audio_human": 0, "audio_ai": 0, "image_human": 0, "image_ai": 0}
+    for snap in snapshots:
+        item = snap.to_dict() or {}
+        public = _human_subadmin_public_earning(item, snap.id)
+        try:
+            record_date = datetime.strptime(public.get("shift_date") or "", "%Y-%m-%d").date()
+        except ValueError:
+            completed = _as_dt(item.get("completed_at")) if item.get("completed_at") else None
+            record_date = completed.date() if completed else None
+        if not record_date or (start and record_date < start) or (end and record_date > end):
+            continue
+        public["work_date"] = record_date.isoformat()
+        rows.append(public)
+        category = str(item.get("category") or "")
+        amount = int(item.get("amount_kes_milli") or 0)
+        if category in totals:
+            totals[category] += amount
+        bucket = daily.setdefault(record_date.isoformat(), {"date": record_date.isoformat(), **{key: 0 for key in totals}, "total_milli_kes": 0, "earning_count": 0})
+        if category in totals:
+            bucket[category] += amount
+        bucket["total_milli_kes"] += amount
+        bucket["earning_count"] += 1
+    rows.sort(key=lambda item: (item.get("work_date") or "", item.get("completed_at") or ""), reverse=True)
+    daily_rows = []
+    for date_key in sorted(daily, reverse=True):
+        bucket = daily[date_key]
+        daily_rows.append({"date": date_key, "earning_count": bucket["earning_count"], "total_kes": _human_subadmin_kes(bucket["total_milli_kes"]), **{key: _human_subadmin_kes(bucket[key]) for key in totals}})
+    return {
+        "earnings": rows,
+        "daily_totals": daily_rows,
+        "totals": {**{key: _human_subadmin_kes(value) for key, value in totals.items()}, "total_kes": _human_subadmin_kes(sum(totals.values()))},
+    }
+
+
+@app.get("/api/admin/subadmin-payouts")
+async def human_admin_subadmin_payouts(request: Request, subadmin_uid: str = "", status: str = "all"):
+    _require_admin(request)
+    if not db:
+        return {"payouts": [], "totals": {"pending_kes": 0, "paid_kes": 0}}
+    await _human_subadmin_close_due_pay_periods()
+    query = db.collection(HUMAN_SUBADMIN_PAYOUT_COLLECTION)
+    if subadmin_uid:
+        query = query.where(filter=FieldFilter("subadmin_uid", "==", subadmin_uid))
+    snapshots = await asyncio.to_thread(lambda: list(query.stream()))
+    status = (status or "all").strip().lower()
+    payouts = []
+    pending_milli = paid_milli = 0
+    for snap in snapshots:
+        raw = snap.to_dict() or {}
+        payout_status = str(raw.get("status") or "pending").lower()
+        total_milli = int(raw.get("total_amount_kes_milli") or 0)
+        if payout_status == "paid":
+            paid_milli += total_milli
+        else:
+            pending_milli += total_milli
+        if status not in {"all", ""} and payout_status != status:
+            continue
+        category_totals = raw.get("category_totals_milli_kes") or {}
+        payouts.append({
+            "payout_id": snap.id,
+            "subadmin_uid": raw.get("subadmin_uid"),
+            "subadmin_email": raw.get("subadmin_email") or "",
+            "period_label": raw.get("period_label"),
+            "period_start": _human_iso(raw.get("period_start")),
+            "period_end": _human_iso(raw.get("period_end")),
+            "total_amount_kes": _human_subadmin_kes(total_milli),
+            "category_totals_kes": {key: _human_subadmin_kes(value) for key, value in category_totals.items()},
+            "status": payout_status,
+            "job_ids": raw.get("job_ids") or [],
+            "items": raw.get("items") or [],
+            "paid_at": _human_iso(raw.get("paidAt")),
+            "paid_by": raw.get("paidBy"),
+        })
+    payouts.sort(key=lambda item: str(item.get("period_label") or ""), reverse=True)
+    return {"payouts": payouts, "totals": {"pending_kes": _human_subadmin_kes(pending_milli), "paid_kes": _human_subadmin_kes(paid_milli)}}
+
+
+@app.post("/api/admin/subadmin-payouts/{payout_id}/mark-paid")
+async def human_admin_mark_subadmin_payout_paid(payout_id: str, request: Request):
+    admin = _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    payout_ref = db.collection(HUMAN_SUBADMIN_PAYOUT_COLLECTION).document(payout_id)
+    snapshot = await asyncio.to_thread(payout_ref.get)
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="That sub-admin payout invoice was not found.")
+    payout = snapshot.to_dict() or {}
+    if str(payout.get("status") or "pending").lower() == "paid":
+        raise HTTPException(status_code=409, detail="This payout has already been marked as paid.")
+    paid_at = _human_shift_local_now().replace(tzinfo=None)
+    await asyncio.to_thread(payout_ref.set, {
+        "status": "paid",
+        "paidAt": paid_at,
+        "paidBy": str(admin.get("email") or "").strip().lower(),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    for item in payout.get("items") or []:
+        earning_id = item.get("earning_id")
+        if earning_id:
+            await asyncio.to_thread(
+                db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(earning_id).set,
+                {"payout_status": "paid", "paid_at": paid_at, "updatedAt": firestore.SERVER_TIMESTAMP},
+                merge=True,
+            )
+    return {"status": "paid", "payout_id": payout_id, "paid_at": _human_iso(paid_at)}
+
+
 @app.get("/human-transcription/worker/payment-history")
 async def human_worker_payment_history(request: Request):
     actor = await _human_actor(request)
@@ -10436,7 +11091,7 @@ async def human_admin_rate_part(job_id: str, request: Request):
 
 @app.post("/human-transcription/jobs/{job_id}/assign-proofreader")
 async def human_admin_assign_proofreader(job_id: str, request: Request):
-    _require_human_job_admin(request)
+    admin = _require_human_job_admin(request)
     payload = await request.json()
     transcript_override = None
     transcript_html_override = None
@@ -10514,6 +11169,11 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
     except Exception as exc:
         logger.exception("Could not assign proofreader %s to Human Work %s", worker_uid, job_id)
         raise HTTPException(status_code=409, detail="The proofreader assignment could not be saved. Refresh the job and try again.") from exc
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+        "proofreader_assigned_by_uid": str(admin.get("uid") or "").strip(),
+        "proofreader_assigned_by_email": str(admin.get("email") or "").strip().lower(),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    })
     now = assignment["assignedAt"]
     await _complete_human_admin_notifications(job_id, {"job_request", "job_approved"})
     await _complete_human_admin_notifications(job_id, {"returned_to_queue"}, target_id="proofreader")
@@ -10941,7 +11601,7 @@ async def human_worker_submit(
 
 @app.post("/human-transcription/jobs/{job_id}/review")
 async def human_admin_review(job_id: str, request: Request):
-    _require_human_job_admin(request)
+    actor = _require_human_job_admin(request)
     job = await _human_job(job_id)
     if job.get("status") not in {"submitted", "client_review"}:
         raise HTTPException(status_code=409, detail="This job is not ready for admin review.")
@@ -11001,6 +11661,10 @@ async def human_admin_review(job_id: str, request: Request):
     if internal_release:
         updates["releasedAt"] = firestore.SERVER_TIMESTAMP
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    try:
+        await _human_subadmin_accrue_job_earnings(job_id, job, actor)
+    except Exception:
+        logger.exception("Could not accrue sub-admin earnings for approved Human Work job %s", job_id)
     for worker_uid in worker_uids:
         await _human_worker_rating_summary(worker_uid, force_refresh=True)
     await _complete_human_admin_notifications(job_id, {"job_submitted"})
@@ -11031,6 +11695,10 @@ async def human_admin_finish_ai_agent_draft(job_id: str, request: Request):
         "releasedAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
+    try:
+        await _human_subadmin_accrue_job_earnings(job_id, job, actor)
+    except Exception:
+        logger.exception("Could not accrue sub-admin earnings for finished AI draft %s", job_id)
     await _complete_human_admin_notifications(job_id, {"job_submitted"})
     return {"status": "released", "job_id": job_id, "client_charged": False, "client_notified": False}
 
@@ -13030,12 +13698,18 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
     if target.get("ai_agent_status") == "queued" or target.get("ai_agent_status") == "processing":
         raise HTTPException(status_code=409, detail="This part already has an AI draft in progress.")
     run_id = uuid.uuid4().hex
+    assignment_at = _human_shift_local_now()
+    assignment_email = str(actor.get("email") or "").strip().lower()
+    assignment_uid = str(actor.get("uid") or "").strip()
     target.update({
         "status": "in_progress", "worker_uid": None, "worker_email": None,
         "worker_name": "Worker 1", "ai_agent_id": agent_id,
         "ai_agent_name": agent["name"], "ai_agent_status": "queued",
         "ai_agent_model_ids": agent["models"], "ai_agent_run_id": run_id,
-        "assignedAt": datetime.now(), "deadlineAt": None, "tat_seconds": None,
+        "ai_agent_assigned_by_uid": assignment_uid,
+        "ai_agent_assigned_by_email": assignment_email,
+        "ai_agent_assignedAt": assignment_at,
+        "assignedAt": assignment_at, "deadlineAt": None, "tat_seconds": None,
     })
     parent_status = _human_split_parent_status(job, segments)
     updates = {
@@ -13043,7 +13717,9 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         "assigned_worker_uids": list(job.get("assigned_worker_uids") or []),
         "ai_agent_status": "queued", "ai_agent_id": agent_id,
         "ai_agent_name": agent["name"], "ai_agent_model_ids": agent["models"],
-        "ai_agent_run_id": run_id, "ai_agent_error": "", "ai_agent_docx": firestore.DELETE_FIELD,
+        "ai_agent_run_id": run_id, "ai_agent_assigned_by_uid": assignment_uid,
+        "ai_agent_assigned_by_email": assignment_email, "ai_agent_assignedAt": assignment_at,
+        "ai_agent_error": "", "ai_agent_docx": firestore.DELETE_FIELD,
         "ai_agent_scope": "whole_job" if whole_job_requested else ("part" if split_job else "single_job"),
         "ai_agent_paused_segments": paused_segments if whole_job_requested else firestore.DELETE_FIELD,
         "ai_agent_previous_split_mode": previous_split_mode if whole_job_requested else firestore.DELETE_FIELD,
@@ -13069,6 +13745,8 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             "run_id": run_id, "job_id": job_id, "segment_id": segment_id,
             "agent_id": agent_id, "agent_name": agent["name"], "model_ids": agent["models"],
             "scope": "whole_job" if whole_job_requested else ("part" if split_job else "single_job"),
+            "assigned_by_uid": assignment_uid, "assigned_by_email": assignment_email,
+            "assignedAt": assignment_at,
             "batch_job_ids": batch_job_ids,
             "template_job_guidelines": job_specific_guidelines if agent_id == "template-claude" else "",
             "template_reference_files": stored_template_reference_files if agent_id == "template-claude" else [],
@@ -13303,6 +13981,9 @@ async def human_admin_assign_letter_agent(job_id: str, request: Request, backgro
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     run_id = uuid.uuid4().hex
+    assignment_at = _human_shift_local_now()
+    assignment_email = str(actor.get("email") or "").strip().lower()
+    assignment_uid = str(actor.get("uid") or "").strip()
     job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
     transaction = db.transaction()
 
@@ -13319,6 +14000,9 @@ async def human_admin_assign_letter_agent(job_id: str, request: Request, backgro
             "letter_agent_name": HUMAN_AI_AGENTS["letter-opus"]["name"],
             "letter_agent_status": "queued", "letter_agent_model_ids": HUMAN_AI_AGENTS["letter-opus"]["models"],
             "letter_agent_run_id": run_id, "letter_agent_error": "",
+            "letter_agent_assigned_by_uid": assignment_uid,
+            "letter_agent_assigned_by_email": assignment_email,
+            "letter_agent_assignedAt": assignment_at,
             "letter_ai_review_status": "not_started", "letter_ai_review_error": "",
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
@@ -13334,6 +14018,7 @@ async def human_admin_assign_letter_agent(job_id: str, request: Request, backgro
             restore_keys = (
                 "status", "letter_agent_id", "letter_agent_name", "letter_agent_status",
                 "letter_agent_model_ids", "letter_agent_run_id", "letter_agent_error",
+                "letter_agent_assigned_by_uid", "letter_agent_assigned_by_email", "letter_agent_assignedAt",
                 "letter_ai_review_status", "letter_ai_review_error", "updatedAt",
             )
             try:
@@ -13348,6 +14033,7 @@ async def human_admin_assign_letter_agent(job_id: str, request: Request, backgro
             restore_keys = (
                 "status", "letter_agent_id", "letter_agent_name", "letter_agent_status",
                 "letter_agent_model_ids", "letter_agent_run_id", "letter_agent_error",
+                "letter_agent_assigned_by_uid", "letter_agent_assigned_by_email", "letter_agent_assignedAt",
                 "letter_ai_review_status", "letter_ai_review_error", "updatedAt",
             )
             try:
@@ -13378,6 +14064,9 @@ async def human_admin_retry_letter_ai_review(job_id: str, request: Request, back
     review_updates = {
         "reviewer_choice": "ai", "reviewer_status": "queued",
         "letter_ai_review_status": "queued", "letter_ai_review_error": "",
+        "letter_ai_review_assigned_by_uid": str(actor.get("uid") or "").strip(),
+        "letter_ai_review_assigned_by_email": str(actor.get("email") or "").strip().lower(),
+        "letter_ai_review_assignedAt": _human_shift_local_now(),
         "letter_ai_review_attachment": None, "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     await asyncio.to_thread(review_ref.update, review_updates)
@@ -14409,6 +15098,9 @@ async def human_admin_ai_review(job_id: str, request: Request):
     }
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
         "ai_review": saved, "ai_review_applied": False,
+        "ai_review_assigned_by_uid": str(actor.get("uid") or "").strip(),
+        "ai_review_assigned_by_email": str(actor.get("email") or "").strip().lower(),
+        "ai_review_assignedAt": _human_shift_local_now(),
         "reviewer_choice": "ai", "reviewer_status": "completed",
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
