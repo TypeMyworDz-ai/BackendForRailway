@@ -8895,6 +8895,13 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
         extra_files.append((extra_name, extra_raw, extra.content_type or "application/octet-stream"))
     admin_note = str(instructions or "").strip()[:4000]
     job_instructions = (TEXT_MESSAGES_DEFAULT_INSTRUCTION if is_text_messages else PDF_JOB_DEFAULT_INSTRUCTION) + (f"\n\n{admin_note}" if admin_note else "")
+    source_filenames = [os.path.basename(str(getattr(item, "filename", "") or "image"))[:180] for item in files]
+    first_source_name = source_filenames[0] if source_filenames else "images"
+    first_source_stem = os.path.splitext(first_source_name)[0] or "images"
+    upload_batch_id = uuid.uuid4().hex
+    upload_batch_name = first_source_name if len(source_filenames) == 1 else f"{first_source_name} + {len(source_filenames) - 1} more"
+    upload_download_name = first_source_stem if len(source_filenames) == 1 else f"{first_source_stem}-combined"
+    upload_page_number = 0
 
     async def rollback():
         bucket = _human_bucket()
@@ -8924,6 +8931,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             if image_count > PDF_JOB_MAX_IMAGES_PER_BATCH:
                 raise HTTPException(status_code=413, detail=f"A single upload batch can contain up to {PDF_JOB_MAX_IMAGES_PER_BATCH} image pages.")
             for rendered in rendered_images:
+                upload_page_number += 1
                 job_id = uuid.uuid4().hex
                 image_meta = await asyncio.to_thread(_human_store_raw_bytes, job_id, rendered["name"], rendered["raw"], "image/jpeg", "pdf")
                 stored_paths.append(image_meta["storage_path"])
@@ -8935,7 +8943,10 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                     reference_meta.append(meta)
                 now = firestore.SERVER_TIMESTAMP
                 job = {
-                    "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf", "pdf_batch_id": batch_id, "status": "approved", "admin_uploaded": True,
+                    "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf",
+                    "pdf_batch_id": batch_id, "pdf_upload_batch_id": upload_batch_id,
+                    "pdf_upload_batch_name": upload_batch_name, "pdf_upload_download_name": upload_download_name,
+                    "pdf_upload_page_number": upload_page_number, "status": "approved", "admin_uploaded": True,
                     "tat_seconds": human_image_tat_seconds(1), "instruction_attachments": reference_meta,
                     "createdAt": now, "updatedAt": now,
                     "seconds": 180, "minutes": 1,
@@ -8958,7 +8969,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                     job_id, "New Text Messages work is available" if is_text_messages else "New PDF image work is available",
                     "An admin-uploaded image is open on the Available Jobs board.",
                 ))
-        return {"created_count": len(created_jobs), "jobs": created_jobs, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
+        return {"created_count": len(created_jobs), "jobs": created_jobs, "upload_batch_id": upload_batch_id, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
     except HTTPException:
         await rollback()
         raise
@@ -8973,6 +8984,35 @@ def _pdf_page_has_text(item):
         if (part or {}).get("status") == "submitted" and str((part or {}).get("transcript") or "").strip():
             return True
     return bool(str(item.get("transcript") or "").strip() or (item.get("final_attachment") or {}).get("storage_path"))
+
+
+def _human_pdf_upload_order_key(job, job_id=""):
+    """Return the original upload order, falling back to legacy source-page order."""
+    image = job.get("pdf_image") or {}
+    for value in (job.get("pdf_upload_page_number"), image.get("page_number")):
+        try:
+            number = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number, str(job_id)
+    return 0, str(job_id)
+
+
+def _human_pdf_same_upload_batch(first, other):
+    first_id = str(first.get("pdf_upload_batch_id") or "").strip()
+    other_id = str(other.get("pdf_upload_batch_id") or "").strip()
+    return bool(first_id) and first_id == other_id
+
+
+def _human_pdf_same_source_file(first, other):
+    first_id = str(first.get("pdf_batch_id") or "").strip()
+    other_id = str(other.get("pdf_batch_id") or "").strip()
+    if first_id or other_id:
+        return bool(first_id) and first_id == other_id
+    first_name = str((first.get("pdf_image") or {}).get("source_filename") or "")
+    other_name = str((other.get("pdf_image") or {}).get("source_filename") or "")
+    return bool(first_name) and first_name == other_name
 
 
 async def _pdf_page_draft_text(item):
@@ -9006,20 +9046,27 @@ async def human_admin_create_file_review(request: Request):
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     payload = await request.json()
-    ids = list(dict.fromkeys(str(item) for item in ((payload or {}).get("job_ids") or [])))[:60]
+    ids = list(dict.fromkeys(str(item) for item in ((payload or {}).get("job_ids") or [])))
     if not ids:
         raise HTTPException(status_code=400, detail="Choose at least one completed image job for review.")
+    if len(ids) > 60:
+        raise HTTPException(status_code=413, detail="Whole-image review currently supports up to 60 images at a time.")
+    requested_upload_batch_id = str((payload or {}).get("upload_batch_id") or "").strip()[:120]
     pages = []
     for job_id in ids:
         pages.append((job_id, await _human_job(job_id)))
     first = pages[0][1]
     category = str(first.get("job_category") or "pdf")
-    batch = str(first.get("pdf_batch_id") or "")
     for job_id, item in pages:
-        same_file = (str(item.get("pdf_batch_id") or "") == batch) and (batch or (item.get("pdf_image") or {}).get("source_filename") == (first.get("pdf_image") or {}).get("source_filename"))
-        if str(item.get("job_type") or "").lower() != "pdf_job" or item.get("pdf_review") or not same_file or str(item.get("job_category") or "pdf") != category:
-            raise HTTPException(status_code=409, detail="Every page must come from the same uploaded file.")
-    pages.sort(key=lambda entry: int(((entry[1].get("pdf_image") or {}).get("page_number")) or 0))
+        same_group = (
+            _human_pdf_same_upload_batch(first, item)
+            and str(first.get("pdf_upload_batch_id") or "").strip() == requested_upload_batch_id
+            if requested_upload_batch_id
+            else _human_pdf_same_source_file(first, item)
+        )
+        if str(item.get("job_type") or "").lower() != "pdf_job" or item.get("pdf_review") or not same_group or str(item.get("job_category") or "pdf") != category:
+            raise HTTPException(status_code=409, detail="Every page must come from the same upload batch or source file.")
+    pages.sort(key=lambda entry: _human_pdf_upload_order_key(entry[1], entry[0]))
     review_key = ",".join(job_id for job_id, _ in pages)
     existing = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("pdf_review_key", "==", review_key)).limit(1).stream()))
     if existing:
@@ -9032,7 +9079,11 @@ async def human_admin_create_file_review(request: Request):
         page_texts.append(text)
     if missing:
         raise HTTPException(status_code=409, detail="These pages have no transcript yet: " + ", ".join(missing) + ". Finish every page before starting the whole-file review.")
-    source_name = str((first.get("pdf_image") or {}).get("source_filename") or "file")
+    source_image = first.get("pdf_image") or {}
+    source_name = str(
+        (first.get("pdf_upload_batch_name") if requested_upload_batch_id else "")
+        or source_image.get("source_filename") or "file"
+    )
     new_id = uuid.uuid4().hex
     bucket = _human_bucket()
     stored_paths = []
@@ -9061,8 +9112,14 @@ async def human_admin_create_file_review(request: Request):
         now = firestore.SERVER_TIMESTAMP
         job = {
             "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job",
-            "job_category": category, "pdf_batch_id": "review-" + (batch or new_id), "status": "approved",
-            "pdf_review": {"source_job_ids": [job_id for job_id, _ in pages], "page_count": len(pages), "page_texts": page_texts, "source_filename": source_name},
+            "job_category": category,
+            "pdf_batch_id": "review-" + (requested_upload_batch_id or str(first.get("pdf_batch_id") or "") or new_id),
+            "status": "approved",
+            "pdf_review": {
+                "source_job_ids": [job_id for job_id, _ in pages], "page_count": len(pages),
+                "page_texts": page_texts, "source_filename": source_name,
+                "source_upload_batch_id": requested_upload_batch_id,
+            },
             "pdf_review_key": review_key,
             "tat_seconds": tat_seconds, "instruction_attachments": reference_meta, "createdAt": now, "updatedAt": now,
             "seconds": 180, "minutes": 1, "turnaround": "standard", "difficulty": "standard",
@@ -9115,8 +9172,13 @@ async def human_admin_list_pdf_jobs(request: Request):
             "ai_agent_error": item.get("ai_agent_error") or "",
             "ai_agent_segment_id": next((str(part.get("id") or "") for part in (item.get("segments") or []) if part.get("ai_agent_id") in HUMAN_IMAGE_AGENT_IDS), ""),
             "category": item.get("job_category") or "pdf", "batch_id": item.get("pdf_batch_id") or "",
+            "upload_batch_id": item.get("pdf_upload_batch_id") or "",
+            "upload_batch_name": item.get("pdf_upload_batch_name") or image.get("source_filename") or image.get("name") or "Image upload",
+            "upload_download_name": item.get("pdf_upload_download_name") or image.get("source_filename") or image.get("name") or "image-upload",
+            "upload_page_number": item.get("pdf_upload_page_number") or image.get("page_number") or 1,
             "has_text": bool(_pdf_page_has_text(item)), "is_review": bool(item.get("pdf_review")),
             "review_of": list((item.get("pdf_review") or {}).get("source_job_ids") or []),
+            "review_upload_batch_id": str((item.get("pdf_review") or {}).get("source_upload_batch_id") or ""),
             "ai_agent_model_ids": item.get("ai_agent_model_ids") or [],
             "reference_files": len(item.get("instruction_attachments") or []),
             "deadline_at": _human_iso(item.get("deadlineAt")),
@@ -9135,19 +9197,32 @@ async def human_admin_download_pdf_batch(batch_id: str, request: Request):
         raise HTTPException(status_code=403, detail="PDF batch downloads are available only to the admin team.")
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    batch_key = str(batch_id)[:120]
     snapshots = await asyncio.to_thread(lambda: list(
         db.collection(HUMAN_JOB_COLLECTION)
-        .where(filter=FieldFilter("pdf_batch_id", "==", str(batch_id)[:120]))
+        .where(filter=FieldFilter("pdf_upload_batch_id", "==", batch_key))
         .stream()
     ))
+    # Older jobs used one batch ID per original PDF/image file. Keep their
+    # existing download links working while new uploads share one ID across
+    # every image selected in the same admin submission.
+    if not snapshots:
+        snapshots = await asyncio.to_thread(lambda: list(
+            db.collection(HUMAN_JOB_COLLECTION)
+            .where(filter=FieldFilter("pdf_batch_id", "==", batch_key))
+            .stream()
+        ))
     pages = [(snap.id, snap.to_dict() or {}) for snap in snapshots]
     pages = [(job_id, job) for job_id, job in pages if job.get("job_type") == "pdf_job" and not job.get("pdf_review")]
     if not pages:
-        raise HTTPException(status_code=404, detail="The uploaded source file was not found.")
-    pages.sort(key=lambda item: int(((item[1].get("pdf_image") or {}).get("page_number")) or 0))
-    source_names = {str((job.get("pdf_image") or {}).get("source_filename") or "") for _, job in pages}
-    if len(source_names) != 1 or len(pages) > 100:
-        raise HTTPException(status_code=409, detail="The source pages could not be safely combined into one file.")
+        raise HTTPException(status_code=404, detail="The uploaded image batch was not found.")
+    pages.sort(key=lambda item: _human_pdf_upload_order_key(item[1], item[0]))
+    if len(pages) > 100:
+        raise HTTPException(status_code=409, detail="The upload contains too many images to safely combine into one PDF.")
+    source_names = list(dict.fromkeys(
+        str((job.get("pdf_image") or {}).get("source_filename") or "") for _, job in pages
+        if str((job.get("pdf_image") or {}).get("source_filename") or "").strip()
+    ))
     bucket = _human_bucket()
     if bucket is None:
         raise HTTPException(status_code=503, detail="Private file storage is not ready yet.")
@@ -9166,8 +9241,14 @@ async def human_admin_download_pdf_batch(batch_id: str, request: Request):
             raise HTTPException(status_code=404, detail="No source pages were available to combine.")
         output = BytesIO()
         page_images[0].save(output, format="PDF", save_all=True, append_images=page_images[1:], resolution=150)
-        filename = os.path.splitext(os.path.basename(next(iter(source_names)) or "source-file"))[0]
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._-") or "source-file"
+        filename = next((
+            str(job.get("pdf_upload_download_name") or "").strip()
+            for _, job in pages if str(job.get("pdf_upload_download_name") or "").strip()
+        ), "")
+        if not filename:
+            filename = os.path.splitext(source_names[0])[0] if len(source_names) == 1 else "combined-images"
+        filename = os.path.splitext(os.path.basename(filename))[0] or "combined-images"
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._-") or "combined-images"
         return Response(
             content=output.getvalue(), media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"', "Cache-Control": "private, no-store"},
@@ -12369,6 +12450,9 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
     review = job.get("pdf_review") or {}
     bucket = _human_bucket()
     metas = job.get("pdf_images") or [job.get("pdf_image") or {}]
+    # Review pages were copied in original upload order; sort once more so the
+    # AI sees the same sequence as the downloadable combined PDF.
+    metas = sorted(metas, key=lambda meta: int((meta or {}).get("page_number") or 0))
     images = []
     page_image_hashes = []
     for meta in metas:
@@ -12881,21 +12965,24 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         raise HTTPException(status_code=409, detail="This job has no source audio for an AI transcription draft.")
     batch_job_ids = []
     requested_batch = (payload or {}).get("batch_job_ids")
+    requested_upload_batch_id = str((payload or {}).get("upload_batch_id") or "").strip()[:120]
     if is_pdf and isinstance(requested_batch, list) and len(requested_batch) > 1:
         wanted = list(dict.fromkeys(str(item) for item in requested_batch))[:200]
         if job_id not in wanted:
-            raise HTTPException(status_code=400, detail="The whole-file list must include this page.")
+            raise HTTPException(status_code=400, detail="The whole-image list must include this image.")
         ordered = []
         for other_id in wanted:
             other = job if other_id == job_id else await _human_job(other_id)
-            same_file = (
-                str(other.get("pdf_batch_id") or "") == str(job.get("pdf_batch_id") or "")
-                and (str(job.get("pdf_batch_id") or "") or (other.get("pdf_image") or {}).get("source_filename") == (job.get("pdf_image") or {}).get("source_filename"))
+            same_group = (
+                _human_pdf_same_upload_batch(job, other)
+                and str(job.get("pdf_upload_batch_id") or "").strip() == requested_upload_batch_id
+                if requested_upload_batch_id
+                else _human_pdf_same_source_file(job, other)
             )
-            if str(other.get("job_type") or "").lower() != "pdf_job" or not same_file or str(other.get("job_category") or "pdf") != str(job.get("job_category") or "pdf"):
-                raise HTTPException(status_code=409, detail="Every page in a whole-file assignment must come from the same uploaded file.")
-            ordered.append((int((other.get("pdf_image") or {}).get("page_number") or 0), other_id))
-        batch_job_ids = [item[1] for item in sorted(ordered)]
+            if str(other.get("job_type") or "").lower() != "pdf_job" or not same_group or str(other.get("job_category") or "pdf") != str(job.get("job_category") or "pdf"):
+                raise HTTPException(status_code=409, detail="Every image in a combined AI assignment must come from the selected upload batch or source file.")
+            ordered.append((_human_pdf_upload_order_key(other, other_id), other_id))
+        batch_job_ids = [item[1] for item in sorted(ordered, key=lambda entry: entry[0])]
     if agent_id == "template-claude":
         _template_meta, template_raw = await _human_template_docx_bytes(job_id, job)
         try:
