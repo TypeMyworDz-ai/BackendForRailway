@@ -7658,6 +7658,31 @@ def _human_ai_draft_finish_eligible(job):
     return bool(job.get("pdf_review") and str(job.get("transcript") or "").strip())
 
 
+def _human_admin_finish_job_eligible(job):
+    """Allow an admin to finish only complete submitted work, never live assignments."""
+    job = job or {}
+    if job.get("status") not in {"submitted", "proofreading_available"}:
+        return False
+    if job.get("proofreader_status") in {"assigned", "in_progress"}:
+        return False
+    if job.get("reviewer_status") in {"queued", "processing"}:
+        return False
+    if job.get("letter_ai_review_status") in {"queued", "processing"}:
+        return False
+    segments = [dict(item or {}) for item in (job.get("segments") or [])]
+    if segments:
+        return all(
+            item.get("status") == "submitted"
+            and bool(str(item.get("transcript") or item.get("transcript_html") or "").strip()
+                     or (item.get("final_attachment") or {}).get("storage_path"))
+            for item in segments
+        )
+    return bool(
+        str(job.get("transcript") or job.get("transcript_html") or "").strip()
+        or (job.get("final_attachment") or {}).get("storage_path")
+    )
+
+
 def _human_claim_is_active(job, worker_uid, claim):
     if not job or not claim:
         return False
@@ -8396,7 +8421,7 @@ def _human_subadmin_assignment_metadata(job, segment=None, ai_used=None):
     return "", "", None
 
 
-def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None):
+def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None, segment_ids=None, ai_only=False):
     """Build one idempotent earning per approved Human Work job or submitted slice."""
     job = job or {}
     actor = actor or {}
@@ -8417,10 +8442,16 @@ def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None):
     image_review_job = is_image and bool(job.get("pdf_review"))
     items = []
     parts = [(None, job)] if image_review_job or not submitted_segments else [(part, part) for part in submitted_segments]
+    if segment_ids is not None and not image_review_job:
+        selected_ids = {str(value or "").strip() for value in segment_ids}
+        parts = [(segment, content) for segment, content in parts if str((segment or {}).get("id") or "").strip() in selected_ids]
 
     for segment, content in parts:
-        if segment is not None and not str(segment.get("transcript") or segment.get("transcript_html") or "").strip():
+        if ai_only and not _human_subadmin_ai_used(job, segment):
             continue
+        if segment is not None and not str(segment.get("transcript") or segment.get("transcript_html") or "").strip():
+            if is_image or not (segment.get("final_attachment") or {}).get("storage_path"):
+                continue
         ai_used = _human_subadmin_ai_used(job, segment)
         if not ai_used:
             has_human_submission = bool(
@@ -10028,7 +10059,7 @@ async def _human_subadmin_close_due_pay_periods(now=None):
             logger.warning("Could not close sub-admin pay period %s: %s", payout_id, exc)
 
 
-async def _human_subadmin_accrue_job_earnings(job_id, job, actor):
+async def _human_subadmin_accrue_job_earnings(job_id, job, actor, segment_ids=None, ai_only=False):
     if not db:
         return 0
     job = dict(job or {})
@@ -10056,7 +10087,9 @@ async def _human_subadmin_accrue_job_earnings(job_id, job, actor):
     except Exception as exc:
         logger.warning("Could not load sub-admin pay rates; using defaults: %s", exc)
         rate_values = _human_subadmin_rate_defaults()
-    specs = _human_subadmin_earning_specs(job_id, job, actor, rates=rate_values)
+    specs = _human_subadmin_earning_specs(
+        job_id, job, actor, rates=rate_values, segment_ids=segment_ids, ai_only=ai_only,
+    )
     created = 0
     for item in specs:
         ref = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(item["earning_id"])
@@ -11701,6 +11734,58 @@ async def human_admin_finish_ai_agent_draft(job_id: str, request: Request):
         logger.exception("Could not accrue sub-admin earnings for finished AI draft %s", job_id)
     await _complete_human_admin_notifications(job_id, {"job_submitted"})
     return {"status": "released", "job_id": job_id, "client_charged": False, "client_notified": False}
+
+
+@app.post("/human-transcription/jobs/{job_id}/finish")
+async def human_admin_finish_job(job_id: str, request: Request):
+    """Complete admin proofreading after every part is submitted, without bypassing client approval or charges."""
+    actor = _require_human_job_admin(request)
+    job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    transaction = db.transaction()
+
+    @firestore.transactional
+    def finish_complete_job(tx):
+        snapshot = job_ref.get(transaction=tx)
+        if not snapshot.exists:
+            raise HTTPException(status_code=404, detail="This Human Work job was not found.")
+        current = snapshot.to_dict() or {}
+        if not _human_admin_finish_job_eligible(current):
+            raise HTTPException(
+                status_code=409,
+                detail="This job is not ready to finish. Every part must be submitted, and any active reviewer must finish or be taken back first.",
+            )
+        job_type = str(current.get("job_type") or "").strip().lower()
+        internal_release = job_type in {"pdf_job", "letter_job"} or current.get("admin_uploaded") is True
+        finished_status = "released" if internal_release else "client_review"
+        updates = {
+            "status": finished_status,
+            "admin_finishedAt": firestore.SERVER_TIMESTAMP,
+            "admin_finishedBy": str(actor.get("email") or "").strip().lower(),
+            "reviewedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        }
+        if internal_release:
+            updates["releasedAt"] = firestore.SERVER_TIMESTAMP
+        tx.update(job_ref, updates)
+        return current, finished_status, internal_release
+
+    current_job, finished_status, internal_release = await asyncio.to_thread(finish_complete_job, transaction)
+    try:
+        await _human_subadmin_accrue_job_earnings(job_id, current_job, actor)
+    except Exception:
+        logger.exception("Could not accrue sub-admin earnings for finished Human Work job %s", job_id)
+    await _complete_human_admin_notifications(job_id, {"job_submitted"})
+    if not internal_release and current_job.get("client_uid"):
+        await _create_user_notification(
+            str(current_job["client_uid"]), f"human-review-ready:{job_id}", "human_review_ready",
+            "Your transcript is ready to review", "Open your Human Work job to review the completed transcript.",
+            route="human_job", job_id=job_id, target_id=job_id, requires_action=True,
+        )
+    return {
+        "status": finished_status, "job_id": job_id, "finished": True,
+        "client_review_required": not internal_release,
+        "client_charged": False, "client_notified": bool(not internal_release and current_job.get("client_uid")),
+    }
 
 
 @app.post("/human-transcription/jobs/{job_id}/client-approve")
@@ -13505,6 +13590,12 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             "status": "submitted", "model_ids": model_ids, "audio_seconds": int(audio_seconds),
             "elapsed_seconds": int(time.time() - started), "completedAt": firestore.SERVER_TIMESTAMP,
         })
+        try:
+            await _human_subadmin_accrue_job_earnings(
+                job_id, {**current, **job_updates}, {}, segment_ids=[segment_id], ai_only=True,
+            )
+        except Exception:
+            logger.exception("Could not accrue sub-admin earnings for successful AI submission %s/%s", job_id, segment_id)
         await _notify_human_admins(
             f"human-ai-agent-submitted:{run_id}", "job_submitted", "AI first draft ready for proofreading",
             f"{agent['name']} finished a draft. Assign an approved human proofreader before releasing the work.",
@@ -13883,13 +13974,20 @@ async def _human_run_letter_ai_review(job_id):
             _human_store_raw_bytes, job_id, f"{safe_base}-AI-reviewed.docx", reviewed_docx,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "letter-reviews",
         )
-        await asyncio.to_thread(job_ref.update, {
+        review_updates = {
             "letter_ai_review_status": "completed", "letter_ai_review_error": "",
             "reviewer_status": "completed", "letter_ai_review_attachment": reviewed_meta,
             "letter_ai_review_model_ids": [model_used] if isinstance(model_used, str) else list(model_used or []),
             "letter_ai_review_completedAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
-        })
+        }
+        await asyncio.to_thread(job_ref.update, review_updates)
+        try:
+            await _human_subadmin_accrue_job_earnings(
+                job_id, {**job, **review_updates, "reviewer_choice": "ai"}, {}, ai_only=True,
+            )
+        except Exception:
+            logger.exception("Could not accrue sub-admin earnings for successful Letter AI review %s", job_id)
     except Exception as exc:
         logger.exception("Letter AI review failed for %s", job_id)
         try:
@@ -13934,7 +14032,7 @@ async def _human_run_letter_agent(job_id, run_id):
         latest = current.to_dict() if current.exists else None
         if not latest or latest.get("letter_agent_run_id") != run_id or latest.get("status") != "in_progress":
             raise RuntimeError("This Letter Agent result was superseded before it could be saved.")
-        await asyncio.to_thread(job_ref.update, {
+        letter_updates = {
             "status": "submitted", "final_attachment": final_meta, "transcript": answer[:1000000],
             "letter_agent_status": "submitted", "letter_agent_error": "",
             "letter_agent_completedAt": firestore.SERVER_TIMESTAMP,
@@ -13943,7 +14041,12 @@ async def _human_run_letter_agent(job_id, run_id):
             "letter_ai_review_attachment": None, "reviewer_choice": "", "reviewer_status": "not_started",
             "submittedAt": firestore.SERVER_TIMESTAMP, "workerCompletedAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
-        })
+        }
+        await asyncio.to_thread(job_ref.update, letter_updates)
+        try:
+            await _human_subadmin_accrue_job_earnings(job_id, {**latest, **letter_updates}, {}, ai_only=True)
+        except Exception:
+            logger.exception("Could not accrue sub-admin earnings for successful Letter Agent submission %s", job_id)
         await _notify_human_admins(
             f"letter-agent-submitted:{job_id}:{run_id}", "job_submitted", "Letter Agent draft is ready",
             "The Letter Agent submitted a Word draft. Choose the AI reviewer or a human proofreader, then complete the final admin review.",
@@ -15096,14 +15199,19 @@ async def human_admin_ai_review(job_id: str, request: Request):
         "models_used": list(dict.fromkeys(models_used)),
         "createdAt": datetime.now().isoformat(),
     }
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+    review_updates = {
         "ai_review": saved, "ai_review_applied": False,
         "ai_review_assigned_by_uid": str(actor.get("uid") or "").strip(),
         "ai_review_assigned_by_email": str(actor.get("email") or "").strip().lower(),
         "ai_review_assignedAt": _human_shift_local_now(),
         "reviewer_choice": "ai", "reviewer_status": "completed",
         "updatedAt": firestore.SERVER_TIMESTAMP,
-    })
+    }
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, review_updates)
+    try:
+        await _human_subadmin_accrue_job_earnings(job_id, {**job, **review_updates}, actor, ai_only=True)
+    except Exception:
+        logger.exception("Could not accrue sub-admin earnings for successful AI review %s", job_id)
     return {"ai_review": saved, **credit_charge}
 
 
