@@ -276,7 +276,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-terra", "gemini-3.8-flash"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["claude-sonnet-5-5", "gemini-3.8-flash"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
         self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
@@ -314,7 +314,7 @@ class AiModelRouting(unittest.TestCase):
             target.id: ast.literal_eval(node.value)
             for node in cls.tree.body if isinstance(node, ast.Assign)
             for target in node.targets if isinstance(target, ast.Name)
-            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN"}
+            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"}
         }
 
     def test_ai_review_preserves_emphatic_repetition_and_limits_self_corrections(self):
@@ -331,8 +331,9 @@ class AiModelRouting(unittest.TestCase):
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("deepseek-v4-flash", "deepseek"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
 
     def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
@@ -374,38 +375,43 @@ class AiModelRouting(unittest.TestCase):
         letter_review = ast.unparse(self.functions["_human_run_letter_ai_review"])
         self.assertIn("AI_REVIEW_MODEL_CHAIN", letter_review)
 
-    def test_letter_research_labels_are_optional_when_results_exist(self):
-        import re
+    def test_research_footer_uses_only_grounded_terms_sources_and_explicit_no_search_note(self):
+        function = self.functions["_human_ai_agent_research_footer"]
+        namespace = {"re": re}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
+        footer = namespace["_human_ai_agent_research_footer"]
+        no_search = footer("Transcript body.", "")
+        self.assertIn("Research Notes:\nNo external searches were needed for this transcript.", no_search)
+        self.assertNotIn("I researched:", no_search)
+        with self.assertRaises(ValueError):
+            footer("Transcript body.\nI researched: Example Org.", "")
+        grounded = footer(
+            "Transcript body.\nClient spellings: Ann, My spellings: Lee.",
+            "Example Org | Example Organization | A service named in the transcript. | yes\n\n"
+            "ACTUAL GOOGLE SEARCH QUERIES:\n- Example Org official service\n\n"
+            "ACTUAL SEARCH SOURCES:\n- Official site: https://example.org",
+        )
+        self.assertIn("My spellings: Lee; I researched: Example Organization.", grounded)
+        self.assertIn("Research Notes:\n- Example Organization: A service named in the transcript. (confidence: yes)", grounded)
+        self.assertIn("https://example.org", grounded)
 
-        for owner_name, validator_name in (
-            ("_human_ai_agent_generate", "validate_template_research"),
-            ("_human_run_letter_ai_review", "validate_research"),
-        ):
-            owner = self.functions[owner_name]
-            validator = next(
-                node for node in ast.walk(owner)
-                if isinstance(node, ast.FunctionDef) and node.name == validator_name
-            )
-            namespace = {"re": re, "research": "Verified search result: Example Organization.", "template_agent": False}
-            exec(compile(ast.Module(body=[validator], type_ignores=[]), "main.py", "exec"), namespace)
-            self.assertIsNone(namespace[validator_name]("Dear Client,\n\nThe requested letter text."))
-            empty_namespace = {"re": re, "research": "", "template_agent": False}
-            exec(compile(ast.Module(body=[validator], type_ignores=[]), "main.py", "exec"), empty_namespace)
-            self.assertIsNone(empty_namespace[validator_name]("Dear Client,\n\nThe requested letter text."))
-            with self.assertRaises(ValueError):
-                empty_namespace[validator_name]("Client spellings: A. I researched: Example Organization.")
-
-    def test_worker_draft_uses_guidelines_context_and_fallback_before_charging(self):
+    def test_worker_draft_is_free_and_proofreader_is_one_credit_with_requested_fallback(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent"}.issubset(formatter_calls))
-        call_lines = {node.func.id: node.lineno for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertLess(call_lines["_human_ai_agent_research"], call_lines["_human_call_model_chain"])
-        model_call = next(node for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain")
-        self.assertTrue(any(keyword.arg == "response_validator" for keyword in model_call.keywords))
+        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent", "_human_ai_agent_research_footer"}.issubset(formatter_calls))
         route = self.functions["human_worker_ai_draft"]
-        call_lines = {node.func.id: node.lineno for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertLess(call_lines["_human_worker_format_ai_draft"], call_lines["charge_credits"])
-        self.assertIn('"format_version": 5', self.source)
+        draft_calls = {node.func.id for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertNotIn("charge_credits", draft_calls)
+        self.assertIn("'credits': 0", ast.unparse(route))
+        self.assertIn("'format_version': 6", ast.unparse(route))
+
+        proofread = self.functions["human_worker_ai_proofread_draft"]
+        proofread_source = ast.unparse(proofread)
+        self.assertIn("WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", proofread_source)
+        self.assertIn("plan_spend", proofread_source)
+        self.assertIn("credit_ledger", proofread_source)
+        self.assertIn("source_sha256", proofread_source)
+        self.assertIn("firestore.transactional", proofread_source)
+        self.assertIn("credits_charged", proofread_source)
 
     def test_worker_draft_prompt_requires_research_notes_and_handles_clear_speaker_corrections(self):
         function = self.functions["_human_worker_ai_draft_system"]
@@ -444,6 +450,9 @@ class AiModelRouting(unittest.TestCase):
         function = self.functions["_gemini_research_blocking"]
         namespace = {"GEMINI_API_KEY": "test-key", "requests": FakeRequests, "logger": QuietLogger()}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
+        with self.assertRaisesRegex(RuntimeError, "no grounded queries or sources"):
+            namespace["_gemini_research_blocking"]("prompt")
+        FakeRequests.response = Response({"candidates": [{"content": {"parts": [{"text": "NO_SEARCHED_TERMS"}]}}]})
         self.assertEqual(namespace["_gemini_research_blocking"]("prompt"), "NO_SEARCHED_TERMS")
 
         FakeRequests.response = Response({"candidates": [{
@@ -456,6 +465,14 @@ class AiModelRouting(unittest.TestCase):
         grounded = namespace["_gemini_research_blocking"]("prompt")
         self.assertIn("ACTUAL GOOGLE SEARCH QUERIES:\n- Summit Psych Ohio provider", grounded)
         self.assertIn("ACTUAL SEARCH SOURCES:\n- Summit Psych: https://example.test", grounded)
+
+    def test_every_ai_agent_image_path_researches_and_appends_notes(self):
+        generate = ast.unparse(self.functions["_human_ai_agent_generate"])
+        batch = ast.unparse(self.functions["_human_image_batch_compute"])
+        self.assertGreaterEqual(generate.count("_human_ai_agent_research"), 4)
+        self.assertGreaterEqual(generate.count("_human_ai_agent_research_footer"), 4)
+        self.assertIn("_human_ai_agent_research(page_draft, system)", batch)
+        self.assertIn("_human_ai_agent_research_footer(page_draft, page_research)", batch)
 
     def test_fallback_runs_only_after_failure_or_unusable_response(self):
         class QuietLogger:

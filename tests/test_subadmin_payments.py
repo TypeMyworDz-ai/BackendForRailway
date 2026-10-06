@@ -130,6 +130,44 @@ class SubadminPaymentTests(unittest.TestCase):
         self.assertIn("_human_subadmin_submission_actor", source)
         self.assertIn("segment_ids", source)
 
+    def test_human_submission_after_shift_uses_the_subadmin_approval_time(self):
+        build = self.namespace["_human_subadmin_earning_specs"]
+        job = {
+            "job_type": "general_job", "seconds": 65, "status": "submitted",
+            "worker_uid": "worker-1", "workerCompletedAt": "submitted",
+            "approvedAt": self.shift_time,
+        }
+        after_shift = datetime(2026, 10, 5, 21, 15, tzinfo=self.zone)
+        row = build("late-worker-submission", job, self.subadmin, now=after_shift)[0]
+        self.assertEqual(row["category"], "audio_human")
+        self.assertEqual(row["subadmin_email"], "info@typemywordz.ai")
+        self.assertEqual(row["shift_date"], "2026-10-05")
+
+    def test_explicit_main_admin_attribution_is_not_reassigned_to_subadmin(self):
+        choose_actor = self.namespace["_human_subadmin_submission_actor"]
+        main_admin_approved = {
+            "human_work_assigned_by_uid": "main-admin",
+            "human_work_assigned_by_email": "typemywordz@gmail.com",
+            "human_work_assignedAt": self.shift_time,
+        }
+        self.assertEqual(choose_actor(main_admin_approved), {})
+
+    def test_legacy_approved_jobs_use_the_queue_approval_timestamp(self):
+        metadata = self.namespace["_human_subadmin_assignment_metadata"]
+        approved = {"approvedAt": self.shift_time}
+        self.assertEqual(metadata(approved, ai_used=False), ("info@typemywordz.ai", "", self.shift_time))
+        actor = self.namespace["_human_subadmin_submission_actor"](approved)
+        self.assertEqual(actor, {"uid": "", "email": "info@typemywordz.ai"})
+
+    def test_approval_route_records_the_admin_and_shift_timestamp(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_approve")
+        source = ast.unparse(route)
+        self.assertIn("human_work_assigned_by_uid", source)
+        self.assertIn("human_work_assigned_by_email", source)
+        self.assertIn("human_work_assignedAt", source)
+        self.assertIn("_human_shift_local_now", source)
+
     def test_audio_earnings_apply_the_human_and_ai_rates_per_minute(self):
         build = self.namespace["_human_subadmin_earning_specs"]
         job = {
