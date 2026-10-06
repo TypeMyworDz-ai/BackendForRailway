@@ -276,7 +276,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["claude-sonnet-5-5", "gemini-3.8-flash"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
         self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
@@ -320,7 +320,7 @@ class AiModelRouting(unittest.TestCase):
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("claude-opus-5-5", "claude")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("deepseek-v4-flash", "deepseek")))
 
     def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
@@ -484,7 +484,15 @@ class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
             node for node in cls.tree.body if isinstance(node, ast.Assign)
             and any(getattr(target, "id", None) == "HUMAN_AI_AGENTS" for target in node.targets)
         )
-        namespace = {"os": __import__("os"), "HUMAN_AI_AGENTS": ast.literal_eval(agent_node.value), "__file__": str(source_path)}
+        correction_node = next(
+            node for node in cls.tree.body if isinstance(node, ast.Assign)
+            and any(getattr(target, "id", None) == "HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE" for target in node.targets)
+        )
+        namespace = {
+            "os": __import__("os"), "HUMAN_AI_AGENTS": ast.literal_eval(agent_node.value),
+            "HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE": ast.literal_eval(correction_node.value),
+            "__file__": str(source_path),
+        }
         selected = [
             cls.functions["_human_template_agent_guidelines"],
             cls.functions["_human_ai_agent_system"],
@@ -523,6 +531,19 @@ class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
         )
         self.assertNotIn("PERMANENT TEMPLATE-JOB GUIDELINES", prompt)
         self.assertNotIn("CURRENT JOB TEMPLATE-SPECIFIC GUIDELINES", prompt)
+
+    def test_general_agent_and_reviewer_only_receive_clear_self_correction_rule(self):
+        general_prompt = self.helpers["_human_ai_agent_system"](
+            "general-gpt", "transcription and formatting", "general instructions", "job files",
+        )
+        template_prompt = self.helpers["_human_ai_agent_system"](
+            "template-claude", "transcription and formatting", "general instructions", "job files",
+        )
+        self.assertIn("Dublin Granville— East Dublin Granville", general_prompt)
+        self.assertIn("Preserve all other wording, order, grammar, and repetition", general_prompt)
+        self.assertNotIn("GENERAL-JOBS SPEAKER SELF-CORRECTIONS", template_prompt)
+        reviewer = ast.unparse(self.functions["human_admin_ai_review"])
+        self.assertIn("HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE if job_type == 'general_job'", reviewer)
 
     def test_current_job_notes_and_uploaded_references_are_saved_privately_per_run(self):
         assign = ast.unparse(next(node for node in self.tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_assign_ai_agent"))

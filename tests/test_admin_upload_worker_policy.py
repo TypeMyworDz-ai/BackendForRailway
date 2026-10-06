@@ -58,7 +58,7 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
             "_human_deadline_event_id", "_human_worker_retraining_updates",
             "_human_shift_parse_datetime", "_human_shift_is_scheduled",
             "_human_shift_call_in_active", "_human_shift_status_payload",
-            "_human_collapse_duplicate_image_page_blocks",
+            "_human_ai_draft_finish_eligible", "_human_collapse_duplicate_image_page_blocks",
         ]
         exec(compile(ast.Module(body=[cls.functions[name] for name in wanted], type_ignores=[]), str(MAIN_PATH), "exec"), cls.namespace)
 
@@ -104,6 +104,47 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertFalse(scheduled(datetime(2026, 10, 5, 20, 0, tzinfo=zone)))
         self.assertFalse(scheduled(datetime(2026, 10, 10, 16, 0, tzinfo=zone)))
         self.assertFalse(scheduled(datetime(2026, 10, 11, 16, 0, tzinfo=zone)))
+
+    def test_off_shift_self_claim_requires_explicit_opt_in_and_fresh_workroom_presence(self):
+        status_payload = self.namespace["_human_shift_status_payload"]
+        zone = self.namespace["HUMAN_SHIFT_TIMEZONE"]
+        now = datetime(2026, 10, 5, 20, 15, tzinfo=zone)
+        recent = {"lastPresenceAt": "2026-10-05T20:14:00+03:00"}
+        opted_in = status_payload("worker-1", {"workerApproved": True, "is_available": True}, recent, now)
+        self.assertTrue(opted_in["can_claim"])
+        self.assertTrue(opted_in["off_shift_self_claim"])
+        self.assertTrue(opted_in["workroom_online"])
+        self.assertFalse(opted_in["clocked_in"])
+        self.assertFalse(opted_in["online"], "off-shift presence must not count as attendance or admin overtime eligibility")
+
+        opted_out = status_payload("worker-1", {"workerApproved": True, "is_available": False}, recent, now)
+        self.assertFalse(opted_out["can_claim"])
+        self.assertFalse(opted_out["off_shift_self_claim"])
+        missing_preference = status_payload("worker-1", {"workerApproved": True}, recent, now)
+        self.assertFalse(missing_preference["can_claim"], "unset availability is not opt-in")
+        stale = status_payload("worker-1", {"workerApproved": True, "is_available": True}, {"lastPresenceAt": "2026-10-05T20:10:00+03:00"}, now)
+        self.assertFalse(stale["can_claim"])
+        called_in = status_payload(
+            "worker-1", {"workerApproved": True, "is_available": True, "humanShiftCallInExpiresAt": "2026-10-06T00:00:00+03:00"}, recent, now,
+        )
+        self.assertFalse(called_in["off_shift_self_claim"], "admin call-ins use clock-in, not the self-claim path")
+
+    def test_scheduled_shift_claim_does_not_require_availability_toggle(self):
+        status_payload = self.namespace["_human_shift_status_payload"]
+        zone = self.namespace["HUMAN_SHIFT_TIMEZONE"]
+        now = datetime(2026, 10, 5, 18, 0, tzinfo=zone)
+        result = status_payload("worker-1", {"workerApproved": True, "is_available": False}, {"clockedInAt": "2026-10-05T15:00:00+03:00"}, now)
+        self.assertTrue(result["scheduled_now"])
+        self.assertFalse(result["availability_required"])
+        self.assertTrue(result["can_claim"])
+        self.assertFalse(result["off_shift_self_claim"])
+
+    def test_off_shift_presence_refresh_does_not_record_shift_attendance(self):
+        presence = ast.unparse(self.functions["human_worker_shift_presence"])
+        self.assertIn("off_shift_available", presence)
+        self.assertIn("lastPresenceAt", presence)
+        self.assertNotIn('updates["clockedInAt"]', presence)
+        self.assertNotIn('updates["clockedOutAt"]', presence)
 
     def test_admin_call_in_allows_clocked_in_worker_to_claim_after_shift(self):
         status_payload = self.namespace["_human_shift_status_payload"]
@@ -177,6 +218,38 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertIn("'admin_uploaded': True", create_audio)
         self.assertIn("'quote_credits': 0", create_audio)
 
+    def test_internal_ai_finish_requires_all_parts_and_no_proofreader(self):
+        eligible = self.namespace["_human_ai_draft_finish_eligible"]
+        base = {
+            "admin_uploaded": True, "ai_agent_status": "submitted", "status": "proofreading_available",
+            "segments": [
+                {"id": "part-1", "status": "submitted", "transcript": "First completed section."},
+                {"id": "part-2", "status": "submitted", "transcript": "Second completed section."},
+            ],
+        }
+        self.assertTrue(eligible(base))
+        self.assertFalse(eligible({**base, "segments": [*base["segments"], {"id": "part-3", "status": "in_progress", "transcript": "unfinished"}]}))
+        self.assertFalse(eligible({**base, "proofreader_status": "assigned"}))
+        self.assertFalse(eligible({**base, "proofreader_status": "in_progress"}))
+        self.assertFalse(eligible({**base, "proofreader_status": "submitted"}))
+        self.assertFalse(eligible({**base, "reviewer_choice": "human"}))
+        self.assertFalse(eligible({**base, "admin_uploaded": False}))
+        self.assertFalse(eligible({**base, "status": "in_progress"}))
+        self.assertFalse(eligible({**base, "segments": [{"id": "part-1", "status": "submitted", "transcript": "  "}]}))
+        self.assertTrue(eligible({
+            "admin_uploaded": True, "ai_agent_status": "submitted", "status": "submitted",
+            "job_type": "pdf_job", "pdf_review": {"page_count": 2}, "transcript": "Complete PDF draft.",
+        }))
+
+    def test_internal_ai_finish_only_marks_finished_without_client_side_effects(self):
+        route = ast.unparse(self.functions["human_admin_finish_ai_agent_draft"])
+        self.assertIn("_human_ai_draft_finish_eligible", route)
+        self.assertIn("'status': 'released'", route)
+        self.assertIn("'client_charged': False", route)
+        self.assertIn("'client_notified': False", route)
+        self.assertNotIn("charge_credits", route)
+        self.assertNotIn("_create_user_notification", route)
+
     def test_audio_jobs_require_a_completed_ai_or_human_review_before_admin_approval(self):
         review = ast.unparse(self.functions["human_admin_review"])
         self.assertIn("not is_pdf_job", review)
@@ -191,6 +264,11 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
 
 
 class ShiftAuthorizationRules(unittest.TestCase):
+    @staticmethod
+    def _functions():
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        return {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
     def test_main_admin_guard_and_after_shift_assigned_start_gate(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
@@ -208,7 +286,10 @@ class ShiftAuthorizationRules(unittest.TestCase):
         async def current_record(_uid):
             return None, shift
         def status_payload(*_args):
-            return {"online": not bool(shift.get("clockedOutAt")), "scheduled_now": False}
+            return {
+                "online": not bool(shift.get("clockedOutAt")), "scheduled_now": False,
+                "clocked_in": bool(shift.get("clockedInAt") and not shift.get("clockedOutAt")),
+            }
 
         namespace = {
             "HTTPException": RequestError,
@@ -233,6 +314,28 @@ class ShiftAuthorizationRules(unittest.TestCase):
         shift["clockedOutAt"] = "2026-10-05T20:30:00+03:00"
         with self.assertRaisesRegex(RequestError, "Clock in before starting"):
             asyncio.run(namespace["_human_shift_assert_can_start_assigned"](actor))
+        permitted_claim = asyncio.run(namespace["_human_shift_assert_can_start_assigned"](
+            actor, allow_after_hours_self_claim=True,
+        ))
+        self.assertFalse(permitted_claim["clocked_in"])
+
+    def test_accepted_after_hours_claim_marker_is_used_for_start_and_submit(self):
+        start = ast.unparse(self._functions()["human_worker_start"])
+        submit = ast.unparse(self._functions()["human_worker_submit"])
+        claim = ast.unparse(self._functions()["human_worker_claim"])
+        self.assertIn("allow_after_hours_self_claim=target.get('after_hours_self_claim') is True", start)
+        self.assertIn("allow_after_hours_self_claim=job.get('after_hours_self_claim') is True", start)
+        self.assertIn("allow_after_hours_self_claim=target.get('after_hours_self_claim') is True", submit)
+        self.assertIn("allow_after_hours_self_claim=job.get('after_hours_self_claim') is True", submit)
+        self.assertIn("require_availability=claim_window['availability_required']", claim)
+        self.assertIn("after_hours_self_claim=claim_window['off_shift_self_claim']", claim)
+
+    def test_direct_overtime_assignment_does_not_depend_on_self_claim_toggle(self):
+        for name in ("human_admin_assign", "human_admin_assign_whole", "human_admin_assign_proofreader"):
+            with self.subTest(route=name):
+                source = ast.unparse(self._functions()[name])
+                self.assertIn("_human_require_worker_online_for_overtime", source)
+                self.assertNotIn("is_available", source)
 
     def test_overtime_assignment_requires_online_presence(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
