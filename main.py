@@ -816,6 +816,7 @@ def _int(value):
 # the bridge and can be changed in one place before production charging starts.
 HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
+HUMAN_WORK_AI_CREDIT_COST = 2
 # Standard transcription starts at 30 KES per completed audio minute. The
 # main admin can change the rate for new jobs from Human Work > Worker rates.
 # Existing jobs keep the rate stored in their original quote; legacy jobs with
@@ -1435,9 +1436,12 @@ async def _notify_available_workers(job_id: str, title: str, body: str):
     except Exception as exc:
         logger.warning("Could not load workers to notify for %s: %s", job_id, exc)
         return
+    now = _human_shift_local_now()
     for snap in snapshots:
         data = snap.to_dict() or {}
-        if not _human_shift_is_scheduled() and data.get("is_available") is not True:
+        _, shift = await _human_shift_current_record(snap.id, now)
+        shift_status = _human_shift_status_payload(snap.id, data, shift, now)
+        if not shift_status.get("can_claim"):
             continue
         try:
             count = int(data.get("worker_rating_count") or 0)
@@ -1632,16 +1636,19 @@ async def _save_credit_updates(user_id: str, updates: dict, ledger_reason: str =
         return False
 
 
-async def charge_credits(user_id: str, user_email: str, amount: int, what: str, usage_category: str = ""):
+async def charge_credits(
+    user_id: str, user_email: str, amount: int, what: str,
+    usage_category: str = "", force_charge: bool = False,
+    require_saved: bool = False,
+):
     """Take credits for something the client has just received.
 
-    Deliberately forgiving. If the ledger cannot be reached we log it and let
-    the client keep what they have already been given, because silently losing
-    a finished transcript over a database hiccup is far worse than missing one
-    charge. The balance check that guards the paywall happens before the work
-    starts, not here.
+    Most uses preserve the historical admin/complimentary exemption and allow
+    completed work through if the ledger is briefly unavailable. Human Work
+    AI agent/reviewer runs opt into force_charge and require_saved because each
+    one must be billed before its provider call begins.
     """
-    if credits_exempt(user_email):
+    if credits_exempt(user_email) and not force_charge:
         return {'charged': 0, 'exempt': True}
     # Transcription jobs are tracked by email, the assistant by id. Accept
     # either, and look the id up when only the email is to hand.
@@ -1656,23 +1663,48 @@ async def charge_credits(user_id: str, user_email: str, amount: int, what: str, 
     usage_fields = {
         "standalone_ask": ("askTypeMyworDzCreditsUsed", "askTypeMyworDzQueries"),
         "transcript_query": ("transcriptAiCreditsUsed", "transcriptAiQueries"),
+        "human_work_ai": ("humanWorkAiCreditsUsed", "humanWorkAiCalls"),
     }
     if ok and usage_category in usage_fields and detail.get("charged", 0) > 0:
         credits_field, queries_field = usage_fields[usage_category]
         updates[credits_field] = firestore.Increment(int(detail["charged"]))
         updates[queries_field] = firestore.Increment(1)
     if updates:
-        await _save_credit_updates(
+        saved = await _save_credit_updates(
             user_id,
             updates,
             ledger_reason=what,
             ledger_context={"operation": "charge", "usage_category": usage_category or None},
         )
+        if require_saved and not saved:
+            return {'charged': 0, 'error': 'credit update could not be saved'}
     if ok:
         logger.info(f"Charged {detail.get('charged')} credits to {user_id} for {what}; {detail.get('remaining')} left")
     else:
         logger.warning(f"Could not charge {amount} credits to {user_id} for {what}: {detail}")
     return detail
+
+
+async def _human_charge_ai_call(actor, job_id: str, action: str):
+    """Charge the signed-in Human Work operator before an AI call starts."""
+    email = str((actor or {}).get("email") or "").strip().lower()
+    uid = str((actor or {}).get("uid") or (actor or {}).get("user_id") or "")
+    if not uid or not email:
+        raise HTTPException(status_code=401, detail="Sign in again before running this AI action.")
+    cost = HUMAN_WORK_AI_CREDIT_COST
+    detail = await charge_credits(
+        uid, email, cost, f"Human Work {action} · {job_id}",
+        usage_category="human_work_ai", force_charge=True, require_saved=True,
+    )
+    if int(detail.get("charged") or 0) != cost:
+        if detail.get("error") or detail.get("exempt"):
+            raise HTTPException(status_code=503, detail="The 2-credit charge could not be saved, so the AI action was not started. Please retry shortly.")
+        available = int(detail.get("available") or 0)
+        raise HTTPException(
+            status_code=402,
+            detail=f"This Human Work AI action costs 2 credits; your spendable balance is {available}. Add credits before continuing.",
+        )
+    return {"credits_deducted": cost, "credits_remaining": detail.get("remaining")}
 
 
 def is_admin_user(user_email: str) -> bool:
@@ -4439,14 +4471,27 @@ def _ask_claude(model_id, system_prompt, turns, question, images, max_tokens, au
 
 
 @app.get("/credits/balance")
-async def credits_balance(user_id: str = "", user_email: str = ""):
+async def credits_balance(
+    request: Request, user_id: str = "", user_email: str = "",
+    billable_ai_balance: bool = False,
+):
     """What this account can spend, and what each thing costs.
 
     The client shows this; it never decides it. Any refill or expiry noticed
     while reading is written back here, so the number a client sees is the
-    number the server will actually honour.
+    number the server will actually honour. The main admin's optional billable
+    AI view is authenticated and only reveals their own account balance.
     """
-    if credits_exempt(user_email):
+    if billable_ai_balance:
+        decoded = _verified_user(request)
+        verified_email = str(decoded.get("email") or "").strip().lower()
+        if (
+            not is_admin_user(verified_email)
+            or str(decoded.get("uid") or decoded.get("user_id") or decoded.get("sub") or "") != str(user_id or "")
+            or verified_email != str(user_email or "").strip().lower()
+        ):
+            raise HTTPException(status_code=403, detail="You can view only your own AI credit balance.")
+    elif credits_exempt(user_email):
         return {"exempt": True, "unlimited": True, "planCredits": None,
                 "topUpCredits": None, "total": None,
                 "costs": {"transcription_per_minute": 1},
@@ -7061,15 +7106,15 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
     presence = _human_shift_parse_datetime(shift.get("lastPresenceAt"))
     presence_age = (local_now - presence).total_seconds() if presence else None
     workroom_online = bool(presence_age is not None and -5 <= presence_age <= HUMAN_SHIFT_ONLINE_TTL_SECONDS)
-    is_online = bool(clocked_in and workroom_online)
+    available_for_work = profile.get("is_available") is True
+    # The switch is only a presence signal for admins. It never grants shift
+    # attendance or permission to claim; a fresh Work Room heartbeat is also
+    # required before the worker is shown as online.
+    is_online = bool(available_for_work and workroom_online)
     approved = profile.get("workerApproved") is True
     retraining = profile.get("worker_retraining_required") is True
-    available_for_off_shift = profile.get("is_available") is True
-    off_shift_self_claim = bool(
-        approved and not retraining and not scheduled and not active_call_in
-        and available_for_off_shift and workroom_online
-    )
-    if shift.get("clockedOutAt"):
+    reclocking_after_call_in = bool(active_call_in and not scheduled)
+    if shift.get("clockedOutAt") and not reclocking_after_call_in:
         status = "clocked_out"
     elif clocked_in:
         status = "online" if is_online else "clocked_in_idle"
@@ -7081,52 +7126,44 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         status = "missed"
     else:
         status = "off_shift"
-    can_clock_in = approved and not clocked_in and not shift.get("clockedOutAt") and (scheduled or active_call_in)
-    can_claim = bool(
-        approved and not retraining
-        and (
-            (clocked_in and (scheduled or active_call_in))
-            or off_shift_self_claim
-        )
-    )
-    availability_required = bool(not scheduled and not active_call_in)
+    can_clock_in = approved and not retraining and not clocked_in and (scheduled or active_call_in) and (not shift.get("clockedOutAt") or reclocking_after_call_in)
+    can_claim = bool(approved and not retraining and clocked_in and (scheduled or active_call_in))
     if retraining:
         message = "Your work access is paused. Please continue in the Training Room."
     elif status == "called_in_not_clocked_in":
-        message = "An admin has called you in. Clock in before claiming work."
+        message = "An admin has called you in. Clock in before claiming or starting work."
     elif status == "not_arrived":
-        message = "Your shift is open. Clock in before claiming work."
-    elif off_shift_self_claim:
-        message = "You are outside your regular shift, but your availability is on and you are online in the Work Room. You can claim queue jobs; their listed turnaround still applies."
-    elif not scheduled and not active_call_in and approved:
-        if not available_for_off_shift:
-            message = "Outside regular shift hours, turn on Available for work and keep the Work Room open to claim queue jobs."
-        elif not workroom_online:
-            message = "Outside regular shift hours. Keep the Work Room open with Available for work on; once your presence is detected, you can claim jobs."
-        else:
-            message = "Off-shift queue claims are unavailable right now. Check your work access or ask an admin."
-    elif status in {"online", "clocked_in_idle"} and not scheduled and not active_call_in:
-        message = "Your shift has ended. Finish any assigned work before clocking out."
+        message = "Your shift is open. Clock in before claiming work. The online toggle does not record attendance."
     elif status == "clocked_out":
-        message = "You are clocked out for the shift. Outside shift hours, you can still opt in to queue work by turning on availability and staying in the Work Room."
+        message = "You are clocked out for this shift. If admin calls you in after hours, clock in before claiming work."
     elif status == "missed":
-        message = "Today's shift has ended. Clock in during the next weekday shift, or opt in to off-shift queue work while online."
+        message = "Today's shift has ended. Contact an admin if you need to be called in; otherwise clock in during the next weekday shift."
     elif status == "off_shift":
-        message = (
-            "There are no regular shifts on weekends. You can opt in to queue work by turning on availability and staying in the Work Room."
-            if local_now.weekday() >= 5 else
-            "Regular shifts run Monday to Friday, 3:00 p.m. to 8:00 p.m. Kenya time. You can opt in to queue work outside those hours by turning on availability and staying in the Work Room."
-        )
+        message = "There are no regular weekend shifts. Work outside scheduled hours requires an admin call-in and clock-in."
+    elif clocked_in and not scheduled and not active_call_in:
+        message = "Your regular shift has ended. Clock out when no assignment is active; an admin call-in is required before taking new overtime work."
+    elif clocked_in and not available_for_work:
+        message = "You are clocked in and can claim work allowed by your current shift or admin call-in. Your online toggle is off, so admins see you as offline."
+    elif clocked_in and not scheduled:
+        message = "You are clocked in for an admin call-in. Finish assigned work before clocking out."
+    elif clocked_in:
+        message = "You are clocked in and can claim available work. Finish assigned work before clocking out."
+    elif is_online:
+        message = "You are marked online to admins. This does not count as attendance; clock in during a shift or after an admin call-in before claiming work."
+    elif available_for_work:
+        message = "Your online toggle is on. Keep this Work Room open so admins can see you online. It does not count as attendance or permit claims by itself."
     else:
-        message = "You are on shift and can claim available work."
+        message = "Your online toggle is off. Clock in during a scheduled shift or after an admin call-in before claiming work."
     return {
         "uid": uid, "date": local_now.date().isoformat(), "status": status,
         "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
         "scheduled_now": scheduled, "call_in_active": active_call_in,
         "clocked_in": clocked_in, "online": is_online, "workroom_online": workroom_online,
-        "off_shift_claim_enabled": available_for_off_shift,
-        "off_shift_self_claim": off_shift_self_claim,
-        "availability_required": availability_required,
+        "available_for_work": available_for_work,
+        # Kept false for old clients during their cache lifetime. Availability
+        # no longer enables off-shift self-claiming.
+        "off_shift_claim_enabled": False, "off_shift_self_claim": False,
+        "availability_required": False,
         "clocked_in_at": shift.get("clockedInAt") or "", "clocked_out_at": shift.get("clockedOutAt") or "",
         "last_presence_at": shift.get("lastPresenceAt") or "",
         "can_clock_in": can_clock_in, "can_claim": can_claim,
@@ -7158,7 +7195,7 @@ async def _human_shift_assert_can_start_assigned(actor, allow_after_hours_self_c
         if not allow_after_hours_self_claim:
             raise HTTPException(
                 status_code=403,
-                detail="Clock in before starting assigned work. Off-shift queue claims can be started and submitted after the regular shift.",
+                detail="Clock in before starting assigned work. If an admin called you in, complete the work before clocking out."
             )
         actor["profile"] = profile
         return _human_shift_status_payload(actor["uid"], profile, shift)
@@ -7167,7 +7204,7 @@ async def _human_shift_assert_can_start_assigned(actor, allow_after_hours_self_c
 
 
 async def _human_require_worker_online_for_overtime(worker_uid, profile=None, now=None):
-    """Outside weekday shift hours, direct admin assignment requires live presence."""
+    """Outside weekday shift hours, require an active call-in, clock-in, and online signal."""
     now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
     profile = profile or await _load_profile(worker_uid) or {}
     if profile.get("workerApproved") is not True:
@@ -7176,10 +7213,10 @@ async def _human_require_worker_online_for_overtime(worker_uid, profile=None, no
         return True
     _, shift = await _human_shift_current_record(worker_uid, now)
     status = _human_shift_status_payload(worker_uid, profile, shift, now)
-    if not status.get("online"):
+    if not status.get("call_in_active") or not status.get("clocked_in") or not status.get("online"):
         raise HTTPException(
             status_code=409,
-            detail="Outside regular shift hours, assign work only to a worker who is clocked in and online in the Work Room.",
+            detail="Outside regular shift hours, call the worker in, have them clock in, and confirm Available for work is on before assigning overtime.",
         )
     return True
 
@@ -7209,16 +7246,36 @@ async def human_worker_shift_clock_in(request: Request):
     if not _human_shift_is_scheduled(local_now) and not active_call_in:
         raise HTTPException(status_code=403, detail="You can clock in outside regular shift hours only after an admin calls you in.")
     ref, shift = await _human_shift_current_record(actor["uid"], local_now)
-    if shift.get("clockedOutAt"):
-        raise HTTPException(status_code=409, detail="You have already clocked out for today's shift.")
-    if not shift.get("clockedInAt"):
-        await asyncio.to_thread(ref.set, {
+    if shift.get("clockedOutAt") and _human_shift_is_scheduled(local_now):
+        raise HTTPException(status_code=409, detail="You have already clocked out for today's regular shift.")
+    if not shift.get("clockedInAt") or shift.get("clockedOutAt"):
+        updates = {
             "uid": actor["uid"], "email": actor.get("email") or "",
             "shift_date": local_now.date().isoformat(), "status": "clocked_in",
             "clockedInAt": local_now.isoformat(), "lastPresenceAt": local_now.isoformat(),
             "call_in": active_call_in, "missed_consecutive_after": None,
-        }, merge=True)
-        shift.update({"clockedInAt": local_now.isoformat(), "lastPresenceAt": local_now.isoformat(), "status": "clocked_in"})
+        }
+        if shift.get("clockedOutAt"):
+            # A worker may be called back after clocking out. Preserve this
+            # finished session and reopen the daily record only after they
+            # explicitly press Clock in following an active admin call-in.
+            sessions = list(shift.get("sessions") or [])
+            prior_session = {
+                "clockedInAt": shift.get("clockedInAt"),
+                "clockedOutAt": shift.get("clockedOutAt"),
+                "call_in": bool(shift.get("call_in")),
+            }
+            if not any(
+                item.get("clockedInAt") == prior_session["clockedInAt"]
+                and item.get("clockedOutAt") == prior_session["clockedOutAt"]
+                for item in sessions if isinstance(item, dict)
+            ):
+                sessions.append(prior_session)
+            updates["sessions"] = sessions[-20:]
+            updates["clockedOutAt"] = firestore.DELETE_FIELD
+        await asyncio.to_thread(ref.set, updates, merge=True)
+        shift.update({"clockedInAt": local_now.isoformat(), "lastPresenceAt": local_now.isoformat(), "status": "clocked_in", "call_in": active_call_in})
+        shift.pop("clockedOutAt", None)
     return _human_shift_status_payload(actor["uid"], profile, shift, local_now)
 
 
@@ -7233,18 +7290,12 @@ async def human_worker_shift_presence(request: Request):
         raise HTTPException(status_code=403, detail="Your work access is paused. Please continue in the Training Room.")
     ref, shift = await _human_shift_current_record(actor["uid"], now)
     clocked_in = bool(shift.get("clockedInAt") and not shift.get("clockedOutAt"))
-    off_shift_available = (
-        not _human_shift_is_scheduled(now)
-        and not _human_shift_call_in_active(profile, now)
-        and profile.get("is_available") is True
-    )
-    if not clocked_in and not off_shift_available:
-        raise HTTPException(status_code=409, detail="Clock in during your shift, or turn on off-shift availability before registering Work Room presence.")
+    online_toggle = profile.get("is_available") is True
+    if not clocked_in and not online_toggle:
+        raise HTTPException(status_code=409, detail="Turn on Available for work to show admins that you are online. This does not clock you in.")
     updates = {"lastPresenceAt": now.isoformat()}
-    if clocked_in:
-        updates["status"] = "clocked_in"
-    else:
-        updates["status"] = "off_shift_available"
+    # A heartbeat is presence only; it never creates or changes attendance.
+    updates["status"] = "clocked_in" if clocked_in else "online"
     await asyncio.to_thread(ref.set, updates, merge=True)
     shift.update(updates)
     return _human_shift_status_payload(actor["uid"], profile, shift, now)
@@ -7261,8 +7312,16 @@ async def human_worker_shift_clock_out(request: Request):
     if await _human_worker_has_active_assignment(actor["uid"]):
         raise HTTPException(status_code=409, detail="Finish your active job before clocking out.")
     now = _human_shift_local_now()
-    await asyncio.to_thread(ref.set, {"status": "clocked_out", "clockedOutAt": now.isoformat()}, merge=True)
-    shift.update({"status": "clocked_out", "clockedOutAt": now.isoformat()})
+    sessions = list(shift.get("sessions") or [])
+    if shift.get("clockedInAt"):
+        sessions.append({
+            "clockedInAt": shift.get("clockedInAt"), "clockedOutAt": now.isoformat(),
+            "call_in": bool(shift.get("call_in")),
+        })
+    await asyncio.to_thread(ref.set, {
+        "status": "clocked_out", "clockedOutAt": now.isoformat(), "sessions": sessions[-20:],
+    }, merge=True)
+    shift.update({"status": "clocked_out", "clockedOutAt": now.isoformat(), "sessions": sessions[-20:]})
     profile = await _human_shift_reconcile(actor["uid"], actor.get("profile") or {}, now)
     return _human_shift_status_payload(actor["uid"], profile, shift, now)
 
@@ -7294,7 +7353,7 @@ async def human_admin_shift_attendance(request: Request):
         })
         workers.append(row)
     order = {"online": 0, "clocked_in_idle": 1, "called_in_not_clocked_in": 2, "not_arrived": 3, "missed": 4, "clocked_out": 5, "off_shift": 6}
-    workers.sort(key=lambda item: (order.get(item["status"], 9), item["name"].lower()))
+    workers.sort(key=lambda item: (0 if item.get("online") else 1, order.get(item["status"], 9), item["name"].lower()))
     return {
         "workers": workers, "date": now.date().isoformat(), "timezone": "Africa/Nairobi",
         "shift_start": "15:00", "shift_end": "20:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
@@ -7730,7 +7789,7 @@ def _human_claim_attempt_document_id(worker_uid, qualification_cycle, item_key):
 
 def _human_claim_assignment_transaction(
     job_id, actor, segment_id="", allow_supervised_starter=False,
-    require_availability=True, after_hours_self_claim=False,
+    require_availability=False, after_hours_self_claim=False,
 ):
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
@@ -7755,8 +7814,15 @@ def _human_claim_assignment_transaction(
         worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
         if worker_profile.get("workerApproved") is not True:
             raise HTTPException(status_code=403, detail="Approved worker access is required.")
-        if require_availability and worker_profile.get("is_available") is not True:
-            raise HTTPException(status_code=409, detail="Turn on off-shift availability before claiming jobs outside your regular shift.")
+        claim_now = _human_shift_local_now()
+        shift_ref = db.collection(HUMAN_SHIFT_COLLECTION).document(
+            _human_shift_doc_id(worker_uid, claim_now.date().isoformat())
+        )
+        shift_snapshot = shift_ref.get(transaction=tx)
+        shift_record = shift_snapshot.to_dict() if shift_snapshot.exists else {}
+        claim_status = _human_shift_status_payload(worker_uid, worker_profile, shift_record, claim_now)
+        if not claim_status.get("can_claim"):
+            raise HTTPException(status_code=403, detail=claim_status.get("message") or "Clock in during your scheduled shift or after an admin call-in before claiming work.")
         if not allow_supervised_starter:
             try:
                 rating_count = int(worker_profile.get("worker_rating_count") or 0)
@@ -8636,7 +8702,7 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
         elif worker_active_assignment:
             claim_block_reason = "Finish your current assignment before claiming another."
         elif worker_shift_status and not worker_shift_status.get("can_claim"):
-            claim_block_reason = worker_shift_status.get("message") or "Clock in during your shift, or enable off-shift availability while online."
+            claim_block_reason = worker_shift_status.get("message") or "Clock in during your scheduled shift or after an admin call-in."
     elif scope == "available":
         if (actor.get("profile") or {}).get("worker_retraining_required") is True:
             raise HTTPException(
@@ -9636,6 +9702,7 @@ async def human_list_workers(request: Request):
             "online": bool(shift_status.get("online")),
             "clocked_in": bool(shift_status.get("clocked_in")),
             "shift_status": shift_status.get("status"),
+            "call_in_active": bool(shift_status.get("call_in_active")),
             "email": data.get("email") or "",
             "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
             "role": role or "worker",
@@ -10072,8 +10139,7 @@ async def human_worker_claim(job_id: str, request: Request):
     try:
         assignment = await asyncio.to_thread(
             _human_claim_assignment_transaction, job_id, actor, segment_id,
-            require_availability=claim_window["availability_required"],
-            after_hours_self_claim=claim_window["off_shift_self_claim"],
+            require_availability=False, after_hours_self_claim=False,
         )
     except HTTPException:
         raise
@@ -11593,7 +11659,7 @@ TRAINING_GUIDELINES = {
         {"title": "8. Numbers, dates, and times", "body": "Generally spell out single-digit numbers and use numerals for larger numbers. Use numerals for money, years, ages, percentages, measurements, equations, dates, times, telephone numbers, and mixed-number sentences when the context calls for them. Write percent in transcript text unless a client brief says otherwise. Use capitalized AM and PM for times. Formal series remain capitalized, such as Grade 8, Section B, Chapter 1, and Article VI."},
         {"title": "9. Names, research, and consistency", "body": "Research distinctive proper nouns, organisations, places, technical terms, and titles when appropriate. Research verifies spelling and context; it does not authorize changing the speaker's wording or adding information. Keep confirmed spellings consistent throughout the transcript and ask the admin when two possible identities cannot be resolved."},
         {"title": "10. Privacy, review, and delivery", "body": "Treat every recording, transcript, name, and client instruction as confidential. Use approved tools and do not share files casually. Before delivery, check the brief, completeness, speaker turns, timestamps, uncertain passages, names, numbers, punctuation, and formatting from beginning to end. Submit work only when another person can use it without needing to reconstruct what you meant."},
-        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts run Monday to Friday from 3:00 p.m. to 8:00 p.m. Kenya time (Africa/Nairobi). Clock in to register attendance; during a scheduled shift, your Available for work toggle does not control queue claims. Outside shift hours, turn that toggle on and keep the Work Room open so the system can confirm you are online before you claim queue work. Off-shift jobs still have their listed turnaround, so claim only work you can complete. If an admin calls you in, clock in before claiming. You may start or submit an already accepted assignment outside shift hours; do not clock out while assigned work is active. Five consecutive missed scheduled shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
+        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts run Monday to Friday from 3:00 p.m. to 8:00 p.m. Kenya time (Africa/Nairobi). Clock in to register attendance; during a scheduled shift, your Available for work toggle does not control queue claims. The Available for work toggle only marks you online or offline for admins; it does not record attendance or allow job claims. Claim during your scheduled shift after clocking in, or after an admin call-in once you have clocked in. You may start or submit an already accepted assignment outside shift hours; do not clock out while assigned work is active. Five consecutive missed scheduled shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
     ],
 }
 
@@ -12747,7 +12813,7 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
 
 @app.post("/human-transcription/jobs/{job_id}/ai-agent/assign")
 async def human_admin_assign_ai_agent(job_id: str, request: Request, background_tasks: BackgroundTasks):
-    _require_ai_agent_assignment(request)
+    actor = _require_ai_agent_assignment(request)
     template_reference_uploads = []
     try:
         if "multipart/form-data" in str(request.headers.get("content-type") or "").lower():
@@ -12903,6 +12969,8 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
     job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
     stored_template_reference_files = []
     run_ref = db.collection("human_ai_agent_runs").document(run_id)
+    job_updated = False
+    credit_charge = None
     try:
         for upload in private_template_uploads:
             meta = await asyncio.to_thread(
@@ -12949,7 +13017,15 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             await asyncio.to_thread(assign_whole_job_ai, transaction)
         else:
             await asyncio.to_thread(job_ref.update, updates)
+        job_updated = True
+        credit_charge = await _human_charge_ai_call(actor, job_id, "AI agent")
     except Exception:
+        if job_updated:
+            try:
+                restore_updates = {key: job[key] if key in job else firestore.DELETE_FIELD for key in updates}
+                await asyncio.to_thread(job_ref.update, restore_updates)
+            except Exception:
+                logger.exception("Could not restore Human Work job %s after AI billing failure", job_id)
         try:
             await asyncio.to_thread(run_ref.delete)
         except Exception:
@@ -12965,7 +13041,7 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
                         logger.warning("Could not remove failed template reference upload %s", path)
         raise
     background_tasks.add_task(_human_run_ai_agent, job_id, segment_id, agent_id, run_id)
-    return {"status": "queued", "job_id": job_id, "segment_id": segment_id, "agent": agent, "human_proofreading_required": True}
+    return {"status": "queued", "job_id": job_id, "segment_id": segment_id, "agent": agent, "human_proofreading_required": True, **(credit_charge or {})}
 
 
 async def _human_run_letter_ai_review(job_id):
@@ -13126,7 +13202,7 @@ async def _human_run_letter_agent(job_id, run_id):
 
 @app.post("/human-transcription/jobs/{job_id}/letter-agent/assign")
 async def human_admin_assign_letter_agent(job_id: str, request: Request, background_tasks: BackgroundTasks):
-    _require_ai_agent_assignment(request)
+    actor = _require_ai_agent_assignment(request)
     job = await _human_job(job_id)
     if str(job.get("job_type") or "") != "letter_job":
         raise HTTPException(status_code=409, detail="The Letter Agent is reserved for Letter Jobs.")
@@ -13160,20 +13236,48 @@ async def human_admin_assign_letter_agent(job_id: str, request: Request, backgro
             "updatedAt": firestore.SERVER_TIMESTAMP,
         })
 
+    queued = False
+    credit_charge = None
     try:
         await asyncio.to_thread(queue_letter, transaction)
+        queued = True
+        credit_charge = await _human_charge_ai_call(actor, job_id, "Letter Agent")
     except HTTPException:
+        if queued:
+            restore_keys = (
+                "status", "letter_agent_id", "letter_agent_name", "letter_agent_status",
+                "letter_agent_model_ids", "letter_agent_run_id", "letter_agent_error",
+                "letter_ai_review_status", "letter_ai_review_error", "updatedAt",
+            )
+            try:
+                await asyncio.to_thread(job_ref.update, {
+                    key: job[key] if key in job else firestore.DELETE_FIELD for key in restore_keys
+                })
+            except Exception:
+                logger.exception("Could not restore Letter Job %s after AI billing failure", job_id)
         raise
     except Exception as exc:
+        if queued:
+            restore_keys = (
+                "status", "letter_agent_id", "letter_agent_name", "letter_agent_status",
+                "letter_agent_model_ids", "letter_agent_run_id", "letter_agent_error",
+                "letter_ai_review_status", "letter_ai_review_error", "updatedAt",
+            )
+            try:
+                await asyncio.to_thread(job_ref.update, {
+                    key: job[key] if key in job else firestore.DELETE_FIELD for key in restore_keys
+                })
+            except Exception:
+                logger.exception("Could not restore Letter Job %s after assignment failure", job_id)
         logger.exception("Could not assign Letter Agent to %s", job_id)
         raise HTTPException(status_code=409, detail="The Letter Agent assignment could not be saved. Refresh and try again.") from exc
     background_tasks.add_task(_human_run_letter_agent, job_id, run_id)
-    return {"status": "queued", "job_id": job_id, "agent": HUMAN_AI_AGENTS["letter-opus"], "human_review_required": True}
+    return {"status": "queued", "job_id": job_id, "agent": HUMAN_AI_AGENTS["letter-opus"], "human_review_required": True, **(credit_charge or {})}
 
 
 @app.post("/human-transcription/jobs/{job_id}/letter-ai-review")
 async def human_admin_retry_letter_ai_review(job_id: str, request: Request, background_tasks: BackgroundTasks):
-    _require_ai_agent_assignment(request)
+    actor = _require_ai_agent_assignment(request)
     job = await _human_job(job_id)
     if str(job.get("job_type") or "") != "letter_job" or job.get("status") != "submitted":
         raise HTTPException(status_code=409, detail="Only a submitted Letter Job can be reviewed.")
@@ -13183,13 +13287,25 @@ async def human_admin_retry_letter_ai_review(job_id: str, request: Request, back
         raise HTTPException(status_code=409, detail="A human reviewer is already working on this letter.")
     if job.get("letter_ai_review_status") in {"queued", "processing"}:
         raise HTTPException(status_code=409, detail="The letter review is already running.")
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+    review_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    review_updates = {
         "reviewer_choice": "ai", "reviewer_status": "queued",
         "letter_ai_review_status": "queued", "letter_ai_review_error": "",
         "letter_ai_review_attachment": None, "updatedAt": firestore.SERVER_TIMESTAMP,
-    })
+    }
+    await asyncio.to_thread(review_ref.update, review_updates)
+    try:
+        credit_charge = await _human_charge_ai_call(actor, job_id, "Letter AI reviewer")
+    except Exception:
+        try:
+            await asyncio.to_thread(review_ref.update, {
+                key: job[key] if key in job else firestore.DELETE_FIELD for key in review_updates
+            })
+        except Exception:
+            logger.exception("Could not restore Letter Job %s after reviewer billing failure", job_id)
+        raise
     background_tasks.add_task(_human_run_letter_ai_review, job_id)
-    return {"status": "queued", "job_id": job_id}
+    return {"status": "queued", "job_id": job_id, **credit_charge}
 
 
 @app.get("/human-transcription/admin/jobs/{job_id}/letter-ai-review-docx")
@@ -14035,6 +14151,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
     texts = [p["text"] for p in parts]
     first_text = parts[0]["text"]
     worker_transcript = "\n\n".join(texts)
+    credit_charge = await _human_charge_ai_call(actor, job_id, "AI reviewer")
 
     try:
         deepgram_data = await _human_review_full_audio_deepgram(job_id, job)
@@ -14208,7 +14325,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
         "reviewer_choice": "ai", "reviewer_status": "completed",
         "updatedAt": firestore.SERVER_TIMESTAMP,
     })
-    return {"ai_review": saved}
+    return {"ai_review": saved, **credit_charge}
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-review/apply")
@@ -15311,7 +15428,7 @@ async def human_admin_worker_options(request: Request):
             "uid": snap.id, "name": data.get("name") or data.get("displayName") or data.get("email") or "Worker",
             "email": data.get("email") or "", "available": data.get("is_available") is True,
             "online": bool(shift_status.get("online")), "clocked_in": bool(shift_status.get("clocked_in")),
-            "shift_status": shift_status.get("status"),
+            "shift_status": shift_status.get("status"), "call_in_active": bool(shift_status.get("call_in_active")),
             "rating": rating.get("average"), "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
     workers.sort(key=lambda item: str(item["name"]).lower())
