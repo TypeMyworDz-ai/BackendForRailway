@@ -49,6 +49,8 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
             "HUMAN_SHIFT_WARNING_MISSES": 5,
             "HUMAN_SHIFT_ONLINE_TTL_SECONDS": 150,
             "HUMAN_SHIFT_CALL_TTL_HOURS": 4,
+            "HUMAN_JOB_DASHBOARD_RETENTION_DAYS": 3,
+            "_as_dt": lambda value: value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None,
             "firestore": _FakeFirestore,
             "HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS": 11,
             "TRAINING_LEVELS": [{"level": level} for level in range(1, 7)],
@@ -58,6 +60,7 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
             "_human_deadline_event_id", "_human_worker_retraining_updates",
             "_human_shift_parse_datetime", "_human_shift_is_scheduled",
             "_human_shift_call_in_active", "_human_shift_status_payload",
+            "_human_job_dashboard_archived",
             "_human_ai_draft_finish_eligible", "_human_collapse_duplicate_image_page_blocks",
         ]
         exec(compile(ast.Module(body=[cls.functions[name] for name in wanted], type_ignores=[]), str(MAIN_PATH), "exec"), cls.namespace)
@@ -270,6 +273,91 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertIn("Apply the AI-reviewed transcript", review)
         self.assertIn("Choose an AI reviewer or assign a human reviewer", review)
 
+
+    def test_three_day_archive_boundary_is_inclusive_and_non_destructive(self):
+        archived = self.namespace["_human_job_dashboard_archived"]
+        now = datetime(2026, 10, 7, 12, 0)
+        self.assertFalse(archived({"createdAt": datetime(2026, 10, 4, 12, 0)}, now=now - timedelta(seconds=1)))
+        self.assertTrue(archived({"createdAt": datetime(2026, 10, 4, 12, 0)}, now=now))
+        self.assertTrue(archived({"createdAt": datetime(2026, 10, 4, 12, 0), "status": "in_progress"}, now=now))
+        self.assertFalse(archived({"status": "released"}, now=now))
+        source = ast.unparse(self.functions["human_list_jobs"])
+        self.assertIn("scope == 'archived'", source)
+        self.assertIn("_human_job_dashboard_archived", source)
+        self.assertNotIn("_human_delete_job_safely", source)
+
+    def test_scheduled_worker_can_clock_in_again_without_an_after_hours_call_in(self):
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        class FakeFirestore:
+            DELETE_FIELD = object()
+
+        class ShiftRef:
+            def __init__(self):
+                self.saved = None
+            def set(self, updates, merge=False):
+                self.saved = (updates, merge)
+
+        class FakeApp:
+            def post(self, *_args, **_kwargs):
+                return lambda function: function
+
+        shift_ref = ShiftRef()
+        shift = {"clockedInAt": "2026-10-05T15:00:00+03:00", "clockedOutAt": "2026-10-05T15:30:00+03:00", "sessions": []}
+        async def actor(_request):
+            return {"uid": "worker-1", "email": "worker@example.com", "role": "worker", "profile": {"workerApproved": True}}
+        async def reconcile(_uid, profile):
+            return profile
+        async def current_record(_uid, _now):
+            return shift_ref, dict(shift)
+        def payload(_uid, _profile, current, _now):
+            return {"clocked_in": bool(current.get("clockedInAt") and not current.get("clockedOutAt")), "online": False}
+
+        namespace = {
+            "app": FakeApp(), "asyncio": asyncio, "Request": object, "HTTPException": RequestError,
+            "firestore": FakeFirestore, "_human_actor": actor, "_human_shift_reconcile": reconcile,
+            "_human_shift_call_in_active": lambda *_args: False,
+            "_human_shift_is_scheduled": lambda *_args: True,
+            "_human_shift_local_now": lambda: datetime(2026, 10, 5, 16, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
+            "_human_shift_current_record": current_record, "_human_shift_status_payload": payload,
+        }
+        route = self.functions["human_worker_shift_clock_in"]
+        exec(compile(ast.Module(body=[route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        result = asyncio.run(namespace["human_worker_shift_clock_in"](object()))
+        saved, merge = shift_ref.saved
+        self.assertTrue(merge)
+        self.assertIs(saved["clockedOutAt"], FakeFirestore.DELETE_FIELD)
+        self.assertEqual(saved["sessions"][0]["clockedOutAt"], shift["clockedOutAt"])
+        self.assertTrue(result["clocked_in"])
+
+    def test_finished_job_conversation_remains_open_to_assigned_worker(self):
+        assert_access = self.functions["_human_assert_access"]
+        assert_thread_access = self.functions["_human_assert_job_conversation_access"]
+        thread_for = self.functions["_human_thread_for"]
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+        namespace = {
+            "HTTPException": RequestError,
+            "_human_job_worker_uids": lambda job: {job.get("worker_uid"), *(item.get("worker_uid") for item in job.get("segments", []))} - {None},
+        }
+        exec(compile(ast.Module(body=[assert_access, assert_thread_access, thread_for], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        job = {"status": "released", "worker_uid": "worker-1", "segments": []}
+        actor = {"uid": "worker-1", "role": "worker"}
+        self.assertIsNone(asyncio.run(namespace["_human_assert_access"](job, actor)))
+        self.assertIsNone(namespace["_human_assert_job_conversation_access"](job, actor))
+        self.assertEqual(namespace["_human_thread_for"](actor), "worker")
+        for name in ("human_messages", "human_send_message"):
+            source = ast.unparse(self.functions[name])
+            self.assertIn("_human_assert_access", source)
+            self.assertIn("_human_assert_job_conversation_access", source)
+            self.assertNotRegex(source, r"\bstatus\b")
 
 class ShiftAuthorizationRules(unittest.TestCase):
     @staticmethod
