@@ -13306,6 +13306,7 @@ def _human_ai_agent_research_footer(transcript, research):
     parsed_findings = 0
     generic_terms = {"caseworker", "social worker", "worker", "supervisor", "client", "mother", "father", "none", "n a", "na"}
     private_contact = re.compile(r"(?i)(?:@|\b(?:e-?mail|handle|username|user name|gmail|yahoo|outlook|icloud|hotmail)\b)")
+    private_handle = re.compile(r"(?i)\b[a-z][a-z0-9]*[._][a-z0-9._-]*\d[a-z0-9._-]*\b")
     for line in findings_block.splitlines():
         line = line.strip().lstrip("-*• ").strip()
         if not line or "|" not in line:
@@ -13325,7 +13326,7 @@ def _human_ai_agent_research_footer(transcript, research):
             continue
         if label_key in client_keys or (label_tokens and all(token in client_tokens for token in label_tokens)):
             continue
-        if private_contact.search(label) or private_contact.search(explanation):
+        if private_contact.search(label) or private_contact.search(explanation) or private_handle.search(label):
             continue
         seen_terms.add(label_key)
         terms.append(label)
@@ -15345,6 +15346,9 @@ def _human_review_candidate_terms(parts, deepgram_text, context):
     # Email addresses and contact handles are not research entities. Mask them
     # before extracting capitalized terms so they cannot leak into search or notes.
     corpus = re.sub(r"(?i)\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b", " ", corpus)
+    # Dotted/numeric handles can look like names even when a full email address
+    # is absent from the transcript or already masked above.
+    corpus = re.sub(r"(?i)\b[a-z][a-z0-9]*[._][a-z0-9._-]*\d[a-z0-9._-]*\b", " ", corpus)
     note_context = str(context or "")
     note_context = re.sub(
         r"(?is)WORKER-REPORTED SEARCH TERMS FROM ALL PARTS.*?(?=\n\n(?:MESSAGES THE ADMIN SENT|REFERENCE FILE|PRIVATE TEMPLATE)|\Z)",
