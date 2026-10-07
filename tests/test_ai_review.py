@@ -66,11 +66,11 @@ class ReviewHelpers(unittest.TestCase):
 
     def test_candidate_terms_exclude_client_spellings_roles_and_contact_handles(self):
         candidates = NS["_human_review_candidate_terms"](
-            [{"text": "Ms. Kneeland spoke with Kyra Kneeland. kyrakneeland55@gmail.com.\nClient spellings: Kneeland, Kyra, Zaden; My spellings: None; I researched: Kneeland, Caseworker."}],
+            [{"text": "Ms. Kneeland spoke with Kyra Kneeland. kyrakneeland55@gmail.com Kyra.Kneeland55.\nClient spellings: Kneeland, Kyra, Zaden; My spellings: None; I researched: Kneeland, Caseworker."}],
             "Kneeland spoke with Caseworker.",
             "",
         )
-        self.assertFalse({"Kneeland", "Kyra", "Kyra Kneeland", "Zaden", "Caseworker", "kyrakneeland55"} & set(candidates))
+        self.assertFalse({"Kneeland", "Kyra", "Kyra Kneeland", "Zaden", "Caseworker", "kyrakneeland55", "Kyra.Kneeland55"} & set(candidates))
         self.assertIn("Family-to-Family Program", NS["_human_review_candidate_terms"](
             [{"text": "The Family-to-Family Program was mentioned."}], "", ""
         ))
@@ -421,6 +421,7 @@ class AiModelRouting(unittest.TestCase):
             "Kneeland | Kneeland | Client's surname, already supplied by the client. | yes",
             "Kneeland | Kneeland | Repeated spelling note for the same surname. | yes",
             "Kyra.Kneeland55 | Kyra Kneeland | Email handle: kyrakneeland55@gmail.com. | yes",
+            "Kyra.Kneeland55 | Kyra Kneeland | Private identifier string, no transcript meaning. | yes",
             "Zaden | Zaden | Name already supplied by the client. | yes",
             "Zaliah | Zaliah | Name already supplied by the client. | yes",
             "Tyshawn | Tyshawn | Name already supplied by the client. | yes",
