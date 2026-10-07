@@ -19,7 +19,7 @@ import tempfile
 import uuid
 import secrets
 from datetime import datetime, timedelta, time as datetime_time, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from html import unescape
 import requests
@@ -8324,25 +8324,45 @@ HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT = "default"
 
 
 def _human_subadmin_rate_defaults():
-    # KES is stored in milli-shillings so a tenth of a cent remains exact.
-    # 0.1 KES cent = 0.001 KES = 1 milli-KES per image word.
+    # Image work is priced in US cents per word and converted to KES with an
+    # editable exchange rate. KES is stored in milli-shillings per unit.
     return {
         "audio_human_kes_per_minute": 10,
         "audio_ai_kes_per_minute": 20,
-        "image_human_rate_milli_kes_per_word": 1,
-        "image_ai_rate_milli_kes_per_word": 2,
+        "image_human_usd_cents_per_word": "0.15",
+        "image_ai_usd_cents_per_word": "0.2",
+        "usd_to_kes_rate": "129",
     }
 
 
+def _human_subadmin_image_milli_rate(usd_cents_per_word, usd_to_kes_rate):
+    # cents/100 * fx = KES per word; * 1000 = milli-KES per word.
+    value = Decimal(str(usd_cents_per_word)) * Decimal(str(usd_to_kes_rate)) * Decimal("10")
+    return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 def _human_subadmin_rate_values(raw=None):
-    values = _human_subadmin_rate_defaults()
-    for key in values:
+    defaults = _human_subadmin_rate_defaults()
+    raw = raw or {}
+    values = {}
+    for key in ("audio_human_kes_per_minute", "audio_ai_kes_per_minute"):
+        values[key] = defaults[key]
         try:
-            value = int((raw or {}).get(key, values[key]))
+            value = int(raw.get(key, defaults[key]))
             if value >= 0:
                 values[key] = value
         except (TypeError, ValueError):
             pass
+    for key, upper in (("image_human_usd_cents_per_word", Decimal("1000")), ("image_ai_usd_cents_per_word", Decimal("1000")), ("usd_to_kes_rate", Decimal("1000"))):
+        values[key] = defaults[key]
+        try:
+            candidate = Decimal(str(raw.get(key, defaults[key])))
+            if candidate.is_finite() and candidate >= 0 and candidate <= upper and (key != "usd_to_kes_rate" or candidate > 0):
+                values[key] = format(candidate.normalize(), "f")
+        except (InvalidOperation, TypeError, ValueError):
+            pass
+    values["image_human_rate_milli_kes_per_word"] = _human_subadmin_image_milli_rate(values["image_human_usd_cents_per_word"], values["usd_to_kes_rate"])
+    values["image_ai_rate_milli_kes_per_word"] = _human_subadmin_image_milli_rate(values["image_ai_usd_cents_per_word"], values["usd_to_kes_rate"])
     return values
 
 
@@ -8351,9 +8371,12 @@ def _human_subadmin_rate_public(raw=None):
     return {
         "audio_human_kes_per_minute": values["audio_human_kes_per_minute"],
         "audio_ai_kes_per_minute": values["audio_ai_kes_per_minute"],
-        "image_human_cents_per_word": values["image_human_rate_milli_kes_per_word"] / 10,
-        "image_ai_cents_per_word": values["image_ai_rate_milli_kes_per_word"] / 10,
-        "applies_to": "future earnings only",
+        "image_human_usd_cents_per_word": float(values["image_human_usd_cents_per_word"]),
+        "image_ai_usd_cents_per_word": float(values["image_ai_usd_cents_per_word"]),
+        "usd_to_kes_rate": float(values["usd_to_kes_rate"]),
+        "image_human_kes_per_word": values["image_human_rate_milli_kes_per_word"] / 1000,
+        "image_ai_kes_per_word": values["image_ai_rate_milli_kes_per_word"] / 1000,
+        "applies_to": "future earnings; use Recalculate to correct accruing image earnings",
     }
 
 
@@ -8371,18 +8394,21 @@ def _human_subadmin_parse_rate_update(payload):
         if value < 0 or value > 10000:
             raise ValueError("Audio rates must be between KES 0 and KES 10,000 per minute.")
         result[key] = value
-    for public_key, storage_key in (
-        ("image_human_cents_per_word", "image_human_rate_milli_kes_per_word"),
-        ("image_ai_cents_per_word", "image_ai_rate_milli_kes_per_word"),
-    ):
+    for key in ("image_human_usd_cents_per_word", "image_ai_usd_cents_per_word"):
         try:
-            decimal_value = Decimal(str(payload.get(public_key)))
-            tenths = decimal_value * Decimal("10")
+            decimal_value = Decimal(str(payload.get(key)))
         except (InvalidOperation, TypeError, ValueError):
-            raise ValueError("Image rates must be numeric KES cents per word.")
-        if not decimal_value.is_finite() or decimal_value < 0 or decimal_value > Decimal("1000") or tenths != tenths.to_integral_value():
-            raise ValueError("Image rates must be from 0 to 1,000 KES cents per word in 0.1-cent steps.")
-        result[storage_key] = int(tenths)
+            raise ValueError("Image rates must be numeric US cents per word.")
+        if not decimal_value.is_finite() or decimal_value < 0 or decimal_value > Decimal("1000") or decimal_value != decimal_value.quantize(Decimal("0.01")):
+            raise ValueError("Image rates must be from 0 to 1,000 US cents per word, up to two decimals.")
+        result[key] = format(decimal_value.normalize(), "f")
+    try:
+        fx = Decimal(str(payload.get("usd_to_kes_rate")))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("The USD to KES rate must be a number.")
+    if not fx.is_finite() or fx <= 0 or fx > Decimal("1000"):
+        raise ValueError("The USD to KES rate must be between 0 and 1,000.")
+    result["usd_to_kes_rate"] = format(fx.normalize(), "f")
     return result
 
 
@@ -8983,6 +9009,60 @@ def _human_job_dashboard_archived(job, now=None):
     return current - created_at >= timedelta(days=HUMAN_JOB_DASHBOARD_RETENTION_DAYS)
 
 
+_HUMAN_LIST_CACHE_TTL_SECONDS = 2.0
+_human_list_cache = {}
+_human_list_cache_epoch = 0
+
+
+def _human_list_cache_bump():
+    global _human_list_cache_epoch
+    _human_list_cache_epoch += 1
+
+
+@app.middleware("http")
+async def _human_list_cache_invalidation_middleware(request: Request, call_next):
+    mutating = request.method not in {"GET", "HEAD", "OPTIONS"} and (
+        request.url.path.startswith("/human-transcription") or request.url.path.startswith("/api/admin")
+    )
+    if mutating:
+        _human_list_cache_bump()
+    try:
+        return await call_next(request)
+    finally:
+        if mutating:
+            _human_list_cache_bump()
+
+
+async def _human_cached_query(key, loader):
+    """Share one Firestore read between overlapping polls for ~2 seconds.
+
+    Any write to Human Work routes bumps the epoch, so a cached list is never
+    reused after a change made through this server.
+    """
+    now = time.monotonic()
+    entry = _human_list_cache.get(key)
+    if entry and entry["epoch"] == _human_list_cache_epoch:
+        if entry.get("task") is not None and not entry["task"].done():
+            return await asyncio.shield(entry["task"])
+        if entry.get("rows") is not None and now - entry["at"] < _HUMAN_LIST_CACHE_TTL_SECONDS:
+            return entry["rows"]
+    epoch = _human_list_cache_epoch
+    task = asyncio.ensure_future(asyncio.to_thread(loader))
+    _human_list_cache[key] = {"epoch": epoch, "task": task, "rows": None, "at": now}
+    try:
+        rows = await asyncio.shield(task)
+    except Exception:
+        _human_list_cache.pop(key, None)
+        raise
+    if epoch == _human_list_cache_epoch:
+        _human_list_cache[key] = {"epoch": epoch, "task": None, "rows": rows, "at": time.monotonic()}
+    else:
+        _human_list_cache.pop(key, None)
+    if len(_human_list_cache) > 200:
+        _human_list_cache.clear()
+    return rows
+
+
 @app.get("/human-transcription/jobs")
 async def human_list_jobs(request: Request, scope: str = "mine"):
     actor = await _human_actor(request)
@@ -9025,8 +9105,11 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
             if item_key:
                 worker_claim_attempt_counts[item_key] = max(0, int(attempt_data.get("claim_count") or 0))
         snapshots_by_id = {}
-        for status in ("approved", "split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"):
-            rows = await asyncio.to_thread(lambda status=status: list(ref.where(filter=FieldFilter("status", "==", status)).stream()))
+        status_rows = await asyncio.gather(*[
+            _human_cached_query(f"status:{status}", lambda status=status: list(ref.where(filter=FieldFilter("status", "==", status)).stream()))
+            for status in ("approved", "split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress")
+        ])
+        for rows in status_rows:
             snapshots_by_id.update({snapshot.id: snapshot for snapshot in rows})
         snapshots = list(snapshots_by_id.values())
         worker_active_assignment = await _human_worker_has_active_assignment(actor["uid"])
@@ -9067,22 +9150,25 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     elif scope == "admin" and actor["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required to view the Human Work queue.")
     elif archived_scope and actor["role"] == "admin":
-        snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
+        snapshots = await _human_cached_query("all_jobs", lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
     elif scope == "admin" and actor["role"] == "admin":
-        snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
+        snapshots = await _human_cached_query("all_jobs", lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
     elif actor["role"] == "admin":
-        snapshots = await asyncio.to_thread(lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
+        snapshots = await _human_cached_query("all_jobs", lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
     elif scope in {"assigned", "finished"} and actor["role"] != "worker":
         raise HTTPException(status_code=403, detail="Approved worker access is required to view assigned or finished jobs.")
     elif actor["role"] == "worker":
         # Keep the original single-worker query and add the split parent query.
         found = {}
-        for snap in await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", actor["uid"])).stream())):
-            found[snap.id] = snap
-        for snap in await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("assigned_worker_uids", "array_contains", actor["uid"])).stream())):
-            found[snap.id] = snap
-        for snap in await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("proofreader_uid", "==", actor["uid"])).stream())):
-            found[snap.id] = snap
+        uid = actor["uid"]
+        worker_rows = await asyncio.gather(
+            _human_cached_query(f"w:{uid}", lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", uid)).stream())),
+            _human_cached_query(f"a:{uid}", lambda: list(ref.where(filter=FieldFilter("assigned_worker_uids", "array_contains", uid)).stream())),
+            _human_cached_query(f"p:{uid}", lambda: list(ref.where(filter=FieldFilter("proofreader_uid", "==", uid)).stream())),
+        )
+        for rows in worker_rows:
+            for snap in rows:
+                found[snap.id] = snap
         snapshots = list(found.values())
     else:
         snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("client_uid", "==", actor["uid"])).stream()))
@@ -10271,6 +10357,95 @@ async def human_admin_update_subadmin_rates(request: Request):
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }, merge=True)
     return _human_subadmin_rate_public(values)
+
+
+@app.post("/api/admin/subadmin-earnings/recalculate-images")
+async def human_admin_recalculate_image_earnings(request: Request):
+    """Re-price image earnings that are still accruing at the current rates.
+
+    Audio earnings, invoiced earnings and paid earnings are never touched.
+    Send {"start_date", "end_date", "apply": false} to preview first.
+    """
+    admin = _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    payload = await request.json()
+    try:
+        start = datetime.strptime(str(payload.get("start_date") or ""), "%Y-%m-%d").date()
+        end = datetime.strptime(str(payload.get("end_date") or payload.get("start_date") or ""), "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must use YYYY-MM-DD format.")
+    if end < start or (end - start).days > 45:
+        raise HTTPException(status_code=400, detail="Choose a date range of up to 45 days.")
+    apply_changes = payload.get("apply") is True
+    settings_ref = db.collection(HUMAN_SUBADMIN_RATE_SETTINGS_COLLECTION).document(HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT)
+    settings_snapshot = await asyncio.to_thread(settings_ref.get)
+    rates = _human_subadmin_rate_values(settings_snapshot.to_dict() if settings_snapshot.exists else None)
+    rate_by_category = {
+        "image_ai": rates["image_ai_rate_milli_kes_per_word"],
+        "image_human": rates["image_human_rate_milli_kes_per_word"],
+    }
+    snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).stream()))
+    changes = []
+    skipped_invoiced = 0
+    for snap in snapshots:
+        item = snap.to_dict() or {}
+        category = str(item.get("category") or "")
+        if category not in rate_by_category:
+            continue
+        public = _human_subadmin_public_earning(item, snap.id)
+        try:
+            work_date = datetime.strptime(public.get("shift_date") or "", "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if work_date < start or work_date > end:
+            continue
+        if str(item.get("payout_status") or "accruing") != "accruing" or item.get("payout_period_id"):
+            skipped_invoiced += 1
+            continue
+        quantity = int(item.get("quantity") or 0)
+        new_rate = rate_by_category[category]
+        new_amount = quantity * new_rate
+        old_amount = int(item.get("amount_kes_milli") or 0)
+        if new_rate == int(item.get("rate_milli_kes_per_unit") or 0) and new_amount == old_amount:
+            continue
+        changes.append({
+            "earning_id": snap.id,
+            "subadmin_email": item.get("subadmin_email") or "",
+            "job_name": item.get("job_name") or "Human Work",
+            "category": category,
+            "words": quantity,
+            "old_rate_kes": _human_subadmin_kes(item.get("rate_milli_kes_per_unit")),
+            "new_rate_kes": _human_subadmin_kes(new_rate),
+            "old_amount_kes": _human_subadmin_kes(old_amount),
+            "new_amount_kes": _human_subadmin_kes(new_amount),
+            "_ref": snap.reference,
+            "_new_rate": new_rate,
+            "_new_amount": new_amount,
+            "_old_rate": int(item.get("rate_milli_kes_per_unit") or 0),
+            "_old_amount": old_amount,
+        })
+    if apply_changes:
+        for change in changes:
+            await asyncio.to_thread(change["_ref"].update, {
+                "rate_milli_kes_per_unit": change["_new_rate"],
+                "amount_kes_milli": change["_new_amount"],
+                "previous_rate_milli_kes_per_unit": change["_old_rate"],
+                "previous_amount_kes_milli": change["_old_amount"],
+                "recalculated_by": str(admin.get("email") or "").strip().lower(),
+                "recalculatedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+    public_changes = [{key: value for key, value in change.items() if not key.startswith("_")} for change in changes]
+    return {
+        "applied": apply_changes,
+        "changed_count": len(public_changes),
+        "skipped_invoiced_count": skipped_invoiced,
+        "old_total_kes": round(sum(change["old_amount_kes"] for change in public_changes), 3),
+        "new_total_kes": round(sum(change["new_amount_kes"] for change in public_changes), 3),
+        "changes": public_changes,
+        "rates": _human_subadmin_rate_public(settings_snapshot.to_dict() if settings_snapshot.exists else None),
+    }
 
 
 @app.get("/api/admin/subadmin-options")
