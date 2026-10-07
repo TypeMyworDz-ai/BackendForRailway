@@ -269,9 +269,9 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         self.assertIn("proofreader_status", review)
         self.assertIn("reviewer_choice == 'ai'", review)
         self.assertIn("ai_review_applied", review)
-        self.assertIn("Run the AI reviewer", review)
-        self.assertIn("Apply the AI-reviewed transcript", review)
-        self.assertIn("Choose an AI reviewer or assign a human reviewer", review)
+        self.assertIn("Run AI proofreading", review)
+        self.assertIn("Apply the AI-proofread transcript", review)
+        self.assertIn("Choose an AI proofreader or assign a human proofreader", review)
 
 
     def test_three_day_archive_boundary_is_inclusive_and_non_destructive(self):
@@ -935,6 +935,7 @@ class HumanWorkAiBillingTests(unittest.TestCase):
 
         namespace = {
             "HUMAN_WORK_AI_CREDIT_COST": 2,
+            "Optional": __import__("typing").Optional,
             "HTTPException": RequestError,
             "charge_credits": charge,
         }
@@ -950,6 +951,33 @@ class HumanWorkAiBillingTests(unittest.TestCase):
             self.assertEqual(kwargs["usage_category"], "human_work_ai")
             self.assertTrue(kwargs["force_charge"])
             self.assertTrue(kwargs["require_saved"])
+
+    def test_proofreading_can_use_the_scoped_five_credit_rate(self):
+        class RequestError(Exception):
+            def __init__(self, status_code, detail):
+                super().__init__(detail)
+                self.status_code = status_code
+                self.detail = detail
+
+        calls = []
+        async def charge(*args, **kwargs):
+            calls.append((args, kwargs))
+            return {"charged": 5, "remaining": 3}
+
+        namespace = {
+            "HUMAN_WORK_AI_CREDIT_COST": 2,
+            "Optional": __import__("typing").Optional,
+            "HTTPException": RequestError,
+            "charge_credits": charge,
+        }
+        exec(compile(ast.Module(body=[self.functions["_human_charge_ai_call"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        result = asyncio.run(namespace["_human_charge_ai_call"](
+            {"uid": "worker-1", "email": "worker@example.com"},
+            "job-1", "AI proofreader", credit_cost=5,
+        ))
+        self.assertEqual(result, {"credits_deducted": 5, "credits_remaining": 3})
+        self.assertEqual(calls[0][0][2], 5)
+        self.assertTrue(str(calls[0][0][3]).startswith("Human Work AI proofreader"))
 
     def test_insufficient_balance_or_failed_save_prevents_ai_call(self):
         class RequestError(Exception):
@@ -967,6 +995,7 @@ class HumanWorkAiBillingTests(unittest.TestCase):
 
         namespace = {
             "HUMAN_WORK_AI_CREDIT_COST": 2,
+            "Optional": __import__("typing").Optional,
             "HTTPException": RequestError,
             "charge_credits": charge,
         }

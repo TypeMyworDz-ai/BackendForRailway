@@ -12,7 +12,7 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_split_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_split_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
@@ -30,6 +30,17 @@ class ReviewHelpers(unittest.TestCase):
     def test_spacing(self):
         out = NS["_review_normalise_sentence_spacing"]("He left. She stayed. Ms. Lee spoke. J. Smith agreed.")
         self.assertEqual(out, "He left.  She stayed.  Ms. Lee spoke.  J. Smith agreed.")
+
+    def test_missing_research_terms_need_structured_confident_findings(self):
+        missing = NS["_human_review_missing_research_terms"]
+        candidates = ["Kneeland", "Tyshawn", "Family to Family Program"]
+        raw_queries = "ACTUAL GOOGLE SEARCH QUERIES:\n- Kneeland Tyshawn Family to Family Program\nACTUAL SEARCH SOURCES:\n- example.org"
+        self.assertEqual(missing(candidates, raw_queries), candidates)
+        grounded = (
+            "Kneeland | Kneeland | Name spelling confirmed. | confidence: yes\n"
+            "Tyshawn | Tyshawn | Name spelling unclear. | confidence: no"
+        )
+        self.assertEqual(missing(candidates, grounded), ["Tyshawn", "Family to Family Program"])
 
     def test_two_space_detect(self):
         self.assertTrue(NS["_review_two_space_style"](["One.  Two.  Three."]))
@@ -340,11 +351,11 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Never treat emphasis", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini")))
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
         self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 
@@ -396,8 +407,11 @@ class AiModelRouting(unittest.TestCase):
         no_search = footer("Transcript body.", "")
         self.assertIn("Research Notes:\nNo external searches were needed for this transcript.", no_search)
         self.assertNotIn("I researched:", no_search)
-        with self.assertRaises(ValueError):
-            footer("Transcript body.\nI researched: Example Org.", "")
+        ungrounded = footer("Transcript body.\nI researched: Example Org.", "")
+        self.assertNotIn("I researched:", ungrounded)
+        self.assertIn("No external searches were needed for this transcript.", ungrounded)
+        malformed = footer("Transcript body.\nI researched: Example Org.", "A result without structured findings.")
+        self.assertEqual(malformed, "Transcript body.")
         grounded = footer(
             "Transcript body.\nClient spellings: Ann, My spellings: Lee.",
             "Example Org | Example Organization | A service named in the transcript. | yes\n\n"
@@ -435,7 +449,7 @@ class AiModelRouting(unittest.TestCase):
         for unwanted in ("My spellings: None", "Kyra.Kneeland55", "gmail.com", "Caseworker:", "- Kneeland:", "Old model-written"):
             self.assertNotIn(unwanted, result)
 
-    def test_worker_draft_charges_audio_minutes_plus_format_and_proofread_remains_one_credit(self):
+    def test_worker_draft_charges_audio_minutes_plus_format_and_proofreading_costs_five(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent", "_human_ai_agent_research_footer"}.issubset(formatter_calls))
         route = self.functions["human_worker_ai_draft"]
@@ -461,7 +475,17 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("source_sha256", proofread_source)
         self.assertIn("firestore.transactional", proofread_source)
         self.assertIn("credits_charged", proofread_source)
+        self.assertIn("HUMAN_WORK_AI_PROOFREAD_CREDIT_COST", proofread_source)
+        self.assertIn("plan_spend(profile_snapshot.to_dict() or {}, HUMAN_WORK_AI_PROOFREAD_CREDIT_COST)", proofread_source)
+        self.assertNotIn("plan_spend(profile_snapshot.to_dict() or {}, 1)", proofread_source)
         self.assertNotIn("Claude Haiku", proofread_source)
+
+        admin_proofread = ast.unparse(self.functions["human_admin_ai_review"])
+        self.assertIn("HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin", admin_proofread)
+        self.assertIn("research_status = 'partial'", admin_proofread)
+        self.assertIn("research_status = 'unavailable'", admin_proofread)
+        self.assertNotIn("Required proper-noun web research did not complete", admin_proofread)
+        self.assertIn("Claude Sonnet 5.5 with Gemini 3.5 Flash-Lite fallback", admin_proofread)
 
     def test_worker_draft_cost_rounds_up_assigned_audio_minutes(self):
         function = self.functions["_human_worker_ai_draft_credit_cost"]
