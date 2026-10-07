@@ -6638,7 +6638,8 @@ async def _human_store_upload(job_id: str, upload: UploadFile, folder: str):
     if bucket is None:
         raise HTTPException(status_code=503, detail="File storage is not ready yet. Please try again shortly.")
     blob = bucket.blob(path)
-    blob.upload_from_string(raw, content_type=upload.content_type or "application/octet-stream")
+    # Run the network upload off the event loop so other requests keep flowing.
+    await asyncio.to_thread(blob.upload_from_string, raw, content_type=upload.content_type or "application/octet-stream")
     return {
         "name": upload.filename,
         "storage_path": path,
@@ -9159,9 +9160,21 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
     elif scope == "admin" and actor["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required to view the Human Work queue.")
     elif archived_scope and actor["role"] == "admin":
-        snapshots = await _human_cached_query("all_jobs", lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
+        # Archived work is everything older than the dashboard window. Read only
+        # that slice, newest first, instead of the whole collection.
+        archive_cutoff = datetime.now(timezone.utc) - timedelta(days=HUMAN_JOB_DASHBOARD_RETENTION_DAYS)
+        snapshots = await _human_cached_query("archived_jobs", lambda: list(
+            ref.where(filter=FieldFilter("createdAt", "<", archive_cutoff - timedelta(hours=1)))
+            .order_by("createdAt", direction=firestore.Query.DESCENDING).limit(400).stream()
+        ))
     elif scope == "admin" and actor["role"] == "admin":
-        snapshots = await _human_cached_query("all_jobs", lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
+        # The live queue only shows work from the last few days. Reading just
+        # that window keeps every poll fast no matter how much history exists.
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(days=HUMAN_JOB_DASHBOARD_RETENTION_DAYS, hours=1)
+        snapshots = await _human_cached_query("recent_jobs", lambda: list(
+            ref.where(filter=FieldFilter("createdAt", ">=", recent_cutoff))
+            .order_by("createdAt", direction=firestore.Query.DESCENDING).stream()
+        ))
     elif actor["role"] == "admin":
         snapshots = await _human_cached_query("all_jobs", lambda: list(ref.order_by("createdAt", direction=firestore.Query.DESCENDING).stream()))
     elif scope in {"assigned", "finished"} and actor["role"] != "worker":
@@ -12264,10 +12277,13 @@ async def _human_archive_job_earnings(job_id, job, delete_source=True):
             await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).delete)
         return 0
     refs = []
-    for item in earnings:
-        archive_id = _human_archive_id(job_id, item["source"], item.get("segment_id"))
-        ref = db.collection(HUMAN_EARNING_ARCHIVE_COLLECTION).document(archive_id)
-        existing = await asyncio.to_thread(ref.get)
+    earning_refs = [
+        db.collection(HUMAN_EARNING_ARCHIVE_COLLECTION).document(_human_archive_id(job_id, item["source"], item.get("segment_id")))
+        for item in earnings
+    ]
+    existing_snaps = await asyncio.gather(*[asyncio.to_thread(r.get) for r in earning_refs])
+    for item, ref, existing in zip(earnings, earning_refs, existing_snaps):
+        archive_id = ref.id
         existing_record = (existing.to_dict() or {}) if existing.exists else {}
         record = {
             "earning_id": archive_id, "job_id": job_id, "source": item["source"], "segment_id": item.get("segment_id"),
@@ -12305,8 +12321,8 @@ async def _human_delete_job_storage(job_id, job, message_snapshots):
     try:
         prefix = f"human-workflow/{job_id}/"
         blobs = await asyncio.to_thread(lambda: list(bucket.list_blobs(prefix=prefix)))
-        for blob in blobs:
-            await asyncio.to_thread(blob.delete)
+        if blobs:
+            await asyncio.gather(*[asyncio.to_thread(blob.delete) for blob in blobs])
         return len(blobs)
     except Exception as exc:
         logger.error("Could not remove stored files for human job %s: %s", job_id, exc)
@@ -12323,14 +12339,20 @@ async def _human_delete_job_messages(message_snapshots):
 
 async def _human_delete_job_safely(job_id, job):
     job_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
-    message_snapshots = await asyncio.to_thread(lambda: list(job_ref.collection("messages").stream()))
     # Archive first, but keep the source job until files and messages are
     # removed. If any later cleanup step fails, a retry is safe and the worker
     # can still see the job; payment history is deduplicated by earning ID.
-    earnings_archived = await _human_archive_job_earnings(job_id, job, delete_source=False)
-    deleted_files = await _human_delete_job_storage(job_id, job, message_snapshots)
-    await _human_delete_job_messages(message_snapshots)
+    # The independent steps run together so a delete finishes in one round trip.
+    message_snapshots, earnings_archived = await asyncio.gather(
+        asyncio.to_thread(lambda: list(job_ref.collection("messages").stream())),
+        _human_archive_job_earnings(job_id, job, delete_source=False),
+    )
+    deleted_files, _ = await asyncio.gather(
+        _human_delete_job_storage(job_id, job, message_snapshots),
+        _human_delete_job_messages(message_snapshots),
+    )
     await asyncio.to_thread(job_ref.delete)
+    _human_list_cache_bump()
     return {"deleted": True, "job_id": job_id, "previous_status": job.get("status"), "files_deleted": deleted_files, "earnings_archived": earnings_archived}
 
 
