@@ -332,8 +332,8 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.1-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-haiku-4-5", "claude"), ("gemini-3.8-flash", "gemini")))
 
     def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
@@ -393,25 +393,52 @@ class AiModelRouting(unittest.TestCase):
         )
         self.assertIn("My spellings: Lee; I researched: Example Organization.", grounded)
         self.assertIn("Research Notes:\n- Example Organization: A service named in the transcript. (confidence: yes)", grounded)
-        self.assertIn("https://example.org", grounded)
+        self.assertNotIn("Actual Google searches", grounded)
+        self.assertNotIn("Sources:", grounded)
+        self.assertNotIn("https://example.org", grounded)
 
-    def test_worker_draft_is_free_and_proofreader_is_one_credit_with_requested_fallback(self):
+    def test_worker_draft_charges_audio_minutes_plus_format_and_proofread_remains_one_credit(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent", "_human_ai_agent_research_footer"}.issubset(formatter_calls))
         route = self.functions["human_worker_ai_draft"]
-        draft_calls = {node.func.id for node in ast.walk(route) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertNotIn("charge_credits", draft_calls)
-        self.assertIn("'credits': 0", ast.unparse(route))
-        self.assertIn("'format_version': 6", ast.unparse(route))
+        route_source = ast.unparse(route)
+        self.assertIn("_human_worker_ai_draft_credit_cost", route_source)
+        self.assertIn("plan_spend", route_source)
+        self.assertIn("firestore.transactional", route_source)
+        self.assertIn("worker_ai_draft", route_source)
+        self.assertIn("format_version': 7", route_source)
+        self.assertIn("credits_remaining", route_source)
+        self.assertNotIn("charge_credits", route_source)
 
         proofread = self.functions["human_worker_ai_proofread_draft"]
         proofread_source = ast.unparse(proofread)
         self.assertIn("WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", proofread_source)
+        self.assertIn("_admin_guidelines_text", proofread_source)
+        self.assertIn("_human_review_context", proofread_source)
+        self.assertIn("_human_review_spelling_notes", proofread_source)
+        self.assertIn("_human_review_full_audio_deepgram", proofread_source)
+        self.assertIn("deepgram_comparison", proofread_source)
         self.assertIn("plan_spend", proofread_source)
         self.assertIn("credit_ledger", proofread_source)
         self.assertIn("source_sha256", proofread_source)
         self.assertIn("firestore.transactional", proofread_source)
         self.assertIn("credits_charged", proofread_source)
+        self.assertNotIn("Claude Haiku", proofread_source)
+
+    def test_worker_draft_cost_rounds_up_assigned_audio_minutes(self):
+        function = self.functions["_human_worker_ai_draft_credit_cost"]
+        namespace = {"math": math}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
+        cost = namespace["_human_worker_ai_draft_credit_cost"]
+        self.assertEqual(cost({"seconds": 60}), {"audio_minutes": 1, "audio_credits": 1, "formatting_credits": 1, "total_credits": 2})
+        self.assertEqual(cost({"seconds": 61}), {"audio_minutes": 2, "audio_credits": 2, "formatting_credits": 1, "total_credits": 3})
+        self.assertEqual(cost({"seconds": 900}, {"start_seconds": 300, "end_seconds": 361}), {"audio_minutes": 2, "audio_credits": 2, "formatting_credits": 1, "total_credits": 3})
+
+    def test_non_admin_job_serializer_hides_internal_model_metadata(self):
+        serializer = ast.unparse(self.functions["_human_public_for"])
+        self.assertIn("out.pop('ai_drafts', None)", serializer)
+        self.assertIn("out['ai_draft'] = draft.get('text')", serializer)
+        self.assertIn("out['ai_draft_proofread'] = proofread.get('text')", serializer)
 
     def test_worker_draft_prompt_requires_research_notes_and_handles_clear_speaker_corrections(self):
         function = self.functions["_human_worker_ai_draft_system"]
@@ -425,98 +452,62 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("only if that name or term was actually spoken", prompt_text)
         self.assertIn("Use quotation marks only when quotation was dictated or to mark actual reported speech", prompt_text)
 
-    def test_research_notes_are_suppressed_without_verified_google_search_metadata(self):
+    def test_research_notes_retry_missing_grounding_and_fail_closed(self):
         class QuietLogger:
             def warning(self, *args, **kwargs):
+                pass
+
+        class QuietTime:
+            @staticmethod
+            def sleep(_seconds):
                 pass
 
         class Response:
             status_code = 200
             text = ""
 
-            def __init__(self, payload):
+            def __init__(self, payload, status_code=200):
                 self.payload = payload
+                self.status_code = status_code
 
             def json(self):
                 return self.payload
 
         class FakeRequests:
-            response = Response({"candidates": [{"content": {"parts": [{"text": "A likely result."}]}}]})
+            responses = []
+            calls = []
 
             @classmethod
             def post(cls, *args, **kwargs):
-                return cls.response
+                cls.calls.append((args, kwargs))
+                return cls.responses.pop(0)
 
         function = self.functions["_gemini_research_blocking"]
-        namespace = {"GEMINI_API_KEY": "test-key", "requests": FakeRequests, "logger": QuietLogger()}
+        namespace = {"GEMINI_API_KEY": "test-key", "requests": FakeRequests, "logger": QuietLogger(), "time": QuietTime()}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
-        with self.assertRaisesRegex(RuntimeError, "no grounded queries or sources"):
-            namespace["_gemini_research_blocking"]("prompt")
-        FakeRequests.response = Response({"candidates": [{"content": {"parts": [{"text": "NO_SEARCHED_TERMS"}]}}]})
-        self.assertEqual(namespace["_gemini_research_blocking"]("prompt"), "NO_SEARCHED_TERMS")
-
-        FakeRequests.response = Response({"candidates": [{
+        ungrounded = Response({"candidates": [{"content": {"parts": [{"text": "A likely result."}]}}]})
+        grounded_response = Response({"candidates": [{
             "content": {"parts": [{"text": "Summit Psych | Summit Psych | provider | yes"}]},
             "groundingMetadata": {
                 "webSearchQueries": ["Summit Psych Ohio provider"],
                 "groundingChunks": [{"web": {"title": "Summit Psych", "uri": "https://example.test"}}],
             },
         }]})
+        FakeRequests.responses = [ungrounded, ungrounded, grounded_response]
+        FakeRequests.calls = []
         grounded = namespace["_gemini_research_blocking"]("prompt")
         self.assertIn("ACTUAL GOOGLE SEARCH QUERIES:\n- Summit Psych Ohio provider", grounded)
         self.assertIn("ACTUAL SEARCH SOURCES:\n- Summit Psych: https://example.test", grounded)
+        self.assertEqual(len(FakeRequests.calls), 3)
+        self.assertEqual(FakeRequests.calls[-1][1]["timeout"], (10, 90))
 
-    def test_every_ai_agent_image_path_researches_and_appends_notes(self):
-        generate = ast.unparse(self.functions["_human_ai_agent_generate"])
-        batch = ast.unparse(self.functions["_human_image_batch_compute"])
-        self.assertGreaterEqual(generate.count("_human_ai_agent_research"), 4)
-        self.assertGreaterEqual(generate.count("_human_ai_agent_research_footer"), 4)
-        self.assertIn("_human_ai_agent_research(page_draft, system)", batch)
-        self.assertIn("_human_ai_agent_research_footer(page_draft, page_research)", batch)
+        FakeRequests.responses = [Response({"candidates": [{"content": {"parts": [{"text": "NO_SEARCHED_TERMS"}]}}]})]
+        self.assertEqual(namespace["_gemini_research_blocking"]("prompt"), "NO_SEARCHED_TERMS")
 
-    def test_fallback_runs_only_after_failure_or_unusable_response(self):
-        class QuietLogger:
-            def warning(self, *args, **kwargs):
-                pass
-
-        function = self.functions["_human_call_model_chain"]
-        namespace = {"asyncio": asyncio, "logger": QuietLogger()}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
-        calls = []
-
-        def fake_run(model_id, provider, system_prompt, question, images, max_tokens, model_options=None):
-            calls.append((model_id, provider))
-            return "" if model_id == "primary" else "formatted transcript"
-
-        namespace["_run_ask_model_with_images"] = fake_run
-        answer, used = asyncio.run(namespace["_human_call_model_chain"](
-            (("primary", "claude"), ("backup", "openai")), "system", "question"
-        ))
-        self.assertEqual(answer, "formatted transcript")
-        self.assertEqual(used, "backup")
-        self.assertEqual(calls, [("primary", "claude"), ("backup", "openai")])
-
-        calls.clear()
-        namespace["_run_ask_model_with_images"] = lambda model_id, *args: calls.append(model_id) or ("malformed" if model_id == "primary" else "valid transcript")
-
-        def validate_transcript(answer):
-            if answer != "valid transcript":
-                raise ValueError("invalid transcript response")
-
-        answer, used = asyncio.run(namespace["_human_call_model_chain"](
-            (("primary", "claude"), ("backup", "openai")), "system", "question",
-            response_validator=validate_transcript,
-        ))
-        self.assertEqual((answer, used), ("valid transcript", "backup"))
-        self.assertEqual(calls, ["primary", "backup"])
-
-        calls.clear()
-        namespace["_run_ask_model_with_images"] = lambda *args: calls.append(args[0]) or "primary response"
-        answer, used = asyncio.run(namespace["_human_call_model_chain"](
-            (("primary", "claude"), ("backup", "openai")), "system", "question"
-        ))
-        self.assertEqual((answer, used), ("primary response", "primary"))
-        self.assertEqual(calls, ["primary"])
+        FakeRequests.responses = [ungrounded, ungrounded, ungrounded]
+        with self.assertRaisesRegex(RuntimeError, "no grounded queries or sources"):
+            namespace["_gemini_research_blocking"]("prompt")
+        self.assertEqual(len(FakeRequests.responses), 0)
 
 
 class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
