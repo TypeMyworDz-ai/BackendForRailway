@@ -8324,20 +8324,18 @@ HUMAN_SUBADMIN_RATE_SETTINGS_DOCUMENT = "default"
 
 
 def _human_subadmin_rate_defaults():
-    # Image work is priced in US cents per word and converted to KES with an
-    # editable exchange rate. KES is stored in milli-shillings per unit.
+    # Image work is priced in KES per word (human 0.2, AI agent 0.15).
+    # KES is stored in milli-shillings per unit so fractions stay exact.
     return {
         "audio_human_kes_per_minute": 10,
         "audio_ai_kes_per_minute": 20,
-        "image_human_usd_cents_per_word": "0.15",
-        "image_ai_usd_cents_per_word": "0.2",
-        "usd_to_kes_rate": "129",
+        "image_human_kes_per_word": "0.2",
+        "image_ai_kes_per_word": "0.15",
     }
 
 
-def _human_subadmin_image_milli_rate(usd_cents_per_word, usd_to_kes_rate):
-    # cents/100 * fx = KES per word; * 1000 = milli-KES per word.
-    value = Decimal(str(usd_cents_per_word)) * Decimal(str(usd_to_kes_rate)) * Decimal("10")
+def _human_subadmin_image_milli_rate(kes_per_word):
+    value = Decimal(str(kes_per_word)) * Decimal("1000")
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
@@ -8353,16 +8351,16 @@ def _human_subadmin_rate_values(raw=None):
                 values[key] = value
         except (TypeError, ValueError):
             pass
-    for key, upper in (("image_human_usd_cents_per_word", Decimal("1000")), ("image_ai_usd_cents_per_word", Decimal("1000")), ("usd_to_kes_rate", Decimal("1000"))):
+    for key in ("image_human_kes_per_word", "image_ai_kes_per_word"):
         values[key] = defaults[key]
         try:
             candidate = Decimal(str(raw.get(key, defaults[key])))
-            if candidate.is_finite() and candidate >= 0 and candidate <= upper and (key != "usd_to_kes_rate" or candidate > 0):
+            if candidate.is_finite() and Decimal("0") <= candidate <= Decimal("1000"):
                 values[key] = format(candidate.normalize(), "f")
         except (InvalidOperation, TypeError, ValueError):
             pass
-    values["image_human_rate_milli_kes_per_word"] = _human_subadmin_image_milli_rate(values["image_human_usd_cents_per_word"], values["usd_to_kes_rate"])
-    values["image_ai_rate_milli_kes_per_word"] = _human_subadmin_image_milli_rate(values["image_ai_usd_cents_per_word"], values["usd_to_kes_rate"])
+    values["image_human_rate_milli_kes_per_word"] = _human_subadmin_image_milli_rate(values["image_human_kes_per_word"])
+    values["image_ai_rate_milli_kes_per_word"] = _human_subadmin_image_milli_rate(values["image_ai_kes_per_word"])
     return values
 
 
@@ -8371,11 +8369,8 @@ def _human_subadmin_rate_public(raw=None):
     return {
         "audio_human_kes_per_minute": values["audio_human_kes_per_minute"],
         "audio_ai_kes_per_minute": values["audio_ai_kes_per_minute"],
-        "image_human_usd_cents_per_word": float(values["image_human_usd_cents_per_word"]),
-        "image_ai_usd_cents_per_word": float(values["image_ai_usd_cents_per_word"]),
-        "usd_to_kes_rate": float(values["usd_to_kes_rate"]),
-        "image_human_kes_per_word": values["image_human_rate_milli_kes_per_word"] / 1000,
-        "image_ai_kes_per_word": values["image_ai_rate_milli_kes_per_word"] / 1000,
+        "image_human_kes_per_word": float(values["image_human_kes_per_word"]),
+        "image_ai_kes_per_word": float(values["image_ai_kes_per_word"]),
         "applies_to": "future earnings; use Recalculate to correct accruing image earnings",
     }
 
@@ -8394,21 +8389,14 @@ def _human_subadmin_parse_rate_update(payload):
         if value < 0 or value > 10000:
             raise ValueError("Audio rates must be between KES 0 and KES 10,000 per minute.")
         result[key] = value
-    for key in ("image_human_usd_cents_per_word", "image_ai_usd_cents_per_word"):
+    for key in ("image_human_kes_per_word", "image_ai_kes_per_word"):
         try:
             decimal_value = Decimal(str(payload.get(key)))
         except (InvalidOperation, TypeError, ValueError):
-            raise ValueError("Image rates must be numeric US cents per word.")
-        if not decimal_value.is_finite() or decimal_value < 0 or decimal_value > Decimal("1000") or decimal_value != decimal_value.quantize(Decimal("0.01")):
-            raise ValueError("Image rates must be from 0 to 1,000 US cents per word, up to two decimals.")
+            raise ValueError("Image rates must be numeric KES per word.")
+        if not decimal_value.is_finite() or decimal_value < 0 or decimal_value > Decimal("1000") or decimal_value != decimal_value.quantize(Decimal("0.001")):
+            raise ValueError("Image rates must be from 0 to 1,000 KES per word, up to three decimals.")
         result[key] = format(decimal_value.normalize(), "f")
-    try:
-        fx = Decimal(str(payload.get("usd_to_kes_rate")))
-    except (InvalidOperation, TypeError, ValueError):
-        raise ValueError("The USD to KES rate must be a number.")
-    if not fx.is_finite() or fx <= 0 or fx > Decimal("1000"):
-        raise ValueError("The USD to KES rate must be between 0 and 1,000.")
-    result["usd_to_kes_rate"] = format(fx.normalize(), "f")
     return result
 
 
@@ -8467,6 +8455,14 @@ def _human_subadmin_ai_used(job, segment=None):
     ))
 
 
+def _human_subadmin_image_agent_used(job, segment=None):
+    job = job or {}
+    done = {"submitted", "completed", "finished"}
+    if segment:
+        return str(segment.get("ai_agent_status") or "").lower() in done
+    return str(job.get("ai_agent_status") or "").lower() in done
+
+
 def _human_subadmin_assignment_metadata(job, segment=None, ai_used=None):
     job = job or {}
     if ai_used is False:
@@ -8522,12 +8518,16 @@ def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None, segm
         parts = [(segment, content) for segment, content in parts if str((segment or {}).get("id") or "").strip() in selected_ids]
 
     for segment, content in parts:
-        if ai_only and not _human_subadmin_ai_used(job, segment):
+        if ai_only and not (_human_subadmin_image_agent_used(job, segment) if is_image else _human_subadmin_ai_used(job, segment)):
             continue
         if segment is not None and not str(segment.get("transcript") or segment.get("transcript_html") or "").strip():
             if is_image or not (segment.get("final_attachment") or {}).get("storage_path"):
                 continue
         ai_used = _human_subadmin_ai_used(job, segment)
+        if is_image:
+            # Only an AI agent that handled the image job counts as AI work;
+            # AI proofreading never changes sub-admin image pay.
+            ai_used = _human_subadmin_image_agent_used(job, segment)
         if not ai_used:
             has_human_submission = bool(
                 (segment and (segment.get("worker_uid") or segment.get("workerCompletedAt") or segment.get("proofreader_uid")))
@@ -10404,16 +10404,31 @@ async def human_admin_recalculate_image_earnings(request: Request):
             skipped_invoiced += 1
             continue
         quantity = int(item.get("quantity") or 0)
-        new_rate = rate_by_category[category]
+        # Re-derive who did the work: only an AI agent counts as AI image work,
+        # never AI proofreading.
+        new_category = category
+        job_id = str(item.get("job_id") or "")
+        if job_id:
+            try:
+                job_snap = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+            except Exception:
+                job_snap = None
+            if job_snap is not None and job_snap.exists:
+                job_data = job_snap.to_dict() or {}
+                segment_id = str(item.get("segment_id") or "")
+                segment = next((part for part in (job_data.get("segments") or []) if str((part or {}).get("id") or "") == segment_id), None) if segment_id else None
+                new_category = "image_ai" if _human_subadmin_image_agent_used(job_data, segment) else "image_human"
+        new_rate = rate_by_category[new_category]
         new_amount = quantity * new_rate
         old_amount = int(item.get("amount_kes_milli") or 0)
-        if new_rate == int(item.get("rate_milli_kes_per_unit") or 0) and new_amount == old_amount:
+        if new_category == category and new_rate == int(item.get("rate_milli_kes_per_unit") or 0) and new_amount == old_amount:
             continue
         changes.append({
             "earning_id": snap.id,
             "subadmin_email": item.get("subadmin_email") or "",
             "job_name": item.get("job_name") or "Human Work",
-            "category": category,
+            "category": new_category,
+            "old_category": category,
             "words": quantity,
             "old_rate_kes": _human_subadmin_kes(item.get("rate_milli_kes_per_unit")),
             "new_rate_kes": _human_subadmin_kes(new_rate),
@@ -10423,6 +10438,7 @@ async def human_admin_recalculate_image_earnings(request: Request):
             "_new_rate": new_rate,
             "_new_amount": new_amount,
             "_old_rate": int(item.get("rate_milli_kes_per_unit") or 0),
+            "_new_category": new_category,
             "_old_amount": old_amount,
         })
     if apply_changes:
@@ -10430,6 +10446,8 @@ async def human_admin_recalculate_image_earnings(request: Request):
             await asyncio.to_thread(change["_ref"].update, {
                 "rate_milli_kes_per_unit": change["_new_rate"],
                 "amount_kes_milli": change["_new_amount"],
+                "category": change["_new_category"],
+                "work_source": "ai" if change["_new_category"] == "image_ai" else "human",
                 "previous_rate_milli_kes_per_unit": change["_old_rate"],
                 "previous_amount_kes_milli": change["_old_amount"],
                 "recalculated_by": str(admin.get("email") or "").strip().lower(),
