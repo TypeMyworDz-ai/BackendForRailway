@@ -829,6 +829,7 @@ def _int(value):
 HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
 HUMAN_WORK_AI_CREDIT_COST = 2
+HUMAN_WORK_AI_PROOFREAD_CREDIT_COST = 5
 # Standard transcription starts at 30 KES per completed audio minute. The
 # main admin can change the rate for new jobs from Human Work > Worker rates.
 # Existing jobs keep the rate stored in their original quote; legacy jobs with
@@ -1713,26 +1714,45 @@ async def charge_credits(
     return detail
 
 
-async def _human_charge_ai_call(actor, job_id: str, action: str):
-    """Charge the signed-in Human Work operator before an AI call starts."""
+async def _human_charge_ai_call(actor, job_id: str, action: str, credit_cost: Optional[int] = None):
+    """Charge the signed-in Human Work operator for an AI action."""
     email = str((actor or {}).get("email") or "").strip().lower()
     uid = str((actor or {}).get("uid") or (actor or {}).get("user_id") or "")
     if not uid or not email:
         raise HTTPException(status_code=401, detail="Sign in again before running this AI action.")
-    cost = HUMAN_WORK_AI_CREDIT_COST
+    cost = max(1, int(credit_cost if credit_cost is not None else HUMAN_WORK_AI_CREDIT_COST))
     detail = await charge_credits(
         uid, email, cost, f"Human Work {action} · {job_id}",
         usage_category="human_work_ai", force_charge=True, require_saved=True,
     )
     if int(detail.get("charged") or 0) != cost:
         if detail.get("error") or detail.get("exempt"):
-            raise HTTPException(status_code=503, detail="The 2-credit charge could not be saved, so the AI action was not started. Please retry shortly.")
+            raise HTTPException(status_code=503, detail=f"The {cost}-credit charge could not be saved, so the AI action was not started. Please retry shortly.")
         available = int(detail.get("available") or 0)
         raise HTTPException(
             status_code=402,
-            detail=f"This Human Work AI action costs 2 credits; your spendable balance is {available}. Add credits before continuing.",
+            detail=f"This Human Work AI action costs {cost} credits; your spendable balance is {available}. Add credits before continuing.",
         )
     return {"credits_deducted": cost, "credits_remaining": detail.get("remaining")}
+
+
+async def _human_require_ai_call_credits(actor, credit_cost: int):
+    """Check a balance before a slow proofreading run without charging for a failed run."""
+    email = str((actor or {}).get("email") or "").strip().lower()
+    uid = str((actor or {}).get("uid") or (actor or {}).get("user_id") or "")
+    if not uid or not email:
+        raise HTTPException(status_code=401, detail="Sign in again before running this AI action.")
+    profile = await _load_profile(uid)
+    if profile is None:
+        raise HTTPException(status_code=503, detail="Your Human Work credit balance could not be checked. Please retry shortly.")
+    available = int(read_balance(profile).get("spendable") or 0)
+    cost = max(1, int(credit_cost))
+    if available < cost:
+        raise HTTPException(
+            status_code=402,
+            detail=f"This Human Work AI proofreading costs {cost} credits; your spendable balance is {available}. Add credits before continuing.",
+        )
+    return available
 
 
 def is_admin_user(user_email: str) -> bool:
@@ -8037,7 +8057,7 @@ def _human_assign_proofreader_transaction(
             reviewable_status = job.get("status") in {"submitted", "client_review", "client_approved"} or (is_image_review and job.get("status") == "approved")
             has_review_material = bool(str(job.get("transcript") or "").strip() or (job.get("final_attachment") or {}).get("storage_path") or is_image_review)
             if not reviewable_status or not has_review_material:
-                raise HTTPException(status_code=409, detail="Submit the complete job before assigning a human reviewer.")
+                raise HTTPException(status_code=409, detail="Submit the complete job before assigning a human proofreader.")
         if job.get("proofreader_status") in {"assigned", "in_progress"}:
             raise HTTPException(status_code=409, detail="A proofreader is already working on this job. Take back that assignment before changing it.")
         now = datetime.now()
@@ -11140,7 +11160,7 @@ async def human_admin_assign_whole(job_id: str, request: Request):
     if job.get("pdf_review"):
         reviewer_rating = await _human_worker_rating_summary(worker_uid, worker_profile)
         if reviewer_rating["average"] is None or reviewer_rating["average"] < MIN_PROOFREADER_RATING:
-            raise HTTPException(status_code=409, detail="A whole-file human reviewer must be rated at least 4.5/5.")
+            raise HTTPException(status_code=409, detail="A whole-file human proofreader must be rated at least 4.5/5.")
     verified_actor = {
         "uid": worker_uid,
         "email": str(worker_profile.get("email") or payload.get("worker_email") or "").strip().lower(),
@@ -11240,7 +11260,7 @@ async def human_admin_assign_proofreader(job_id: str, request: Request):
         reviewable_status = job.get("status") in {"submitted", "client_review", "client_approved"} or (is_image_review and job.get("status") == "approved")
         has_review_material = bool(str(job.get("transcript") or "").strip() or (job.get("final_attachment") or {}).get("storage_path") or is_image_review)
         if not reviewable_status or not has_review_material:
-            raise HTTPException(status_code=409, detail="Submit the complete job before assigning a human reviewer.")
+            raise HTTPException(status_code=409, detail="Submit the complete job before assigning a human proofreader.")
     submitted_segment_ids = {
         str((item or {}).get("id") or "")
         for item in (job.get("segments") or [])
@@ -11642,7 +11662,7 @@ async def human_worker_submit(
             await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
             await _notify_human_admins(
                 f"human-submitted:{job_id}:proofreader", "job_submitted", "Proofreading was submitted",
-                "Review the completed Human Work job.", route="human_ops", job_id=job_id, requires_action=True,
+                "Check the completed proofreading submission.", route="human_ops", job_id=job_id, requires_action=True,
             )
             return {"status": "submitted", "job_id": job_id, "role": "proofreader"}
         raise HTTPException(status_code=409, detail="This assignment is no longer active.")
@@ -11651,7 +11671,7 @@ async def human_worker_submit(
         if job.get("proofreader_status") == "assigned":
             await _human_shift_assert_can_start_assigned(actor)
         if not transcript_text and not (attachment and attachment.filename):
-            raise HTTPException(status_code=400, detail="Submit the reviewed transcript or attach the checked Word document.")
+            raise HTTPException(status_code=400, detail="Submit the proofread transcript or attach the checked Word document.")
         final_attachment = job.get("final_attachment")
         if attachment and attachment.filename:
             final_attachment = await _human_store_upload(job_id, attachment, "final-proofread")
@@ -11682,8 +11702,8 @@ async def human_worker_submit(
         await _human_release_worker_claim(actor["uid"], job_id, "proofreader", "proofreader")
         await _update_user_notification_states(actor["uid"], job_id=job_id, kinds={"assignment"}, read=True, completed=True)
         await _notify_human_admins(
-            f"human-reviewer-submitted:{job_id}", "job_submitted", "Human review was submitted",
-            "The assigned human reviewer completed this job. Check the reviewed transcript or Word document before final approval.",
+            f"human-proofreader-submitted:{job_id}", "job_submitted", "Human proofreading was submitted",
+            "The assigned human proofreader completed this job. Check the proofread transcript or Word document before final approval.",
             route="human_ops", job_id=job_id, requires_action=True,
         )
         return {"status": "submitted", "job_id": job_id, "role": "proofreader"}
@@ -11771,27 +11791,27 @@ async def human_admin_review(job_id: str, request: Request):
     if not is_pdf_job and not is_letter_job:
         if reviewer_choice == "human":
             if job.get("proofreader_status") != "submitted":
-                raise HTTPException(status_code=409, detail="The assigned human reviewer must submit before final admin approval.")
+                raise HTTPException(status_code=409, detail="The assigned human proofreader must submit before final admin approval.")
         elif reviewer_choice == "ai":
             if not str((job.get("ai_review") or {}).get("combined_text") or "").strip():
-                raise HTTPException(status_code=409, detail="Run the AI reviewer before final admin approval.")
+                raise HTTPException(status_code=409, detail="Run AI proofreading before final admin approval.")
             if job.get("ai_review_applied") is not True:
-                raise HTTPException(status_code=409, detail="Apply the AI-reviewed transcript before final admin approval.")
+                raise HTTPException(status_code=409, detail="Apply the AI-proofread transcript before final admin approval.")
         else:
-            raise HTTPException(status_code=409, detail="Choose an AI reviewer or assign a human reviewer before final admin approval.")
+            raise HTTPException(status_code=409, detail="Choose an AI proofreader or assign a human proofreader before final admin approval.")
     if is_letter_job:
         if reviewer_choice == "human":
             if job.get("proofreader_status") != "submitted":
-                raise HTTPException(status_code=409, detail="The assigned human reviewer must submit before the Letter Job can be released.")
+                raise HTTPException(status_code=409, detail="The assigned human proofreader must submit before the Letter Job can be released.")
         elif job.get("letter_ai_review_status") != "completed":
-            raise HTTPException(status_code=409, detail="Choose the AI Letter Reviewer or assign a human reviewer before final admin approval.")
+            raise HTTPException(status_code=409, detail="Run AI proofreading for this Letter Job or assign a human proofreader before final admin approval.")
     if is_pdf_job and job.get("pdf_review"):
         if reviewer_choice == "human":
             human_review_submitted = job.get("proofreader_status") == "submitted" or (job.get("worker_uid") and job.get("reviewer_status") == "completed")
             if not human_review_submitted:
-                raise HTTPException(status_code=409, detail="The assigned human reviewer must submit before the image-file review can be completed.")
+                raise HTTPException(status_code=409, detail="The assigned human proofreader must submit before the image-file proofread can be completed.")
         elif reviewer_choice != "ai" or job.get("ai_agent_status") != "submitted":
-            raise HTTPException(status_code=409, detail="Choose the AI reviewer or assign a human reviewer before approving this whole-file review.")
+            raise HTTPException(status_code=409, detail="Choose the AI proofreader or assign a human proofreader before approving this whole-file proofread.")
     internal_release = is_pdf_job or is_letter_job or job.get("admin_uploaded") is True
     review_status = "released" if internal_release else "client_review"
     updates = {
@@ -11865,7 +11885,7 @@ async def human_admin_finish_job(job_id: str, request: Request):
         if not _human_admin_finish_job_eligible(current):
             raise HTTPException(
                 status_code=409,
-                detail="This job is not ready to finish. Every part must be submitted, and any active reviewer must finish or be taken back first.",
+                detail="This job is not ready to finish. Every part must be submitted, and any active proofreader assignment must be completed or taken back first.",
             )
         job_type = str(current.get("job_type") or "").strip().lower()
         internal_release = job_type in {"pdf_job", "letter_job"} or current.get("admin_uploaded") is True
@@ -12928,11 +12948,11 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"))
+AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
-WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"))
+WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
     "GENERAL-JOBS SPEAKER SELF-CORRECTIONS: When the speaker immediately and unmistakably replaces a word or phrase with a correction, remove only the abandoned version and retain the corrected wording. "
     "Example: 'She stated that she is at the Dublin Granville— East Dublin Granville Children's Close to Home.' becomes 'She stated that she is at the East Dublin Granville Children's Close to Home.' "
@@ -13243,9 +13263,8 @@ async def _human_ai_agent_research(raw_text, context):
 def _human_ai_agent_research_footer(transcript, research):
     """Append grounded, deduplicated research without repeating supplied spellings or exposing contact details."""
     raw = str(transcript or "").strip()
-    had_claim = bool(re.search(r"(?i)\bI\s+(?:researched|searched)\s*:", raw))
     body = re.split(r"(?im)^\s*Research Notes\s*:\s*$", raw, maxsplit=1)[0]
-    body = re.sub(r"(?i)(?:[.;]?\s*)I\s+(?:researched|searched)\s*:\s*[^\n]*", "", body)
+    body = re.sub(r"(?i)(?:[.;]?[ \t]*)I\s+(?:researched|searched)\s*:\s*[^\n]*", "", body)
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
 
     def normalized(value):
@@ -13295,8 +13314,6 @@ def _human_ai_agent_research_footer(transcript, research):
 
     research = str(research or "").strip()
     if not research:
-        if had_claim:
-            raise ValueError("The draft claimed research although no grounded web search was completed.")
         return body + "\n\nResearch Notes:\nNo external searches were needed for this transcript."
 
     findings_block = research.split("ACTUAL GOOGLE SEARCH QUERIES:", 1)[0].split("ACTUAL SEARCH SOURCES:", 1)[0]
@@ -13316,7 +13333,7 @@ def _human_ai_agent_research_footer(transcript, research):
             continue
         dictated, verified, explanation, confidence = fields
         confidence = re.sub(r"(?i)^confidence\s*:?\s*", "", confidence).strip().rstrip(".").casefold()
-        if confidence not in {"yes", "no"} or not (dictated or verified) or not explanation:
+        if confidence != "yes" or not (dictated or verified) or not explanation:
             continue
         parsed_findings += 1
         label = verified or dictated
@@ -13333,7 +13350,7 @@ def _human_ai_agent_research_footer(transcript, research):
         findings.append(f"- {label}: {explanation} (confidence: {confidence})")
 
     if not parsed_findings:
-        raise RuntimeError("Grounded Google Search results could not be matched to researched terms; the draft was stopped.")
+        return body
     if not terms:
         notes = "Research Notes:\nNo additional research notes were needed beyond the supplied spellings and references."
         return body + "\n\n" + notes
@@ -14098,7 +14115,16 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         else:
             await asyncio.to_thread(job_ref.update, updates)
         job_updated = True
-        credit_charge = await _human_charge_ai_call(actor, job_id, "AI agent")
+        is_pdf_proofread = bool(is_pdf and job.get("pdf_review"))
+        credit_cost = (
+            HUMAN_WORK_AI_PROOFREAD_CREDIT_COST
+            if is_pdf_proofread and is_human_subadmin(assignment_email)
+            else HUMAN_WORK_AI_CREDIT_COST
+        )
+        credit_charge = await _human_charge_ai_call(
+            actor, job_id, "AI proofreader" if is_pdf_proofread else "AI agent",
+            credit_cost=credit_cost,
+        )
     except Exception:
         if job_updated:
             try:
@@ -14194,7 +14220,7 @@ async def _human_run_letter_ai_review(job_id):
         reviewed_docx = await asyncio.to_thread(_human_letter_render_docx, template_bytes, reviewed_text)
         safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.splitext(os.path.basename(meta.get("name") or "letter"))[0])[:100].strip("._-") or "letter"
         reviewed_meta = await asyncio.to_thread(
-            _human_store_raw_bytes, job_id, f"{safe_base}-AI-reviewed.docx", reviewed_docx,
+            _human_store_raw_bytes, job_id, f"{safe_base}-AI-proofread.docx", reviewed_docx,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "letter-reviews",
         )
         review_updates = {
@@ -14272,7 +14298,7 @@ async def _human_run_letter_agent(job_id, run_id):
             logger.exception("Could not accrue sub-admin earnings for successful Letter Agent submission %s", job_id)
         await _notify_human_admins(
             f"letter-agent-submitted:{job_id}:{run_id}", "job_submitted", "Letter Agent draft is ready",
-            "The Letter Agent submitted a Word draft. Choose the AI reviewer or a human proofreader, then complete the final admin review.",
+            "The Letter Agent submitted a Word draft. Choose AI proofreading or a human proofreader, then complete final admin approval.",
             route="human_ops", job_id=job_id, requires_action=True,
         )
     except Exception as exc:
@@ -14379,13 +14405,13 @@ async def human_admin_retry_letter_ai_review(job_id: str, request: Request, back
     actor = _require_ai_agent_assignment(request)
     job = await _human_job(job_id)
     if str(job.get("job_type") or "") != "letter_job" or job.get("status") != "submitted":
-        raise HTTPException(status_code=409, detail="Only a submitted Letter Job can be reviewed.")
+        raise HTTPException(status_code=409, detail="Only a submitted Letter Job can be sent for AI proofreading.")
     if not (job.get("final_attachment") or {}).get("storage_path"):
         raise HTTPException(status_code=409, detail="The finished Word document is missing.")
     if job.get("proofreader_status") in {"assigned", "in_progress"}:
-        raise HTTPException(status_code=409, detail="A human reviewer is already working on this letter.")
+        raise HTTPException(status_code=409, detail="A human proofreader is already working on this letter.")
     if job.get("letter_ai_review_status") in {"queued", "processing"}:
-        raise HTTPException(status_code=409, detail="The letter review is already running.")
+        raise HTTPException(status_code=409, detail="AI proofreading is already running.")
     review_ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
     review_updates = {
         "reviewer_choice": "ai", "reviewer_status": "queued",
@@ -14396,8 +14422,11 @@ async def human_admin_retry_letter_ai_review(job_id: str, request: Request, back
         "letter_ai_review_attachment": None, "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     await asyncio.to_thread(review_ref.update, review_updates)
+    letter_proofread_credit_cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin(actor.get("email")) else HUMAN_WORK_AI_CREDIT_COST
     try:
-        credit_charge = await _human_charge_ai_call(actor, job_id, "Letter AI reviewer")
+        credit_charge = await _human_charge_ai_call(
+            actor, job_id, "Letter AI proofreader", credit_cost=letter_proofread_credit_cost,
+        )
     except Exception:
         try:
             await asyncio.to_thread(review_ref.update, {
@@ -14419,15 +14448,15 @@ async def human_admin_letter_ai_review_docx(job_id: str, request: Request):
     meta = job.get("letter_ai_review_attachment") or {}
     path = str(meta.get("storage_path") or "")
     if not path.startswith(f"human-workflow/{job_id}/letter-reviews/"):
-        raise HTTPException(status_code=404, detail="The reviewed Word document is not available yet.")
+        raise HTTPException(status_code=404, detail="The AI-proofread Word document is not available yet.")
     bucket = _human_bucket()
     if bucket is None:
         raise HTTPException(status_code=503, detail="Private file storage is not ready yet.")
     blob = bucket.blob(path)
     if not await asyncio.to_thread(blob.exists):
-        raise HTTPException(status_code=404, detail="The reviewed Word document could not be found.")
+        raise HTTPException(status_code=404, detail="The AI-proofread Word document could not be found.")
     raw = await asyncio.to_thread(blob.download_as_bytes)
-    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "letter-AI-reviewed.docx")) or "letter-AI-reviewed.docx"
+    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(meta.get("name") or "letter-AI-proofread.docx")) or "letter-AI-proofread.docx"
     return Response(
         content=raw, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "private, no-store"},
@@ -14742,16 +14771,26 @@ async def _human_worker_ai_proofread_research(job_id, draft_text, deepgram_text,
         research = "\n\n".join(dict.fromkeys(fragments))
         missing = _human_review_missing_research_terms(candidates, research)
         if missing:
-            raise RuntimeError(f"Grounded research did not verify {len(missing)} required term(s).")
+            logger.warning(
+                "Worker AI proofread search left %s term(s) unverified for %s; continuing without research-based corrections",
+                len(missing), job_id,
+            )
+            research = (research + "\n\n" if research else "") + (
+                "UNVERIFIED TERMS (leave unchanged unless the source audio or client evidence proves a correction):\n"
+                + ", ".join(missing[:100])
+            )
         return research
     except Exception as exc:
-        logger.warning("Worker AI proofread research failed for %s: %s", job_id, str(exc)[:300])
-        raise RuntimeError("Required grounded research could not be completed for the worker proofread.") from exc
+        logger.warning("Worker AI proofread research failed for %s; continuing without research-based corrections: %s", job_id, str(exc)[:300])
+        return (
+            "GROUNDED_SEARCH_UNAVAILABLE (do not correct names from memory). Unverified terms: "
+            + ", ".join(candidates[:100])
+        )
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-draft/proofread")
 async def human_worker_ai_proofread_draft(job_id: str, request: Request):
-    """Independently proofread a worker draft with guidelines and Deepgram comparison; charge one credit after success."""
+    """Independently proofread a worker draft with guidelines and Deepgram comparison; charge five credits after success."""
     actor = await _human_actor(request)
     if actor.get("role") != "worker":
         raise HTTPException(status_code=403, detail="Worker access is required.")
@@ -14783,9 +14822,7 @@ async def human_worker_ai_proofread_draft(job_id: str, request: Request):
     cached = draft.get("proofread") or {}
     if cached.get("worker_uid") == uid and cached.get("source_sha256") == source_sha256 and cached.get("text"):
         return {"proofread": cached.get("text"), "already_proofread": True, "credits_charged": 0}
-    profile = actor.get("profile") or {}
-    if int(read_balance(profile).get("total") or 0) < 1:
-        raise HTTPException(status_code=402, detail="AI proofreading needs 1 credit. Add credits to proofread this draft.")
+    await _human_require_ai_call_credits(actor, HUMAN_WORK_AI_PROOFREAD_CREDIT_COST)
 
     proofread_id = hashlib.sha256(f"{job_id}:{key}:{uid}:{source_sha256}".encode("utf-8")).hexdigest()
     proof_ref = db.collection("human_worker_ai_proofreads").document(proofread_id)
@@ -14837,7 +14874,8 @@ async def human_worker_ai_proofread_draft(job_id: str, request: Request):
             deepgram_text, [comparison_part], [0], deepgram_data.get("duration_seconds"),
         )
         research_context = (
-            "VERIFIED SEARCH FINDINGS AND INTERNAL GROUNDING METADATA (use only as spelling/context evidence; do not print search queries or sources):\n" + research[:16000]
+            "GROUNDED SEARCH METADATA (spelling/context evidence only; use only structured lines marked confidence yes; do not print queries or sources). Any unverified term or unavailable search is unresolved: preserve its spelling unless the source audio or client/reference evidence proves a correction.\n"
+            + research[:16000]
             if research else
             "No external searches were needed for this draft. Do not claim that a search was run."
         )
@@ -14879,7 +14917,7 @@ async def human_worker_ai_proofread_draft(job_id: str, request: Request):
         ledger_ref = profile_ref.collection("credit_ledger").document(f"worker-ai-proofread-{proofread_id}")
         proof_entry = {
             "text": proofread_text[:400000], "worker_uid": uid,
-            "source_sha256": source_sha256, "credits": 1,
+            "source_sha256": source_sha256, "credits": HUMAN_WORK_AI_PROOFREAD_CREDIT_COST,
             "model_id": model_used,
             "deepgram_comparison": {
                 "model": str(deepgram_data.get("model") or "Deepgram"),
@@ -14918,7 +14956,7 @@ async def human_worker_ai_proofread_draft(job_id: str, request: Request):
                 return {"already_proofread": True, "proofread": current_cached["text"], "charged": 0, "remaining": None}
             if not profile_snapshot.exists:
                 return {"insufficient": True, "error": "profile unavailable", "available": 0}
-            ok, credit_updates, detail = plan_spend(profile_snapshot.to_dict() or {}, 1)
+            ok, credit_updates, detail = plan_spend(profile_snapshot.to_dict() or {}, HUMAN_WORK_AI_PROOFREAD_CREDIT_COST)
             if not ok:
                 return {"insufficient": True, **detail}
             after_balance = int(detail.get("remaining") or 0)
@@ -14928,17 +14966,17 @@ async def human_worker_ai_proofread_draft(job_id: str, request: Request):
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             })
             tx.set(ledger_ref, {
-                "amount": -1, "direction": "deducted",
+                "amount": -HUMAN_WORK_AI_PROOFREAD_CREDIT_COST, "direction": "deducted",
                 "reason": f"Human Work AI proofreading · {job_id}",
                 "context": {"operation": "charge", "usage_category": "worker_ai_proofread", "job_id": job_id, "segment_id": key, "source_sha256": source_sha256},
                 "createdAt": firestore.SERVER_TIMESTAMP, "balanceAfter": after_balance,
             })
             tx.set(proof_ref, {
                 "status": "completed", "text": proof_entry["text"],
-                "model_id": model_used, "credits_charged": 1,
+                "model_id": model_used, "credits_charged": HUMAN_WORK_AI_PROOFREAD_CREDIT_COST,
                 "completedAt": firestore.SERVER_TIMESTAMP,
             }, merge=True)
-            return {"already_proofread": False, "proofread": proof_entry["text"], "charged": 1, "remaining": after_balance}
+            return {"already_proofread": False, "proofread": proof_entry["text"], "charged": HUMAN_WORK_AI_PROOFREAD_CREDIT_COST, "remaining": after_balance}
 
         detail = await asyncio.to_thread(charge_and_save, transaction)
         if detail.get("insufficient"):
@@ -15413,8 +15451,17 @@ def _human_review_candidate_terms(parts, deepgram_text, context):
 
 
 def _human_review_missing_research_terms(candidates, research_text):
-    """Return candidates not represented by at least one distinctive grounded search term."""
-    result_tokens = set(re.findall(r"[a-z0-9]+", str(research_text or "").casefold()))
+    """Return candidates without a structured, confident grounded finding."""
+    content = str(research_text or "").split("ACTUAL GOOGLE SEARCH QUERIES:", 1)[0].split("ACTUAL SEARCH SOURCES:", 1)[0]
+    verified_lines = []
+    for line in content.splitlines():
+        fields = [part.strip() for part in line.strip().lstrip("-*• ").split("|", 3)]
+        if len(fields) < 4:
+            continue
+        confidence = re.sub(r"(?i)^confidence\s*:?\s*", "", fields[3]).strip().rstrip(".").casefold()
+        if confidence == "yes":
+            verified_lines.append(" ".join(fields[:3]))
+    result_tokens = set(re.findall(r"[a-z0-9]+", " ".join(verified_lines).casefold()))
     skip = {
         "of", "the", "and", "for", "at", "to", "in", "on", "by", "county", "government", "university",
         "national", "council", "services", "service", "office", "department", "authority", "organization", "organisation",
@@ -15679,9 +15726,9 @@ async def human_admin_ai_review(job_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Admin access is required.")
     job = await _human_job(job_id)
     if job.get("proofreader_status") in {"assigned", "in_progress"}:
-        raise HTTPException(status_code=409, detail="A human reviewer is already working on this job.")
+        raise HTTPException(status_code=409, detail="A human proofreader is already working on this job.")
     if str(job.get("job_type") or "").lower() == "pdf_job":
-        raise HTTPException(status_code=409, detail="The audio AI review is for audio jobs.")
+        raise HTTPException(status_code=409, detail="AI proofreading from audio is available only for audio jobs.")
     job_type = str(job.get("job_type") or "").strip().lower()
     review_system = _REVIEW_SYSTEM + (
         "\n\n" + HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE if job_type == "general_job" else ""
@@ -15697,6 +15744,8 @@ async def human_admin_ai_review(job_id: str, request: Request):
         parts = [{"id": "main", "label": "Full transcript", "text": str(job.get("transcript") or "")}]
     if not any(p["text"].strip() for p in parts):
         raise HTTPException(status_code=409, detail="The submitted parts have no typed text. Attached files cannot be reviewed by the AI.")
+    proofread_credit_cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin(actor.get("email")) else HUMAN_WORK_AI_CREDIT_COST
+    await _human_require_ai_call_credits(actor, proofread_credit_cost)
     guidelines = await _admin_guidelines_text()
     context_data = await _human_review_context(job_id, job)
     context = context_data["text"]
@@ -15704,16 +15753,15 @@ async def human_admin_ai_review(job_id: str, request: Request):
     texts = [p["text"] for p in parts]
     first_text = parts[0]["text"]
     worker_transcript = "\n\n".join(texts)
-    credit_charge = await _human_charge_ai_call(actor, job_id, "AI reviewer")
 
     try:
         deepgram_data = await _human_review_full_audio_deepgram(job_id, job)
     except Exception as exc:
         logger.warning("Full-audio Deepgram comparison failed for AI review %s: %s", job_id, exc)
-        raise HTTPException(status_code=502, detail="The full-audio Deepgram comparison could not be completed. Please retry the AI review.")
+        raise HTTPException(status_code=502, detail="The full-audio Deepgram comparison could not be completed. Please retry AI proofreading.")
     deepgram_text = str(deepgram_data.get("text") or "").strip()
     if not deepgram_text:
-        raise HTTPException(status_code=502, detail="Deepgram returned no full-audio comparison transcript. Please retry the AI review.")
+        raise HTTPException(status_code=502, detail="Deepgram returned no full-audio comparison transcript. Please retry AI proofreading.")
 
     research_text = ""
     research_status = "not_started"
@@ -15751,31 +15799,46 @@ async def human_admin_ai_review(job_id: str, request: Request):
         missing_terms = _human_review_missing_research_terms(candidate_terms, research_text)
         if missing_terms:
             logger.warning(
-                "AI review research coverage incomplete for %s (%s of %s candidate checks missing)",
+                "AI review research coverage incomplete for %s (%s of %s candidate checks missing); continuing with verified findings only",
                 job_id, len(missing_terms), len(candidate_terms),
             )
-            raise HTTPException(status_code=502, detail="Required proper-noun web research did not complete for every candidate. Please retry before approving this audio review.")
-        if research_text:
+            issues.append(
+                "Grounded web research could not verify these terms; they must remain unchanged unless supported by the source audio, client spellings, or job references: "
+                + ", ".join(missing_terms[:30])
+            )
+            research_status = "partial"
+            research_text = (research_text + "\n\n" if research_text else "") + (
+                "UNVERIFIED TERMS (do not correct from memory): " + ", ".join(missing_terms[:100])
+            )
+        elif research_text:
             research_status = "completed"
         elif candidate_terms:
-            raise HTTPException(status_code=502, detail="Required proper-noun web research did not complete. Please retry before approving this audio review.")
+            research_status = "unavailable"
+            issues.append(
+                "Grounded web research returned no verifiable findings; unverified names must remain unchanged unless supported by the source audio, client spellings, or job references."
+            )
+            research_text = "GROUNDED_SEARCH_UNAVAILABLE (do not correct names from memory). Unverified terms: " + ", ".join(candidate_terms[:100])
         else:
             research_text = "No unconfirmed proper nouns or specialist terms requiring web research were identified in the worker transcript, full-audio Deepgram comparison, or job notes."
             research_status = "no_unconfirmed_terms"
-    except HTTPException:
-        raise
     except Exception as exc:
-        logger.warning("AI review proper-noun research failed for %s: %s", job_id, exc)
+        logger.warning("AI review proper-noun research failed for %s; continuing without research-based corrections: %s", job_id, exc)
         if candidate_terms:
-            raise HTTPException(status_code=502, detail="Required proper-noun web research is temporarily unavailable. Please retry before approving this audio review.")
-        research_text = "No unconfirmed proper nouns or specialist terms requiring web research were identified; a search was not needed."
-        research_status = "no_unconfirmed_terms"
+            research_status = "unavailable"
+            research_text = "GROUNDED_SEARCH_UNAVAILABLE (do not correct names from memory). Unverified terms: " + ", ".join(candidate_terms[:100])
+            issues.append(
+                "Grounded web research was temporarily unavailable; unverified names must remain unchanged unless supported by the source audio, client spellings, or job references."
+            )
+        else:
+            research_text = "No unconfirmed proper nouns or specialist terms requiring web research were identified; a search was not needed."
+            research_status = "no_unconfirmed_terms"
 
-    indent_hint = "Paragraphs start with a TAB character." if sum(1 for line in "\n".join(texts).split("\n") if line.startswith("\t")) > 0 else "Follow the layout the parts use."
-    spacing_hint = "Use two spaces after every sentence." if _review_two_space_style(texts) else "Follow the sentence spacing the parts use."
+    indent_hint = "Every body paragraph starts with one real TAB for a 0.5-inch indent; headings and the spellings section remain flush left."
+    spacing_hint = "Use exactly two spaces after every sentence."
     shared = (
         f"COMPANY GUIDELINES:\n{guidelines[:50000]}\n\n{context or 'NO EXTRA JOB INSTRUCTIONS WERE SUPPLIED.'}\n\n"
-        f"RESEARCH RESULTS (spelling checks):\n{research_text[:12000] or 'None available.'}\n\nFORMAT: {indent_hint} {spacing_hint}\n\n"
+        "GROUNDED RESEARCH (spelling/context evidence only): Use only structured findings explicitly marked confidence yes. Treat every unverified term, missing result, or search failure as unresolved; preserve the transcript's source wording unless the audio or client/reference evidence proves a correction. Never correct a name from memory, and do not print search queries or source URLs.\n"
+        f"RESEARCH RESULTS:\n{research_text[:12000] or 'None available.'}\n\nFORMAT: {indent_hint} {spacing_hint}\n\n"
     )
     # Long jobs are reviewed in batches so nothing is cut off. Every batch is
     # shown the first part so the spellings stay identical across the job.
@@ -15817,7 +15880,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
             models_used.append(model_used)
         except Exception as exc:
             logger.warning("AI review failed for %s: %s", job_id, exc)
-            raise HTTPException(status_code=502, detail="The AI review could not be completed. Please try again later.")
+            raise HTTPException(status_code=502, detail="AI proofreading could not be completed. Please try again later.")
         final_chunks.append(text)
         all_parts.extend(data.get("parts") or [])
         all_changes.extend(data.get("changes") or [])
@@ -15828,11 +15891,9 @@ async def human_admin_ai_review(job_id: str, request: Request):
     combined = "\n\n".join(chunk.strip("\n") for chunk in final_chunks)
     combined, restored_boundaries = _review_restore_dictation_boundaries(combined, deepgram_text)
     combined = _review_enforce_indent(combined, texts)
-    if _review_two_space_style(texts):
-        combined = _review_normalise_sentence_spacing(combined)
-    combined = _human_ai_agent_research_footer(
-        combined, research_text if research_status == "completed" else "",
-    )
+    combined = _review_normalise_sentence_spacing(combined)
+    research_for_footer = research_text if research_status in {"completed", "partial", "unavailable"} else ""
+    combined = _human_ai_agent_research_footer(combined, research_for_footer)
     if any(item.get("restored") for item in restored_boundaries):
         issues.append("Restored dictated paragraph or line breaks using the full-audio Deepgram comparison.")
 
@@ -15850,9 +15911,17 @@ async def human_admin_ai_review(job_id: str, request: Request):
     for item in all_changes[:400]:
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
-    model_label = "Claude Opus 5.5"
-    if "gpt-5.6-sol" in models_used:
-        model_label = "Claude Opus 5.5 with GPT-5.6 Sol fallback"
+    used_model_ids = {str(model).strip().casefold() for model in models_used}
+    used_claude = "claude-sonnet-5-5" in used_model_ids
+    used_gemini = "gemini-3.5-flash-lite" in used_model_ids
+    if used_claude and used_gemini:
+        model_label = "Claude Sonnet 5.5 with Gemini 3.5 Flash-Lite fallback"
+    elif used_gemini:
+        model_label = "Gemini 3.5 Flash-Lite"
+    elif used_claude:
+        model_label = "Claude Sonnet 5.5"
+    else:
+        model_label = ", ".join(dict.fromkeys(models_used)) or "AI Proofreader"
     saved = {
         "combined_text": combined[:1000000],
         "combined_html": _review_text_to_html(combined[:1000000]),
@@ -15876,6 +15945,9 @@ async def human_admin_ai_review(job_id: str, request: Request):
         "models_used": list(dict.fromkeys(models_used)),
         "createdAt": datetime.now().isoformat(),
     }
+    credit_charge = await _human_charge_ai_call(
+        actor, job_id, "AI proofreader", credit_cost=proofread_credit_cost,
+    )
     review_updates = {
         "ai_review": saved, "ai_review_applied": False,
         "ai_review_assigned_by_uid": str(actor.get("uid") or "").strip(),
@@ -15901,7 +15973,7 @@ async def human_admin_apply_ai_review(job_id: str, request: Request):
     job = await _human_job(job_id)
     review = job.get("ai_review") or {}
     if not str(review.get("combined_text") or "").strip():
-        raise HTTPException(status_code=409, detail="Run the AI review first.")
+        raise HTTPException(status_code=409, detail="Run AI proofreading first.")
     html = review.get("combined_html") or _review_text_to_html(review.get("combined_text"))
     if not _human_is_split_job(job):
         if job.get("status") != "submitted":
