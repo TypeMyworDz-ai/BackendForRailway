@@ -5,7 +5,7 @@ import math
 import re
 import unittest
 from datetime import datetime, time as datetime_time, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ class SubadminPaymentTests(unittest.TestCase):
     def setUpClass(cls):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
         wanted = {
-            "_human_subadmin_rate_defaults", "_human_subadmin_rate_values",
+            "_human_subadmin_rate_defaults", "_human_subadmin_rate_values", "_human_subadmin_image_milli_rate",
             "_human_subadmin_rate_public", "_human_subadmin_parse_rate_update",
             "_human_subadmin_word_count", "_human_subadmin_audio_minutes",
             "_human_subadmin_ai_used", "_human_subadmin_assignment_metadata",
@@ -44,6 +44,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "unescape": unescape,
             "Decimal": Decimal,
             "InvalidOperation": InvalidOperation,
+            "ROUND_HALF_UP": ROUND_HALF_UP,
             "datetime": datetime,
             "datetime_time": datetime_time,
             "timedelta": timedelta,
@@ -61,34 +62,35 @@ class SubadminPaymentTests(unittest.TestCase):
         cls.shift_time = datetime(2026, 10, 5, 15, 30, tzinfo=cls.zone)
         cls.subadmin = {"uid": "subadmin-1", "email": "info@typemywordz.ai"}
 
-    def test_defaults_preserve_exact_audio_and_image_units(self):
+    def test_image_rates_are_us_cents_per_word_converted_to_kes(self):
         defaults = self.namespace["_human_subadmin_rate_defaults"]()
+        values = self.namespace["_human_subadmin_rate_values"](defaults)
         public = self.namespace["_human_subadmin_rate_public"](defaults)
         self.assertEqual(defaults["audio_human_kes_per_minute"], 10)
         self.assertEqual(defaults["audio_ai_kes_per_minute"], 20)
-        self.assertEqual(defaults["image_human_rate_milli_kes_per_word"], 1)
-        self.assertEqual(defaults["image_ai_rate_milli_kes_per_word"], 2)
-        self.assertEqual(public["image_human_cents_per_word"], 0.1)
-        self.assertEqual(public["image_ai_cents_per_word"], 0.2)
+        # 0.2 US cents * 129 KES = 0.258 KES per word; 0.15 cents = 0.1935 KES.
+        self.assertEqual(values["image_ai_rate_milli_kes_per_word"], 258)
+        self.assertEqual(values["image_human_rate_milli_kes_per_word"], 194)
+        self.assertEqual(public["image_ai_usd_cents_per_word"], 0.2)
+        self.assertEqual(public["image_human_usd_cents_per_word"], 0.15)
+        self.assertEqual(public["usd_to_kes_rate"], 129)
 
-    def test_admin_rate_updates_validate_and_store_tenths_of_a_cent_exactly(self):
+    def test_legacy_milli_image_keys_are_ignored(self):
+        values = self.namespace["_human_subadmin_rate_values"]({"image_ai_rate_milli_kes_per_word": 2, "image_human_rate_milli_kes_per_word": 1})
+        self.assertEqual(values["image_ai_rate_milli_kes_per_word"], 258)
+
+    def test_admin_rate_updates_validate_and_convert_exactly(self):
         parse = self.namespace["_human_subadmin_parse_rate_update"]
-        values = parse({
-            "audio_human_kes_per_minute": 10,
-            "audio_ai_kes_per_minute": 20,
-            "image_human_cents_per_word": 0.1,
-            "image_ai_cents_per_word": 0.2,
-        })
-        self.assertEqual(values["image_human_rate_milli_kes_per_word"], 1)
-        self.assertEqual(values["image_ai_rate_milli_kes_per_word"], 2)
-        for invalid in (0.15, -0.1, 1001, "not-a-rate"):
-            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                parse({
-                    "audio_human_kes_per_minute": 10,
-                    "audio_ai_kes_per_minute": 20,
-                    "image_human_cents_per_word": invalid,
-                    "image_ai_cents_per_word": 0.2,
-                })
+        base = {"audio_human_kes_per_minute": 10, "audio_ai_kes_per_minute": 20,
+                "image_human_usd_cents_per_word": 0.15, "image_ai_usd_cents_per_word": 0.2, "usd_to_kes_rate": 130}
+        stored = parse(base)
+        values = self.namespace["_human_subadmin_rate_values"](stored)
+        self.assertEqual(values["image_human_rate_milli_kes_per_word"], 195)
+        self.assertEqual(values["image_ai_rate_milli_kes_per_word"], 260)
+        for field, invalid in (("image_human_usd_cents_per_word", -0.1), ("image_ai_usd_cents_per_word", 1001),
+                               ("image_ai_usd_cents_per_word", "not-a-rate"), ("usd_to_kes_rate", 0), ("usd_to_kes_rate", "x")):
+            with self.subTest(field=field, invalid=invalid), self.assertRaises(ValueError):
+                parse({**base, field: invalid})
 
     def test_word_count_handles_html_and_apostrophes(self):
         count = self.namespace["_human_subadmin_word_count"]
@@ -244,11 +246,11 @@ class SubadminPaymentTests(unittest.TestCase):
         human = build("image-human", human_job, self.subadmin, now=self.shift_time)[0]
         self.assertEqual(human["category"], "image_human")
         self.assertEqual(human["quantity"], 4)
-        self.assertEqual(human["amount_kes_milli"], 4)
+        self.assertEqual(human["amount_kes_milli"], 4 * 194)
         ai_job = {**human_job, "ai_agent_status": "submitted"}
         ai = build("image-ai", ai_job, self.subadmin, now=self.shift_time)[0]
         self.assertEqual(ai["category"], "image_ai")
-        self.assertEqual(ai["amount_kes_milli"], 8)
+        self.assertEqual(ai["amount_kes_milli"], 4 * 258)
 
     def test_main_admin_review_uses_subadmin_ai_assignment_and_shift_timestamp(self):
         build = self.namespace["_human_subadmin_earning_specs"]
