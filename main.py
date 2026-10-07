@@ -6231,7 +6231,15 @@ TEMPLATE_JOB_DEFAULT_INSTRUCTION = (
     "Follow the attached template, job-specific notes, and TypeMyworDz human-work guidelines. Letter correspondence belongs in Letter Jobs."
 )
 PDF_JOB_WORKER_PAY_KES = 100
-TEXT_MESSAGES_IMAGES_PER_JOB = 2
+TEXT_MESSAGES_IMAGES_PER_JOB = 1
+TEXT_MESSAGES_WORKER_PAY_KES = 50
+
+
+def _human_pdf_job_pay_kes(job):
+    """Fixed worker pay for one submitted image job: KES 50 for Text Messages, KES 100 for PDF jobs."""
+    if str((job or {}).get("job_category") or "").strip().lower() == "text_messages":
+        return TEXT_MESSAGES_WORKER_PAY_KES
+    return PDF_JOB_WORKER_PAY_KES
 PDF_JOB_REVIEW_PAY_KES_PER_PAGE = 50
 PDF_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PDF_JOB_MAX_PAGES_PER_FILE = 100
@@ -8656,7 +8664,7 @@ def _human_worker_earning_items(job_id, job, include_processed=False):
     is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
     single_source = "pdf" if is_pdf_job else "job"
     if is_pdf_job:
-        default_rate = PDF_JOB_WORKER_PAY_KES
+        default_rate = _human_pdf_job_pay_kes(job)
     single = normalize(single_source, job, job.get("worker_uid"), job.get("worker_email"), job.get("worker_name"), job.get("worker_minutes") or job.get("minutes"), job.get("workerCompletedAt"), default_rate, job.get("payout_status"), job.get("payout_period_id"), job.get("workerPaidAt"))
     if single:
         yield single
@@ -9403,7 +9411,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             "instructions": job_instructions,
             "pdf_image": image_meta, "audio": None,
             "quote_credits": 0,
-            "quote": {"credits": 0, "minutes": 1, "transcriber_payout_kes_per_minute": PDF_JOB_WORKER_PAY_KES, "worker_fixed_amount_kes": PDF_JOB_WORKER_PAY_KES},
+            "quote": {"credits": 0, "minutes": 1, "transcriber_payout_kes_per_minute": TEXT_MESSAGES_WORKER_PAY_KES if is_text_messages else PDF_JOB_WORKER_PAY_KES, "worker_fixed_amount_kes": TEXT_MESSAGES_WORKER_PAY_KES if is_text_messages else PDF_JOB_WORKER_PAY_KES},
             "worker_uid": None, "worker_email": None, "worker_name": None,
             "worker_minutes": 1, "worker_amount_kes": None, "worker_gross_amount_kes": None,
             "worker_deduction_kes": 0, "worker_deduction_reason": "",
@@ -9441,7 +9449,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
                     pending_group = []
         if pending_group:
             await create_group(pending_group)
-        return {"created_count": len(created_jobs), "jobs": created_jobs, "upload_batch_id": upload_batch_id, "worker_pay_kes_per_image": PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
+        return {"created_count": len(created_jobs), "jobs": created_jobs, "upload_batch_id": upload_batch_id, "worker_pay_kes_per_image": TEXT_MESSAGES_WORKER_PAY_KES if is_text_messages else PDF_JOB_WORKER_PAY_KES, "tat_minutes": PDF_JOB_TAT_SECONDS // 60}
     except HTTPException:
         await rollback()
         raise
@@ -11991,8 +11999,8 @@ async def human_worker_submit(
     quote = job.get("quote") or {}
     is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
     minutes = int(job.get("minutes") or quote.get("minutes") or 0)
-    rate = PDF_JOB_WORKER_PAY_KES if is_pdf_job else int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
-    worker_amount_kes = PDF_JOB_WORKER_PAY_KES if is_pdf_job else max(0, minutes * rate)
+    rate = _human_pdf_job_pay_kes(job) if is_pdf_job else int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+    worker_amount_kes = _human_pdf_job_pay_kes(job) if is_pdf_job else max(0, minutes * rate)
     if is_pdf_job and job.get("pdf_review"):
         worker_amount_kes = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * max(1, int((job.get("pdf_review") or {}).get("page_count") or 1))
     updates = {
