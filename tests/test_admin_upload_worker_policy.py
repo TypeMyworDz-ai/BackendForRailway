@@ -608,13 +608,17 @@ class PdfBatchDownloadTests(unittest.TestCase):
         self.assertIn("upload_batch_id", source)
         rendered_loop = source.index("for rendered in rendered_images:")
         self.assertLess(source.index("for upload in files:"), rendered_loop)
-        self.assertLess(source.index("upload_page_number += 1", rendered_loop), source.index("pdf_upload_page_number", rendered_loop))
+        self.assertIn("pending_group.append", source[rendered_loop:])
+        group_def = source.index("async def create_group(group):")
+        self.assertLess(source.index("upload_page_number += 1", group_def), source.index("'pdf_upload_page_number'", group_def))
+        self.assertIn("TEXT_MESSAGES_IMAGES_PER_JOB", source)
 
     def test_private_page_images_are_combined_into_pdf_in_page_order(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_download_pdf_batch")
         order_helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_human_pdf_upload_order_key")
+        metas_helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_human_pdf_job_image_metas")
         route.decorator_list = []
 
         class Snapshot:
@@ -706,7 +710,7 @@ class PdfBatchDownloadTests(unittest.TestCase):
             "db": Database(snapshots), "_human_actor": actor, "_human_bucket": lambda: Bucket(files),
             "os": __import__("os"), "re": re, "logger": _FakeLogger(),
         }
-        exec(compile(ast.Module(body=[order_helper, route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        exec(compile(ast.Module(body=[order_helper, metas_helper, route], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
         response = asyncio.run(namespace["human_admin_download_pdf_batch"]("upload-batch-a", object()))
         self.assertEqual(response.media_type, "application/pdf")
         self.assertIn("conversation-combined.pdf", response.headers["Content-Disposition"])
@@ -764,7 +768,7 @@ class PdfBatchDownloadTests(unittest.TestCase):
         import uuid
 
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
-        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"_human_pdf_upload_order_key", "_human_pdf_same_upload_batch", "_human_pdf_same_source_file"}]
+        helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in {"_human_pdf_upload_order_key", "_human_pdf_same_upload_batch", "_human_pdf_same_source_file", "_human_pdf_job_image_metas"}]
         route = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "human_admin_create_file_review")
         route.decorator_list = []
         jobs = {
@@ -856,7 +860,7 @@ class PdfBatchDownloadTests(unittest.TestCase):
             "_human_actor": actor, "_human_job": get_job, "_pdf_page_draft_text": page_text,
             "_human_bucket": lambda: FakeBucket(), "_human_store_raw_bytes": store_bytes,
             "_human_pdf_upload_order_key": None, "_human_pdf_same_upload_batch": None,
-            "_human_pdf_same_source_file": None, "_human_collapse_duplicate_image_page_blocks": lambda text, *_args: text,
+            "_human_pdf_same_source_file": None, "_human_pdf_job_image_metas": None, "_human_collapse_duplicate_image_page_blocks": lambda text, *_args: text,
             "human_image_tat_seconds": lambda count: count * 60,
             "_review_text_to_html": lambda text: text, "_sanitize_editor_html": lambda text: text,
         }

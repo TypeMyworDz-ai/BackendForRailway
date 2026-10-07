@@ -39,6 +39,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
             "_human_worker_rating_for_job",
             "_human_worker_rating_summary_from_jobs",
             "_human_worker_earning_items",
+            "_human_pdf_job_pay_kes",
             "_pdf_job_jpeg_bytes",
             "_pdf_job_images_from_upload",
             "_as_dt",
@@ -62,7 +63,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
                     "HUMAN_AVAILABLE_SLICE_MINUTES", "MIN_HUMAN_WORKER_RATING",
                     "HUMAN_WORKER_MAX_CLAIMS_PER_ITEM",
                     "HUMAN_LEGACY_STANDARD_PAYOUT_KES", "HUMAN_PROOFREADING_PAYOUT_KES",
-                    "PDF_JOB_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE", "PDF_JOB_WORD_EXTENSIONS",
+                    "PDF_JOB_WORKER_PAY_KES", "TEXT_MESSAGES_WORKER_PAY_KES", "PDF_JOB_MAX_PAGES_PER_FILE", "PDF_JOB_WORD_EXTENSIONS",
                     "PLAN_CREDITS"
                 }:
                     constants[target.id] = ast.literal_eval(node.value)
