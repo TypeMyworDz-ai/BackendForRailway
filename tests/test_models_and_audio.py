@@ -78,7 +78,10 @@ class ModelsAndAudioTests(unittest.TestCase):
     def test_standard_plan_does_not_get_premium_models(self):
         ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
         self.assertIn("gpt-5.6-luna", ids)
+        self.assertIn("gemini-3.5-flash-lite", ids)
         self.assertNotIn("claude-opus-5-5", ids)
+        research_ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", False, True)]
+        self.assertNotIn("gemini-3.5-flash-lite", research_ids)
 
     def test_audio_full_and_ranges(self):
         respond = self.ns["_human_audio_response"]

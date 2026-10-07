@@ -12,7 +12,7 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_worker_feedback", "_review_split_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_split_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
@@ -63,6 +63,17 @@ class ReviewHelpers(unittest.TestCase):
 
     def test_no_worker_spelling_notes_returns_empty_context(self):
         self.assertEqual(NS["_human_review_spelling_notes"]([{"text": "Ordinary transcript text."}]), "")
+
+    def test_candidate_terms_exclude_client_spellings_roles_and_contact_handles(self):
+        candidates = NS["_human_review_candidate_terms"](
+            [{"text": "Ms. Kneeland spoke with Kyra Kneeland. kyrakneeland55@gmail.com.\nClient spellings: Kneeland, Kyra, Zaden; My spellings: None; I researched: Kneeland, Caseworker."}],
+            "Kneeland spoke with Caseworker.",
+            "",
+        )
+        self.assertFalse({"Kneeland", "Kyra", "Kyra Kneeland", "Zaden", "Caseworker", "kyrakneeland55"} & set(candidates))
+        self.assertIn("Family-to-Family Program", NS["_human_review_candidate_terms"](
+            [{"text": "The Family-to-Family Program was mentioned."}], "", ""
+        ))
 
     def test_worker_sees_only_own_feedback_as_admin(self):
         feedback = NS["_human_worker_feedback"]({
@@ -314,7 +325,7 @@ class AiModelRouting(unittest.TestCase):
             target.id: ast.literal_eval(node.value)
             for node in cls.tree.body if isinstance(node, ast.Assign)
             for target in node.targets if isinstance(target, ast.Name)
-            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"}
+            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", "ASK_MODEL_CATALOGUE"}
         }
 
     def test_ai_review_preserves_emphatic_repetition_and_limits_self_corrections(self):
@@ -329,11 +340,13 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Never treat emphasis", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.1-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-haiku-4-5", "claude"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
+        flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
+        self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 
     def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
@@ -396,6 +409,30 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("Actual Google searches", grounded)
         self.assertNotIn("Sources:", grounded)
         self.assertNotIn("https://example.org", grounded)
+
+    def test_research_footer_removes_duplicate_spellings_roles_and_contact_details(self):
+        transcript = (
+            "Transcript body.\n"
+            "Client spellings: Kneeland, Kyra, Zaden, Zaliah, Zaire, Tyshawn; "
+            "My spellings: None; I researched: Kneeland, Kyra.Kneeland55, Zaden, Zaliah, Caseworker, Tyshawn.\n\n"
+            "Research Notes:\n- Old model-written duplicate notes."
+        )
+        research = "\n".join([
+            "Kneeland | Kneeland | Client's surname, already supplied by the client. | yes",
+            "Kneeland | Kneeland | Repeated spelling note for the same surname. | yes",
+            "Kyra.Kneeland55 | Kyra Kneeland | Email handle: kyrakneeland55@gmail.com. | yes",
+            "Zaden | Zaden | Name already supplied by the client. | yes",
+            "Zaliah | Zaliah | Name already supplied by the client. | yes",
+            "Tyshawn | Tyshawn | Name already supplied by the client. | yes",
+            "Caseworker | Caseworker | Generic role, not a research entity. | yes",
+            "Family to Family Program | Family to Family Program | A family-support initiative relevant to the program discussed. | yes",
+            "Family to Family Program | Family to Family Program | Duplicate search finding for the same initiative. | yes",
+        ])
+        result = NS["_human_ai_agent_research_footer"](transcript, research)
+        self.assertIn("Client spellings: Kneeland, Kyra, Zaden, Zaliah, Zaire, Tyshawn; I researched: Family to Family Program.", result)
+        self.assertEqual(result.count("- Family to Family Program:"), 1)
+        for unwanted in ("My spellings: None", "Kyra.Kneeland55", "gmail.com", "Caseworker:", "- Kneeland:", "Old model-written"):
+            self.assertNotIn(unwanted, result)
 
     def test_worker_draft_charges_audio_minutes_plus_format_and_proofread_remains_one_credit(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
