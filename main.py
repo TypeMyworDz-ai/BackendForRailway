@@ -3327,6 +3327,14 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
+    # Every database and storage call runs in a worker thread. The default pool
+    # (40) fills up when many workers and admins are active at once, which makes
+    # everything queue. Give the pool room so busy periods stay fast.
+    try:
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 200
+    except Exception as exc:
+        logger.warning("Could not raise the worker thread limit: %s", exc)
     health_task = asyncio.create_task(health_monitor())
     logger.info("Health monitor task created")
     human_expiry_task = asyncio.create_task(human_expiry_monitor())
