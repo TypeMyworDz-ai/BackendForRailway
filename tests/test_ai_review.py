@@ -434,6 +434,14 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("Sources:", grounded)
         self.assertNotIn("https://example.org", grounded)
 
+    def test_candidate_terms_skip_sentence_start_words_and_titles(self):
+        text = "Present at the home was Ms. Wade. Both children were home. They visited Woodward Park. Then Ohio came up. Historically Owens lived there. If Aaliyah came later."
+        terms = NS["_human_review_candidate_terms"]([{"text": text}], "", "")
+        self.assertIn("Woodward Park", terms)
+        for junk in ("Present", "Both", "Historically", "If Aaliyah"):
+            self.assertNotIn(junk, terms)
+        self.assertFalse([term for term in terms if "Wade" in term and "Ms" in term])
+
     def test_research_footer_removes_duplicate_spellings_roles_and_contact_details(self):
         transcript = (
             "Transcript body.\n"
