@@ -4342,7 +4342,7 @@ OPENAI_FORMAT_ENDPOINTS = {
 _DEEPSEEK_DOWN_UNTIL = [0.0]
 
 
-def _ask_openai_format(provider, model_id, system_prompt, turns, question, images, max_tokens):
+def _ask_openai_format(provider, model_id, system_prompt, turns, question, images, max_tokens, auto_continue=False):
     """Call OpenAI or Mistral and return the answer text."""
     url, get_key = OPENAI_FORMAT_ENDPOINTS[provider]
     key = get_key()
@@ -4353,7 +4353,7 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         # Pictures go to ChatGPT Luna. So does everything while DeepSeek is
         # unavailable (for example an empty balance), so clients see no error.
         if images or time.time() < _DEEPSEEK_DOWN_UNTIL[0]:
-            return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens)
+            return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
     content = []
     for img in images:
         content.append({
@@ -4367,39 +4367,58 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": content})
 
-    payload = {"model": model_id, "messages": messages}
-    if provider == "deepseek":
-        # The retired v4 names are still accepted, but the current name is
-        # deepseek-flash. Reasoning is switched off: its tokens are billed as
-        # output and a chat answer does not need them.
-        payload["model"] = "deepseek-flash"
-        payload["thinking"] = {"type": "disabled"}
-    if provider == "openai":
-        # These models count reasoning tokens against the output budget, so
-        # keep reasoning light for chat and give the answer room to finish.
-        payload["max_completion_tokens"] = max(max_tokens, 4000)
-        payload["reasoning_effort"] = "low"
-    else:
-        payload["max_tokens"] = max(max_tokens, 4000)
-
-    r = requests.post(
-        url,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=180,
-    )
-    if r.status_code != 200:
-        logger.error(f"{provider} returned {r.status_code}: {r.text[:400]}")
+    chunks = []
+    max_attempts = 12 if auto_continue else 1
+    for attempt in range(max_attempts):
+        payload = {"model": model_id, "messages": messages}
         if provider == "deepseek":
-            _DEEPSEEK_DOWN_UNTIL[0] = time.time() + 300
-            return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens)
-        raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    text = ((choice.get("message") or {}).get("content") or "").strip()
-    if choice.get("finish_reason") == "length" and text:
-        text += "\n\n[The answer was cut short because it reached its length limit. Ask me to continue and I will pick up where I stopped.]"
-    return text
+            # The retired v4 names are still accepted, but the current name is
+            # deepseek-flash. Reasoning is switched off: its tokens are billed as
+            # output and a chat answer does not need them.
+            payload["model"] = "deepseek-flash"
+            payload["thinking"] = {"type": "disabled"}
+        budget = max(max_tokens, 16000 if auto_continue else 4000)
+        if provider == "openai":
+            # These models count reasoning tokens against the output budget, so
+            # keep reasoning light for chat and give the answer room to finish.
+            payload["max_completion_tokens"] = budget
+            payload["reasoning_effort"] = "low"
+        else:
+            payload["max_tokens"] = budget
+
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=300 if auto_continue else 180,
+        )
+        if r.status_code != 200:
+            logger.error(f"{provider} returned {r.status_code}: {r.text[:400]}")
+            if provider == "deepseek":
+                _DEEPSEEK_DOWN_UNTIL[0] = time.time() + 300
+                return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
+            raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
+        data = r.json()
+        choice = (data.get("choices") or [{}])[0]
+        text = ((choice.get("message") or {}).get("content") or "").strip()
+        if text:
+            chunks.append(text)
+        if choice.get("finish_reason") == "length":
+            if not auto_continue:
+                if text:
+                    return text + "\n\n[The answer was cut short because it reached its length limit.  Ask me to continue and I will pick up where I stopped.]"
+                return text
+            if not text:
+                raise RuntimeError("The model reached its output limit without a continuation point.")
+            if attempt + 1 >= max_attempts:
+                raise RuntimeError("The model could not finish the response after automatic continuation.")
+            messages = messages + [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": "Continue exactly where the previous response stopped. Do not repeat earlier output. Return only the remaining text, with no explanation or status notice."},
+            ]
+            continue
+        break
+    return "".join(chunks).strip()
 
 
 def _ask_gemini(model_id, system_prompt, turns, question, images, max_tokens, thinking_level=None, auto_continue=False):
@@ -4416,7 +4435,7 @@ def _ask_gemini(model_id, system_prompt, turns, question, images, max_tokens, th
     for img in images:
         parts.append({"inline_data": {"mime_type": img["media_type"], "data": img["data"]}})
 
-    gen = {"maxOutputTokens": max(max_tokens, GEMINI_MIN_OUTPUT_TOKENS)}
+    gen = {"maxOutputTokens": max(max_tokens, 16000 if auto_continue else GEMINI_MIN_OUTPUT_TOKENS)}
     if thinking_level and str(model_id).startswith("gemini-3."):
         gen["thinkingConfig"] = {"thinkingLevel": str(thinking_level)}
     elif model_id in GEMINI_THINKING_OFF:
@@ -4424,7 +4443,7 @@ def _ask_gemini(model_id, system_prompt, turns, question, images, max_tokens, th
 
     contents = [{"role": "user", "parts": parts}]
     visible_chunks = []
-    max_attempts = 5 if auto_continue else 1
+    max_attempts = 12 if auto_continue else 1
     length_notice = "\n\n[The answer was cut short because it reached its length limit. Ask me to continue and I will pick up where I stopped.]"
     for attempt in range(max_attempts):
         r = requests.post(
@@ -4483,12 +4502,12 @@ def _ask_claude(model_id, system_prompt, turns, question, images, max_tokens, au
     content.append({"type": "text", "text": question})
     messages = [{"role": t["role"], "content": t["content"]} for t in turns]
     messages.append({"role": "user", "content": content})
-    max_attempts = 5 if auto_continue else 1
+    max_attempts = 12 if auto_continue else 1
     output_chunks = []
     for attempt in range(max_attempts):
         response = claude_client.messages.create(
             model=model_id,
-            max_tokens=max(max_tokens, 4000),
+            max_tokens=max(max_tokens, 16000 if auto_continue else 4000),
             system=system_prompt,
             messages=messages,
         )
@@ -4503,7 +4522,7 @@ def _ask_claude(model_id, system_prompt, turns, question, images, max_tokens, au
             output_chunks.append(text)
             if attempt + 1 >= max_attempts:
                 raise RuntimeError("Claude could not finish the response after automatic continuation.")
-            messages.append({"role": "assistant", "content": text})
+            messages.append({"role": "assistant", "content": text.rstrip()})
             messages.append({
                 "role": "user",
                 "content": "Continue exactly where the previous response stopped. Do not repeat earlier output. Return only the remaining transcript text, with no explanation or status notice.",
@@ -15321,7 +15340,7 @@ def _run_ask_model_with_images(model_id, provider, system_prompt, question, imag
     attachments = list(images or [])
     options = dict(model_options or {})
     if provider in OPENAI_FORMAT_ENDPOINTS:
-        return _ask_openai_format(provider, model_id, system_prompt, [], question, attachments, max_tokens)
+        return _ask_openai_format(provider, model_id, system_prompt, [], question, attachments, max_tokens, auto_continue=bool(options.get("auto_continue")))
     if provider == "gemini":
         return _ask_gemini(
             model_id, system_prompt, [], question, attachments, max_tokens,
@@ -15337,6 +15356,9 @@ def _run_ask_model_with_images(model_id, provider, system_prompt, question, imag
 async def _human_call_model_chain(model_chain, system_prompt, question, images=None, max_tokens=8000, response_validator=None, model_options=None):
     """Use the primary model first; try backups only after failure or unusable output."""
     last_error = None
+    # Job agents must never hand back a cut-off document: always let the
+    # provider call keep going until the model finishes on its own.
+    model_options = {**(model_options or {}), "auto_continue": True}
     for model_id, provider in model_chain:
         try:
             answer = await asyncio.to_thread(
@@ -15346,6 +15368,8 @@ async def _human_call_model_chain(model_chain, system_prompt, question, images=N
             answer = str(answer or "").strip()
             if not answer:
                 raise ValueError("empty model response")
+            if "[The answer was cut short because it reached its length limit" in answer:
+                raise ValueError("model output was truncated")
             if response_validator:
                 response_validator(answer)
             return answer, model_id
