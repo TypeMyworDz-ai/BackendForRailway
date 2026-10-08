@@ -421,6 +421,15 @@ ASK_MODEL_CATALOGUE = [
     #    "blurb": "A capable European model. Good for summaries and everyday questions.",
     #    "tier": "standard", "credits": 1, "transcript_only": False},
     {
+        "id": "claude-haiku-5-5",
+        "provider": "claude",
+        "label": "Claude Haiku 5.5",
+        "blurb": "Claude's newest quick model. Careful with long documents and very economical.",
+        "tier": "standard",
+        "credits": 2,
+        "transcript_only": False,
+    },
+    {
         "id": "claude-haiku-4-5-20251001",
         "provider": "claude",
         "label": "Claude Haiku 4.5",
@@ -458,15 +467,6 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "claude-sonnet-5-5",
-        "provider": "claude",
-        "label": "Claude Sonnet 5.5",
-        "blurb": "An excellent all-rounder. Careful, thorough answers.",
-        "tier": "premium",
-        "credits": 10,
-        "transcript_only": False,
-    },
-    {
         "id": "claude-opus-5-5",
         "provider": "claude",
         "label": "Claude Opus 5.5",
@@ -498,7 +498,8 @@ ASK_MODEL_CATALOGUE = [
 # Model ids that were renamed or replaced. A client who saved one in Settings
 # is moved to its successor instead of being dropped back to the default.
 ASK_MODEL_ALIASES = {
-    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-sonnet-5": "claude-haiku-5-5",
+    "claude-sonnet-5-5": "claude-haiku-5-5",
     "claude-opus-4-6": "claude-opus-5-5",
     "gemini-3.6-flash": "gemini-3.8-flash",
 }
@@ -13529,11 +13530,11 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"))
+AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"), ("claude-haiku-5-5", "claude"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude"))
-WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
-WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gemini-3.5-flash-lite", "gemini"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini"))
+WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
+WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
     "GENERAL-JOBS SPEAKER SELF-CORRECTIONS: When the speaker immediately and unmistakably replaces a word or phrase with a correction, remove only the abandoned version and retain the corrected wording. "
     "Example: 'She stated that she is at the Dublin Granville— East Dublin Granville Children's Close to Home.' becomes 'She stated that she is at the East Dublin Granville Children's Close to Home.' "
@@ -13543,8 +13544,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Gemini 3.8 Flash + Claude Sonnet 5.5 fallback", "job_types": ["audio", "general_job"],
-        "models": ["gemini-3.8-flash", "claude-sonnet-5-5"],
+        "display": "Claude Haiku 5.5 + Gemini 3.8 Flash fallback", "job_types": ["audio", "general_job"],
+        "models": ["claude-haiku-5-5", "gemini-3.8-flash"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -13833,7 +13834,7 @@ def _human_term_snippets(text, terms, width=260):
     return "\n".join(out)
 
 
-def _claude_research_blocking(prompt, model_id="claude-sonnet-5-5"):
+def _claude_research_blocking(prompt, model_id="claude-haiku-5-5"):
     """Online research through Claude's own web search tool (a second, independent search route)."""
     if not claude_client:
         raise RuntimeError("Claude is not configured for web research.")
@@ -13874,7 +13875,7 @@ def _human_research_blocking(prompt):
     routes = (
         ("gemini-3.8-flash", lambda: _gemini_research_blocking(prompt, "gemini-3.8-flash", 2)),
         ("gemini-3.5-flash-lite", lambda: _gemini_research_blocking(prompt, "gemini-3.5-flash-lite", 2)),
-        ("claude-sonnet-5-5", lambda: _claude_research_blocking(prompt)),
+        ("claude-haiku-5-5", lambda: _claude_research_blocking(prompt)),
     )
     last = None
     for name, call in routes:
@@ -16785,14 +16786,12 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    used_terra = "gpt-5.6-terra" in used_model_ids
-    used_gemini = "gemini-3.8-flash" in used_model_ids
-    if used_terra and used_gemini:
-        model_label = "GPT-5.6 Terra with Gemini 3.8 Flash fallback"
-    elif used_gemini:
-        model_label = "Gemini 3.8 Flash"
-    elif used_terra:
-        model_label = "GPT-5.6 Terra"
+    names = {"gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gemini-3.8-flash": "Gemini 3.8 Flash", "claude-haiku-5-5": "Claude Haiku 5.5"}
+    ordered = [names[m] for m in names if m in used_model_ids]
+    if len(ordered) > 1:
+        model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
+    elif ordered:
+        model_label = ordered[0]
     else:
         model_label = ", ".join(dict.fromkeys(models_used)) or "AI Proofreader"
     saved = {
