@@ -13683,8 +13683,8 @@ async def admin_workers(request: Request):
 AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini"))
-WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
-WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"))
+WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
+WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
     "GENERAL-JOBS SPEAKER SELF-CORRECTIONS: When the speaker immediately and unmistakably replaces a word or phrase with a correction, remove only the abandoned version and retain the corrected wording. "
     "Example: 'She stated that she is at the Dublin Granville— East Dublin Granville Children's Close to Home.' becomes 'She stated that she is at the East Dublin Granville Children's Close to Home.' "
@@ -15491,7 +15491,6 @@ def _human_worker_ai_draft_credit_cost(job, segment=None):
 
 
 async def _human_worker_format_ai_draft(job_id, job, transcript):
-    await _progress("Reading the guidelines and job notes", 10)
     guidelines = await _admin_guidelines_text()
     context_data = await _human_review_context(job_id, job)
     context = context_data["text"]
