@@ -15863,6 +15863,7 @@ def _human_draft_stray_message(answer):
 async def _human_call_model_chain(model_chain, system_prompt, question, images=None, max_tokens=8000, response_validator=None, model_options=None):
     """Use the primary model first; try backups only after failure or unusable output."""
     last_error = None
+    failures = []
     # Job agents must never hand back a cut-off document: always let the
     # provider call keep going until the model finishes on its own.
     model_options = {**(model_options or {}), "auto_continue": True}
@@ -15883,8 +15884,9 @@ async def _human_call_model_chain(model_chain, system_prompt, question, images=N
             return answer, model_id
         except Exception as exc:
             last_error = exc
+            failures.append(f"{model_id}: {str(exc)[:200]}")
             logger.warning("AI model %s failed or returned unusable output; trying the next model: %s", model_id, str(exc)[:300])
-    raise RuntimeError("All configured AI models failed or returned unusable output.") from last_error
+    raise RuntimeError("All configured AI models failed or returned unusable output. " + " | ".join(failures)) from last_error
 
 
 def _run_ask_model(model_id, provider, system_prompt, question, max_tokens=8000):
@@ -16749,7 +16751,8 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
             models_used.append(model_used)
         except Exception as exc:
             logger.warning("AI review failed for %s: %s", job_id, exc)
-            raise HTTPException(status_code=502, detail="AI proofreading could not be completed. Please try again later.")
+            reason = str(exc).replace("All configured AI models failed or returned unusable output.", "").strip()[:420]
+            raise HTTPException(status_code=502, detail="AI proofreading could not be completed" + (f" ({reason})" if reason else "") + ". Please try again.")
         final_chunks.append(text)
         all_parts.extend(data.get("parts") or [])
         all_changes.extend(data.get("changes") or [])
