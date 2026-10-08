@@ -1,3 +1,4 @@
+import functools
 import logging
 import sys
 import asyncio
@@ -1472,12 +1473,23 @@ async def _human_job_owner_lookup(job_id):
     return owner[0], owner[1], True
 
 
+_human_email_uid_cache = {}
+
+
 async def _human_uids_for_email(email):
+    key = str(email or "").strip().lower()
+    cached = _human_email_uid_cache.get(key)
+    if cached and time.monotonic() - cached[0] < 600:
+        return set(cached[1])
     try:
         record = await asyncio.to_thread(firebase_auth.get_user_by_email, str(email))
-        return {record.uid} if record.uid else set()
+        found = {record.uid} if record.uid else set()
     except Exception:
         return set()
+    if len(_human_email_uid_cache) > 500:
+        _human_email_uid_cache.clear()
+    _human_email_uid_cache[key] = (time.monotonic(), tuple(found))
+    return found
 
 
 async def _human_main_admin_uids():
@@ -5875,19 +5887,21 @@ async def admin_traffic(request: Request):
     _require_admin(request)
     if not db:
         return {"events": []}
-    cutoff = datetime.utcnow() - timedelta(days=30)
-    events = []
-    query = db.collection("trafficEvents").where(
-        filter=FieldFilter("createdAt", ">=", cutoff)
-    )
-    for document in await asyncio.to_thread(lambda: list(query.stream())):
-        data = document.to_dict() or {}
-        created_at = data.get("createdAt")
-        if hasattr(created_at, "isoformat"):
-            data["createdAt"] = created_at.isoformat()
-        data["id"] = document.id
-        events.append(data)
-    return {"events": events}
+    async def _load_traffic():
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        events = []
+        query = db.collection("trafficEvents").where(
+            filter=FieldFilter("createdAt", ">=", cutoff)
+        )
+        for document in await asyncio.to_thread(lambda: list(query.stream())):
+            data = document.to_dict() or {}
+            created_at = data.get("createdAt")
+            if hasattr(created_at, "isoformat"):
+                data["createdAt"] = created_at.isoformat()
+            data["id"] = document.id
+            events.append(data)
+        return {"events": events}
+    return await _ttl_single_flight("admin:traffic", 30.0, _load_traffic)
 
 
 @app.get("/api/admin/users")
@@ -5896,7 +5910,9 @@ async def admin_users(request: Request):
     _require_admin(request)
     if not db:
         raise HTTPException(status_code=503, detail="The admin data service is not available.")
-    return {"users": await asyncio.to_thread(_read_admin_users_snapshot)}
+    async def _load_users():
+        return {"users": await asyncio.to_thread(_read_admin_users_snapshot)}
+    return await _ttl_single_flight("admin:users", 30.0, _load_users)
 
 
 @app.post("/api/admin/delete-user")
@@ -9134,6 +9150,7 @@ def _human_list_cache_bump():
 async def _human_list_cache_invalidation_middleware(request: Request, call_next):
     mutating = request.method not in {"GET", "HEAD", "OPTIONS"} and (
         request.url.path.startswith("/human-transcription") or request.url.path.startswith("/api/admin")
+        or request.url.path.startswith("/api/messaging") or request.url.path.startswith("/api/notifications")
     )
     if mutating:
         _human_list_cache_bump()
@@ -9172,6 +9189,40 @@ async def _human_cached_query(key, loader):
     if len(_human_list_cache) > 200:
         _human_list_cache.clear()
     return rows
+
+
+_ttl_cache = {}
+
+
+async def _ttl_single_flight(key, ttl, factory):
+    """Compute an async result once and share it between overlapping or near-simultaneous requests.
+
+    Any write that bumps the Human Work epoch (including messaging and notification
+    writes) discards the stored result, so people never see stale data after a change.
+    """
+    now = time.monotonic()
+    entry = _ttl_cache.get(key)
+    if entry and entry["epoch"] == _human_list_cache_epoch:
+        if entry["task"] is not None and not entry["task"].done():
+            return await asyncio.shield(entry["task"])
+        if entry["task"] is None and now - entry["at"] < ttl:
+            return entry["value"]
+    epoch = _human_list_cache_epoch
+    task = asyncio.ensure_future(factory())
+    _ttl_cache[key] = {"epoch": epoch, "task": task, "value": None, "at": now}
+    try:
+        value = await asyncio.shield(task)
+    except BaseException:
+        if (_ttl_cache.get(key) or {}).get("task") is task:
+            _ttl_cache.pop(key, None)
+        raise
+    if epoch == _human_list_cache_epoch:
+        _ttl_cache[key] = {"epoch": epoch, "task": None, "value": value, "at": time.monotonic()}
+    elif (_ttl_cache.get(key) or {}).get("task") is task:
+        _ttl_cache.pop(key, None)
+    if len(_ttl_cache) > 500:
+        _ttl_cache.clear()
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -9268,6 +9319,26 @@ def _human_collect_worker_uids(node, found):
             _human_collect_worker_uids(value, found)
 
 
+_NAME_SWAP_MAX_CHARS = 20000
+
+
+def _human_swap_names(value, needles):
+    """Replace every worker name or email in a short string with its stable label, in one pass."""
+    if not needles or not isinstance(value, str) or len(value) < 4 or len(value) > _NAME_SWAP_MAX_CHARS:
+        return value
+    pattern, mapping = _human_needle_regex(tuple(needles))
+    return pattern.sub(lambda match: mapping.get(match.group(0).casefold(), match.group(0)), value)
+
+
+@functools.lru_cache(maxsize=4)
+def _human_needle_regex(needles):
+    mapping = {}
+    for needle, label in needles:
+        mapping.setdefault(needle, label)
+    pattern = re.compile("|".join(re.escape(needle) for needle in mapping), re.IGNORECASE)
+    return pattern, mapping
+
+
 def _human_anonymize_node(node, by_uid, needles):
     agent_ids = list(HUMAN_AI_AGENTS)
     if isinstance(node, dict):
@@ -9294,23 +9365,14 @@ def _human_anonymize_node(node, by_uid, needles):
                 node[key] = "a human worker"
         for key, value in list(node.items()):
             if isinstance(value, str):
-                lowered = value.casefold()
-                for needle, label in needles:
-                    if needle in lowered:
-                        value = re.sub(re.escape(needle), label, value, flags=re.IGNORECASE)
-                        lowered = value.casefold()
-                node[key] = value
+                node[key] = _human_swap_names(value, needles)
             else:
                 node[key] = _human_anonymize_node(value, by_uid, needles)
         return node
     if isinstance(node, list):
         return [_human_anonymize_node(item, by_uid, needles) for item in node]
     if isinstance(node, str):
-        lowered = node.casefold()
-        for needle, label in needles:
-            if needle in lowered:
-                node = re.sub(re.escape(needle), label, node, flags=re.IGNORECASE)
-                lowered = node.casefold()
+        return _human_swap_names(node, needles)
     return node
 
 
@@ -9335,18 +9397,22 @@ async def _human_subadmin_scope_middleware(request: Request, call_next):
     response = await call_next(request)
     if "application/json" not in str(response.headers.get("content-type") or "").lower():
         return response
-    body = b""
+    chunks = []
     async for chunk in response.body_iterator:
-        body += chunk
+        chunks.append(chunk)
+    body = b"".join(chunks)
+
+    def _parse(raw):
+        return json.loads(raw.decode("utf-8"))
     try:
-        data = json.loads(body.decode("utf-8"))
+        data = await asyncio.to_thread(_parse, body)
     except Exception:
         return Response(content=body, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
     try:
         uids = set()
-        _human_collect_worker_uids(data, uids)
+        await asyncio.to_thread(_human_collect_worker_uids, data, uids)
         by_uid, needles = await _human_worker_aliases(uids)
-        data = _human_anonymize_node(data, by_uid, needles)
+        data = await asyncio.to_thread(_human_anonymize_node, data, by_uid, needles)
     except Exception:
         logger.exception("Sub-admin worker anonymisation failed; withholding the response")
         return JSONResponse({"detail": "This page could not be prepared. Please retry."}, status_code=503)
@@ -13530,7 +13596,7 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"), ("claude-haiku-5-5", "claude"))
+AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -16812,7 +16878,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    names = {"gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gemini-3.8-flash": "Gemini 3.8 Flash", "claude-haiku-5-5": "Claude Haiku 5.5"}
+    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "claude-haiku-5-5": "Claude Haiku 5.5"}
     ordered = [names[m] for m in names if m in used_model_ids]
     if len(ordered) > 1:
         model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
@@ -17518,6 +17584,12 @@ async def messaging_inbox(request: Request):
     actor = await _human_actor(request)
     if not db:
         return {"threads": []}
+    return await _ttl_single_flight(f"inbox:{actor['uid']}", 4.0, lambda: _messaging_inbox_build(actor))
+
+
+async def _messaging_inbox_build(actor):
+    if not db:
+        return {"threads": []}
 
     threads = []
     # Firestore returns only threads whose participant array includes this
@@ -17532,14 +17604,15 @@ async def messaging_inbox(request: Request):
         )
     )
     user_chat_entries = [(snapshot.id, snapshot.reference, snapshot.to_dict() or {}) for snapshot in user_chat_snapshots]
+    user_chat_message_rows = await asyncio.gather(*[
+        asyncio.to_thread(lambda ref=thread_ref.collection("messages"): list(ref.order_by("createdAt").stream()))
+        for _, thread_ref, _ in user_chat_entries
+    ]) if user_chat_entries else []
 
-    for thread_id, thread_ref, parent in user_chat_entries:
+    for (thread_id, thread_ref, parent), message_snapshots in zip(user_chat_entries, user_chat_message_rows):
         parent_participants = {str(uid) for uid in (parent.get("participants") or []) if uid}
         if actor["uid"] not in parent_participants:
             continue
-        message_snapshots = await asyncio.to_thread(
-            lambda ref=thread_ref.collection("messages"): list(ref.order_by("createdAt").stream())
-        )
         messages = []
         other_uids = set()
         for message_snapshot in message_snapshots:
@@ -17586,24 +17659,30 @@ async def messaging_inbox(request: Request):
             "latestUnread": {"id": latest_unread.get("id"), "createdAt": latest_unread.get("createdAt")} if latest_unread else None,
         })
 
-    job_snapshots = await asyncio.to_thread(lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream()))
+    job_snapshots = await _human_cached_query(
+        "inbox:all_jobs", lambda: list(db.collection(HUMAN_JOB_COLLECTION).stream())
+    ) if actor["role"] in {"admin", "worker"} else []
+    accessible_jobs = []
     for job_snapshot in job_snapshots:
-        if actor["role"] not in {"admin", "worker"}:
-            continue
         job = job_snapshot.to_dict() or {}
-        job_id = job_snapshot.id
         has_access = (
-            actor["role"] == "admin"
+            (actor["role"] == "admin" and _human_admin_can_see_job(actor, job))
             or job.get("client_uid") == actor["uid"]
             or job.get("worker_uid") == actor["uid"]
             or job.get("proofreader_uid") == actor["uid"]
             or any((segment or {}).get("worker_uid") == actor["uid"] for segment in (job.get("segments") or []))
         )
-        if not has_access:
-            continue
-        message_snapshots = await asyncio.to_thread(
-            lambda ref=job_snapshot.reference.collection("messages"): list(ref.order_by("createdAt").stream())
-        )
+        if has_access:
+            accessible_jobs.append((job_snapshot, job))
+    semaphore = asyncio.Semaphore(16)
+
+    async def _job_messages(snapshot):
+        async with semaphore:
+            return await asyncio.to_thread(lambda: list(snapshot.reference.collection("messages").order_by("createdAt").stream()))
+
+    job_message_rows = await asyncio.gather(*[_job_messages(snap) for snap, _ in accessible_jobs]) if accessible_jobs else []
+    for (job_snapshot, job), message_snapshots in zip(accessible_jobs, job_message_rows):
+        job_id = job_snapshot.id
         if not message_snapshots:
             continue
         thread_groups = {"client": [], "worker": []}
@@ -17726,10 +17805,13 @@ async def application_notifications(request: Request):
     actor = await _human_actor(request)
     if not db:
         return {"notifications": [], "unread_count": 0, "unread_message_count": 0, "unread_event_count": 0}
+    return await _ttl_single_flight(f"notifications:{actor['uid']}", 3.0, lambda: _application_notifications_build(actor))
 
+
+async def _application_notifications_build(actor):
     # Reuse the participant-scoped inbox; previews stay server-side and are
     # never copied into alert cards.
-    inbox = await messaging_inbox(request)
+    inbox = await _ttl_single_flight(f"inbox:{actor['uid']}", 4.0, lambda: _messaging_inbox_build(actor))
     unread_threads = {}
     unread_message_count = 0
     for thread in inbox.get("threads") or []:
