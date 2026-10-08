@@ -15353,6 +15353,50 @@ def _run_ask_model_with_images(model_id, provider, system_prompt, question, imag
     )
 
 
+_STRAY_META_BRACKET = re.compile(
+    r"(?im)^\s*[\[(]\s*(?:the answer was cut short|note\s*:|notes?\s+to\s+(?:the\s+)?(?:editor|reader|user)|"
+    r"(?:output|response|text|transcript|draft)\s+(?:was\s+)?(?:truncated|cut off|continues|continued)|"
+    r"continued\b|to be continued|remaining (?:text|transcript|content)|rest of (?:the )?(?:text|transcript|document)|"
+    r"\.{3}\s*(?:remaining|rest|continues)|truncated|i (?:have|had|was) (?:unable|not able)|as an ai\b)[^\n]{0,200}[\])]\s*$"
+)
+_STRAY_PREFACE = re.compile(
+    r"(?is)\A\s*(?:sure|certainly|of course|absolutely)[,!.]?[ ]+(?:here\b|i(?:'ll| will|'ve| have) (?:format|proofread|review|transcribe|prepare|provide)\w*)|"
+    r"\A\s*(?:here(?:'s| is| are)|below is|i(?:'ve| have) (?:formatted|proofread|reviewed|transcribed|prepared|completed))\b[^\n]{0,160}(?:transcript|draft|document|version|formatted|proofread)[^\n]{0,80}:\s*\n"
+)
+_STRAY_CLOSING = re.compile(
+    r"(?im)^\s*(?:let me know if you(?:'d| would) like me to\b|i hope (?:this|that) (?:helps|meets|works)\b|would you like me to\b)[^\n]*\s*\Z"
+)
+_STRAY_REFUSAL = re.compile(
+    r"(?is)\A\s*(?:i(?:'m| am) sorry\b|sorry,|i apologi[sz]e\b|i (?:cannot|can't|can not|am unable to|'m unable to|was unable to) (?:assist|help|complete|process|provide|transcribe|format|proofread|continue)|as an ai\b|unfortunately,? i\b)"
+)
+
+
+def _human_draft_stray_message(answer):
+    """Name any assistant chatter, status notice or refusal left inside a draft.
+
+    Returns a short reason, or an empty string when the draft is clean. Only
+    unmistakable machine wording is matched, so normal bracketed transcript
+    notes such as [inaudible] or staff instructions are never rejected.
+    """
+    text = str(answer or "")
+    if "[The answer was cut short because it reached its length limit" in text:
+        return "a length-limit notice"
+    if _STRAY_META_BRACKET.search(text):
+        return "a status or truncation notice"
+    if _STRAY_REFUSAL.search(text):
+        return "a refusal or apology instead of a draft"
+    if _STRAY_PREFACE.search(text):
+        return "an introduction such as 'Here is the transcript'"
+    if _STRAY_CLOSING.search(text):
+        return "a closing offer such as 'Let me know if you need anything'"
+    if "<thinking>" in text.lower() or "</thinking>" in text.lower():
+        return "leaked reasoning"
+    stripped = text.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        return "the whole draft wrapped in a code block"
+    return ""
+
+
 async def _human_call_model_chain(model_chain, system_prompt, question, images=None, max_tokens=8000, response_validator=None, model_options=None):
     """Use the primary model first; try backups only after failure or unusable output."""
     last_error = None
@@ -15368,8 +15412,9 @@ async def _human_call_model_chain(model_chain, system_prompt, question, images=N
             answer = str(answer or "").strip()
             if not answer:
                 raise ValueError("empty model response")
-            if "[The answer was cut short because it reached its length limit" in answer:
-                raise ValueError("model output was truncated")
+            stray = _human_draft_stray_message(answer)
+            if stray:
+                raise ValueError(f"model output contained {stray}")
             if response_validator:
                 response_validator(answer)
             return answer, model_id
