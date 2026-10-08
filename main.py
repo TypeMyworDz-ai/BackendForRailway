@@ -3335,6 +3335,7 @@ async def lifespan(app: FastAPI):
         anyio.to_thread.current_default_thread_limiter().total_tokens = 200
     except Exception as exc:
         logger.warning("Could not raise the worker thread limit: %s", exc)
+    resume_task = asyncio.create_task(_human_resume_orphans_after_start())
     health_task = asyncio.create_task(health_monitor())
     logger.info("Health monitor task created")
     human_expiry_task = asyncio.create_task(human_expiry_monitor())
@@ -13585,6 +13586,38 @@ async def _human_ai_agent_research(raw_text, context):
     return result
 
 
+def _human_research_parse_findings(research):
+    """Read grounded research lines into (dictated, verified, explanation, confidence) rows.
+
+    Accepts plain "a | b | c | yes" lines, bulleted lines, and markdown tables with
+    leading and trailing pipes, so a harmless formatting difference never makes
+    verified research look empty.
+    """
+    content = str(research or "").split("ACTUAL GOOGLE SEARCH QUERIES:", 1)[0].split("ACTUAL SEARCH SOURCES:", 1)[0]
+    rows = []
+    for line in content.splitlines():
+        line = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s+", "", line.strip()).replace("**", "")
+        if "|" not in line or re.fullmatch(r"[\s|:\-]+", line):
+            continue
+        fields = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(fields) < 4:
+            continue
+        dictated, verified = fields[0], fields[1]
+        explanation = " | ".join(fields[2:-1]).strip()
+        confidence = re.sub(r"(?i)^confidence\s*:?\s*", "", fields[-1]).strip().rstrip(".").casefold()
+        if dictated.casefold() in {"dictated form", "dictated", "term"}:
+            continue
+        rows.append((dictated, verified, explanation, "yes" if confidence.startswith("yes") else confidence))
+    return rows
+
+
+def _human_research_unverified_terms(research):
+    match = re.search(r"(?is)(?:unverified terms[^:\n]*:|terms that still require research:)\s*([^\n]+)", str(research or ""))
+    if not match:
+        return []
+    return [item.strip(" .") for item in re.split(r"[,;]", match.group(1)) if item.strip(" .")][:40]
+
+
 def _human_ai_agent_research_footer(transcript, research):
     """Append grounded, deduplicated research without repeating supplied spellings or exposing contact details."""
     raw = str(transcript or "").strip()
@@ -13641,7 +13674,6 @@ def _human_ai_agent_research_footer(transcript, research):
     if not research:
         return body + "\n\nResearch Notes:\nNo external searches were needed for this transcript."
 
-    findings_block = research.split("ACTUAL GOOGLE SEARCH QUERIES:", 1)[0].split("ACTUAL SEARCH SOURCES:", 1)[0]
     findings = []
     terms = []
     seen_terms = set()
@@ -13649,15 +13681,7 @@ def _human_ai_agent_research_footer(transcript, research):
     generic_terms = {"caseworker", "social worker", "worker", "supervisor", "client", "mother", "father", "none", "n a", "na"}
     private_contact = re.compile(r"(?i)(?:@|\b(?:e-?mail|handle|username|user name|gmail|yahoo|outlook|icloud|hotmail)\b)")
     private_handle = re.compile(r"(?i)\b[a-z][a-z0-9]*[._][a-z0-9._-]*\d[a-z0-9._-]*\b")
-    for line in findings_block.splitlines():
-        line = line.strip().lstrip("-*• ").strip()
-        if not line or "|" not in line:
-            continue
-        fields = [part.strip() for part in line.split("|", 3)]
-        if len(fields) < 4:
-            continue
-        dictated, verified, explanation, confidence = fields
-        confidence = re.sub(r"(?i)^confidence\s*:?\s*", "", confidence).strip().rstrip(".").casefold()
+    for dictated, verified, explanation, confidence in _human_research_parse_findings(research):
         if confidence != "yes" or not (dictated or verified) or not explanation:
             continue
         parsed_findings += 1
@@ -13675,7 +13699,15 @@ def _human_ai_agent_research_footer(transcript, research):
         findings.append(f"- {label}: {explanation} (confidence: {confidence})")
 
     if not parsed_findings:
-        return body
+        unverified = _human_research_unverified_terms(research)
+        if unverified:
+            note = (
+                "Research Notes:\nWeb research could not confirm these terms, so they were left exactly as dictated: "
+                + ", ".join(unverified) + "."
+            )
+        else:
+            note = "Research Notes:\nWeb research returned no confirmed findings for this transcript, so no spellings were changed because of research."
+        return body.rstrip() + "\n\n" + note
     if not terms:
         notes = "Research Notes:\nNo additional research notes were needed beyond the supplied spellings and references."
         return body + "\n\n" + notes
@@ -14228,6 +14260,71 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             logger.exception("Could not save AI-agent failure status for job %s", job_id)
 
 
+_AI_RUNS_ACTIVE = set()
+_AI_RUN_MAX_RESUMES = 2
+
+
+async def _human_run_ai_agent_tracked(job_id, segment_id, agent_id, run_id):
+    """Run an AI agent and remember it is alive, so a restart can spot orphans."""
+    _AI_RUNS_ACTIVE.add(run_id)
+    try:
+        await _human_run_ai_agent(job_id, segment_id, agent_id, run_id)
+    finally:
+        _AI_RUNS_ACTIVE.discard(run_id)
+
+
+async def human_resume_orphaned_ai_runs():
+    """Restart AI drafts that a server restart or deploy interrupted.
+
+    Background AI work lives inside the server process, so a restart silently
+    kills it and the job would otherwise show "preparing a draft" forever. Each
+    run is saved in Firestore, so it can simply be started again. Credits were
+    charged once when the run was assigned and are not charged again.
+    """
+    if not db:
+        return 0
+    try:
+        snapshots = await asyncio.to_thread(
+            lambda: list(db.collection("human_ai_agent_runs").where(filter=FieldFilter("status", "==", "queued")).stream())
+        )
+    except Exception as exc:
+        logger.warning("Could not look for interrupted AI runs: %s", exc)
+        return 0
+    resumed = 0
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    for snap in snapshots:
+        run = snap.to_dict() or {}
+        run_id = str(run.get("run_id") or snap.id)
+        if run_id in _AI_RUNS_ACTIVE:
+            continue
+        created = _as_dt(run.get("createdAt"))
+        if created is not None and getattr(created, "tzinfo", None):
+            created = created.astimezone(timezone.utc).replace(tzinfo=None)
+        if created is not None and now - created > timedelta(hours=6):
+            continue
+        if int(run.get("resume_count") or 0) >= _AI_RUN_MAX_RESUMES:
+            continue
+        job_id, segment_id, agent_id = run.get("job_id"), run.get("segment_id"), run.get("agent_id")
+        if not (job_id and segment_id and agent_id in HUMAN_AI_AGENTS):
+            continue
+        try:
+            await asyncio.to_thread(snap.reference.update, {"resume_count": int(run.get("resume_count") or 0) + 1})
+        except Exception:
+            continue
+        logger.info("Resuming interrupted AI run %s for job %s", run_id, job_id)
+        asyncio.create_task(_human_run_ai_agent_tracked(job_id, segment_id, agent_id, run_id))
+        resumed += 1
+    return resumed
+
+
+async def _human_resume_orphans_after_start():
+    await asyncio.sleep(20)
+    try:
+        await human_resume_orphaned_ai_runs()
+    except Exception as exc:
+        logger.warning("Resuming interrupted AI runs failed: %s", exc)
+
+
 @app.post("/human-transcription/jobs/{job_id}/ai-agent/assign")
 async def human_admin_assign_ai_agent(job_id: str, request: Request, background_tasks: BackgroundTasks):
     actor = _require_ai_agent_assignment(request)
@@ -14479,7 +14576,7 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
                     except Exception:
                         logger.warning("Could not remove failed template reference upload %s", path)
         raise
-    background_tasks.add_task(_human_run_ai_agent, job_id, segment_id, agent_id, run_id)
+    background_tasks.add_task(_human_run_ai_agent_tracked, job_id, segment_id, agent_id, run_id)
     return {"status": "queued", "job_id": job_id, "segment_id": segment_id, "agent": agent, "human_proofreading_required": True, **(credit_charge or {})}
 
 
@@ -15828,6 +15925,15 @@ def _human_review_candidate_terms(parts, deepgram_text, context):
             continue
         if candidate.casefold() in note_text:
             continue
+        # Skip fragments that are not real research entities: titles joined to
+        # names, two names joined by "and", unit numbers, and role abbreviations.
+        key_tokens = key.split()
+        if {"mr", "mrs", "ms", "mx", "dr"} & set(key_tokens) or " and " in f" {key} ":
+            continue
+        if key_tokens and key_tokens[0] in {"apartment", "apt", "unit", "suite", "room", "floor", "building"}:
+            continue
+        if any(re.fullmatch(r"[A-Z]{2,6}s?", token) for token in candidate.split()):
+            continue
         seen.add(key)
         unique.append(candidate)
     return unique[:100]
@@ -15836,14 +15942,11 @@ def _human_review_candidate_terms(parts, deepgram_text, context):
 def _human_review_missing_research_terms(candidates, research_text):
     """Return candidates without a structured, confident grounded finding."""
     content = str(research_text or "").split("ACTUAL GOOGLE SEARCH QUERIES:", 1)[0].split("ACTUAL SEARCH SOURCES:", 1)[0]
-    verified_lines = []
-    for line in content.splitlines():
-        fields = [part.strip() for part in line.strip().lstrip("-*• ").split("|", 3)]
-        if len(fields) < 4:
-            continue
-        confidence = re.sub(r"(?i)^confidence\s*:?\s*", "", fields[3]).strip().rstrip(".").casefold()
-        if confidence == "yes":
-            verified_lines.append(" ".join(fields[:3]))
+    verified_lines = [
+        " ".join((dictated, verified, explanation))
+        for dictated, verified, explanation, confidence in _human_research_parse_findings(content)
+        if confidence == "yes"
+    ]
     result_tokens = set(re.findall(r"[a-z0-9]+", " ".join(verified_lines).casefold()))
     skip = {
         "of", "the", "and", "for", "at", "to", "in", "on", "by", "county", "government", "university",
