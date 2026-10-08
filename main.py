@@ -15909,12 +15909,19 @@ def _human_review_candidate_terms(parts, deepgram_text, context):
         generic_titles = {"the", "a", "an", "social", "worker", "caseworker", "supervisor", "officer", "officers", "mr", "mrs", "ms", "dr"}
         while leading_words and leading_words[0].casefold().strip(".,") in generic_titles:
             leading_words.pop(0)
+        sentence_starters = {"if", "both", "due", "then", "when", "while", "because", "although", "so", "as", "since", "after", "before", "present", "initially", "later", "finally", "also", "however", "prior", "outside", "inside", "historically", "previously", "currently", "additionally", "unfortunately", "apparently"}
+        while len(leading_words) > 1 and (leading_words[0].casefold() in sentence_starters):
+            leading_words.pop(0)
         candidate = " ".join(leading_words)
         if candidate:
             candidates.append(candidate)
     for match in re.finditer(r"\b[A-Z][a-z][A-Za-z0-9'’.-]*\b", corpus):
         candidate = match.group(0).strip(" .,:;-")
         if candidate.casefold() in stop:
+            continue
+        # A capitalized word that only ever starts sentences is ordinary English
+        # ("Present", "Both", "Historically"), not a name worth searching.
+        if not re.search(r"(?<=[a-z,;:] )" + re.escape(candidate) + r"\b", corpus):
             continue
         candidates.append(candidate)
     normalized_candidates = [
@@ -15937,7 +15944,9 @@ def _human_review_candidate_terms(parts, deepgram_text, context):
         # Skip fragments that are not real research entities: titles joined to
         # names, two names joined by "and", unit numbers, and role abbreviations.
         key_tokens = key.split()
-        if {"mr", "mrs", "ms", "mx", "dr"} & set(key_tokens) or " and " in f" {key} ":
+        if key_tokens and key_tokens[0] in {"if", "both", "due", "then", "when", "while", "because", "although", "so", "as", "since", "after", "before", "and", "but", "or", "she", "he", "they", "we", "it", "there", "this", "that"}:
+            continue
+        if {"mr", "mrs", "ms", "mx", "dr", "miss", "mister"} & set(key_tokens) or " and " in f" {key} ":
             continue
         if key_tokens and key_tokens[0] in {"apartment", "apt", "unit", "suite", "room", "floor", "building"}:
             continue
