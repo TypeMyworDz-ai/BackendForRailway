@@ -6316,7 +6316,7 @@ HUMAN_JOB_COLLECTION = "human_jobs"
 HUMAN_WORKER_CLAIM_COLLECTION = "human_worker_claims"
 HUMAN_WORKER_ITEM_CLAIM_COLLECTION = "human_worker_item_claims"
 HUMAN_WORKER_DEADLINE_EVENT_COLLECTION = "human_worker_deadline_events"
-HUMAN_WORKER_MAX_CLAIMS_PER_ITEM = 2
+HUMAN_WORKER_MAX_CLAIMS_PER_ITEM = 1
 HUMAN_WORKER_DEADLINE_WARNING_RETURNS = 10
 HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS = 11
 HUMAN_AVAILABLE_SLICE_MINUTES = 5
@@ -6485,6 +6485,54 @@ def _human_worker_feedback(data, actor_uid):
     return feedback
 
 
+def _human_worker_audio_gate(job, uid, segment_id=""):
+    """Decide whether a transcribing worker may open the recording yet.
+
+    Returns (locked, key). The recording stays closed until the worker has
+    generated their formatted draft, so the audio cannot be taken outside the
+    system. Proofreaders, admins and clients are never gated here. An admin can
+    unlock one assignment by hand if drafting fails (job["audio_unlocked"]).
+    """
+    if str(job.get("job_type") or "").lower() in {"pdf_job", "letter_job"}:
+        return False, ""
+    uid = str(uid or "")
+    if _human_is_split_job(job):
+        mine = [
+            item for item in (job.get("segments") or [])
+            if str(item.get("worker_uid") or "") == uid and item.get("status") in {"assigned", "in_progress"}
+        ]
+        if segment_id:
+            mine = [item for item in mine if item.get("id") == segment_id]
+        if not mine:
+            return False, ""
+        key = str(mine[0].get("id") or "")
+    else:
+        if str(job.get("worker_uid") or "") != uid or job.get("status") not in {"assigned", "in_progress"}:
+            return False, ""
+        key = "main"
+    draft = (job.get("ai_drafts") or {}).get(key) or {}
+    if str(draft.get("worker_uid") or "") == uid and str(draft.get("text") or "").strip():
+        return False, key
+    if (job.get("audio_unlocked") or {}).get(key):
+        return False, key
+    return True, key
+
+
+def _human_audio_lock_entries(job):
+    """Assignments whose worker is still waiting for the recording (shown to admins)."""
+    entries = []
+    if _human_is_split_job(job):
+        for item in job.get("segments") or []:
+            uid = str(item.get("worker_uid") or "")
+            if uid and _human_worker_audio_gate(job, uid, str(item.get("id") or ""))[0]:
+                entries.append({"key": str(item.get("id") or ""), "label": str(item.get("label") or "Part")})
+    else:
+        uid = str(job.get("worker_uid") or "")
+        if uid and _human_worker_audio_gate(job, uid)[0]:
+            entries.append({"key": "main", "label": "Whole job"})
+    return entries
+
+
 def _human_public_for(data, actor_role, actor_uid=""):
     """Serialize a human job without leaking the other side's identity.
 
@@ -6508,6 +6556,8 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("worker_ratings", None)
         out.pop("worker_rating", None)
     segments = data.get("segments") or []
+    if actor_role in {"admin", "human_ops_admin"}:
+        out["audio_locked_assignments"] = _human_audio_lock_entries(data)
     if actor_role in {"worker", "client"}:
         for key in (
             "last_assignment_takeback_at", "last_assignment_takeback_worker_uid",
@@ -6598,6 +6648,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
             out["transcript_html"] = assignment.get("transcript_html") or ""
             out["final_attachment"] = assignment.get("final_attachment")
             if assignment.get("role") == "transcriber":
+                out["audio_locked"] = _human_worker_audio_gate(data, actor_uid, str(assignment.get("id") or "") if owned_segment else "")[0]
                 draft = (data.get("ai_drafts") or {}).get(str(assignment.get("id") or "main") if owned_segment else "main") or {}
                 if draft.get("worker_uid") == actor_uid and draft.get("text"):
                     out["ai_draft"] = draft.get("text")
@@ -6612,7 +6663,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         # Preserve only the authorized worker-facing draft text above; never
         # return raw draft records that include provider/model metadata.
         out.pop("ai_drafts", None)
-        for key in ("ai_review", "ai_review_run", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override"):
+        for key in ("ai_review", "ai_review_run", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "audio_unlocked"):
             out.pop(key, None)
         for key in (
             "worker_minutes", "worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason",
@@ -6698,7 +6749,7 @@ def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full
         part["claim_attempt_count"] = used
         part["can_claim"] = bool(can_claim and used < HUMAN_WORKER_MAX_CLAIMS_PER_ITEM)
         part["claim_block_reason"] = (
-            "You have already successfully claimed this job part twice."
+            "You have already claimed this job part once. It cannot be claimed again."
             if used >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM else claim_block_reason
         )
     whole_key = _human_claim_item_key(data.get("id") or "", "")
@@ -6709,7 +6760,7 @@ def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full
     public_item["max_claims_per_item"] = HUMAN_WORKER_MAX_CLAIMS_PER_ITEM
     public_item["can_claim"] = bool(can_claim and (not claimable_full_job or whole_used < HUMAN_WORKER_MAX_CLAIMS_PER_ITEM))
     public_item["claim_block_reason"] = (
-        "You have already successfully claimed this job twice."
+        "You have already claimed this job once. It cannot be claimed again."
         if claimable_full_job and whole_used >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM else claim_block_reason
     )
     return public_item
@@ -8072,7 +8123,7 @@ def _human_claim_assignment_transaction(
             attempt_data = attempt_snapshot.to_dict() if attempt_snapshot.exists else {}
             claim_count = int(attempt_data.get("claim_count") or 0)
             if claim_count >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM:
-                raise HTTPException(status_code=409, detail="You have already successfully claimed this job part twice. Choose another available part.")
+                raise HTTPException(status_code=409, detail="You have already claimed this job part once. It cannot be claimed again. Choose another available part.")
             seconds = max(0.0, float(target.get("end_seconds") or 0) - float(target.get("start_seconds") or 0))
             tat_seconds = human_tat_seconds(seconds)
             deadline = now + timedelta(seconds=tat_seconds)
@@ -8118,7 +8169,7 @@ def _human_claim_assignment_transaction(
         attempt_data = attempt_snapshot.to_dict() if attempt_snapshot.exists else {}
         claim_count = int(attempt_data.get("claim_count") or 0)
         if claim_count >= HUMAN_WORKER_MAX_CLAIMS_PER_ITEM:
-            raise HTTPException(status_code=409, detail="You have already successfully claimed this job twice. Choose another available job.")
+            raise HTTPException(status_code=409, detail="You have already claimed this job once. It cannot be claimed again. Choose another available job.")
         tat_seconds = (
             human_image_tat_seconds((job.get("pdf_review") or {}).get("page_count") or 1)
             if job_type == "pdf_job"
@@ -13176,6 +13227,16 @@ async def human_audio(job_id: str, request: Request, segment_id: str = "", downl
     actor = await _human_actor(request)
     job = await _human_job(job_id)
     await _human_assert_access(job, actor)
+    if actor.get("role") == "worker":
+        locked, locked_key = _human_worker_audio_gate(job, actor.get("uid"), segment_id)
+        if locked:
+            raise HTTPException(
+                status_code=403,
+                detail="The recording opens after you generate your formatted draft. Generate the draft first. If it fails, contact the admin.",
+            )
+        # A split-job transcriber only ever receives their own part, even if the request omits the part id.
+        if locked_key and not segment_id and _human_is_split_job(job):
+            segment_id = locked_key
     meta = job.get("audio") or {}
     path = meta.get("storage_path")
     bucket = _human_bucket()
@@ -13246,6 +13307,29 @@ async def human_audio(job_id: str, request: Request, segment_id: str = "", downl
             raise HTTPException(status_code=502, detail="The assigned recording could not be prepared for playback. Please contact the admin team.") from exc
     media_type = _AUDIO_TYPES.get(suffix) or meta.get("content_type") or "application/octet-stream"
     return _human_audio_response(request, raw, media_type, str(meta.get("name") or "source-audio"), bool(download))
+
+
+@app.post("/human-transcription/jobs/{job_id}/unlock-worker-audio")
+async def human_unlock_worker_audio(job_id: str, request: Request):
+    """Admin override: open the recording for one assignment when the worker's draft could not be generated."""
+    actor = await _human_actor(request)
+    if actor.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    job = await _human_job(job_id)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    key = str((payload or {}).get("key") or "").strip()
+    valid = {entry["key"] for entry in _human_audio_lock_entries(job)}
+    if not key or key not in valid:
+        raise HTTPException(status_code=409, detail="That assignment is not waiting for the recording.")
+    await asyncio.to_thread(
+        db.collection(HUMAN_JOB_COLLECTION).document(job_id).update,
+        {f"audio_unlocked.{key}": True, "updatedAt": firestore.SERVER_TIMESTAMP},
+    )
+    _human_list_cache_bump()
+    return {"unlocked": True, "key": key}
 
 
 @app.get("/human-transcription/jobs/{job_id}/download")
@@ -13953,6 +14037,17 @@ def _human_research_blocking(prompt):
     raise RuntimeError("Online research could not be completed on any route.") from last
 
 
+_RESEARCH_SCOPE_RULES = (
+    "RESEARCH SCOPE (STRICT, overrides everything below): Research ONLY unfamiliar proper nouns that were actually dictated in this audio: "
+    "people, agencies, organizations, programs, companies, places, street addresses and unusual specialist terms. Do NOT research common words, "
+    "well-known places or agencies (states, major cities, DSS and similar), roles such as Caseworker, or anything the client already spelled or the job notes supply. "
+    "NEVER add information that was not dictated: no background, no official full names, no titles, no addresses, no extra or fewer words. "
+    "The verified spelling must be the SAME words that were dictated; you may only correct spelling and capitalisation, never expand, shorten, reword or replace them. "
+    "Keep the answer brief: one short line per term, in the form dictated form | verified spelling (same words) | one short reason (about 12 words) why it fits this audio's context | confidence yes/no. "
+    "No paragraphs, history or URLs in those lines.\n\n"
+)
+
+
 async def _human_ai_agent_research(raw_text, context):
     """Research proper nouns online by any available route. A long file never fails just because one search route is down."""
     raw_text = str(raw_text or "")
@@ -13961,7 +14056,8 @@ async def _human_ai_agent_research(raw_text, context):
     fragments = []
     any_success = False
     prompt = (
-        "REQUIRED WEB RESEARCH BEFORE DRAFTING. Identify proper nouns and specialist terms: people, agencies, "
+        _RESEARCH_SCOPE_RULES
+        + "REQUIRED WEB RESEARCH BEFORE DRAFTING. Identify proper nouns and specialist terms: people, agencies, "
         "organizations, programs, companies, places, street addresses, citations, and unusual medical or legal terms. "
         "Use job context and explicit client spellings as authoritative. Search the web for each identifiable term "
         "that is not already spelled by the client or supplied in the job context; do not answer from memory. "
@@ -13982,7 +14078,8 @@ async def _human_ai_agent_research(raw_text, context):
     for offset in range(0, len(missing), 8):
         batch = missing[offset:offset + 8]
         retry_prompt = (
-            "MANDATORY WEB SEARCH. Search the web for each listed term; do not answer from memory and do not return NO_SEARCHED_TERMS. "
+            _RESEARCH_SCOPE_RULES
+            + "MANDATORY WEB SEARCH. Search the web for each listed term; do not answer from memory and do not return NO_SEARCHED_TERMS. "
             "Use job context and explicit client spellings as authoritative; skip a term only if its spelling is explicitly supplied there. "
             "Return exactly one pipe-delimited line per term: dictated form | verified spelling | what it refers to and why it fits this transcript | confidence yes/no.\n\n"
             f"Terms to search: {', '.join(batch)}\n\nWHERE EACH TERM APPEARS:\n{_human_term_snippets(raw_text, batch) or 'Not available.'}\n\nJOB CONTEXT:\n{str(context or '')[:6000]}"
@@ -14098,6 +14195,10 @@ def _human_ai_agent_research_footer(transcript, research):
     terms = []
     seen_terms = set()
     parsed_findings = 0
+    body_match_text = " " + normalized("\n".join(
+        line for line in body.splitlines()
+        if not re.match(r"(?i)^\s*(?:Client spellings|My spellings|I researched|I searched)\s*:", line)
+    )) + " "
     generic_terms = {"caseworker", "social worker", "worker", "supervisor", "client", "mother", "father", "none", "n a", "na"}
     private_contact = re.compile(r"(?i)(?:@|\b(?:e-?mail|handle|username|user name|gmail|yahoo|outlook|icloud|hotmail)\b)")
     private_handle = re.compile(r"(?i)\b[a-z][a-z0-9]*[._][a-z0-9._-]*\d[a-z0-9._-]*\b")
@@ -14106,6 +14207,18 @@ def _human_ai_agent_research_footer(transcript, research):
             continue
         parsed_findings += 1
         label = verified or dictated
+        # Only terms that really appear in the transcript, spelled as dictated, are listed.
+        if body_match_text:
+            for candidate in (verified, dictated):
+                candidate_key = normalized(candidate)
+                if candidate_key and f" {candidate_key} " in body_match_text:
+                    label = candidate
+                    break
+            else:
+                continue
+        explanation = re.split(r"(?<=[.!?])\s", explanation.strip(), maxsplit=1)[0]
+        if len(explanation) > 150:
+            explanation = explanation[:147].rsplit(" ", 1)[0].rstrip(" ,;:") + "..."
         label_key = normalized(label)
         label_tokens = label_key.split()
         if not label_key or label_key in seen_terms or label_key in generic_terms:
@@ -14114,6 +14227,8 @@ def _human_ai_agent_research_footer(transcript, research):
             continue
         if private_contact.search(label) or private_contact.search(explanation) or private_handle.search(label):
             continue
+        if len(terms) >= 20:
+            break
         seen_terms.add(label_key)
         terms.append(label)
         findings.append(f"- {label}: {explanation} (confidence: {confidence})")
@@ -15598,7 +15713,8 @@ async def _human_worker_ai_proofread_research(job_id, draft_text, deepgram_text,
     if not candidates:
         return ""
     prompt = (
-        "REQUIRED RESEARCH BEFORE PROOFREADING. Scan the primary worker draft and secondary full-audio Deepgram transcript for each distinct proper noun or specialist term that genuinely needs outside verification: people, agencies, organizations, programs, companies, places, street addresses, statutes/citations, and unusual medical or legal terms. "
+        _RESEARCH_SCOPE_RULES
+        + "REQUIRED RESEARCH BEFORE PROOFREADING. Scan the primary worker draft and secondary full-audio Deepgram transcript for each distinct proper noun or specialist term that genuinely needs outside verification: people, agencies, organizations, programs, companies, places, street addresses, statutes/citations, and unusual medical or legal terms. "
         "Search each unique unsupplied term only once. Do not search any client-provided spelling, a common role such as Caseworker, an email address, email handle, username, or other contact detail. Never answer from memory. Treat explicit client spellings and detailed verified Research Notes as authoritative; a bare I researched/I searched list is not verification. Do not change the transcript or replace a dictated entity with another official variant. "
         "Return one pipe-delimited line per distinct term actually searched: dictated form | verified spelling | a concise explanation of what it refers to and why it fits this audio | confidence yes/no. Do not repeat a term for each occurrence or alternate ASR spelling. Include actual grounded search metadata. Do not invent searches, findings, or sources.\n\n"
         f"TERMS TO VERIFY (excluding terms already supplied in job context):\n{', '.join(candidates)}\n\n"
@@ -15613,7 +15729,8 @@ async def _human_worker_ai_proofread_research(job_id, draft_text, deepgram_text,
         for offset in range(0, len(missing), 8):
             batch = missing[offset:offset + 8]
             retry_prompt = (
-                "MANDATORY GROUNDED GOOGLE SEARCH. Search each listed term, do not answer from memory, and do not return NO_SEARCHED_TERMS. "
+                _RESEARCH_SCOPE_RULES
+                + "MANDATORY GROUNDED GOOGLE SEARCH. Search each listed term, do not answer from memory, and do not return NO_SEARCHED_TERMS. "
                 "For every term return dictated form | verified spelling | identity/context | confidence yes/no, with actual grounded sources. Do not rewrite the transcript.\n\n"
                 f"Terms still requiring verification: {', '.join(batch)}\n\n"
                 f"JOB NOTES:\n{str(context or '')[:8000] or 'None.'}\n\n"
@@ -16623,7 +16740,7 @@ _REVIEW_SYSTEM = (
     "5a. Remove an abandoned spoken word or phrase only when the speaker immediately and unmistakably corrects that same wording; keep the corrected version. Preserve repetitions used for emphasis exactly, including phrases such as `very, very hot`. Never treat emphasis, hesitation, an incomplete thought, or an ambiguous alternative as a self-correction.\n"
     "6. The submitted worker parts are the PRIMARY transcript for wording and word order. The complete Deepgram transcript made from the WHOLE original audio is the COMPARISON for context and for structure. Use it to make clear, contextual corrections supported by the recording, to restore any dictated content or paragraph the workers left out, and to remove anything the workers inserted that was never dictated. Never replace the worker transcript wholesale, paraphrase, or smooth the speaker's grammar.\n"
     "7. PARAGRAPHS COME FROM THE DICTATION, NOT FROM THE WORKERS. A paragraph or line break belongs in the final transcript only where the speaker dictated it (`next paragraph`, `new paragraph`, `paragraph break`, `next line`, `new line`, `line break`), plus headings, list items and the closing spellings section, plus anything the job instructions or guidelines explicitly require. The prompt lists every dictated command found in the audio. For each one, make sure the break is present at the matching place (a blank line for a paragraph command, a single line break for a line command) and delete the command words, which are instructions, not content. Where a worker started a new paragraph that the speaker never dictated, join it back into the surrounding paragraph. Never leave a worker's own paragraph breaks in just because they were already there. Record every paragraph added or removed in `changes`.\n"
-    "8. Thorough proper-noun research is a required review task. Use the supplied grounded WEB SEARCH RESULTS for every identifiable proper noun or specialist term that was not explicitly spelled by the client or provided in job notes. Do not rely on memory or say that no research was done when actual queries or sources are supplied. Research verifies spelling/context only; do not change the dictated entity or add undictated words. If a term is ambiguous, leave it unchanged and report the uncertainty in issues. At the end of the transcript, use `I researched:` (not `I searched:`) for actual, newly researched terms only, then include a separate `Research Notes:` section with one concise item per term explaining what it refers to and why it fits the audio/job. Never list the client-confirmed spelling among researched terms.\n"
+    "8. Thorough proper-noun research is a required review task. Use the supplied grounded WEB SEARCH RESULTS for every identifiable proper noun or specialist term that was not explicitly spelled by the client or provided in job notes. Do not rely on memory or say that no research was done when actual queries or sources are supplied. Research verifies spelling/context only; do not change the dictated entity or add undictated words. If a term is ambiguous, leave it unchanged and report the uncertainty in issues. Research ONLY unfamiliar proper nouns that were actually dictated; never add information that was not dictated, and a researched term must use exactly the dictated words (spelling and capitalisation corrections only, no additions, expansions or rewording). At the end of the transcript, use `I researched:` (not `I searched:`) for actual, newly researched terms only, then include a separate BRIEF `Research Notes:` section with one short line per unfamiliar dictated term: the term as dictated, a few words on why it fits the context, and a confidence check. Never list the client-confirmed spelling among researched terms.\n"
     "9. Keep the formatting exactly as the parts use it: real TAB characters at the start of paragraphs, a blank line between paragraphs, flush-left plain headings, and two spaces after every sentence if the parts use that. Never convert tabs to spaces and never collapse double spaces.\n"
     "10. Output the transcript once, in order, with no part labels and no commentary inside it.\n"
     "REPLY FORMAT (exactly, with these two marker lines):\n"
@@ -16727,7 +16844,8 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
     issues = list(context_data["issues"])
     candidate_terms = _human_review_candidate_terms(parts, deepgram_text, context)
     research_prompt = (
-        "REQUIRED RESEARCH STEP BEFORE AUDIO REVIEW. Scan the complete submitted worker transcript and the full-audio Deepgram comparison below for every proper noun and specialist term: people, agencies, organizations, programs, companies, places, street addresses, statutes/citations, and unusual medical or legal terms. "
+        _RESEARCH_SCOPE_RULES
+        + "REQUIRED RESEARCH STEP BEFORE AUDIO REVIEW. Scan the complete submitted worker transcript and the full-audio Deepgram comparison below for every proper noun and specialist term: people, agencies, organizations, programs, companies, places, street addresses, statutes/citations, and unusual medical or legal terms. "
         "Treat a client spelling list, an explicitly spelled-out client term, a term supplied in job notes, and a term backed by detailed worker Research Notes as authoritative; do not search those. A bare worker I researched/I searched list is not proof of prior verification. For every other identifiable term, you MUST use Google Search, not memory, to confirm spelling, identity and whether it fits this transcript. Search each distinct unsupplied candidate, including names appearing in only one transcript. Do not say that no research was done when any candidate is present. If a candidate cannot be confidently verified, report it as unresolved rather than guessing. "
         "Return one line per researched term: dictated form | verified spelling | what it refers to and why it fits | confident yes/no. Do not rewrite the transcript.\n\n"
         f"POTENTIAL TERMS TO CHECK (still apply client/job-note exclusions):\n{', '.join(candidate_terms) or 'Identify terms from the transcripts.'}\n\n"
@@ -16745,7 +16863,8 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
             for offset in range(0, len(remaining_terms), 8):
                 term_batch = remaining_terms[offset:offset + 8]
                 retry_prompt = (
-                    "MANDATORY GROUNDED GOOGLE SEARCH. Search each listed term; do not answer from memory or return NO_SEARCHED_TERMS. "
+                    _RESEARCH_SCOPE_RULES
+                    + "MANDATORY GROUNDED GOOGLE SEARCH. Search each listed term; do not answer from memory or return NO_SEARCHED_TERMS. "
                     "Use job notes/client spellings as authority and exclude a term only if its spelling is explicitly provided there. "
                     "For every term, return its dictated form | verified spelling | identity/context | confidence yes/no. Include actual search results and sources.\n\n"
                     f"Terms that still require research: {', '.join(term_batch)}\n\nJOB NOTES:\n{context[:8000] or 'None.'}\n\n"
