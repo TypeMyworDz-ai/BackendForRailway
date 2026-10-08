@@ -13531,7 +13531,7 @@ async def admin_workers(request: Request):
 # no sign-in, mailbox, payout profile, or client-facing permissions.
 AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
@@ -13543,8 +13543,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Claude Sonnet 5.5 + Gemini 3.8 Flash fallback", "job_types": ["audio", "general_job"],
-        "models": ["claude-sonnet-5-5", "gemini-3.8-flash"],
+        "display": "Gemini 3.8 Flash + Claude Sonnet 5.5 fallback", "job_types": ["audio", "general_job"],
+        "models": ["gemini-3.8-flash", "claude-sonnet-5-5"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -13819,61 +13819,123 @@ async def _human_ai_transcribe_audio(job_id, job, segment):
     return transcripts, len(source) / 1000.0
 
 
+def _human_term_snippets(text, terms, width=260):
+    """Short passages around each term, so research never has to resend a whole long transcript."""
+    text = str(text or "")
+    lowered = text.casefold()
+    out = []
+    for term in terms:
+        index = lowered.find(str(term).casefold())
+        if index < 0:
+            continue
+        start, end = max(0, index - width // 2), min(len(text), index + len(str(term)) + width // 2)
+        out.append(f"- {term}: ...{text[start:end].strip()}...")
+    return "\n".join(out)
+
+
+def _claude_research_blocking(prompt, model_id="claude-sonnet-5-5"):
+    """Online research through Claude's own web search tool (a second, independent search route)."""
+    if not claude_client:
+        raise RuntimeError("Claude is not configured for web research.")
+    message = claude_client.messages.create(
+        model=model_id, max_tokens=6000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+        messages=[{"role": "user", "content": prompt}],
+    )
+    texts, queries, sources = [], [], []
+    for block in message.content or []:
+        kind = getattr(block, "type", "")
+        if kind == "text":
+            texts.append(getattr(block, "text", "") or "")
+        elif kind == "server_tool_use":
+            query = str((getattr(block, "input", None) or {}).get("query") or "").strip()
+            if query:
+                queries.append(query)
+        elif kind == "web_search_tool_result":
+            content = getattr(block, "content", None)
+            for item in content if isinstance(content, list) else []:
+                url = str(getattr(item, "url", "") or "").strip()
+                title = str(getattr(item, "title", "") or "").strip()
+                if url:
+                    sources.append(f"- {title}: {url}" if title else f"- {url}")
+    text = "".join(texts).strip()
+    if not queries and not sources:
+        if text.casefold().strip() in {"no_searched_terms", "no searched terms", "none"}:
+            return "NO_SEARCHED_TERMS"
+        raise RuntimeError("Claude web search returned no searches.")
+    details = ["ACTUAL GOOGLE SEARCH QUERIES:\n" + "\n".join(f"- {q}" for q in queries)] if queries else []
+    if sources:
+        details.append("ACTUAL SEARCH SOURCES:\n" + "\n".join(dict.fromkeys(sources)))
+    return f"{text or 'Web search completed; see the sources below.'}\n\n" + "\n\n".join(details)
+
+
+def _human_research_blocking(prompt):
+    """Try every online research route in turn; the job only stops if all of them fail."""
+    routes = (
+        ("gemini-3.8-flash", lambda: _gemini_research_blocking(prompt, "gemini-3.8-flash", 2)),
+        ("gemini-3.5-flash-lite", lambda: _gemini_research_blocking(prompt, "gemini-3.5-flash-lite", 2)),
+        ("claude-sonnet-5-5", lambda: _claude_research_blocking(prompt)),
+    )
+    last = None
+    for name, call in routes:
+        try:
+            return str(call() or "").strip()
+        except Exception as exc:
+            last = exc
+            logger.warning("Online research route %s failed: %s", name, str(exc)[:300])
+    raise RuntimeError("Online research could not be completed on any route.") from last
+
+
 async def _human_ai_agent_research(raw_text, context):
+    """Research proper nouns online by any available route. A long file never fails just because one search route is down."""
+    raw_text = str(raw_text or "")
+    declined_values = {"no_searched_terms", "no searched terms", "none"}
+    candidates = _human_review_candidate_terms([{"text": raw_text}], "", context)
+    fragments = []
+    any_success = False
     prompt = (
         "REQUIRED WEB RESEARCH BEFORE DRAFTING. Identify proper nouns and specialist terms: people, agencies, "
         "organizations, programs, companies, places, street addresses, citations, and unusual medical or legal terms. "
-        "Use job context and explicit client spellings as authoritative. Use Google Search for each identifiable term "
+        "Use job context and explicit client spellings as authoritative. Search the web for each identifiable term "
         "that is not already spelled by the client or supplied in the job context; do not answer from memory. "
         "Return exactly one pipe-delimited line per term actually searched: dictated form | verified spelling | what it refers to and why it fits this transcript | confidence yes/no. "
         "If no external searches are genuinely needed, return exactly NO_SEARCHED_TERMS. Never invent searches, results, or sources. Do not rewrite the transcript.\n\n"
-        f"JOB CONTEXT:\n{str(context or '')[:8000]}\n\nTRANSCRIPT OR IMAGE TRANSCRIPTION:\n{str(raw_text or '')[:60000]}"
+        f"JOB CONTEXT:\n{str(context or '')[:8000]}\n\nTRANSCRIPT OR IMAGE TRANSCRIPTION:\n{raw_text[:30000]}"
     )
-    result = ""
-    last_exc = None
-    # Try the primary search model, then a second one, so one overloaded model
-    # does not stop a long job. A draft is still never saved without real research.
-    for research_model in ("gemini-3.8-flash", "gemini-3.5-flash-lite"):
-        try:
-            result = str(await asyncio.to_thread(_gemini_research_blocking, prompt, research_model) or "").strip()
-            last_exc = None
-            break
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("AI agent proper-noun research failed on %s: %s", research_model, exc)
-    if last_exc is not None:
-        raise RuntimeError("Required Google Search research could not be completed; no unresearched AI draft was saved.") from last_exc
-    if not result:
-        raise RuntimeError("Google Search returned no answer; the AI draft was stopped rather than claiming research.")
-    declined = result.casefold() in {"no_searched_terms", "no searched terms", "none"}
-    # The first call is allowed to decline, but a transcript that clearly contains
-    # names (places, hospitals, programs) must not skip the search. Search every
-    # candidate term the first answer did not cover.
-    candidates = _human_review_candidate_terms([{"text": str(raw_text or "")}], "", context)
-    fragments = [] if declined or not result else [result]
+    try:
+        first = str(await asyncio.to_thread(_human_research_blocking, prompt) or "").strip()
+        any_success = True
+        if first and first.casefold() not in declined_values:
+            fragments.append(first)
+    except Exception as exc:
+        logger.warning("AI agent first research pass failed: %s", str(exc)[:300])
+    # A transcript that clearly contains names must not skip the search: look up
+    # every candidate the first answer did not cover, using short excerpts only.
     missing = _human_review_missing_research_terms(candidates, "\n".join(fragments)) if candidates else []
     for offset in range(0, len(missing), 8):
         batch = missing[offset:offset + 8]
         retry_prompt = (
-            "MANDATORY GROUNDED GOOGLE SEARCH. Search each listed term with Google Search; do not answer from memory and do not return NO_SEARCHED_TERMS. "
+            "MANDATORY WEB SEARCH. Search the web for each listed term; do not answer from memory and do not return NO_SEARCHED_TERMS. "
             "Use job context and explicit client spellings as authoritative; skip a term only if its spelling is explicitly supplied there. "
             "Return exactly one pipe-delimited line per term: dictated form | verified spelling | what it refers to and why it fits this transcript | confidence yes/no.\n\n"
-            f"Terms to search: {', '.join(batch)}\n\nJOB CONTEXT:\n{str(context or '')[:8000]}\n\nTRANSCRIPT:\n{str(raw_text or '')[:60000]}"
+            f"Terms to search: {', '.join(batch)}\n\nWHERE EACH TERM APPEARS:\n{_human_term_snippets(raw_text, batch) or 'Not available.'}\n\nJOB CONTEXT:\n{str(context or '')[:6000]}"
         )
-        for research_model in ("gemini-3.8-flash", "gemini-3.5-flash-lite"):
-            try:
-                extra = str(await asyncio.to_thread(_gemini_research_blocking, retry_prompt, research_model) or "").strip()
-            except Exception as exc:
-                logger.warning("AI agent forced research failed on %s: %s", research_model, exc)
-                continue
-            if extra and extra.casefold() not in {"no_searched_terms", "no searched terms", "none"}:
-                fragments.append(extra)
-            break
+        try:
+            extra = str(await asyncio.to_thread(_human_research_blocking, retry_prompt) or "").strip()
+        except Exception as exc:
+            logger.warning("AI agent term research failed for %s: %s", batch, str(exc)[:300])
+            continue
+        any_success = True
+        if extra and extra.casefold() not in declined_values:
+            fragments.append(extra)
     result = "\n\n".join(dict.fromkeys(fragments))
     if not result:
+        if candidates and not any_success:
+            logger.warning("Every online research route failed; continuing without research-based corrections.")
         return ""
     if "ACTUAL GOOGLE SEARCH QUERIES:" not in result and "ACTUAL SEARCH SOURCES:" not in result:
-        raise RuntimeError("Google Search did not return verifiable search metadata; the AI draft was stopped rather than claiming research.")
+        logger.warning("Research came back without verifiable search evidence; ignoring it.")
+        return ""
     return result
 
 
@@ -15385,7 +15447,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
     except Exception as exc:
         logger.warning("AI draft formatting failed for %s: %s", job_id, exc)
         if "research" in str(exc).casefold() or "grounded" in str(exc).casefold():
-            detail = "Required web research could not be verified after three tries. The draft was not saved and no credits were charged. Please try again shortly."
+            detail = "Online research could not be completed right now. The draft was not saved and no credits were charged. Please try again shortly."
         else:
             detail = "The formatted draft could not be completed. No credits were charged; please try again."
         raise HTTPException(status_code=502, detail=detail) from exc
@@ -15478,7 +15540,7 @@ async def _human_worker_ai_proofread_research(job_id, draft_text, deepgram_text,
         f"SECONDARY DEEPGRAM TRANSCRIPT:\n{str(deepgram_text or '')[:70000]}"
     )
     try:
-        initial = str(await asyncio.to_thread(_gemini_research_blocking, prompt) or "").strip()
+        initial = str(await asyncio.to_thread(_human_research_blocking, prompt) or "").strip()
         fragments = [initial] if initial and initial.casefold() != "no_searched_terms" else []
         missing = _human_review_missing_research_terms(candidates, initial)
         for offset in range(0, len(missing), 8):
@@ -15491,7 +15553,7 @@ async def _human_worker_ai_proofread_research(job_id, draft_text, deepgram_text,
                 f"PRIMARY WORKER DRAFT:\n{str(draft_text or '')[:45000]}\n\n"
                 f"SECONDARY DEEPGRAM TRANSCRIPT:\n{str(deepgram_text or '')[:45000]}"
             )
-            result = str(await asyncio.to_thread(_gemini_research_blocking, retry_prompt) or "").strip()
+            result = str(await asyncio.to_thread(_human_research_blocking, retry_prompt) or "").strip()
             if result and result.casefold() != "no_searched_terms":
                 fragments.append(result)
         research = "\n\n".join(dict.fromkeys(fragments))
@@ -16580,7 +16642,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         + f"\n\nSECONDARY DEEPGRAM TRANSCRIPT OF THE WHOLE AUDIO:\n{deepgram_text[:90000]}"
     )
     try:
-        initial_research = str(await asyncio.to_thread(_gemini_research_blocking, research_prompt) or "").strip()
+        initial_research = str(await asyncio.to_thread(_human_research_blocking, research_prompt) or "").strip()
         research_fragments = []
         if initial_research and initial_research.casefold() != "no_searched_terms":
             research_fragments.append(initial_research)
@@ -16596,7 +16658,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
                     f"Terms that still require research: {', '.join(term_batch)}\n\nJOB NOTES:\n{context[:8000] or 'None.'}\n\n"
                     f"PRIMARY WORKER TRANSCRIPT:\n{worker_transcript[:50000]}\n\nDEEPGRAM TRANSCRIPT OF THE COMPLETE AUDIO:\n{deepgram_text[:50000]}"
                 )
-                retry_result = str(await asyncio.to_thread(_gemini_research_blocking, retry_prompt) or "").strip()
+                retry_result = str(await asyncio.to_thread(_human_research_blocking, retry_prompt) or "").strip()
                 if retry_result and retry_result.casefold() != "no_searched_terms":
                     research_fragments.append(retry_result)
         research_text = "\n\n".join(dict.fromkeys(research_fragments))
