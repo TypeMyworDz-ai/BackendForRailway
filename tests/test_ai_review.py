@@ -416,20 +416,23 @@ class AiModelRouting(unittest.TestCase):
         )
         self.assertIn("could not confirm these terms, so they were left exactly as dictated: Walden Park, Summit Clinic.", unverified)
         table = footer(
-            "Transcript body.",
+            "Transcript body about Family to Family.",
             "| Dictated form | Verified spelling | Meaning | Confident |\n| --- | --- | --- | --- |\n"
             "| Family to Family | Family to Family Program | A family-support initiative. | Yes |",
         )
-        self.assertIn("I researched: Family to Family Program.", table)
-        self.assertIn("- Family to Family Program: A family-support initiative. (confidence: yes)", table)
+        self.assertIn("I researched: Family to Family.", table)
+        self.assertNotIn("Family to Family Program", table)
+        self.assertIn("- Family to Family: A family-support initiative. (confidence: yes)", table)
+        absent = footer("Transcript body.", "Zebra Corp | Zebra Corporation | A company never dictated here. | yes")
+        self.assertNotIn("Zebra", absent)
         grounded = footer(
-            "Transcript body.\nClient spellings: Ann, My spellings: Lee.",
+            "Transcript body about Example Org.\nClient spellings: Ann, My spellings: Lee.",
             "Example Org | Example Organization | A service named in the transcript. | yes\n\n"
             "ACTUAL GOOGLE SEARCH QUERIES:\n- Example Org official service\n\n"
             "ACTUAL SEARCH SOURCES:\n- Official site: https://example.org",
         )
-        self.assertIn("My spellings: Lee; I researched: Example Organization.", grounded)
-        self.assertIn("Research Notes:\n- Example Organization: A service named in the transcript. (confidence: yes)", grounded)
+        self.assertIn("My spellings: Lee; I researched: Example Org.", grounded)
+        self.assertIn("Research Notes:\n- Example Org: A service named in the transcript. (confidence: yes)", grounded)
         self.assertNotIn("Actual Google searches", grounded)
         self.assertNotIn("Sources:", grounded)
         self.assertNotIn("https://example.org", grounded)
@@ -444,7 +447,7 @@ class AiModelRouting(unittest.TestCase):
 
     def test_research_footer_removes_duplicate_spellings_roles_and_contact_details(self):
         transcript = (
-            "Transcript body.\n"
+            "Transcript body about the Family to Family Program.\n"
             "Client spellings: Kneeland, Kyra, Zaden, Zaliah, Zaire, Tyshawn; "
             "My spellings: None; I researched: Kneeland, Kyra.Kneeland55, Zaden, Zaliah, Caseworker, Tyshawn.\n\n"
             "Research Notes:\n- Old model-written duplicate notes."
