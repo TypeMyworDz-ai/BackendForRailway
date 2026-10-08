@@ -12,9 +12,9 @@ def _fn(name):
 
 
 def _ns():
-    ns = {"re": re, "HUMAN_AI_AGENTS": {"agent_a": {}, "agent_b": {}}}
+    ns = {"re": re, "functools": __import__("functools"), "_NAME_SWAP_MAX_CHARS": 20000, "HUMAN_AI_AGENTS": {"agent_a": {}, "agent_b": {}}}
     ns["is_admin_user"] = lambda email: str(email).lower() == "typemywordz@gmail.com"
-    for name in ("_human_job_owner_of", "_human_admin_can_see_job", "_human_anonymize_node", "_human_collect_worker_uids"):
+    for name in ("_human_job_owner_of", "_human_admin_can_see_job", "_human_swap_names", "_human_needle_regex", "_human_anonymize_node", "_human_collect_worker_uids"):
         exec(compile(ast.Module(body=[_fn(name)], type_ignores=[]), "main.py", "exec"), ns)
     return ns
 

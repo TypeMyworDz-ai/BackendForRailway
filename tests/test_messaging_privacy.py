@@ -119,6 +119,10 @@ def _load_functions():
         "_human_assert_job_conversation_access",
         "_human_thread_for",
         "messaging_inbox",
+        "_messaging_inbox_build",
+        "_ttl_single_flight",
+        "_human_job_owner_of",
+        "_human_admin_can_see_job",
     }
     nodes = []
     for node in tree.body:
@@ -127,6 +131,10 @@ def _load_functions():
             nodes.append(node)
     namespace = {
         "asyncio": asyncio,
+        "time": __import__("time"),
+        "_ttl_cache": {},
+        "_human_list_cache_epoch": 0,
+        "_human_cached_query": lambda key, loader: asyncio.to_thread(loader),
         "FieldFilter": lambda field, operator, value: (field, operator, value),
         "HUMAN_JOB_COLLECTION": "human_jobs",
         "HTTPException": FakeHTTPException,
@@ -148,9 +156,11 @@ class MessagingPrivacyTests(unittest.TestCase):
     def setUp(self):
         self.functions["_human_actor"] = _worker_actor
         self.functions["db"] = FakeDatabase({})
+        self.functions["_ttl_cache"].clear()
 
     def test_inbox_returns_only_participant_threads(self):
         functions = self.functions
+        functions["_ttl_cache"].clear()
         actor_uid = "worker-1"
         own_thread = functions["_user_chat_thread_id"](actor_uid, "admin-1")
         unrelated_thread = functions["_user_chat_thread_id"]("client-1", "client-2")
@@ -187,6 +197,7 @@ class MessagingPrivacyTests(unittest.TestCase):
 
     def test_worker_inbox_never_includes_the_client_job_thread(self):
         functions = self.functions
+        functions["_ttl_cache"].clear()
         database = FakeDatabase({}, {
             "job-1": {
                 "client_uid": "client-1",
@@ -208,6 +219,7 @@ class MessagingPrivacyTests(unittest.TestCase):
 
     def test_admin_inbox_exposes_only_worker_thread_for_split_claimants(self):
         functions = self.functions
+        functions["_ttl_cache"].clear()
         functions["_human_actor"] = _admin_actor
         database = FakeDatabase({}, {
             "job-2": {
@@ -235,6 +247,7 @@ class MessagingPrivacyTests(unittest.TestCase):
 
     def test_only_admins_and_assigned_workers_can_use_job_conversations(self):
         functions = self.functions
+        functions["_ttl_cache"].clear()
         allowed_job = {"segments": [{"worker_uid": "worker-1"}]}
         functions["_human_assert_job_conversation_access"](allowed_job, {"uid": "admin-1", "role": "admin"})
         functions["_human_assert_job_conversation_access"](allowed_job, {"uid": "worker-1", "role": "worker"})
@@ -256,6 +269,7 @@ class MessagingPrivacyTests(unittest.TestCase):
 
     def test_message_must_belong_to_exact_actor_pair_and_path(self):
         functions = self.functions
+        functions["_ttl_cache"].clear()
         pair_id = functions["_user_chat_thread_id"]("worker-1", "admin-1")
         own_message = {"sender_uid": "admin-1", "recipient_uid": "worker-1"}
         other_people_message = {"sender_uid": "client-1", "recipient_uid": "client-2"}

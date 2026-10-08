@@ -351,7 +351,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Never treat emphasis", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"), ("claude-haiku-5-5", "claude")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai")))
@@ -503,7 +503,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("research_status = 'partial'", admin_proofread)
         self.assertIn("research_status = 'unavailable'", admin_proofread)
         self.assertNotIn("Required proper-noun web research did not complete", admin_proofread)
-        self.assertIn("GPT-5.6 Luna", admin_proofread)
+        self.assertIn("Claude Sonnet 5.5", admin_proofread)
         self.assertIn("fallback", admin_proofread)
 
     def test_worker_draft_cost_rounds_up_assigned_audio_minutes(self):
