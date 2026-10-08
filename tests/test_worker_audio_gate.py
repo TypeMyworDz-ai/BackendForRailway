@@ -69,3 +69,10 @@ class WorkerAudioGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerDraftFormatterRegression(unittest.TestCase):
+    def test_formatter_has_no_call_to_a_progress_helper_it_does_not_own(self):
+        node = next(n for n in TREE.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_human_worker_format_ai_draft")
+        calls = [c.func.id for c in ast.walk(node) if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)]
+        self.assertNotIn("_progress", calls)

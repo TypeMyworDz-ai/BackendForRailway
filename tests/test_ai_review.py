@@ -354,8 +354,8 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai")))
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
         self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 
