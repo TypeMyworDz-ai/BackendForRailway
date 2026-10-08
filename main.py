@@ -13574,11 +13574,20 @@ async def _human_ai_agent_research(raw_text, context):
         "If no external searches are genuinely needed, return exactly NO_SEARCHED_TERMS. Never invent searches, results, or sources. Do not rewrite the transcript.\n\n"
         f"JOB CONTEXT:\n{str(context or '')[:8000]}\n\nTRANSCRIPT OR IMAGE TRANSCRIPTION:\n{str(raw_text or '')[:60000]}"
     )
-    try:
-        result = str(await asyncio.to_thread(_gemini_research_blocking, prompt) or "").strip()
-    except Exception as exc:
-        logger.warning("AI agent proper-noun research could not complete: %s", exc)
-        raise RuntimeError("Required Google Search research could not be completed; no unresearched AI draft was saved.") from exc
+    result = ""
+    last_exc = None
+    # Try the primary search model, then a second one, so one overloaded model
+    # does not stop a long job. A draft is still never saved without real research.
+    for research_model in ("gemini-3.8-flash", "gemini-3.5-flash-lite"):
+        try:
+            result = str(await asyncio.to_thread(_gemini_research_blocking, prompt, research_model) or "").strip()
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("AI agent proper-noun research failed on %s: %s", research_model, exc)
+    if last_exc is not None:
+        raise RuntimeError("Required Google Search research could not be completed; no unresearched AI draft was saved.") from last_exc
     if result.casefold() in {"no_searched_terms", "no searched terms", "none"}:
         return ""
     if not result or ("ACTUAL GOOGLE SEARCH QUERIES:" not in result and "ACTUAL SEARCH SOURCES:" not in result):
@@ -15736,7 +15745,7 @@ def _gemini_research_blocking(prompt, model_id="gemini-3.8-flash", max_attempts=
                     "tools": [{"google_search": {}}],
                     "generationConfig": {"maxOutputTokens": 8000},
                 },
-                timeout=(10, 90),
+                timeout=(10, 150),
             )
         except Exception as exc:
             last_error = exc
