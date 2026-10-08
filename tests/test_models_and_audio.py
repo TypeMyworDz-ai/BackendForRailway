@@ -42,7 +42,7 @@ class ModelsAndAudioTests(unittest.TestCase):
     def test_old_model_ids_move_to_their_successors(self):
         resolve = self.ns["resolve_ask_model"]
         self.assertEqual(resolve("claude-opus-4-6", "Monthly Plan", "a@b.c", True, True)[0], "claude-opus-5-5")
-        self.assertEqual(resolve("claude-sonnet-5", "Monthly Plan", "a@b.c", True, True)[0], "claude-sonnet-5-5")
+        self.assertEqual(resolve("claude-sonnet-5", "Monthly Plan", "a@b.c", True, True)[0], "claude-haiku-5-5")
         self.assertEqual(resolve("gemini-3.6-flash", "Monthly Plan", "a@b.c", True, True)[0], "gemini-3.8-flash")
 
     def test_unknown_model_falls_back_to_default(self):

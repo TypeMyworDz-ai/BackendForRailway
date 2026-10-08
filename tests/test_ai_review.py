@@ -297,8 +297,8 @@ class AiAgentCatalog(unittest.TestCase):
         self.assertEqual(set(self.agents), {
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
-        expected_audio_models = ["claude-opus-5-5", "gpt-5.6-sol"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "claude-sonnet-5-5"])
+        expected_audio_models = ["gpt-5.6-sol", "claude-opus-5-5"]
+        self.assertEqual(self.agents["general-gpt"]["models"], ["claude-haiku-5-5", "gemini-3.8-flash"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
         self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
@@ -351,11 +351,11 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Never treat emphasis", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gemini-3.5-flash-lite", "gemini")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini"), ("claude-haiku-5-5", "claude")))
+        self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.8-flash", "gemini")))
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
         self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 
@@ -503,7 +503,8 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("research_status = 'partial'", admin_proofread)
         self.assertIn("research_status = 'unavailable'", admin_proofread)
         self.assertNotIn("Required proper-noun web research did not complete", admin_proofread)
-        self.assertIn("GPT-5.6 Terra with Gemini 3.8 Flash fallback", admin_proofread)
+        self.assertIn("GPT-5.6 Luna", admin_proofread)
+        self.assertIn("fallback", admin_proofread)
 
     def test_worker_draft_cost_rounds_up_assigned_audio_minutes(self):
         function = self.functions["_human_worker_ai_draft_credit_cost"]
