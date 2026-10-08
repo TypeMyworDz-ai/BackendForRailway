@@ -6523,7 +6523,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         # Preserve only the authorized worker-facing draft text above; never
         # return raw draft records that include provider/model metadata.
         out.pop("ai_drafts", None)
-        for key in ("ai_review", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override"):
+        for key in ("ai_review", "ai_review_run", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override"):
             out.pop(key, None)
         for key in (
             "worker_minutes", "worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason",
@@ -6546,7 +6546,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("proofreader_payout_status", None)
         out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
-        for key in ("ai_drafts", "ai_review", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "ai_agent_docx", "ai_agent_scope", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "proofreader_use_combined_transcript"):
+        for key in ("ai_drafts", "ai_review", "ai_review_run", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "ai_agent_docx", "ai_agent_scope", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "proofreader_use_combined_transcript"):
             out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
@@ -13588,9 +13588,36 @@ async def _human_ai_agent_research(raw_text, context):
             logger.warning("AI agent proper-noun research failed on %s: %s", research_model, exc)
     if last_exc is not None:
         raise RuntimeError("Required Google Search research could not be completed; no unresearched AI draft was saved.") from last_exc
-    if result.casefold() in {"no_searched_terms", "no searched terms", "none"}:
+    if not result:
+        raise RuntimeError("Google Search returned no answer; the AI draft was stopped rather than claiming research.")
+    declined = result.casefold() in {"no_searched_terms", "no searched terms", "none"}
+    # The first call is allowed to decline, but a transcript that clearly contains
+    # names (places, hospitals, programs) must not skip the search. Search every
+    # candidate term the first answer did not cover.
+    candidates = _human_review_candidate_terms([{"text": str(raw_text or "")}], "", context)
+    fragments = [] if declined or not result else [result]
+    missing = _human_review_missing_research_terms(candidates, "\n".join(fragments)) if candidates else []
+    for offset in range(0, len(missing), 8):
+        batch = missing[offset:offset + 8]
+        retry_prompt = (
+            "MANDATORY GROUNDED GOOGLE SEARCH. Search each listed term with Google Search; do not answer from memory and do not return NO_SEARCHED_TERMS. "
+            "Use job context and explicit client spellings as authoritative; skip a term only if its spelling is explicitly supplied there. "
+            "Return exactly one pipe-delimited line per term: dictated form | verified spelling | what it refers to and why it fits this transcript | confidence yes/no.\n\n"
+            f"Terms to search: {', '.join(batch)}\n\nJOB CONTEXT:\n{str(context or '')[:8000]}\n\nTRANSCRIPT:\n{str(raw_text or '')[:60000]}"
+        )
+        for research_model in ("gemini-3.8-flash", "gemini-3.5-flash-lite"):
+            try:
+                extra = str(await asyncio.to_thread(_gemini_research_blocking, retry_prompt, research_model) or "").strip()
+            except Exception as exc:
+                logger.warning("AI agent forced research failed on %s: %s", research_model, exc)
+                continue
+            if extra and extra.casefold() not in {"no_searched_terms", "no searched terms", "none"}:
+                fragments.append(extra)
+            break
+    result = "\n\n".join(dict.fromkeys(fragments))
+    if not result:
         return ""
-    if not result or ("ACTUAL GOOGLE SEARCH QUERIES:" not in result and "ACTUAL SEARCH SOURCES:" not in result):
+    if "ACTUAL GOOGLE SEARCH QUERIES:" not in result and "ACTUAL SEARCH SOURCES:" not in result:
         raise RuntimeError("Google Search did not return verifiable search metadata; the AI draft was stopped rather than claiming research.")
     return result
 
@@ -14332,6 +14359,10 @@ async def _human_resume_orphans_after_start():
         await human_resume_orphaned_ai_runs()
     except Exception as exc:
         logger.warning("Resuming interrupted AI runs failed: %s", exc)
+    try:
+        await human_resume_orphaned_ai_reviews()
+    except Exception as exc:
+        logger.warning("Resuming interrupted AI proofreads failed: %s", exc)
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-agent/assign")
@@ -14961,6 +14992,7 @@ def _human_worker_ai_draft_credit_cost(job, segment=None):
 
 
 async def _human_worker_format_ai_draft(job_id, job, transcript):
+    await _progress("Reading the guidelines and job notes", 10)
     guidelines = await _admin_guidelines_text()
     context_data = await _human_review_context(job_id, job)
     context = context_data["text"]
@@ -16222,10 +16254,21 @@ def _review_validate_output(answer):
     return text, data
 
 
-@app.post("/human-transcription/jobs/{job_id}/ai-review")
-async def human_admin_ai_review(job_id: str, request: Request):
-    """AI proofreading: standardise one or more parts into a single client-ready transcript."""
-    actor = await _human_actor(request)
+async def human_admin_ai_review(job_id: str, request: Request = None, actor=None, progress=None):
+    """AI proofreading: standardise one or more parts into a single client-ready transcript.
+
+    Runs in the background (see human_admin_ai_review_start); `progress` receives
+    (stage text, percent) so the page can show a progress bar.
+    """
+    async def _progress(stage, percent):
+        if progress:
+            try:
+                await progress(stage, percent)
+            except Exception:
+                logger.debug("AI proofread progress update failed", exc_info=True)
+
+    if actor is None:
+        actor = await _human_actor(request)
     if actor.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
     job = await _human_job(job_id)
@@ -16258,6 +16301,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
     first_text = parts[0]["text"]
     worker_transcript = "\n\n".join(texts)
 
+    await _progress("Transcribing the full recording to check wording", 15)
     try:
         deepgram_data = await _human_review_full_audio_deepgram(job_id, job)
     except Exception as exc:
@@ -16267,6 +16311,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
     if not deepgram_text:
         raise HTTPException(status_code=502, detail="Deepgram returned no full-audio comparison transcript. Please retry AI proofreading.")
 
+    await _progress("Researching names and terms on the web", 40)
     research_text = ""
     research_status = "not_started"
     issues = list(context_data["issues"])
@@ -16337,6 +16382,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
             research_text = "No unconfirmed proper nouns or specialist terms requiring web research were identified; a search was not needed."
             research_status = "no_unconfirmed_terms"
 
+    await _progress("Proofreading the transcript", 55)
     indent_hint = "Every body paragraph starts with one real TAB for a 0.5-inch indent; headings and the spellings section remain flush left."
     spacing_hint = "Use exactly two spaces after every sentence."
     shared = (
@@ -16359,7 +16405,9 @@ async def human_admin_ai_review(job_id: str, request: Request):
 
     final_chunks, all_parts, all_changes, summary_bits = [], [], [], []
     models_used = []
-    for batch in batches:
+    for batch_number, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            await _progress(f"Proofreading section {batch_number} of {len(batches)}", 55 + int(35 * (batch_number - 1) / len(batches)))
         blocks = []
         if 0 not in batch:
             blocks.append(f"=== FIRST PART (spelling authority only, do not repeat it in your transcript) ===\n{first_text[:30000]}")
@@ -16392,6 +16440,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
         if data.get("summary"):
             summary_bits.append(str(data["summary"]))
 
+    await _progress("Tidying the formatting and research notes", 92)
     combined = "\n\n".join(chunk.strip("\n") for chunk in final_chunks)
     combined, restored_boundaries = _review_restore_dictation_boundaries(combined, deepgram_text)
     combined = _review_enforce_indent(combined, texts)
@@ -16449,6 +16498,7 @@ async def human_admin_ai_review(job_id: str, request: Request):
         "models_used": list(dict.fromkeys(models_used)),
         "createdAt": datetime.now().isoformat(),
     }
+    await _progress("Saving the result", 97)
     credit_charge = await _human_charge_ai_call(
         actor, job_id, "AI proofreader", credit_cost=proofread_credit_cost,
     )
@@ -16466,6 +16516,106 @@ async def human_admin_ai_review(job_id: str, request: Request):
     except Exception:
         logger.exception("Could not accrue sub-admin earnings for successful AI review %s", job_id)
     return {"ai_review": saved, **credit_charge}
+
+
+_AI_REVIEW_RUN_STALE_SECONDS = 30 * 60
+_AI_REVIEW_MAX_RESUMES = 2
+
+
+def _human_ai_review_run_active(job):
+    run = (job or {}).get("ai_review_run") or {}
+    if str(run.get("status") or "") not in {"queued", "processing"}:
+        return False
+    started = _as_dt(run.get("startedAt"))
+    if started is not None and getattr(started, "tzinfo", None):
+        started = started.astimezone(timezone.utc).replace(tzinfo=None)
+    if started is None:
+        return False
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - started).total_seconds() < _AI_REVIEW_RUN_STALE_SECONDS
+
+
+async def _human_ai_review_write_run(job_id, **fields):
+    updates = {f"ai_review_run.{key}": value for key, value in fields.items()}
+    updates["ai_review_run.updatedAt"] = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    _human_list_cache_bump()
+
+
+async def _human_run_ai_review_background(job_id, actor, run_id):
+    """Run the AI proofread outside the browser request and record progress on the job."""
+    _AI_RUNS_ACTIVE.add(run_id)
+
+    async def progress(stage, percent):
+        await _human_ai_review_write_run(job_id, status="processing", stage=stage, progress=int(percent))
+
+    try:
+        await _human_ai_review_write_run(job_id, status="processing", stage="Starting", progress=3)
+        await human_admin_ai_review(job_id, actor=actor, progress=progress)
+        await _human_ai_review_write_run(job_id, status="completed", stage="Done", progress=100, error="")
+    except HTTPException as exc:
+        await _human_ai_review_write_run(job_id, status="failed", stage="Stopped", error=str(exc.detail)[:600])
+    except Exception as exc:
+        logger.exception("AI proofread failed for %s", job_id)
+        await _human_ai_review_write_run(job_id, status="failed", stage="Stopped", error="AI proofreading could not be completed. Please try again.")
+    finally:
+        _AI_RUNS_ACTIVE.discard(run_id)
+
+
+@app.post("/human-transcription/jobs/{job_id}/ai-review")
+async def human_admin_ai_review_start(job_id: str, request: Request, background_tasks: BackgroundTasks):
+    """Start an AI proofread in the background; the page polls the job for progress."""
+    actor = await _human_actor(request)
+    if actor.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access is required.")
+    job = await _human_job(job_id)
+    if _human_ai_review_run_active(job):
+        return {"started": False, "ai_review_run": job.get("ai_review_run")}
+    if job.get("proofreader_status") in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="A human proofreader is already working on this job.")
+    cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin(actor.get("email")) else HUMAN_WORK_AI_CREDIT_COST
+    await _human_require_ai_call_credits(actor, cost)
+    run_id = uuid.uuid4().hex
+    run = {
+        "run_id": run_id, "status": "queued", "stage": "Waiting to start", "progress": 1, "error": "",
+        "startedAt": datetime.now(timezone.utc).isoformat(), "updatedAt": datetime.now(timezone.utc).isoformat(),
+        "resume_count": 0,
+        "actor": {"uid": str(actor.get("uid") or ""), "email": str(actor.get("email") or ""), "role": "admin"},
+    }
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"ai_review_run": run})
+    _human_list_cache_bump()
+    background_tasks.add_task(_human_run_ai_review_background, job_id, run["actor"], run_id)
+    return {"started": True, "ai_review_run": {key: value for key, value in run.items() if key != "actor"}}
+
+
+async def human_resume_orphaned_ai_reviews():
+    """Restart AI proofreads that a deploy or restart interrupted (credits are only charged at the end)."""
+    if not db:
+        return 0
+    try:
+        snapshots = await asyncio.to_thread(
+            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("ai_review_run.status", "in", ["queued", "processing"])).stream())
+        )
+    except Exception as exc:
+        logger.warning("Could not look for interrupted AI proofreads: %s", exc)
+        return 0
+    resumed = 0
+    for snap in snapshots:
+        run = (snap.to_dict() or {}).get("ai_review_run") or {}
+        run_id = str(run.get("run_id") or "")
+        if not run_id or run_id in _AI_RUNS_ACTIVE or not run.get("actor"):
+            continue
+        if not _human_ai_review_run_active({"ai_review_run": run}):
+            continue
+        if int(run.get("resume_count") or 0) >= _AI_REVIEW_MAX_RESUMES:
+            continue
+        try:
+            await _human_ai_review_write_run(snap.id, resume_count=int(run.get("resume_count") or 0) + 1, stage="Restarting after a server update")
+        except Exception:
+            continue
+        logger.info("Resuming interrupted AI proofread %s for job %s", run_id, snap.id)
+        asyncio.create_task(_human_run_ai_review_background(snap.id, dict(run["actor"]), run_id))
+        resumed += 1
+    return resumed
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-review/apply")
