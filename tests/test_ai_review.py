@@ -12,7 +12,7 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_split_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_split_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
@@ -400,10 +400,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("AI_REVIEW_MODEL_CHAIN", letter_review)
 
     def test_research_footer_uses_only_grounded_terms_sources_and_explicit_no_search_note(self):
-        function = self.functions["_human_ai_agent_research_footer"]
-        namespace = {"re": re}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
-        footer = namespace["_human_ai_agent_research_footer"]
+        footer = NS["_human_ai_agent_research_footer"]
         no_search = footer("Transcript body.", "")
         self.assertIn("Research Notes:\nNo external searches were needed for this transcript.", no_search)
         self.assertNotIn("I researched:", no_search)
@@ -411,7 +408,20 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("I researched:", ungrounded)
         self.assertIn("No external searches were needed for this transcript.", ungrounded)
         malformed = footer("Transcript body.\nI researched: Example Org.", "A result without structured findings.")
-        self.assertEqual(malformed, "Transcript body.")
+        self.assertTrue(malformed.startswith("Transcript body."))
+        self.assertIn("Research Notes:\nWeb research returned no confirmed findings", malformed)
+        unverified = footer(
+            "Transcript body.",
+            "UNVERIFIED TERMS (do not correct from memory): Walden Park, Summit Clinic",
+        )
+        self.assertIn("could not confirm these terms, so they were left exactly as dictated: Walden Park, Summit Clinic.", unverified)
+        table = footer(
+            "Transcript body.",
+            "| Dictated form | Verified spelling | Meaning | Confident |\n| --- | --- | --- | --- |\n"
+            "| Family to Family | Family to Family Program | A family-support initiative. | Yes |",
+        )
+        self.assertIn("I researched: Family to Family Program.", table)
+        self.assertIn("- Family to Family Program: A family-support initiative. (confidence: yes)", table)
         grounded = footer(
             "Transcript body.\nClient spellings: Ann, My spellings: Lee.",
             "Example Org | Example Organization | A service named in the transcript. | yes\n\n"
@@ -561,7 +571,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("ACTUAL GOOGLE SEARCH QUERIES:\n- Summit Psych Ohio provider", grounded)
         self.assertIn("ACTUAL SEARCH SOURCES:\n- Summit Psych: https://example.test", grounded)
         self.assertEqual(len(FakeRequests.calls), 3)
-        self.assertEqual(FakeRequests.calls[-1][1]["timeout"], (10, 90))
+        self.assertEqual(FakeRequests.calls[-1][1]["timeout"], (10, 150))
 
         FakeRequests.responses = [Response({"candidates": [{"content": {"parts": [{"text": "NO_SEARCHED_TERMS"}]}}]})]
         self.assertEqual(namespace["_gemini_research_blocking"]("prompt"), "NO_SEARCHED_TERMS")
