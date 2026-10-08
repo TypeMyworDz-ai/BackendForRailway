@@ -13680,9 +13680,9 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gemini-3.8-flash", "gemini"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("deepseek-v4-flash", "deepseek"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
@@ -13694,8 +13694,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Claude Haiku 5.5 + Gemini 3.8 Flash fallback", "job_types": ["audio", "general_job"],
-        "models": ["claude-haiku-5-5", "gemini-3.8-flash"],
+        "display": "GPT-5.6 Luna + DeepSeek V4 Flash fallback", "job_types": ["audio", "general_job"],
+        "models": ["gpt-5.6-luna", "deepseek-v4-flash"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
