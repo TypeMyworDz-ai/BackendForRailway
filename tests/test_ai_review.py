@@ -351,11 +351,11 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Never treat emphasis", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude")))
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
         self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 
@@ -503,7 +503,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("research_status = 'partial'", admin_proofread)
         self.assertIn("research_status = 'unavailable'", admin_proofread)
         self.assertNotIn("Required proper-noun web research did not complete", admin_proofread)
-        self.assertIn("Claude Sonnet 5.5 with Gemini 3.5 Flash-Lite fallback", admin_proofread)
+        self.assertIn("Gemini 3.8 Flash with Claude Sonnet 5.5 fallback", admin_proofread)
 
     def test_worker_draft_cost_rounds_up_assigned_audio_minutes(self):
         function = self.functions["_human_worker_ai_draft_credit_cost"]
