@@ -13529,11 +13529,11 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini"))
+AI_REVIEW_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("claude-opus-5-5", "claude"), ("gpt-5.6-sol", "openai"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
-WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.5-flash-lite", "gemini"))
+WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-sonnet-5-5", "claude"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
     "GENERAL-JOBS SPEAKER SELF-CORRECTIONS: When the speaker immediately and unmistakably replaces a word or phrase with a correction, remove only the abandoned version and retain the corrected wording. "
     "Example: 'She stated that she is at the Dublin Granville— East Dublin Granville Children's Close to Home.' becomes 'She stated that she is at the East Dublin Granville Children's Close to Home.' "
@@ -16783,11 +16783,11 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
     used_claude = "claude-sonnet-5-5" in used_model_ids
-    used_gemini = "gemini-3.5-flash-lite" in used_model_ids
+    used_gemini = "gemini-3.8-flash" in used_model_ids
     if used_claude and used_gemini:
-        model_label = "Claude Sonnet 5.5 with Gemini 3.5 Flash-Lite fallback"
+        model_label = "Gemini 3.8 Flash with Claude Sonnet 5.5 fallback"
     elif used_gemini:
-        model_label = "Gemini 3.5 Flash-Lite"
+        model_label = "Gemini 3.8 Flash"
     elif used_claude:
         model_label = "Claude Sonnet 5.5"
     else:
