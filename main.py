@@ -42,7 +42,7 @@ import httpx
 from docx import Document
 from docx.shared import Inches
 from io import BytesIO
-from fastapi.responses import StreamingResponse, RedirectResponse
+from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 import re
 from copy import deepcopy
 import anthropic
@@ -303,7 +303,7 @@ def _require_ai_agent_assignment(request: Request) -> dict:
     decoded = _verified_user(request)
     email = (decoded.get("email") or "").strip().lower()
     allowed_emails = {item.lower() for item in ADMIN_EMAILS}
-    allowed_emails.add("info@typemywordz.ai")
+    allowed_emails.update(item.lower() for item in HUMAN_JOB_ADMIN_EMAILS)
     if email not in allowed_emails:
         raise HTTPException(status_code=403, detail="AI-agent assignment access is required.")
     return decoded
@@ -1353,7 +1353,7 @@ def credits_exempt(user_email: str) -> bool:
 # never grants the app-wide admin dashboard, never bypasses the paywall for
 # AI transcription or Ask TypeMyworDz, and never exempts anything except the
 # human-transcription jobs these accounts personally own as the "client".
-HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai']
+HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai', 'gracenyaitara@gmail.com']
 USER_NOTIFICATION_COLLECTION = "user_notifications"
 
 
@@ -1430,8 +1430,80 @@ async def _human_notification_admin_uids(exclude_uids=None):
 
 async def _notify_human_admins(event_key: str, kind: str, title: str, body: str, *, route: str, job_id: str, requires_action: bool = False, exclude_uids=None, target_id: str = ""):
     recipients = await _human_notification_admin_uids(exclude_uids)
+    if job_id:
+        # Each admin only hears about work they uploaded. Work with no recorded
+        # uploader (client orders, older jobs) belongs to the main admin.
+        owner_uid, owner_email, found = await _human_job_owner_lookup(job_id)
+        if found:
+            excluded = {str(uid) for uid in (exclude_uids or []) if uid}
+            if owner_uid:
+                recipients = [owner_uid] if owner_uid not in excluded else []
+            elif owner_email:
+                recipients = [uid for uid in recipients if uid in await _human_uids_for_email(owner_email)]
+            else:
+                recipients = [uid for uid in recipients if uid in await _human_main_admin_uids()]
     for uid in recipients:
         await _create_user_notification(uid, event_key, kind, title, body, route=route, job_id=job_id, target_id=target_id or job_id, requires_action=requires_action)
+
+
+_human_job_owner_cache = {}
+
+
+async def _human_job_owner_lookup(job_id):
+    """Return (uploader uid, uploader email, job exists). Owners never change, so they are cached."""
+    job_id = str(job_id or "")
+    if not job_id or not db:
+        return "", "", False
+    cached = _human_job_owner_cache.get(job_id)
+    if cached:
+        return cached[0], cached[1], True
+    try:
+        snap = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+    except Exception:
+        return "", "", False
+    if not snap.exists:
+        return "", "", False
+    data = snap.to_dict() or {}
+    owner = (str(data.get("created_by_uid") or "").strip(), str(data.get("created_by_email") or "").strip().lower())
+    if len(_human_job_owner_cache) > 5000:
+        _human_job_owner_cache.clear()
+    _human_job_owner_cache[job_id] = owner
+    return owner[0], owner[1], True
+
+
+async def _human_uids_for_email(email):
+    try:
+        record = await asyncio.to_thread(firebase_auth.get_user_by_email, str(email))
+        return {record.uid} if record.uid else set()
+    except Exception:
+        return set()
+
+
+async def _human_main_admin_uids():
+    found = set()
+    for email in ADMIN_EMAILS:
+        found |= await _human_uids_for_email(email)
+    return found
+
+
+def _human_job_owner_of(item):
+    return str((item or {}).get("created_by_uid") or "").strip(), str((item or {}).get("created_by_email") or "").strip().lower()
+
+
+def _human_admin_can_see_job(actor, item, owner_all=False):
+    """Each admin only sees the work they uploaded. Only the main admin, in the
+    admin dashboard, can ask for every sub-admin's work (owner_all)."""
+    email = str((actor or {}).get("email") or "").strip().lower()
+    uid = str((actor or {}).get("uid") or "").strip()
+    main = is_admin_user(email)
+    if main and owner_all:
+        return True
+    owner_uid, owner_email = _human_job_owner_of(item)
+    if not owner_uid and not owner_email:
+        return main
+    if owner_uid:
+        return owner_uid == uid
+    return owner_email == email
 
 
 async def _complete_human_admin_notifications(job_id: str, kinds, *, target_id: str = ""):
@@ -6245,7 +6317,7 @@ HUMAN_SHIFT_ONLINE_TTL_SECONDS = 150
 HUMAN_SHIFT_CALL_TTL_HOURS = 4
 HUMAN_SHIFT_COLLECTION = "human_worker_shifts"
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
-PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com"}
+PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com"}
 HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
 TEXT_MESSAGES_DEFAULT_INSTRUCTION = "Text Messages job: transcribe the screenshot following the Text Messages guidelines."
 GENERAL_JOB_DEFAULT_INSTRUCTION = (
@@ -6285,7 +6357,7 @@ def human_image_tat_seconds(image_count=1):
 PDF_JOB_DEFAULT_INSTRUCTION = "Always use Gemini for image transcription"
 PDF_JOB_WORD_EXTENSIONS = (".docx", ".doc", ".rtf", ".odt")
 PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "jpg", "jpeg", "png", "webp", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
-LETTER_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com"}
+LETTER_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com"}
 LETTER_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 LETTER_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac", "mov", "mkv", "avi"}
 HUMAN_JOB_STATUSES = {
@@ -9101,9 +9173,190 @@ async def _human_cached_query(key, loader):
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Sub-admin isolation. A sub-admin only reaches jobs they uploaded, and never
+# sees which real worker did the work: workers appear as "Human Worker N" and AI
+# agents as "Agent Worker N". The main admin is exempt from all of this.
+# ---------------------------------------------------------------------------
+_HUMAN_JOB_PATH_RE = re.compile(r"^/human-transcription/(?:admin/)?jobs/([^/]+)")
+_HUMAN_SCOPED_PREFIXES = ("/human-transcription", "/api/notifications")
+_human_alias_lock = asyncio.Lock()
+_human_alias_cache = {"loaded_at": 0.0, "by_uid": {}, "needles": []}
+
+
+def _human_token_identity(request):
+    """Read uid and email from the bearer token without trusting it for access.
+
+    It only decides whether extra restrictions apply; the route itself still
+    verifies the token, so a forged token gains nothing."""
+    header = request.headers.get("authorization") or ""
+    if not header.lower().startswith("bearer "):
+        return "", ""
+    try:
+        payload = header[7:].strip().split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()))
+        return str(claims.get("user_id") or claims.get("uid") or claims.get("sub") or ""), str(claims.get("email") or "").strip().lower()
+    except Exception:
+        return "", ""
+
+
+async def _human_worker_aliases(extra_uids=()):
+    """Stable labels: each real worker keeps the same "Human Worker N" forever."""
+    async with _human_alias_lock:
+        cache = _human_alias_cache
+        now = time.monotonic()
+        stale = now - cache["loaded_at"] > 120
+        if stale:
+            try:
+                alias_rows = await asyncio.to_thread(lambda: list(db.collection("human_worker_aliases").stream()))
+                worker_rows = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
+            except Exception as exc:
+                logger.warning("Could not load worker aliases: %s", exc)
+                return cache["by_uid"], cache["needles"]
+            by_uid = {row.id: int((row.to_dict() or {}).get("number") or 0) for row in alias_rows}
+            people = {row.id: row.to_dict() or {} for row in worker_rows}
+            for row in alias_rows:
+                data = row.to_dict() or {}
+                people.setdefault(row.id, {"name": data.get("name"), "email": data.get("email")})
+            cache["_numbers"] = by_uid
+            cache["_people"] = people
+            cache["loaded_at"] = now
+        numbers = cache.setdefault("_numbers", {})
+        people = cache.setdefault("_people", {})
+        wanted = set(str(uid) for uid in extra_uids if uid) | set(people)
+        missing = sorted(uid for uid in wanted if not numbers.get(uid))
+        next_number = max(numbers.values() or [0]) + 1
+        for uid in missing:
+            numbers[uid] = next_number
+            person = people.get(uid) or {}
+            try:
+                await asyncio.to_thread(
+                    db.collection("human_worker_aliases").document(uid).set,
+                    {"number": next_number, "name": str(person.get("name") or person.get("displayName") or ""), "email": str(person.get("email") or "").lower(), "createdAt": firestore.SERVER_TIMESTAMP},
+                )
+            except Exception as exc:
+                logger.warning("Could not save worker alias %s: %s", uid, exc)
+            next_number += 1
+        by_uid = {uid: f"Human Worker {number}" for uid, number in numbers.items()}
+        needles = []
+        for uid, person in people.items():
+            label = by_uid.get(uid)
+            if not label:
+                continue
+            for value in (person.get("name"), person.get("displayName"), person.get("full_name"), person.get("email")):
+                value = str(value or "").strip()
+                if len(value) >= 4:
+                    needles.append((value.casefold(), label))
+        needles.sort(key=lambda pair: len(pair[0]), reverse=True)
+        cache["by_uid"], cache["needles"] = by_uid, needles
+        return by_uid, needles
+
+
+def _human_collect_worker_uids(node, found):
+    if isinstance(node, dict):
+        for key in ("worker_uid", "proofreader_uid"):
+            if node.get(key):
+                found.add(str(node[key]))
+        if node.get("uid") and ("online" in node or "shift_status" in node):
+            found.add(str(node["uid"]))
+        for value in node.values():
+            _human_collect_worker_uids(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _human_collect_worker_uids(value, found)
+
+
+def _human_anonymize_node(node, by_uid, needles):
+    agent_ids = list(HUMAN_AI_AGENTS)
+    if isinstance(node, dict):
+        agent_id = node.get("ai_agent_id")
+        if agent_id and "worker_name" in node and not node.get("worker_uid"):
+            number = agent_ids.index(agent_id) + 1 if agent_id in agent_ids else 1
+            node["worker_name"] = f"Agent Worker {number}"
+            if "worker_email" in node:
+                node["worker_email"] = ""
+        for uid_key, name_key, email_key in (("worker_uid", "worker_name", "worker_email"), ("proofreader_uid", "proofreader_name", "proofreader_email")):
+            uid = node.get(uid_key)
+            if uid and str(uid) in by_uid:
+                if name_key in node:
+                    node[name_key] = by_uid[str(uid)]
+                if email_key in node:
+                    node[email_key] = ""
+        if node.get("uid") and str(node["uid"]) in by_uid and ("online" in node or "shift_status" in node):
+            node["name"] = by_uid[str(node["uid"])]
+            for key in ("email", "phone", "displayName", "full_name"):
+                if key in node:
+                    node[key] = ""
+        for key in ("last_auto_reassigned_worker_name", "last_assignment_takeback_worker_name"):
+            if node.get(key):
+                node[key] = "a human worker"
+        for key, value in list(node.items()):
+            if isinstance(value, str):
+                lowered = value.casefold()
+                for needle, label in needles:
+                    if needle in lowered:
+                        value = re.sub(re.escape(needle), label, value, flags=re.IGNORECASE)
+                        lowered = value.casefold()
+                node[key] = value
+            else:
+                node[key] = _human_anonymize_node(value, by_uid, needles)
+        return node
+    if isinstance(node, list):
+        return [_human_anonymize_node(item, by_uid, needles) for item in node]
+    if isinstance(node, str):
+        lowered = node.casefold()
+        for needle, label in needles:
+            if needle in lowered:
+                node = re.sub(re.escape(needle), label, node, flags=re.IGNORECASE)
+                lowered = node.casefold()
+    return node
+
+
+@app.middleware("http")
+async def _human_subadmin_scope_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or not path.startswith(_HUMAN_SCOPED_PREFIXES):
+        return await call_next(request)
+    uid, email = _human_token_identity(request)
+    if not email or not is_human_subadmin(email):
+        return await call_next(request)
+    match = _HUMAN_JOB_PATH_RE.match(path)
+    if match:
+        owner_uid, owner_email, found = await _human_job_owner_lookup(match.group(1))
+        mine = (owner_uid and owner_uid == uid) or (not owner_uid and owner_email and owner_email == email)
+        if found and not mine:
+            headers = {}
+            origin = request.headers.get("origin")
+            if origin:
+                headers = {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
+            return JSONResponse({"detail": "This job was not found in your uploads."}, status_code=404, headers=headers)
+    response = await call_next(request)
+    if "application/json" not in str(response.headers.get("content-type") or "").lower():
+        return response
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except Exception:
+        return Response(content=body, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
+    try:
+        uids = set()
+        _human_collect_worker_uids(data, uids)
+        by_uid, needles = await _human_worker_aliases(uids)
+        data = _human_anonymize_node(data, by_uid, needles)
+    except Exception:
+        logger.exception("Sub-admin worker anonymisation failed; withholding the response")
+        return JSONResponse({"detail": "This page could not be prepared. Please retry."}, status_code=503)
+    headers = {key: value for key, value in response.headers.items() if key.lower() not in {"content-length", "content-type"}}
+    return JSONResponse(data, status_code=response.status_code, headers=headers)
+
+
 @app.get("/human-transcription/jobs")
-async def human_list_jobs(request: Request, scope: str = "mine"):
+async def human_list_jobs(request: Request, scope: str = "mine", owner: str = ""):
     actor = await _human_actor(request)
+    owner_all = str(owner or "").strip().lower() == "all" and is_admin_user(actor.get("email") or "")
     if not db:
         return {"jobs": []}
     ref = db.collection(HUMAN_JOB_COLLECTION)
@@ -9229,6 +9482,8 @@ async def human_list_jobs(request: Request, scope: str = "mine"):
             continue
         item = snap.to_dict() or {}
         item["id"] = snap.id
+        if actor["role"] == "admin" and not _human_admin_can_see_job(actor, item, owner_all):
+            continue
         is_archived = _human_job_dashboard_archived(item)
         if actor["role"] == "admin" and scope in {"admin", "archived"} and is_archived != archived_scope:
             continue
@@ -9697,7 +9952,7 @@ async def human_admin_list_pdf_jobs(request: Request):
     jobs = []
     for snapshot in snapshots:
         item = snapshot.to_dict() or {}
-        if _human_job_dashboard_archived(item):
+        if _human_job_dashboard_archived(item) or not _human_admin_can_see_job(actor, item):
             continue
         image = item.get("pdf_image") or {}
         jobs.append({
@@ -9741,7 +9996,7 @@ async def human_admin_recent_pdf_batches(request: Request, category: str = ""):
     batches = {}
     for snapshot in snapshots:
         item = snapshot.to_dict() or {}
-        if item.get("pdf_review") or _human_job_dashboard_archived(item):
+        if item.get("pdf_review") or _human_job_dashboard_archived(item) or not _human_admin_can_see_job(actor, item):
             continue
         job_category = item.get("job_category") or "pdf"
         if wanted and job_category != wanted:
@@ -10114,7 +10369,7 @@ async def human_admin_list_letter_jobs(request: Request):
     jobs = []
     for snapshot in snapshots:
         item = snapshot.to_dict() or {}
-        if _human_job_dashboard_archived(item):
+        if _human_job_dashboard_archived(item) or not _human_admin_can_see_job(actor, item):
             continue
         item["id"] = snapshot.id
         jobs.append(_human_public_for(item, "admin", actor.get("uid") or ""))
@@ -10138,7 +10393,7 @@ async def human_workflow_notifications(request: Request, since: str = ""):
     found = {}
     if actor["role"] == "admin":
         snapshots = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("updatedAt", ">=", since_dt)).stream()))
-        found.update({snap.id: snap for snap in snapshots})
+        found.update({snap.id: snap for snap in snapshots if _human_admin_can_see_job(actor, snap.to_dict() or {})})
     elif actor["role"] == "worker":
         for field, op in (("worker_uid", "=="), ("assigned_worker_uids", "array_contains"), ("proofreader_uid", "==")):
             snapshots = await asyncio.to_thread(lambda field=field, op=op: list(ref.where(filter=FieldFilter(field, op, actor["uid"])).stream()))
