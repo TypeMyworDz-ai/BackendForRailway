@@ -85,3 +85,13 @@ class Wiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OwnerFieldRegressionTests(unittest.TestCase):
+    def test_image_and_letter_job_creators_record_their_owner(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text()
+        pdf = src[src.index("async def human_admin_create_pdf_jobs"):src.index("async def human_admin_create_file_review")]
+        self.assertIn('"created_by_uid": actor["uid"]', pdf)
+        letter = src[src.index("async def human_admin_create_letter_job"):src.index("async def human_admin_create_audio_job")]
+        self.assertIn('"created_by_uid": actor["uid"]', letter)

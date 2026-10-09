@@ -308,7 +308,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["gpt-5.6-sol", "claude-opus-5-5"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "gpt-5.6-luna"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "gpt-5.6-terra"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         image_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
         self.assertEqual(self.agents["pdf-gemini"]["models"], image_models)
@@ -367,7 +367,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_TEXT_MESSAGES_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
