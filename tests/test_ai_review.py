@@ -308,7 +308,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["gpt-5.6-sol", "claude-opus-5-5"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-terra", "gemini-3.5-flash-lite"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["claude-sonnet-5-5", "gpt-5.6-terra", "gemini-3.5-flash-lite"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         image_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
         self.assertEqual(self.agents["pdf-gemini"]["models"], image_models)
@@ -365,7 +365,7 @@ class AiModelRouting(unittest.TestCase):
 
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
-        self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")))
+        self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini")))
         self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
@@ -415,7 +415,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(len(image_calls), 1)
         self.assertEqual(len(pdf_calls), 2)
         self.assertEqual(len(agent_calls), 5)
-        self.assertIn("HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == 'general-gpt'", agent_source)
+        self.assertIn("_human_general_agent_chain(audio_seconds) if agent_id == 'general-gpt'", agent_source)
         self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN if job.get('pdf_review')", ast.unparse(self.functions["_human_image_review_draft"]))
         image_batch = ast.unparse(self.functions["_human_image_batch_compute"])
         self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN", image_batch)
