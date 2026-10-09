@@ -13693,7 +13693,7 @@ async def admin_workers(request: Request):
 AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini"), ("claude-sonnet-5-5", "claude"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -13756,8 +13756,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "GPT-5.6 Terra + Gemini 3.5 Flash-Lite + Claude Sonnet 5.5 fallback", "job_types": ["audio", "general_job"],
-        "models": ["gpt-5.6-terra", "gemini-3.5-flash-lite", "claude-sonnet-5-5"],
+        "display": "Set by the Super admin in Admin > Model routing", "job_types": ["audio", "general_job"],
+        "models": ["gemini-3.8-flash", "gpt-5.6-terra"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -13782,6 +13782,102 @@ HUMAN_AI_AGENTS = {
 }
 HUMAN_TEXT_MESSAGES_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 _IMAGE_AGENT_SEMAPHORE = asyncio.Semaphore(4)
+
+# ---- Super-admin model routing -------------------------------------------
+# Each job type has a default chain (above).  The Super admin can override the
+# primary and fallback models from Admin > Model routing; the override lives in
+# Firestore and is read through a short cache, so any failure falls back to the
+# defaults and never blocks a job.
+MODEL_ROUTES = {
+    "general": ("General Jobs agent", lambda: HUMAN_GENERAL_AGENT_MODEL_CHAIN),
+    "template": ("Template Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
+    "letter": ("Letter Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
+    "pdf": ("PDF and image Jobs agent", lambda: HUMAN_PDF_AGENT_MODEL_CHAIN),
+    "text_messages": ("Text Messages Jobs agent", lambda: HUMAN_TEXT_MESSAGES_MODEL_CHAIN),
+    "worker_format": ("Worker formatted draft", lambda: WORKER_DRAFT_FORMAT_MODEL_CHAIN),
+    "worker_proofread": ("Worker AI proofread", lambda: WORKER_DRAFT_PROOFREAD_MODEL_CHAIN),
+    "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
+}
+MODEL_ROUTE_EXTRA_MODELS = {"claude-sonnet-5-5": ("claude", "Claude Sonnet 5.5")}
+_MODEL_ROUTE_CACHE = {"at": 0.0, "routes": {}}
+_MODEL_ROUTE_TTL_SECONDS = 30
+
+
+def _model_route_options():
+    options = {m["id"]: (m["provider"], m.get("label") or m["id"]) for m in ASK_MODEL_CATALOGUE}
+    options.update(MODEL_ROUTE_EXTRA_MODELS)
+    return options
+
+
+def _model_route_overrides():
+    now = time.time()
+    if now - _MODEL_ROUTE_CACHE["at"] < _MODEL_ROUTE_TTL_SECONDS:
+        return _MODEL_ROUTE_CACHE["routes"]
+    routes = {}
+    try:
+        snap = db.collection("admin_settings").document("model_routing").get()
+        data = (snap.to_dict() if snap.exists else None) or {}
+        routes = data.get("routes") if isinstance(data.get("routes"), dict) else {}
+    except Exception as exc:  # never let settings block a job
+        logger.warning("Model routing settings could not be read; using defaults: %s", exc)
+        routes = _MODEL_ROUTE_CACHE["routes"]
+    _MODEL_ROUTE_CACHE.update({"at": now, "routes": routes})
+    return routes
+
+
+def _route_chain(key, default_chain):
+    options = _model_route_options()
+    ids = (_model_route_overrides() or {}).get(key)
+    chain = []
+    for model_id in ids if isinstance(ids, list) else []:
+        if model_id in options and all(model_id != c[0] for c in chain):
+            chain.append((model_id, options[model_id][0]))
+    return tuple(chain) or default_chain
+
+
+@app.get("/api/admin/model-routing")
+async def admin_get_model_routing(request: Request):
+    _require_admin(request)
+    options = _model_route_options()
+    overrides = await asyncio.to_thread(lambda: _model_route_overrides_fresh())
+    routes = []
+    for key, (label, default_fn) in MODEL_ROUTES.items():
+        default_ids = [c[0] for c in default_fn()]
+        chosen = [m for m in (overrides.get(key) or []) if m in options] if isinstance(overrides.get(key), list) else []
+        routes.append({"key": key, "label": label, "default": default_ids, "models": chosen or default_ids, "customised": bool(chosen)})
+    return {"routes": routes, "models": [{"id": k, "label": v[1], "provider": v[0]} for k, v in options.items()]}
+
+
+def _model_route_overrides_fresh():
+    _MODEL_ROUTE_CACHE["at"] = 0.0
+    return _model_route_overrides()
+
+
+@app.put("/api/admin/model-routing")
+async def admin_put_model_routing(request: Request):
+    _require_admin(request)
+    payload = await request.json()
+    key = str(payload.get("key") or "")
+    if key not in MODEL_ROUTES:
+        raise HTTPException(status_code=400, detail="Unknown job type.")
+    options = _model_route_options()
+    reset = bool(payload.get("reset"))
+    ids = []
+    for model_id in payload.get("models") or []:
+        model_id = str(model_id or "").strip()
+        if not model_id:
+            continue
+        if model_id not in options:
+            raise HTTPException(status_code=400, detail="Unknown model: " + model_id[:60])
+        if model_id not in ids:
+            ids.append(model_id)
+    if not reset and not ids:
+        raise HTTPException(status_code=400, detail="Choose at least a primary model.")
+    ref = db.collection("admin_settings").document("model_routing")
+    value = firestore.DELETE_FIELD if reset else ids[:4]
+    await asyncio.to_thread(ref.set, {"routes": {key: value}, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    _MODEL_ROUTE_CACHE["at"] = 0.0
+    return {"status": "reset" if reset else "saved", "key": key, "models": ids}
 
 HUMAN_TEXT_MESSAGES_GUIDELINES = """TEXT MESSAGES GUIDELINES (these apply ONLY to Text Messages jobs)
 
@@ -14468,7 +14564,7 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
         + drafts[:300000]
         + (_human_text_messages_reminder(bool(example_images)) if is_text else "")
     )
-    chain = HUMAN_PDF_AGENT_MODEL_CHAIN if job.get("pdf_review") else HUMAN_TEXT_MESSAGES_MODEL_CHAIN
+    chain = _route_chain("pdf", HUMAN_PDF_AGENT_MODEL_CHAIN) if job.get("pdf_review") else _route_chain("text_messages", HUMAN_TEXT_MESSAGES_MODEL_CHAIN)
     async with _IMAGE_AGENT_SEMAPHORE:
         answer, model_used = await _human_call_model_chain(
             chain, system, question, images + list(reference_images or []) + example_images,
@@ -14517,7 +14613,7 @@ async def _human_image_batch_compute(system, agent_id, job_ids, reference_images
             page_images.append({"raw": raw, "media_type": str(image.get("content_type") or "image/jpeg")})
         pages.append({"id": job_id, "images": page_images, "raw": b"".join(item["raw"] for item in page_images)})
     is_text = agent_id == "text-messages-gemini"
-    chain = HUMAN_TEXT_MESSAGES_MODEL_CHAIN if is_text else HUMAN_PDF_AGENT_MODEL_CHAIN
+    chain = _route_chain("text_messages", HUMAN_TEXT_MESSAGES_MODEL_CHAIN) if is_text else _route_chain("pdf", HUMAN_PDF_AGENT_MODEL_CHAIN)
     example_images = _human_text_messages_example_images() if is_text else []
     chunks, current, size = [], [], 0
     for page in pages:
@@ -14637,7 +14733,7 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             example_images = _human_text_messages_example_images()
             async with _IMAGE_AGENT_SEMAPHORE:
                 text_draft, text_model = await _human_call_model_chain(
-                    HUMAN_TEXT_MESSAGES_MODEL_CHAIN,
+                    _route_chain("text_messages", HUMAN_TEXT_MESSAGES_MODEL_CHAIN),
                     system,
                     text_question + _human_text_messages_reminder(bool(example_images)),
                     images + example_images,
@@ -14665,14 +14761,14 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
                 logger.warning("Whole-file AI run for %s failed; drafting this page on its own: %s", job_id, exc)
         async with _IMAGE_AGENT_SEMAPHORE:
             answer, _draft_model = await _human_call_model_chain(
-                HUMAN_PDF_AGENT_MODEL_CHAIN, system, question, images, 16000,
+                _route_chain("pdf", HUMAN_PDF_AGENT_MODEL_CHAIN), system, question, images, 16000,
             )
         draft = str(answer or "").strip()
         research = await _human_ai_agent_research(draft, context)
         if research:
             checked_system = system + "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
             checked, _review_model = await _human_call_model_chain(
-                HUMAN_PDF_AGENT_MODEL_CHAIN, checked_system,
+                _route_chain("pdf", HUMAN_PDF_AGENT_MODEL_CHAIN), checked_system,
                 "Review the first transcription against the first attached source image. Use remaining images only as job references. Correct only clear OCR/spelling/formatting mistakes supported by the source image or research. Keep every word otherwise.\n\nDRAFT TRANSCRIPTION:\n" + draft[:250000],
                 images, 16000,
             )
@@ -14696,7 +14792,10 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Use the AssemblyAI transcript; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
-    audio_agent_chain = HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
+    audio_agent_chain = _route_chain(
+        {"general-gpt": "general", "letter-opus": "letter"}.get(agent_id, "template"),
+        HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN,
+    )
     first, _first_model = await _human_call_model_chain(
         audio_agent_chain, system, first_question, reference_images, 16000,
     )
@@ -15302,7 +15401,7 @@ async def _human_run_letter_ai_review(job_id):
             f"SUBMITTED WORD DOCUMENT TEXT:\n{letter_text[:250000]}"
         )
         reviewed_text, model_used = await _human_call_model_chain(
-            AI_REVIEW_MODEL_CHAIN, system, question, context_data["images"], 16000,
+            _route_chain("letter_review", AI_REVIEW_MODEL_CHAIN), system, question, context_data["images"], 16000,
             response_validator=validate_research,
         )
         reviewed_text = re.sub(r"\n{3,}", "\n\n", _review_normalise_sentence_spacing(str(reviewed_text or "").strip()))
@@ -15628,7 +15727,7 @@ async def _human_worker_format_ai_draft(job_id, job, transcript):
         "No external searches were needed for this transcript. Do not claim a search or invent research."
     )
     answer, model_used = await _human_call_model_chain(
-        WORKER_DRAFT_FORMAT_MODEL_CHAIN, system,
+        _route_chain("worker_format", WORKER_DRAFT_FORMAT_MODEL_CHAIN), system,
         "Format the following AssemblyAI transcript using the TypeMyworDz guidelines, job-specific notes, and attached reference files/images. Keep the dictated wording and order; reference material may clarify spelling and required layout, but must not add undictated content. Return only the transcript body and any non-empty client/My spellings section; do not write a research footer, search queries, or source URLs because the application adds a verified, deduplicated footer. Never include email addresses, handles, usernames, or contact details in research notes.\n\n"
         + research_context + "\n\nSOURCE TRANSCRIPT:\n" + str(transcript or "")[:350000],
         context_data["images"], 16000,
@@ -15998,7 +16097,7 @@ async def human_worker_ai_proofread_draft(job_id: str, request: Request):
                 raise ValueError("empty proofread response")
 
         proofread_text, model_used = await _human_call_model_chain(
-            WORKER_DRAFT_PROOFREAD_MODEL_CHAIN, system, question,
+            _route_chain("worker_proofread", WORKER_DRAFT_PROOFREAD_MODEL_CHAIN), system, question,
             context_data.get("images") or [], 16000,
             response_validator=validate_proofread,
         )
@@ -18175,6 +18274,31 @@ async def mark_application_notification_read(notification_id: str, request: Requ
         raise HTTPException(status_code=404, detail="That notification was not found.")
     await asyncio.to_thread(ref.set, {"readAt": firestore.SERVER_TIMESTAMP}, merge=True)
     return {"status": "read", "notification_id": notification_id}
+
+
+@app.post("/api/notifications/read-all")
+async def mark_application_notifications_read(request: Request):
+    """Mark the given notifications read in one call, so a Cancel in one tab or
+    browser silences the alerts everywhere the account is open."""
+    actor = await _human_actor(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Notifications are not available yet.")
+    payload = await request.json()
+    ids = [str(item)[:200] for item in (payload.get("ids") or []) if item][:300]
+    if not ids:
+        return {"status": "read", "count": 0}
+    refs = [db.collection(USER_NOTIFICATION_COLLECTION).document(item) for item in ids]
+    snapshots = await asyncio.to_thread(lambda: list(db.get_all(refs)))
+    batch = db.batch()
+    count = 0
+    for snapshot in snapshots:
+        data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+        if snapshot.exists and data.get("recipient_uid") == actor["uid"]:
+            batch.set(snapshot.reference, {"readAt": firestore.SERVER_TIMESTAMP}, merge=True)
+            count += 1
+    if count:
+        await asyncio.to_thread(batch.commit)
+    return {"status": "read", "count": count}
 
 
 @app.post("/api/notifications/{notification_id}/snooze")
