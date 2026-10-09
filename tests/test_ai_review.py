@@ -365,7 +365,7 @@ class AiModelRouting(unittest.TestCase):
 
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
-        self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
@@ -654,8 +654,13 @@ class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
             node for node in cls.tree.body if isinstance(node, ast.Assign)
             and any(getattr(target, "id", None) == "HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE" for target in node.targets)
         )
+        date_node = next(
+            node for node in cls.tree.body if isinstance(node, ast.Assign)
+            and any(getattr(target, "id", None) == "HUMAN_DATE_FIDELITY_RULES" for target in node.targets)
+        )
         namespace = {
             "os": __import__("os"), "HUMAN_AI_AGENTS": ast.literal_eval(agent_node.value),
+            "HUMAN_DATE_FIDELITY_RULES": ast.literal_eval(date_node.value),
             "HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE": ast.literal_eval(correction_node.value),
             "__file__": str(source_path),
         }
