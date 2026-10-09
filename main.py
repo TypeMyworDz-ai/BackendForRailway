@@ -1500,7 +1500,14 @@ async def _human_main_admin_uids():
 
 
 def _human_job_owner_of(item):
-    return str((item or {}).get("created_by_uid") or "").strip(), str((item or {}).get("created_by_email") or "").strip().lower()
+    item = item or {}
+    uid = str(item.get("created_by_uid") or "").strip()
+    email = str(item.get("created_by_email") or "").strip().lower()
+    if not uid and not email and item.get("job_type") == "letter_job":
+        # Letter jobs created before owner fields existed stored the uploading admin as the client.
+        uid = str(item.get("client_uid") or "").strip()
+        email = str(item.get("client_email") or "").strip().lower()
+    return uid, email
 
 
 def _human_admin_can_see_job(actor, item, owner_all=False):
@@ -9832,6 +9839,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             "payout_status": None, "payout_period_id": None, "workerPaymentStatus": None,
             "assigned_worker_uids": [], "transcript": "", "worker_notes": "", "final_attachment": None,
             "client_uid": None, "client_email": "",
+            "created_by_uid": actor["uid"], "created_by_email": str(actor.get("email") or "").strip().lower(),
         }
         if len(image_metas) > 1:
             job["pdf_images"] = image_metas
@@ -10277,6 +10285,7 @@ async def human_admin_create_letter_job(
         now = firestore.SERVER_TIMESTAMP
         job = {
             "client_uid": actor["uid"], "client_email": email,
+            "created_by_uid": actor["uid"], "created_by_email": str(email or "").strip().lower(),
             "status": "approved", "createdAt": now, "updatedAt": now, "admin_uploaded": True,
             "job_name": safe_title, "job_type": "letter_job", "source_type": "letter_job", "job_category": "letter",
             "seconds": duration, "minutes": quote["minutes"], "turnaround": "standard", "difficulty": "standard",
@@ -13683,7 +13692,7 @@ async def admin_workers(request: Request):
 AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -13696,8 +13705,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Gemini 3.8 Flash + GPT-5.6 Luna fallback", "job_types": ["audio", "general_job"],
-        "models": ["gemini-3.8-flash", "gpt-5.6-luna"],
+        "display": "Gemini 3.8 Flash + GPT-5.6 Terra fallback", "job_types": ["audio", "general_job"],
+        "models": ["gemini-3.8-flash", "gpt-5.6-terra"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
