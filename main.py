@@ -13691,9 +13691,12 @@ async def admin_workers(request: Request):
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
 AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
-HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
+HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini"))
+# General audio jobs up to ten minutes go to Claude Sonnet 5.5 first; longer audio goes to Terra.
+HUMAN_GENERAL_SHORT_AGENT_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai"))
+HUMAN_GENERAL_SHORT_JOB_SECONDS = 600
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -13756,8 +13759,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "GPT-5.6 Terra + Gemini 3.5 Flash-Lite fallback", "job_types": ["audio", "general_job"],
-        "models": ["gpt-5.6-terra", "gemini-3.5-flash-lite"],
+        "display": "Claude Sonnet 5.5 up to 10 minutes, GPT-5.6 Terra for longer audio", "job_types": ["audio", "general_job"],
+        "models": ["claude-sonnet-5-5", "gpt-5.6-terra", "gemini-3.5-flash-lite"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -13978,6 +13981,17 @@ def _human_ai_assembly_transcript(assembly_result):
     if not text:
         raise RuntimeError("The AssemblyAI transcript is required for the AI agent but came back empty.")
     return {"AssemblyAI": text}
+
+
+def _human_general_agent_chain(audio_seconds):
+    """Claude Sonnet 5.5 for audio of ten minutes or less; GPT-5.6 Terra for anything longer."""
+    try:
+        seconds = float(audio_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if 0 < seconds <= HUMAN_GENERAL_SHORT_JOB_SECONDS:
+        return HUMAN_GENERAL_SHORT_AGENT_MODEL_CHAIN
+    return HUMAN_GENERAL_AGENT_MODEL_CHAIN
 
 
 async def _human_ai_transcribe_audio(job_id, job, segment):
@@ -14696,7 +14710,7 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Use the AssemblyAI transcript; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
-    audio_agent_chain = HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
+    audio_agent_chain = _human_general_agent_chain(audio_seconds) if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
     first, _first_model = await _human_call_model_chain(
         audio_agent_chain, system, first_question, reference_images, 16000,
     )
@@ -17147,7 +17161,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "claude-haiku-5-5": "Claude Haiku 5.5"}
+    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-sol": "GPT-5.6 Sol", "claude-haiku-5-5": "Claude Haiku 5.5"}
     ordered = [names[m] for m in names if m in used_model_ids]
     if len(ordered) > 1:
         model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
