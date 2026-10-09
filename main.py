@@ -13693,7 +13693,7 @@ async def admin_workers(request: Request):
 AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -13706,8 +13706,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Gemini 3.8 Flash + GPT-5.6 Terra fallback", "job_types": ["audio", "general_job"],
-        "models": ["gemini-3.8-flash", "gpt-5.6-terra"],
+        "display": "Gemini 3.5 Flash-Lite + GPT-5.6 Luna fallback", "job_types": ["audio", "general_job"],
+        "models": ["gemini-3.5-flash-lite", "gpt-5.6-luna"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
