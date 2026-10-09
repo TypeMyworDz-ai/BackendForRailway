@@ -45,7 +45,7 @@ class PromptTests(unittest.TestCase):
         self.assertGreaterEqual(SRC.count("HUMAN_DATE_FIDELITY_RULES"), 3)
         self.assertIn("5b. DATES STAY AS DICTATED", SRC)
         self.assertIn("STRUCTURE CHECK only", SRC)
-        self.assertIn("_human_review_full_audio_assemblyai(job_id, job)", SRC)
+        self.assertNotIn("_human_review_full_audio_assemblyai", SRC)
 
 
 if __name__ == "__main__":

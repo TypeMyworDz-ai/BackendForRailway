@@ -375,27 +375,30 @@ class AiModelRouting(unittest.TestCase):
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
         self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 
-    def test_audio_agents_compare_both_transcripts_and_fail_if_either_is_missing(self):
+    def test_audio_agents_use_only_the_assemblyai_transcript(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
         calls = {node.func.id for node in ast.walk(transcriber) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertTrue({"transcribe_with_assemblyai", "transcribe_with_deepgram", "_human_ai_pair_asr_transcripts"}.issubset(calls))
-        self.assertTrue(any(
-            isinstance(node.func, ast.Attribute) and node.func.attr == "gather"
-            and isinstance(node.func.value, ast.Name) and node.func.value.id == "asyncio"
-            for node in ast.walk(transcriber) if isinstance(node, ast.Call)
-        ))
+        self.assertIn("transcribe_with_assemblyai", calls)
+        self.assertIn("_human_ai_assembly_transcript", calls)
+        self.assertNotIn("transcribe_with_deepgram", calls)
         agent_source = "".join(node.value for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Constant) and isinstance(node.value, str))
-        self.assertIn("Compare the independent AssemblyAI and Deepgram transcripts", agent_source)
-        self.assertIn("Compare both source transcripts", agent_source)
+        self.assertIn("Format the AssemblyAI transcript below, which is the only transcript of this audio", agent_source)
+        self.assertNotIn("Deepgram", agent_source)
 
-        helper = self.functions["_human_ai_pair_asr_transcripts"]
+        helper = self.functions["_human_ai_assembly_transcript"]
         namespace = {"asyncio": asyncio}
         exec(compile(ast.Module(body=[helper], type_ignores=[]), "main.py", "exec"), namespace)
-        pair = namespace["_human_ai_pair_asr_transcripts"]
-        result = pair({"status": "completed", "transcription": "Assembly words."}, {"status": "completed", "transcript": "Deepgram words."})
-        self.assertEqual(result, {"AssemblyAI": "Assembly words.", "Deepgram": "Deepgram words."})
-        with self.assertRaisesRegex(RuntimeError, "Both AssemblyAI and Deepgram"):
-            pair({"status": "completed", "transcription": "Assembly words."}, {"status": "failed"})
+        single = namespace["_human_ai_assembly_transcript"]
+        self.assertEqual(single({"status": "completed", "transcription": "Assembly words."}), {"AssemblyAI": "Assembly words."})
+        with self.assertRaisesRegex(RuntimeError, "AssemblyAI transcript is required"):
+            single({"status": "failed"})
+
+    def test_admin_proofreader_pulls_only_deepgram_as_structure_check(self):
+        review = self.functions["human_admin_ai_review"]
+        called = {node.func.id for node in ast.walk(review) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+        self.assertIn("_human_review_full_audio_deepgram", called)
+        self.assertNotIn("transcribe_with_assemblyai", called)
+        self.assertNotIn("_human_review_full_audio_assemblyai", self.source)
 
     def test_ai_review_and_both_agent_passes_use_fallback_chain(self):
         review_calls = [node for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
