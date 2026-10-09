@@ -12,7 +12,7 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_split_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
@@ -60,11 +60,21 @@ class ReviewHelpers(unittest.TestCase):
         self.assertEqual(text, "\tHello.  World.")
         self.assertEqual(data["summary"], "ok")
 
+    def test_batch_footer_is_removed_without_losing_transcript(self):
+        strip_footer = NS["_review_strip_model_footer"]
+        first = strip_footer("Part one text.\nClient spellings: Ann.\nResearch Notes:\n- Note for first part.")
+        second = strip_footer("Part two text.\nClient spellings: Lee.\nResearch Notes:\n- Note for second part.")
+        self.assertEqual(first, "Part one text.")
+        self.assertEqual(second, "Part two text.")
+        self.assertEqual("\n\n".join([first, second]), "Part one text.\n\nPart two text.")
+
     def test_cross_part_client_spellings_and_worker_research_are_collected(self):
         notes = NS["_human_review_spelling_notes"]([
             {"label": "Part 1", "text": "Transcript body.\nClient spellings: Jon, My spellings: Renee"},
             {"label": "Part 3", "text": "Transcript body.\nClient spellings: John; I searched: Summit Psych\nResearch Notes:\nSummit Psych is the provider named in the recording."},
         ])
+        self.assertIn("CONSOLIDATED CLIENT SPELLINGS FROM ALL PARTS", notes)
+        self.assertIn("Jon, John", notes)
         self.assertIn("Part 1: Jon", notes)
         self.assertIn("Part 3: John", notes)
         self.assertIn("WORKER-REPORTED SEARCH TERMS FROM ALL PARTS", notes)
@@ -298,10 +308,11 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["gpt-5.6-sol", "claude-opus-5-5"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-luna", "deepseek-v4-flash"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "gpt-5.6-luna"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
-        self.assertEqual(self.agents["pdf-gemini"]["models"], ["gemini-3.8-flash"])
-        self.assertEqual(self.agents["text-messages-gemini"]["models"], ["gemini-3.8-flash", "claude-opus-5-5"])
+        image_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+        self.assertEqual(self.agents["pdf-gemini"]["models"], image_models)
+        self.assertEqual(self.agents["text-messages-gemini"]["models"], image_models)
         self.assertEqual(self.agents["letter-opus"]["models"], expected_audio_models)
 
     def test_agents_are_internal_not_email_accounts(self):
@@ -336,7 +347,7 @@ class AiModelRouting(unittest.TestCase):
             target.id: ast.literal_eval(node.value)
             for node in cls.tree.body if isinstance(node, ast.Assign)
             for target in node.targets if isinstance(target, ast.Name)
-            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", "ASK_MODEL_CATALOGUE"}
+            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "HUMAN_PDF_AGENT_MODEL_CHAIN", "HUMAN_TEXT_MESSAGES_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", "ASK_MODEL_CATALOGUE"}
         }
 
     def test_ai_review_preserves_emphatic_repetition_and_limits_self_corrections(self):
@@ -349,11 +360,16 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("immediately and unmistakably corrects that same wording", prompt)
         self.assertIn("very, very hot", prompt)
         self.assertIn("Never treat emphasis", prompt)
+        self.assertIn("application will append one consolidated client-spellings line", prompt)
+        self.assertIn("Do not add a closing spellings line or `Research Notes:` section to an individual batch", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("deepseek-v4-flash", "deepseek")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
+        self.assertEqual(self.assignments["HUMAN_TEXT_MESSAGES_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai")))
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
@@ -384,20 +400,27 @@ class AiModelRouting(unittest.TestCase):
     def test_ai_review_and_both_agent_passes_use_fallback_chain(self):
         review_calls = [node for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
         self.assertEqual(len(review_calls), 1)
-        self.assertTrue(any(isinstance(arg, ast.Name) and arg.id == "AI_REVIEW_MODEL_CHAIN" for arg in review_calls[0].args))
+        self.assertTrue(any(isinstance(arg, ast.Name) and arg.id == "HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN" for arg in review_calls[0].args))
         self.assertTrue(any(keyword.arg == "response_validator" and isinstance(keyword.value, ast.Name) and keyword.value.id == "_review_validate_output" for keyword in review_calls[0].keywords))
         self.assertNotIn("resolve_ask_model", {node.func.id for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
         agent_calls = [node for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
         audio_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "audio_agent_chain" for arg in call.args)]
         image_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_TEXT_MESSAGES_MODEL_CHAIN" for arg in call.args)]
+        pdf_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_PDF_AGENT_MODEL_CHAIN" for arg in call.args)]
         agent_source = ast.unparse(self.functions["_human_ai_agent_generate"])
         self.assertEqual(len(audio_calls), 2)
         self.assertEqual(len(image_calls), 1)
-        self.assertEqual(len(agent_calls), 3)
+        self.assertEqual(len(pdf_calls), 2)
+        self.assertEqual(len(agent_calls), 5)
         self.assertIn("HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == 'general-gpt'", agent_source)
-        self.assertIn("AI_REVIEW_MODEL_CHAIN if job.get('pdf_review')", ast.unparse(self.functions["_human_image_review_draft"]))
+        self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN if job.get('pdf_review')", ast.unparse(self.functions["_human_image_review_draft"]))
+        image_batch = ast.unparse(self.functions["_human_image_batch_compute"])
+        self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN", image_batch)
         letter_review = ast.unparse(self.functions["_human_run_letter_ai_review"])
         self.assertIn("AI_REVIEW_MODEL_CHAIN", letter_review)
+        admin_review = ast.unparse(self.functions["human_admin_ai_review"])
+        self.assertIn("source_parts=parts", admin_review)
+        self.assertIn("_review_strip_model_footer", ast.unparse(self.functions["_review_validate_output"]))
 
     def test_research_footer_uses_only_grounded_terms_sources_and_explicit_no_search_note(self):
         footer = NS["_human_ai_agent_research_footer"]
@@ -409,12 +432,12 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("No external searches were needed for this transcript.", ungrounded)
         malformed = footer("Transcript body.\nI researched: Example Org.", "A result without structured findings.")
         self.assertTrue(malformed.startswith("Transcript body."))
-        self.assertIn("Research Notes:\nWeb research returned no confirmed findings", malformed)
+        self.assertIn("Research Notes:\nOnline research did not confirm a reliable finding", malformed)
         unverified = footer(
             "Transcript body.",
             "UNVERIFIED TERMS (do not correct from memory): Walden Park, Summit Clinic",
         )
-        self.assertIn("could not confirm these terms, so they were left exactly as dictated: Walden Park, Summit Clinic.", unverified)
+        self.assertIn("could not confidently verify these terms; they were left as dictated: Walden Park, Summit Clinic.", unverified)
         table = footer(
             "Transcript body about Family to Family.",
             "| Dictated form | Verified spelling | Meaning | Confident |\n| --- | --- | --- | --- |\n"
@@ -436,6 +459,25 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("Actual Google searches", grounded)
         self.assertNotIn("Sources:", grounded)
         self.assertNotIn("https://example.org", grounded)
+
+    def test_admin_final_footer_consolidates_part_spellings_and_unresolved_research(self):
+        footer = NS["_human_ai_agent_research_footer"]
+        transcript = "Woodward Park was the meeting place.\nClient spellings: ModelOnly."
+        parts = [
+            {"text": "Part one.\nClient spellings: Alia; My spellings: Renee."},
+            {"text": "Part two.\nClient spellings: Zaliah; My spellings: Alia."},
+        ]
+        research = (
+            "Woodward Park | Woodward Park | A local park named as the meeting place in the transcript. | confidence: yes\n"
+            "UNVERIFIED TERMS (do not correct from memory): Summit Psych"
+        )
+        result = footer(transcript, research, source_parts=parts)
+        self.assertIn("Client spellings: Alia, Zaliah; My spellings: Renee; I researched: Woodward Park.", result)
+        self.assertNotIn("ModelOnly", result)
+        self.assertEqual(result.count("Client spellings:"), 1)
+        self.assertIn("Research Notes:\n- Woodward Park: A local park named as the meeting place in the transcript. (confidence: yes)", result)
+        self.assertIn("Online research could not confidently verify: Summit Psych. These terms were left as dictated.", result)
+        self.assertNotIn("UNVERIFIED TERMS", result)
 
     def test_candidate_terms_skip_sentence_start_words_and_titles(self):
         text = "Present at the home was Ms. Wade. Both children were home. They visited Woodward Park. Then Ohio came up. Historically Owens lived there. If Aaliyah came later."
