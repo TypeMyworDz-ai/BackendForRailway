@@ -13681,8 +13681,10 @@ async def admin_workers(request: Request):
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
 AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("deepseek-v4-flash", "deepseek"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
 HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
@@ -13694,8 +13696,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "GPT-5.6 Luna + DeepSeek V4 Flash fallback", "job_types": ["audio", "general_job"],
-        "models": ["gpt-5.6-luna", "deepseek-v4-flash"],
+        "display": "Gemini 3.8 Flash + GPT-5.6 Luna fallback", "job_types": ["audio", "general_job"],
+        "models": ["gemini-3.8-flash", "gpt-5.6-luna"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -13709,16 +13711,16 @@ HUMAN_AI_AGENTS = {
     },
     "pdf-gemini": {
         "id": "pdf-gemini", "name": "PDF and Image Agent",
-        "display": "Gemini 3.8 Flash", "job_types": ["pdf_job"],
-        "models": ["gemini-3.8-flash"],
+        "display": "Gemini 3.5 Flash-Lite + Gemini 3.8 Flash fallback", "job_types": ["pdf_job"],
+        "models": ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
     },
     "text-messages-gemini": {
         "id": "text-messages-gemini", "name": "Text Messages Agent",
-        "display": "Gemini 3.8 Flash + Claude Opus 5.5 fallback", "job_types": ["pdf_job"],
-        "models": ["gemini-3.8-flash", "claude-opus-5-5"],
+        "display": "Gemini 3.5 Flash-Lite + Gemini 3.8 Flash fallback", "job_types": ["pdf_job"],
+        "models": ["gemini-3.5-flash-lite", "gemini-3.8-flash"],
     },
 }
-HUMAN_TEXT_MESSAGES_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("claude-opus-5-5", "claude"))
+HUMAN_TEXT_MESSAGES_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 _IMAGE_AGENT_SEMAPHORE = asyncio.Semaphore(4)
 
 HUMAN_TEXT_MESSAGES_GUIDELINES = """TEXT MESSAGES GUIDELINES (these apply ONLY to Text Messages jobs)
@@ -14135,8 +14137,8 @@ def _human_research_unverified_terms(research):
     return [item.strip(" .") for item in re.split(r"[,;]", match.group(1)) if item.strip(" .")][:40]
 
 
-def _human_ai_agent_research_footer(transcript, research):
-    """Append grounded, deduplicated research without repeating supplied spellings or exposing contact details."""
+def _human_ai_agent_research_footer(transcript, research, source_parts=None, no_search_note=None):
+    """Append one consolidated, client-ready spellings and research footer."""
     raw = str(transcript or "").strip()
     body = re.split(r"(?im)^\s*Research Notes\s*:\s*$", raw, maxsplit=1)[0]
     body = re.sub(r"(?i)(?:[.;]?[ \t]*)I\s+(?:researched|searched)\s*:\s*[^\n]*", "", body)
@@ -14156,40 +14158,72 @@ def _human_ai_agent_research_footer(transcript, research):
             found.append(item)
         return found
 
-    # Preserve actual spelling entries, but rebuild the footer so empty
-    # placeholders and model-written research lists cannot leak through.
+    # Gather every client/name spelling footer from the model output and each
+    # submitted part.  Then remove all those model-written footer lines so the
+    # final job contains exactly one authoritative consolidated line.
     body_lines = body.splitlines()
-    closing_index = next((i for i in range(len(body_lines) - 1, -1, -1) if re.search(r"(?i)^(?:Client spellings|My spellings):", body_lines[i].strip())), None)
+    section_pattern = re.compile(r"(?i)(Client spellings|My spellings|I searched|I researched)\s*:")
+    footer_line_pattern = re.compile(r"(?i)^\s*(?:Client spellings|My spellings|I searched|I researched)\s*:")
     client_spellings, my_spellings = [], []
-    if closing_index is not None:
-        closing_line = body_lines[closing_index].strip()
-        section_pattern = re.compile(r"(?i)(Client spellings|My spellings|I searched|I researched)\s*:")
-        sections = list(section_pattern.finditer(closing_line))
-        for index, section in enumerate(sections):
-            end = sections[index + 1].start() if index + 1 < len(sections) else len(closing_line)
-            values = items(closing_line[section.end():end].strip(" ;."))
-            if section.group(1).casefold() == "client spellings":
-                client_spellings = values
-            elif section.group(1).casefold() == "my spellings":
-                my_spellings = values
 
+    def collect_spellings(text, include_client=True):
+        source = re.split(r"(?im)^\s*Research Notes\s*:", str(text or ""), maxsplit=1)[0]
+        for line in source.splitlines():
+            line = line.strip()
+            if not footer_line_pattern.match(line):
+                continue
+            sections = list(section_pattern.finditer(line))
+            for index, section in enumerate(sections):
+                end = sections[index + 1].start() if index + 1 < len(sections) else len(line)
+                values = items(line[section.end():end].strip(" ;."))
+                section_name = section.group(1).casefold()
+                target = client_spellings if section_name == "client spellings" and include_client else my_spellings if section_name == "my spellings" else None
+                if target is not None:
+                    target.extend(values)
+
+    collect_spellings(body, include_client=not bool(source_parts))
+    for part in source_parts or []:
+        if isinstance(part, dict):
+            collect_spellings(part.get("text") or part.get("transcript") or "")
+        else:
+            collect_spellings(part)
+
+    def unique_items(values):
+        result, seen = [], set()
+        for value in values:
+            key = normalized(value)
+            if key and key not in seen:
+                seen.add(key)
+                result.append(value)
+        return result
+
+    client_spellings = unique_items(client_spellings)
+    my_spellings = unique_items(my_spellings)
     client_keys = {normalized(item) for item in client_spellings}
     client_tokens = {token for item in client_keys for token in item.split()}
-    my_spellings = [item for item in my_spellings if normalized(item) not in client_keys]
+    my_spellings = [
+        item for item in my_spellings
+        if normalized(item) not in client_keys
+        and not (normalized(item).split() and all(token in client_tokens for token in normalized(item).split()))
+    ]
+    body = "\n".join(line for line in body_lines if not footer_line_pattern.match(line)).strip()
+
     footer_parts = []
     if client_spellings:
         footer_parts.append("Client spellings: " + ", ".join(client_spellings))
     if my_spellings:
         footer_parts.append("My spellings: " + ", ".join(my_spellings))
-    if closing_index is not None:
-        body_lines[closing_index] = "; ".join(footer_parts)
-        if not body_lines[closing_index]:
-            body_lines.pop(closing_index)
-        body = "\n".join(body_lines).strip()
+
+    def finish(body_text, footer_sections, notes_text):
+        output = str(body_text or "").rstrip()
+        if footer_sections:
+            output = (output + "\n\n" if output else "") + "; ".join(footer_sections)
+        return output + ("\n\n" if output else "") + str(notes_text or "").strip()
 
     research = str(research or "").strip()
     if not research:
-        return body + "\n\nResearch Notes:\nNo external searches were needed for this transcript."
+        note = no_search_note or "No external searches were needed for this transcript."
+        return finish(body, footer_parts, "Research Notes:\n" + note)
 
     findings = []
     terms = []
@@ -14237,29 +14271,30 @@ def _human_ai_agent_research_footer(transcript, research):
         unverified = _human_research_unverified_terms(research)
         if unverified:
             note = (
-                "Research Notes:\nWeb research could not confirm these terms, so they were left exactly as dictated: "
+                "Research Notes:\nOnline research could not confidently verify these terms; they were left as dictated: "
                 + ", ".join(unverified) + "."
             )
         else:
-            note = "Research Notes:\nWeb research returned no confirmed findings for this transcript, so no spellings were changed because of research."
-        return body.rstrip() + "\n\n" + note
+            note = "Research Notes:\nOnline research did not confirm a reliable finding, so no spelling changes were made based on research."
+        return finish(body, footer_parts, note)
     if not terms:
         notes = "Research Notes:\nNo additional research notes were needed beyond the supplied spellings and references."
-        return body + "\n\n" + notes
+        return finish(body, footer_parts, notes)
 
-    # Queries and source URLs stay in internal grounding metadata. The worker
-    # sees one concise note per distinct, non-client-supplied research term.
+    # Keep search queries and source URLs internal. Show concise explanations
+    # for verified terms and explicitly disclose any terms left unresolved.
     footer_parts.append("I researched: " + ", ".join(terms) + ".")
-    closing = "; ".join(footer_parts)
-    body_lines = body.splitlines()
-    closing_index = next((i for i in range(len(body_lines) - 1, -1, -1) if re.search(r"(?i)^(?:Client spellings|My spellings|I researched):", body_lines[i].strip())), None)
-    if closing_index is None:
-        body = (body.rstrip() + "\n\n" + closing).strip()
-    else:
-        body_lines[closing_index] = closing
-        body = "\n".join(body_lines).strip()
+    unverified = _human_research_unverified_terms(research)
+    verified_keys = {normalized(term) for term in terms}
+    unverified = [term for term in unique_items(unverified) if normalized(term) not in verified_keys and normalized(term) not in client_keys]
+    if unverified:
+        findings.append(
+            "- Online research could not confidently verify: "
+            + ", ".join(unverified[:20])
+            + ". These terms were left as dictated."
+        )
     notes = "Research Notes:\n" + "\n".join(findings)
-    return body.rstrip() + "\n\n" + notes
+    return finish(body, footer_parts, notes)
 
 
 def _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_texts=None):
@@ -14384,7 +14419,7 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
         + drafts[:300000]
         + (_human_text_messages_reminder(bool(example_images)) if is_text else "")
     )
-    chain = AI_REVIEW_MODEL_CHAIN if job.get("pdf_review") else HUMAN_TEXT_MESSAGES_MODEL_CHAIN
+    chain = HUMAN_PDF_AGENT_MODEL_CHAIN if job.get("pdf_review") else HUMAN_TEXT_MESSAGES_MODEL_CHAIN
     async with _IMAGE_AGENT_SEMAPHORE:
         answer, model_used = await _human_call_model_chain(
             chain, system, question, images + list(reference_images or []) + example_images,
@@ -14433,7 +14468,7 @@ async def _human_image_batch_compute(system, agent_id, job_ids, reference_images
             page_images.append({"raw": raw, "media_type": str(image.get("content_type") or "image/jpeg")})
         pages.append({"id": job_id, "images": page_images, "raw": b"".join(item["raw"] for item in page_images)})
     is_text = agent_id == "text-messages-gemini"
-    chain = HUMAN_TEXT_MESSAGES_MODEL_CHAIN if is_text else (("gemini-3.8-flash", "gemini"),)
+    chain = HUMAN_TEXT_MESSAGES_MODEL_CHAIN if is_text else HUMAN_PDF_AGENT_MODEL_CHAIN
     example_images = _human_text_messages_example_images() if is_text else []
     chunks, current, size = [], [], 0
     for page in pages:
@@ -14580,16 +14615,17 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             except Exception as exc:
                 logger.warning("Whole-file AI run for %s failed; drafting this page on its own: %s", job_id, exc)
         async with _IMAGE_AGENT_SEMAPHORE:
-            answer = await asyncio.to_thread(
-                _ask_gemini, "gemini-3.8-flash", system, [], question, images, 16000
+            answer, _draft_model = await _human_call_model_chain(
+                HUMAN_PDF_AGENT_MODEL_CHAIN, system, question, images, 16000,
             )
         draft = str(answer or "").strip()
         research = await _human_ai_agent_research(draft, context)
         if research:
             checked_system = system + "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
-            checked = await asyncio.to_thread(
-                _run_ask_model_with_images, "gemini-3.8-flash", "gemini", checked_system,
-                "Review the first transcription against the first attached source image. Use remaining images only as job references. Correct only clear OCR/spelling/formatting mistakes supported by the source image or research. Keep every word otherwise.\n\nDRAFT TRANSCRIPTION:\n" + draft[:250000], images, 16000,
+            checked, _review_model = await _human_call_model_chain(
+                HUMAN_PDF_AGENT_MODEL_CHAIN, checked_system,
+                "Review the first transcription against the first attached source image. Use remaining images only as job references. Correct only clear OCR/spelling/formatting mistakes supported by the source image or research. Keep every word otherwise.\n\nDRAFT TRANSCRIPTION:\n" + draft[:250000],
+                images, 16000,
             )
             draft = str(checked or draft).strip()
         draft = _human_ai_agent_research_footer(draft, research)
@@ -16369,6 +16405,8 @@ def _gemini_research_blocking(prompt, model_id="gemini-3.8-flash", max_attempts=
 def _human_review_spelling_notes(parts):
     """Collect client-confirmed spellings and worker research notes from every part."""
     client_rows = []
+    consolidated_client_spellings = []
+    seen_client_spellings = set()
     search_rows = []
     research_note_rows = []
     for index, part in enumerate(parts or []):
@@ -16387,6 +16425,11 @@ def _human_review_spelling_notes(parts):
                 words = [word.strip(" .;:-\t") for word in re.split(r"[,;]", value) if word.strip(" .;:-\t")]
                 if words:
                     client_rows.append(f"- {label}: {', '.join(words)}")
+                    for word in words:
+                        key = re.sub(r"[^a-z0-9]+", " ", word.casefold()).strip()
+                        if key and key not in seen_client_spellings:
+                            seen_client_spellings.add(key)
+                            consolidated_client_spellings.append(word)
                 searched_inline = re.search(r"(?:^|[,;]\s*)I (?:searched|researched)\s*:\s*(.*)$", stripped, re.IGNORECASE)
                 if searched_inline and searched_inline.group(1).strip():
                     search_rows.append(f"- {label}: {searched_inline.group(1).strip()[:1200]}")
@@ -16411,8 +16454,10 @@ def _human_review_spelling_notes(parts):
             research_note_rows.append(f"- {label}: {' '.join(research_lines)[:2400]}")
 
     blocks = []
+    if consolidated_client_spellings:
+        blocks.append("CONSOLIDATED CLIENT SPELLINGS FROM ALL PARTS (authoritative throughout the whole job; use these exact forms):\n" + ", ".join(consolidated_client_spellings))
     if client_rows:
-        blocks.append("CLIENT SPELLINGS FOUND IN ANY PART (authoritative for the same entity across the whole transcript):\n" + "\n".join(dict.fromkeys(client_rows)))
+        blocks.append("CLIENT SPELLINGS BY PART (use context to avoid merging different people or entities):\n" + "\n".join(dict.fromkeys(client_rows)))
     if research_note_rows:
         blocks.append("WORKER RESEARCH NOTES FROM ALL PARTS (use detailed supporting notes when no client spelling conflicts):\n" + "\n".join(dict.fromkeys(research_note_rows)))
     if search_rows:
@@ -16738,8 +16783,8 @@ _REVIEW_SYSTEM = (
     "5. Do NOT paraphrase, rearrange, professionalise or add or remove meaning. Only fix spelling, capitalisation, numbers, dates, times, punctuation, spacing and formatting to the rules above. Keep the dictated wording and word order.\n"
     "5a. Remove an abandoned spoken word or phrase only when the speaker immediately and unmistakably corrects that same wording; keep the corrected version. Preserve repetitions used for emphasis exactly, including phrases such as `very, very hot`. Never treat emphasis, hesitation, an incomplete thought, or an ambiguous alternative as a self-correction.\n"
     "6. The submitted worker parts are the PRIMARY transcript for wording and word order. The complete Deepgram transcript made from the WHOLE original audio is the COMPARISON for context and for structure. Use it to make clear, contextual corrections supported by the recording, to restore any dictated content or paragraph the workers left out, and to remove anything the workers inserted that was never dictated. Never replace the worker transcript wholesale, paraphrase, or smooth the speaker's grammar.\n"
-    "7. PARAGRAPHS COME FROM THE DICTATION, NOT FROM THE WORKERS. A paragraph or line break belongs in the final transcript only where the speaker dictated it (`next paragraph`, `new paragraph`, `paragraph break`, `next line`, `new line`, `line break`), plus headings, list items and the closing spellings section, plus anything the job instructions or guidelines explicitly require. The prompt lists every dictated command found in the audio. For each one, make sure the break is present at the matching place (a blank line for a paragraph command, a single line break for a line command) and delete the command words, which are instructions, not content. Where a worker started a new paragraph that the speaker never dictated, join it back into the surrounding paragraph. Never leave a worker's own paragraph breaks in just because they were already there. Record every paragraph added or removed in `changes`.\n"
-    "8. Thorough proper-noun research is a required review task. Use the supplied grounded WEB SEARCH RESULTS for every identifiable proper noun or specialist term that was not explicitly spelled by the client or provided in job notes. Do not rely on memory or say that no research was done when actual queries or sources are supplied. Research verifies spelling/context only; do not change the dictated entity or add undictated words. If a term is ambiguous, leave it unchanged and report the uncertainty in issues. Research ONLY unfamiliar proper nouns that were actually dictated; never add information that was not dictated, and a researched term must use exactly the dictated words (spelling and capitalisation corrections only, no additions, expansions or rewording). At the end of the transcript, use `I researched:` (not `I searched:`) for actual, newly researched terms only, then include a separate BRIEF `Research Notes:` section with one short line per unfamiliar dictated term: the term as dictated, a few words on why it fits the context, and a confidence check. Never list the client-confirmed spelling among researched terms.\n"
+    "7. PARAGRAPHS COME FROM THE DICTATION, NOT FROM THE WORKERS. A paragraph or line break belongs in the final transcript only where the speaker dictated it (`next paragraph`, `new paragraph`, `paragraph break`, `next line`, `new line`, `line break`), plus headings and list items, plus anything the job instructions or guidelines explicitly require. The prompt lists every dictated command found in the audio. For each one, make sure the break is present at the matching place (a blank line for a paragraph command, a single line break for a line command) and delete the command words, which are instructions, not content. Where a worker started a new paragraph that the speaker never dictated, join it back into the surrounding paragraph. Never leave a worker's own paragraph breaks in just because they were already there. Record every paragraph added or removed in `changes`.\n"
+    "8. Thorough proper-noun research is a required review task. Use the supplied grounded WEB SEARCH RESULTS for every identifiable proper noun or specialist term that was not explicitly spelled by the client or provided in job notes. Do not rely on memory or say that no research was done when actual queries or sources are supplied. Research verifies spelling/context only; do not change the dictated entity or add undictated words. If a term is ambiguous, leave it unchanged and report the uncertainty in issues. Research ONLY unfamiliar proper nouns that were actually dictated; never add information that was not dictated, and a researched term must use exactly the dictated words (spelling and capitalisation corrections only, no additions, expansions or rewording). Use the supplied research only to verify spelling and context. Do not add a closing spellings line or `Research Notes:` section to an individual batch; after all parts are combined, the application will append one consolidated client-spellings line and a final client-ready Research Notes section. Never list a client-confirmed spelling among researched terms.\n"
     "9. Keep the formatting exactly as the parts use it: real TAB characters at the start of paragraphs, a blank line between paragraphs, flush-left plain headings, and two spaces after every sentence if the parts use that. Never convert tabs to spaces and never collapse double spaces.\n"
     "10. Output the transcript once, in order, with no part labels and no commentary inside it.\n"
     "REPLY FORMAT (exactly, with these two marker lines):\n"
@@ -16751,6 +16796,18 @@ _REVIEW_SYSTEM = (
     "List EVERY change you made to a part (spelling, name, number, format, instruction followed) in \"changes\", each with a short reason. "
     "Rate each part 1-5 for accuracy and for following the instructions and guidelines."
 )
+
+
+def _review_strip_model_footer(text):
+    """Remove model-written footers from one proofread batch before batches are joined."""
+    lines = str(text or "").splitlines()
+    research_heading = next((index for index, line in enumerate(lines) if re.match(r"(?i)^\s*Research Notes\s*:", line)), None)
+    if research_heading is not None:
+        lines = lines[:research_heading]
+    footer_line = re.compile(r"(?i)^\s*(?:Client spellings|My spellings|I searched|I researched)\s*:")
+    while lines and (not lines[-1].strip() or footer_line.match(lines[-1])):
+        lines.pop()
+    return "\n".join(lines).strip()
 
 
 def _review_split_output(answer):
@@ -16771,6 +16828,7 @@ def _review_split_output(answer):
 
 def _review_validate_output(answer):
     text, data = _review_split_output(answer)
+    text = _review_strip_model_footer(text)
     if not text.strip():
         raise ValueError("empty transcript in AI review response")
     if not isinstance(data, dict) or not {"parts", "changes", "issues", "summary"}.issubset(data):
@@ -16955,7 +17013,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         )
         try:
             answer, model_used = await _human_call_model_chain(
-                AI_REVIEW_MODEL_CHAIN, review_system, question[:450000],
+                HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN, review_system, question[:450000],
                 reference_images, 16000, response_validator=_review_validate_output,
             )
             text, data = _review_validate_output(answer)
@@ -16977,7 +17035,10 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
     combined = _review_enforce_indent(combined, texts)
     combined = _review_normalise_sentence_spacing(combined)
     research_for_footer = research_text if research_status in {"completed", "partial", "unavailable"} else ""
-    combined = _human_ai_agent_research_footer(combined, research_for_footer)
+    combined = _human_ai_agent_research_footer(
+        combined, research_for_footer, source_parts=parts,
+        no_search_note="No unfamiliar proper nouns or specialist terms needed external verification; no spelling changes were based on online research.",
+    )
     if any(item.get("restored") for item in restored_boundaries):
         issues.append("Restored dictated paragraph or line breaks using the full-audio Deepgram comparison.")
 
