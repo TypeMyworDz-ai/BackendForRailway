@@ -95,3 +95,36 @@ class OwnerFieldRegressionTests(unittest.TestCase):
         self.assertIn('"created_by_uid": actor["uid"]', pdf)
         letter = src[src.index("async def human_admin_create_letter_job"):src.index("async def human_admin_create_audio_job")]
         self.assertIn('"created_by_uid": actor["uid"]', letter)
+
+
+class RoutingLayerTests(unittest.TestCase):
+    def setUp(self):
+        import pathlib
+        self.src = (pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text()
+
+    def test_new_admin_uploads_wait_for_routing_and_do_not_notify_workers(self):
+        audio = self.src[self.src.index("async def human_admin_create_audio_job"):self.src.index("async def human_admin_list_letter_jobs")]
+        self.assertIn('"routing_status": "pending"', audio)
+        self.assertNotIn("_notify_available_workers", audio)
+        pdf = self.src[self.src.index("async def human_admin_create_pdf_jobs"):self.src.index("async def human_admin_create_file_review")]
+        self.assertIn('"routing_status": "pending"', pdf)
+        self.assertNotIn("_notify_available_workers", pdf)
+
+    def test_workers_cannot_see_or_claim_unrouted_jobs(self):
+        self.assertIn("if _human_routing_blocks_workers(item):", self.src)
+        self.assertIn("This job has not been released to workers yet.", self.src)
+
+    def test_routing_endpoint_exists_and_checks_owner(self):
+        endpoint = self.src[self.src.index("async def human_admin_route_job"):self.src.index("async def human_admin_assign_ai_agent")]
+        self.assertIn("_human_admin_can_see_job", endpoint)
+        self.assertIn("_notify_available_workers", endpoint)
+
+    def test_blocking_helper(self):
+        ns = {}
+        start = self.src.index("def _human_routing_blocks_workers")
+        exec(self.src[start:self.src.index("def _human_job_owner_of")], ns)
+        f = ns["_human_routing_blocks_workers"]
+        self.assertTrue(f({"routing_status": "pending"}))
+        self.assertTrue(f({"routing_status": "ai"}))
+        self.assertFalse(f({"routing_status": "workers"}))
+        self.assertFalse(f({}))

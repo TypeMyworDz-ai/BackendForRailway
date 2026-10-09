@@ -205,7 +205,7 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         text = ast.unparse(route)
         for expected in (
             "admin_uploaded", "status", "approved", "quote_credits", "worker_amount_kes",
-            "_human_build_available_segments", "_notify_available_workers",
+            "_human_build_available_segments", "routing_status",
             "GENERAL_JOB_DEFAULT_INSTRUCTION", "TEMPLATE_JOB_DEFAULT_INSTRUCTION",
             "A Template Job requires exactly one job-specific .docx template", "template_file",
             "is_template", "max_reference_count",
