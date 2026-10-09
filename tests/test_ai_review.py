@@ -308,7 +308,7 @@ class AiAgentCatalog(unittest.TestCase):
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
         expected_audio_models = ["gpt-5.6-sol", "claude-opus-5-5"]
-        self.assertEqual(self.agents["general-gpt"]["models"], ["gpt-5.6-terra", "gemini-3.5-flash-lite", "claude-sonnet-5-5"])
+        self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "gpt-5.6-terra"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         image_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
         self.assertEqual(self.agents["pdf-gemini"]["models"], image_models)
@@ -367,7 +367,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
-        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini"), ("claude-sonnet-5-5", "claude")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")))
         self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_TEXT_MESSAGES_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
@@ -408,15 +408,16 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("resolve_ask_model", {node.func.id for node in ast.walk(self.functions["human_admin_ai_review"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)})
         agent_calls = [node for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_human_call_model_chain"]
         audio_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "audio_agent_chain" for arg in call.args)]
-        image_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_TEXT_MESSAGES_MODEL_CHAIN" for arg in call.args)]
-        pdf_calls = [call for call in agent_calls if any(isinstance(arg, ast.Name) and arg.id == "HUMAN_PDF_AGENT_MODEL_CHAIN" for arg in call.args)]
+        image_calls = [call for call in agent_calls if any("HUMAN_TEXT_MESSAGES_MODEL_CHAIN" in ast.unparse(arg) for arg in call.args)]
+        pdf_calls = [call for call in agent_calls if any("HUMAN_PDF_AGENT_MODEL_CHAIN" in ast.unparse(arg) for arg in call.args)]
         agent_source = ast.unparse(self.functions["_human_ai_agent_generate"])
         self.assertEqual(len(audio_calls), 2)
         self.assertEqual(len(image_calls), 1)
         self.assertEqual(len(pdf_calls), 2)
         self.assertEqual(len(agent_calls), 5)
         self.assertIn("HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == 'general-gpt'", agent_source)
-        self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN if job.get('pdf_review')", ast.unparse(self.functions["_human_image_review_draft"]))
+        self.assertIn("_route_chain", agent_source)
+        self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN)", ast.unparse(self.functions["_human_image_review_draft"]))
         image_batch = ast.unparse(self.functions["_human_image_batch_compute"])
         self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN", image_batch)
         letter_review = ast.unparse(self.functions["_human_run_letter_ai_review"])
