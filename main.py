@@ -13693,10 +13693,7 @@ async def admin_workers(request: Request):
 AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
 HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini"))
-# General audio jobs up to ten minutes go to Claude Sonnet 5.5 first; longer audio goes to Terra.
-HUMAN_GENERAL_SHORT_AGENT_MODEL_CHAIN = (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai"))
-HUMAN_GENERAL_SHORT_JOB_SECONDS = 600
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini"), ("claude-sonnet-5-5", "claude"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -13759,8 +13756,8 @@ HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE = (
 HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
-        "display": "Claude Sonnet 5.5 up to 10 minutes, GPT-5.6 Terra for longer audio", "job_types": ["audio", "general_job"],
-        "models": ["claude-sonnet-5-5", "gpt-5.6-terra", "gemini-3.5-flash-lite"],
+        "display": "GPT-5.6 Terra + Gemini 3.5 Flash-Lite + Claude Sonnet 5.5 fallback", "job_types": ["audio", "general_job"],
+        "models": ["gpt-5.6-terra", "gemini-3.5-flash-lite", "claude-sonnet-5-5"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
@@ -13981,17 +13978,6 @@ def _human_ai_assembly_transcript(assembly_result):
     if not text:
         raise RuntimeError("The AssemblyAI transcript is required for the AI agent but came back empty.")
     return {"AssemblyAI": text}
-
-
-def _human_general_agent_chain(audio_seconds):
-    """Claude Sonnet 5.5 for audio of ten minutes or less; GPT-5.6 Terra for anything longer."""
-    try:
-        seconds = float(audio_seconds or 0)
-    except (TypeError, ValueError):
-        seconds = 0.0
-    if 0 < seconds <= HUMAN_GENERAL_SHORT_JOB_SECONDS:
-        return HUMAN_GENERAL_SHORT_AGENT_MODEL_CHAIN
-    return HUMAN_GENERAL_AGENT_MODEL_CHAIN
 
 
 async def _human_ai_transcribe_audio(job_id, job, segment):
@@ -14710,7 +14696,7 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Use the AssemblyAI transcript; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
-    audio_agent_chain = _human_general_agent_chain(audio_seconds) if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
+    audio_agent_chain = HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
     first, _first_model = await _human_call_model_chain(
         audio_agent_chain, system, first_question, reference_images, 16000,
     )
@@ -17257,10 +17243,11 @@ async def _human_run_ai_review_background(job_id, actor, run_id):
 
 @app.post("/human-transcription/jobs/{job_id}/ai-review")
 async def human_admin_ai_review_start(job_id: str, request: Request, background_tasks: BackgroundTasks):
-    """Start an AI proofread in the background; the page polls the job for progress."""
+    """Admin AI proofreading has been retired; the endpoint stays only to give a clear answer."""
     actor = await _human_actor(request)
     if actor.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access is required.")
+    raise HTTPException(status_code=410, detail="Admin AI proofreading has been removed. Assign a human proofreader instead.")
     job = await _human_job(job_id)
     if _human_ai_review_run_active(job):
         return {"started": False, "ai_review_run": job.get("ai_review_run")}
