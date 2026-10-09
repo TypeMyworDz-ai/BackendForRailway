@@ -13699,7 +13699,7 @@ WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flas
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
 HUMAN_DATE_FIDELITY_RULES = (
     "DATES STAY AS DICTATED: Keep every date in the form the speaker said it. A dictated month-name date such as `May 1, 2026` must stay `May 1, 2026`; never convert it to numeric forms such as `05/01/2026`, `5/1/26` or `2026-05-01`. A date dictated in numbers stays numeric. Only change a date's form when a TypeMyworDz guideline, the client's rules, or the job notes explicitly require that exact change (for example spelling out numeric dates), and then follow that rule exactly. "
-    "Speech-recognition engines, especially Deepgram, often rewrite spoken dates into numeric form, so a numeric date in a Deepgram transcript is NOT evidence of how the date was dictated. Take date wording from AssemblyAI and the worker transcript, then format it only as the TypeMyworDz guidelines require.\n"
+    "Speech-recognition engines, especially Deepgram, often rewrite spoken dates into numeric form, so a numeric date in a Deepgram transcript is NOT evidence of how the date was dictated. Take date wording from the AssemblyAI-based transcript or the worker text, then format it only as the TypeMyworDz guidelines require.\n"
 )
 
 _DATE_MONTHS = {
@@ -13966,30 +13966,18 @@ def _human_worker_ai_draft_system(guidelines, context):
     )
 
 
-def _human_ai_pair_asr_transcripts(assembly_result, deepgram_result):
-    """Require two completed, non-empty ASR transcripts for agent comparison."""
-    transcripts = {}
-    missing = []
-    for provider, result in (("AssemblyAI", assembly_result), ("Deepgram", deepgram_result)):
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-        if isinstance(result, Exception):
-            missing.append(provider)
-            continue
-        if not isinstance(result, dict) or str(result.get("status") or "").casefold() != "completed":
-            missing.append(provider)
-            continue
-        text = str(result.get("transcription") or result.get("transcript") or result.get("text") or "").strip()
-        if not text:
-            missing.append(provider)
-            continue
-        transcripts[provider] = text
-    if missing:
-        raise RuntimeError(
-            "Both AssemblyAI and Deepgram transcripts are required for AI-agent comparison. "
-            f"Unavailable: {', '.join(missing)}."
-        )
-    return transcripts
+def _human_ai_assembly_transcript(assembly_result):
+    """Require one completed, non-empty AssemblyAI transcript as the agent's only source text."""
+    if isinstance(assembly_result, asyncio.CancelledError):
+        raise assembly_result
+    if isinstance(assembly_result, Exception):
+        raise RuntimeError("The AssemblyAI transcript is required for the AI agent but could not be produced.") from assembly_result
+    if not isinstance(assembly_result, dict) or str(assembly_result.get("status") or "").casefold() != "completed":
+        raise RuntimeError("The AssemblyAI transcript is required for the AI agent but did not complete.")
+    text = str(assembly_result.get("transcription") or assembly_result.get("transcript") or assembly_result.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("The AssemblyAI transcript is required for the AI agent but came back empty.")
+    return {"AssemblyAI": text}
 
 
 async def _human_ai_transcribe_audio(job_id, job, segment):
@@ -14017,14 +14005,13 @@ async def _human_ai_transcribe_audio(job_id, job, segment):
             tmp_path = handle.name
         await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
         agent_audio_id = f"ai-agent-{job_id}-{segment.get('id') if segment else 'main'}"
-        assembly_result, deepgram_result = await asyncio.gather(
-            transcribe_with_assemblyai(
+        try:
+            assembly_result = await transcribe_with_assemblyai(
                 tmp_path, "en", False, ["universal-3-5-pro", "universal-2"], agent_audio_id,
-            ),
-            transcribe_with_deepgram(tmp_path, "en", False, agent_audio_id),
-            return_exceptions=True,
-        )
-        transcripts = _human_ai_pair_asr_transcripts(assembly_result, deepgram_result)
+            )
+        except Exception as exc:
+            assembly_result = exc
+        transcripts = _human_ai_assembly_transcript(assembly_result)
     finally:
         if tmp_path:
             try:
@@ -14699,15 +14686,15 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
     if research:
         system += "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
     first_question = (
-        "Compare the independent AssemblyAI and Deepgram transcripts below before formatting. Take dates and number wording from AssemblyAI (Deepgram often rewrites spoken dates as numeric dates); keep every date as dictated. Use agreement as strong evidence; when they differ, resolve only what is supported by the transcript evidence and job references. Do not invent words, smooth awkward phrasing, or combine alternatives. Preserve the dictated wording and order, and apply the supplied job notes, reference images, and guidelines. The transcripts are text evidence from the same audio; use attached images only as job references. Return only the formatted transcript.\n\n"
-        "SOURCE TRANSCRIPTS:\n" + raw_text[:350000]
+        "Format the AssemblyAI transcript below, which is the only transcript of this audio. Keep every date as dictated. Do not invent words, smooth awkward phrasing, or combine alternatives. Preserve the dictated wording and order, and apply the supplied job notes, reference images, and guidelines. Use attached images only as job references. Return only the formatted transcript.\n\n"
+        "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
     )
     if letter_agent:
         first_question = (
             "Format this entire recording as one complete letter using the bundled Letter Standard Indentation layout and the permanent Letter Agent guidelines. "
             "This is correspondence and must be formatted; do not refuse or return TEMPLATE_JOB_BLOCKED_LETTER. "
-            "Compare both independent transcripts; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
-            "SOURCE TRANSCRIPTS:\n" + raw_text[:350000]
+            "Use the AssemblyAI transcript; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
+            "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
     audio_agent_chain = HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN
     first, _first_model = await _human_call_model_chain(
@@ -14717,15 +14704,15 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         return first, audio_seconds, agent["models"]
     second_system = _human_ai_agent_system(agent_id, "independent accuracy check", guidelines, context, job_specific_guidelines)
     second_question = (
-        "Compare both source transcripts against the formatted draft. Use attached images as job references only. Correct only clear recognition, spelling, or formatting errors supported by the source transcripts or job references. Do not rewrite, paraphrase, or add content. Return the complete corrected transcript only.\n\n"
-        "SOURCE TRANSCRIPTS:\n" + raw_text[:250000] + "\n\nFORMATTED DRAFT TO CHECK:\n" + first[:250000]
+        "Compare the source transcript against the formatted draft. Use attached images as job references only. Correct only clear recognition, spelling, or formatting errors supported by the source transcript or job references. Do not rewrite, paraphrase, or add content. Return the complete corrected transcript only.\n\n"
+        "SOURCE TRANSCRIPT:\n" + raw_text[:250000] + "\n\nFORMATTED DRAFT TO CHECK:\n" + first[:250000]
     )
     if letter_agent:
         second_question = (
-            "Independently review the complete letter against both full-recording transcripts and the attached instructions. "
+            "Independently review the complete letter against the full-recording transcript and the attached instructions. "
             "Check the required date, Re: line, Dear line, omitted undictated fields, dictated paragraph breaks, staff instructions, spellings, and template-only content. "
             "Correct only clear errors; preserve the speaker's wording and order. Keep it as one complete letter. Return only the complete letter text for the .docx renderer.\n\n"
-            "SOURCE TRANSCRIPTS:\n" + raw_text[:250000] + "\n\nLETTER DRAFT:\n" + first[:250000]
+            "SOURCE TRANSCRIPT:\n" + raw_text[:250000] + "\n\nLETTER DRAFT:\n" + first[:250000]
         )
     answer, _second_model = await _human_call_model_chain(
         audio_agent_chain, second_system, second_question, reference_images, 16000,
@@ -15293,7 +15280,7 @@ async def _human_run_letter_ai_review(job_id):
         system = _human_ai_agent_system("letter-opus", "independent Word-document review", guidelines, context)
         system += (
             "\n\nYou are now the independent final-letter reviewer. The Word document is a worker/agent submission, not a client release. "
-            "Use the full-recording AssemblyAI and Deepgram transcripts below as evidence of the source audio. Follow the permanent Letter Agent guidelines and the bundled template profile. "
+            "Use the full-recording AssemblyAI transcript below as evidence of the source audio. Follow the permanent Letter Agent guidelines and the bundled template profile. "
             "Preserve dictated wording, paragraph breaks, the required letter fields, and any correctly formatted bracketed staff instructions. Do not flatten the letter into one block. "
             "Correct only clear recognition, spelling, or formatting errors supported by the recording transcripts, admin instructions, or verified research."
         )
@@ -16854,42 +16841,6 @@ async def _human_review_full_audio_deepgram(job_id, job):
                 pass
 
 
-async def _human_review_full_audio_assemblyai(job_id, job):
-    """Transcribe the complete source recording with AssemblyAI as date and wording evidence."""
-    meta = job.get("audio") or {}
-    path = meta.get("storage_path")
-    bucket = _human_bucket()
-    if not path or bucket is None:
-        raise RuntimeError("The complete source audio is not available for AssemblyAI comparison.")
-    blob = bucket.blob(path)
-    if not await asyncio.to_thread(blob.exists):
-        raise RuntimeError("The complete source audio is no longer available for AssemblyAI comparison.")
-    raw = await asyncio.to_thread(blob.download_as_bytes)
-    suffix = str(meta.get("name") or "").rsplit(".", 1)[-1].lower()
-    fmt = suffix if suffix in {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac"} else None
-    source = await asyncio.to_thread(lambda: AudioSegment.from_file(BytesIO(raw), format=fmt))
-    if len(source) <= 0:
-        raise RuntimeError("The complete source audio is empty.")
-    tmp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
-            tmp_path = handle.name
-        await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
-        result = await transcribe_with_assemblyai(
-            tmp_path, "en", False, ["universal-3-5-pro", "universal-2"], f"ai-review-{job_id}-full-audio-aai",
-        )
-        transcript = str((result or {}).get("transcription") or (result or {}).get("transcript") or (result or {}).get("text") or "").strip()
-        if str((result or {}).get("status") or "").casefold() != "completed" or not transcript:
-            raise RuntimeError("AssemblyAI did not return a complete transcript for the full source audio.")
-        return {"text": transcript, "duration_seconds": round(len(source) / 1000.0, 2), "model": "AssemblyAI"}
-    finally:
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
 def _review_deepgram_reference_for_batch(deepgram_text, parts, batch, total_seconds):
     """Pass a whole reference for ordinary jobs and the matching excerpt for oversized batches."""
     raw = str(deepgram_text or "")
@@ -16918,8 +16869,8 @@ _REVIEW_SYSTEM = (
     "4. Use the RESEARCH RESULTS to correct spelling or capitalisation of proper nouns that the client did not spell. Change a term only when the research is confident. Research never permits changing the dictated wording, adding words or replacing one entity with another.\n"
     "5. Do NOT paraphrase, rearrange, professionalise or add or remove meaning. Only fix spelling, capitalisation, numbers, dates, times, punctuation, spacing and formatting to the rules above. Keep the dictated wording and word order.\n"
     "5a. Remove an abandoned spoken word or phrase only when the speaker immediately and unmistakably corrects that same wording; keep the corrected version. Preserve repetitions used for emphasis exactly, including phrases such as `very, very hot`. Never treat emphasis, hesitation, an incomplete thought, or an ambiguous alternative as a self-correction.\n"
-    "5b. DATES STAY AS DICTATED. Keep every date in the form the speaker said it: `May 1, 2026` stays `May 1, 2026` and is never converted to `05/01/2026`, `5/1/26` or `2026-05-01`; a date dictated in numbers stays numeric. Change a date's form only when a TypeMyworDz guideline, the client's rules or the job notes explicitly require it, and then follow that rule exactly. Deepgram often rewrites spoken dates into numeric form, so NEVER take a date, time or number format from the Deepgram transcript. Use the AssemblyAI transcript and the worker parts for date wording and format the date according to the TypeMyworDz guidelines.\n"
-    "6. The submitted worker parts are the PRIMARY transcript for wording and word order. The complete Deepgram transcript made from the WHOLE original audio is a STRUCTURE CHECK only: always compare against it to make sure no dictated paragraph or content was omitted and no paragraph or content was added that was never dictated. Restore a clearly dictated omission and remove clearly undictated insertions, but never take wording, dates, numbers or formatting from Deepgram, never replace the worker transcript wholesale, paraphrase, or smooth the speaker's grammar. The AssemblyAI transcript of the whole audio, when supplied, is the tie-breaker for a clear word, date or number recognition error.\n"
+    "5b. DATES STAY AS DICTATED. Keep every date in the form the speaker said it: `May 1, 2026` stays `May 1, 2026` and is never converted to `05/01/2026`, `5/1/26` or `2026-05-01`; a date dictated in numbers stays numeric. Change a date's form only when a TypeMyworDz guideline, the client's rules or the job notes explicitly require it, and then follow that rule exactly. Deepgram often rewrites spoken dates into numeric form, so NEVER take a date, time or number format from the Deepgram transcript. Use the worker parts (which come from the AssemblyAI-based transcript) for date wording and format the date according to the TypeMyworDz guidelines.\n"
+    "6. The submitted worker parts are the PRIMARY transcript for wording and word order. The complete Deepgram transcript made from the WHOLE original audio is a STRUCTURE CHECK only: always compare against it to make sure no dictated paragraph or content was omitted and no paragraph or content was added that was never dictated. Restore a clearly dictated omission and remove clearly undictated insertions, but never take wording, dates, numbers or formatting from Deepgram, never replace the worker transcript wholesale, paraphrase, or smooth the speaker's grammar.\n"
     "7. PARAGRAPHS COME FROM THE DICTATION, NOT FROM THE WORKERS. A paragraph or line break belongs in the final transcript only where the speaker dictated it (`next paragraph`, `new paragraph`, `paragraph break`, `next line`, `new line`, `line break`), plus headings and list items, plus anything the job instructions or guidelines explicitly require. The prompt lists every dictated command found in the audio. For each one, make sure the break is present at the matching place (a blank line for a paragraph command, a single line break for a line command) and delete the command words, which are instructions, not content. Where a worker started a new paragraph that the speaker never dictated, join it back into the surrounding paragraph. Never leave a worker's own paragraph breaks in just because they were already there. Record every paragraph added or removed in `changes`.\n"
     "8. Thorough proper-noun research is a required review task. Use the supplied grounded WEB SEARCH RESULTS for every identifiable proper noun or specialist term that was not explicitly spelled by the client or provided in job notes. Do not rely on memory or say that no research was done when actual queries or sources are supplied. Research verifies spelling/context only; do not change the dictated entity or add undictated words. If a term is ambiguous, leave it unchanged and report the uncertainty in issues. Research ONLY unfamiliar proper nouns that were actually dictated; never add information that was not dictated, and a researched term must use exactly the dictated words (spelling and capitalisation corrections only, no additions, expansions or rewording). Use the supplied research only to verify spelling and context. Do not add a closing spellings line or `Research Notes:` section to an individual batch; after all parts are combined, the application will append one consolidated client-spellings line and a final client-ready Research Notes section. Never list a client-confirmed spelling among researched terms.\n"
     "9. Keep the formatting exactly as the parts use it: real TAB characters at the start of paragraphs, a blank line between paragraphs, flush-left plain headings, and two spaces after every sentence if the parts use that. Never convert tabs to spaces and never collapse double spaces.\n"
@@ -17023,20 +16974,11 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
     worker_transcript = "\n\n".join(texts)
 
     await _progress("Transcribing the full recording to check wording", 15)
-    deepgram_outcome, assembly_outcome = await asyncio.gather(
-        _human_review_full_audio_deepgram(job_id, job),
-        _human_review_full_audio_assemblyai(job_id, job),
-        return_exceptions=True,
-    )
-    if isinstance(deepgram_outcome, Exception):
-        logger.warning("Full-audio Deepgram comparison failed for AI review %s: %s", job_id, deepgram_outcome)
+    try:
+        deepgram_data = await _human_review_full_audio_deepgram(job_id, job)
+    except Exception as exc:
+        logger.warning("Full-audio Deepgram comparison failed for AI review %s: %s", job_id, exc)
         raise HTTPException(status_code=502, detail="The full-audio Deepgram comparison could not be completed. Please retry AI proofreading.")
-    deepgram_data = deepgram_outcome
-    assembly_text = ""
-    if isinstance(assembly_outcome, Exception):
-        logger.warning("Full-audio AssemblyAI comparison failed for AI review %s: %s", job_id, assembly_outcome)
-    else:
-        assembly_text = str((assembly_outcome or {}).get("text") or "").strip()
     deepgram_text = str(deepgram_data.get("text") or "").strip()
     if not deepgram_text:
         raise HTTPException(status_code=502, detail="Deepgram returned no full-audio comparison transcript. Please retry AI proofreading.")
@@ -17148,16 +17090,13 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         deepgram_excerpt = _review_deepgram_reference_for_batch(
             deepgram_text, parts, batch, deepgram_data.get("duration_seconds")
         )
-        assembly_excerpt = _review_deepgram_reference_for_batch(
-            assembly_text, parts, batch, deepgram_data.get("duration_seconds")
-        ) if assembly_text else ""
         question = (
             shared
             + "COMPARISON EVIDENCE — DEEPGRAM TRANSCRIBED THE COMPLETE ORIGINAL AUDIO. Compare against it ONLY to make sure no dictated paragraph or content was omitted and none was added by mistake. Do not take wording, dates, numbers or formatting from it, and do not paraphrase or rewrite the worker wording with it.\n\n"
             + _review_dictated_boundary_digest(deepgram_excerpt)
             + "\n\nDEEPGRAM TRANSCRIPT:\n"
             + deepgram_excerpt
-            + (("\n\nASSEMBLYAI TRANSCRIPT OF THE SAME AUDIO (use for date, number and word recognition checks; keep dates as dictated and format them per the TypeMyworDz guidelines):\n" + assembly_excerpt) if assembly_excerpt else "")
+
             + "\n\nWORKER PARTS (preserve their wording and order; their paragraph breaks are NOT authoritative, the dictated commands above are):\n\n"
             + "\n\n".join(blocks)
         )
@@ -17184,7 +17123,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
     combined, restored_boundaries = _review_restore_dictation_boundaries(combined, deepgram_text)
     combined = _review_enforce_indent(combined, texts)
     combined = _review_normalise_sentence_spacing(combined)
-    combined = _human_restore_dictated_dates(combined, texts + ([assembly_text] if assembly_text else []))
+    combined = _human_restore_dictated_dates(combined, texts)
     research_for_footer = research_text if research_status in {"completed", "partial", "unavailable"} else ""
     combined = _human_ai_agent_research_footer(
         combined, research_for_footer, source_parts=parts,
