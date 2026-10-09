@@ -1499,6 +1499,11 @@ async def _human_main_admin_uids():
     return found
 
 
+def _human_routing_blocks_workers(job):
+    """New admin uploads wait for the uploading admin to choose workers or an AI agent."""
+    return str((job or {}).get("routing_status") or "").strip().lower() in {"pending", "ai"}
+
+
 def _human_job_owner_of(item):
     item = item or {}
     uid = str(item.get("created_by_uid") or "").strip()
@@ -8080,6 +8085,8 @@ def _human_claim_assignment_transaction(
             raise HTTPException(status_code=403, detail="Letter Jobs are assigned by an admin as one complete job.")
         if job_type == "pdf_job" and job.get("admin_uploaded") is not True:
             raise HTTPException(status_code=403, detail="This PDF job is assigned by an admin.")
+        if not allow_supervised_starter and _human_routing_blocks_workers(job):
+            raise HTTPException(status_code=409, detail="This job has not been released to workers yet.")
         worker_snapshot = worker_ref.get(transaction=tx)
         worker_profile = worker_snapshot.to_dict() if worker_snapshot.exists else {}
         if worker_profile.get("workerApproved") is not True:
@@ -9617,6 +9624,8 @@ async def human_list_jobs(request: Request, scope: str = "mine", owner: str = ""
             item_type = str(item.get("job_type") or "").strip().lower()
             if item_type == "letter_job":
                 continue
+            if _human_routing_blocks_workers(item):
+                continue
             if item_type == "pdf_job" and (item.get("admin_uploaded") is not True or item.get("pdf_review")):
                 continue
             if _human_is_split_job(item):
@@ -9823,7 +9832,7 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             "job_type": "pdf_job", "source_type": "text_messages" if is_text_messages else "pdf_job", "job_category": "text_messages" if is_text_messages else "pdf",
             "pdf_batch_id": batch_id, "pdf_upload_batch_id": upload_batch_id,
             "pdf_upload_batch_name": upload_batch_name, "pdf_upload_download_name": upload_download_name,
-            "pdf_upload_page_number": upload_page_number, "status": "approved", "admin_uploaded": True,
+            "pdf_upload_page_number": upload_page_number, "status": "approved", "admin_uploaded": True, "routing_status": "pending",
             "tat_seconds": human_image_tat_seconds(len(group)), "instruction_attachments": reference_meta,
             "createdAt": now, "updatedAt": now,
             "seconds": 180, "minutes": 1,
@@ -9846,10 +9855,6 @@ async def human_admin_create_pdf_jobs(request: Request, files: List[UploadFile] 
             job["pdf_image_count"] = len(image_metas)
         await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, job)
         created_jobs.append(job_id)
-        asyncio.create_task(_notify_available_workers(
-            job_id, "New Text Messages work is available" if is_text_messages else "New PDF image work is available",
-            "A new image transcription job is available on the Available Jobs board.",
-        ))
 
     try:
         image_count = 0
@@ -10429,7 +10434,7 @@ async def human_admin_create_audio_job(
         base_job = {
             "client_uid": None, "client_email": "", "created_by_uid": actor["uid"],
             "created_by_email": str(actor.get("email") or "").strip().lower(),
-            "admin_uploaded": True, "source_type": "admin_upload", "job_category": job_category,
+            "admin_uploaded": True, "routing_status": "pending", "source_type": "admin_upload", "job_category": job_category,
             "job_type": "general_job" if job_category == "general" else "template_job",
             "job_name": str(title or "").strip()[:180] or os.path.basename(audio.filename or f"{job_category.title()} Job"),
             "status": "approved", "createdAt": now, "approvedAt": now, "updatedAt": now,
@@ -10463,10 +10468,6 @@ async def human_admin_create_audio_job(
         saved_snapshot = await asyncio.to_thread(job_ref.get)
         saved_job = saved_snapshot.to_dict() or base_job
         saved_job["id"] = job_id
-        asyncio.create_task(_notify_available_workers(
-            job_id, "New General Work is available" if job_category == "general" else "New Template Work is available",
-            "A new recording is available on the Available Jobs board.",
-        ))
         return {"job": _human_public_for(saved_job, "admin", actor.get("uid") or ""), "parts_count": len(segments), "worker_pay_kes_per_minute": quote["transcriber_payout_kes_per_minute"]}
     except Exception:
         bucket = _human_bucket()
@@ -14907,6 +14908,42 @@ async def _human_resume_orphans_after_start():
         await human_resume_orphaned_ai_reviews()
     except Exception as exc:
         logger.warning("Resuming interrupted AI proofreads failed: %s", exc)
+
+
+@app.post("/human-transcription/jobs/{job_id}/routing")
+async def human_admin_route_job(job_id: str, request: Request):
+    """The uploading admin decides whether a new job goes live to workers or is kept for an AI agent."""
+    _require_human_job_admin(request)
+    payload = await request.json()
+    destination = str((payload or {}).get("destination") or "").strip().lower()
+    if destination not in {"workers", "ai"}:
+        raise HTTPException(status_code=400, detail="Choose whether this job goes to workers or to an AI agent.")
+    job = await _human_job(job_id)
+    full_actor = await _human_actor(request)
+    if not _human_admin_can_see_job(full_actor, job):
+        raise HTTPException(status_code=403, detail="This job belongs to another admin.")
+    job_type = str(job.get("job_type") or "").strip().lower()
+    if job_type == "letter_job":
+        raise HTTPException(status_code=409, detail="Letter Jobs are not sent to the worker queue.")
+    current = str(job.get("routing_status") or "").strip().lower()
+    if current not in {"pending", "ai"}:
+        raise HTTPException(status_code=409, detail="This job has already been released.")
+    if destination == "ai" and current == "ai":
+        return {"job": _human_public_for({**job, "id": job_id}, "admin", full_actor.get("uid") or ""), "routing_status": "ai"}
+    updates = {"routing_status": destination if destination == "ai" else "workers", "routingDecidedAt": firestore.SERVER_TIMESTAMP,
+               "routing_decided_by_uid": full_actor.get("uid") or "", "updatedAt": firestore.SERVER_TIMESTAMP}
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).set, updates, merge=True)
+    _human_list_cache_bump()
+    if destination == "workers":
+        if job_type == "pdf_job":
+            title = "New Text Messages work is available" if str(job.get("job_category") or "") == "text_messages" else "New PDF image work is available"
+            body = "A new image transcription job is available on the Available Jobs board."
+        else:
+            title = "New General Work is available" if str(job.get("job_category") or "") == "general" else "New Template Work is available"
+            body = "A new recording is available on the Available Jobs board."
+        asyncio.create_task(_notify_available_workers(job_id, title, body))
+    saved = {**job, "routing_status": updates["routing_status"], "id": job_id}
+    return {"job": _human_public_for(saved, "admin", full_actor.get("uid") or ""), "routing_status": updates["routing_status"]}
 
 
 @app.post("/human-transcription/jobs/{job_id}/ai-agent/assign")
