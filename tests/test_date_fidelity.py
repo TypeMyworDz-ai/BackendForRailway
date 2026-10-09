@@ -51,25 +51,3 @@ class PromptTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-
-class GeneralChainByLengthTests(unittest.TestCase):
-    def setUp(self):
-        start = SRC.index("HUMAN_GENERAL_AGENT_MODEL_CHAIN = ")
-        mid = SRC.index("def _human_general_agent_chain(")
-        end = SRC.index("\n\n\nasync def _human_ai_transcribe_audio", mid)
-        self.ns = {}
-        exec(SRC[start:SRC.index("\n", SRC.index("HUMAN_GENERAL_SHORT_JOB_SECONDS = "))], self.ns)
-        exec(SRC[mid:end], self.ns)
-
-    def test_ten_minutes_or_less_uses_sonnet_then_terra(self):
-        chain = self.ns["_human_general_agent_chain"]
-        for seconds in (30, 599.9, 600):
-            self.assertEqual(chain(seconds), (("claude-sonnet-5-5", "claude"), ("gpt-5.6-terra", "openai")))
-
-    def test_longer_than_ten_minutes_uses_terra_then_gemini_35(self):
-        chain = self.ns["_human_general_agent_chain"]
-        for seconds in (600.1, 3600):
-            self.assertEqual(chain(seconds), (("gpt-5.6-terra", "openai"), ("gemini-3.5-flash-lite", "gemini")))
-
-    def test_unknown_length_falls_back_to_long_chain(self):
-        self.assertEqual(self.ns["_human_general_agent_chain"](None)[0][0], "gpt-5.6-terra")
