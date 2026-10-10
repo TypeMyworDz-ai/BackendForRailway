@@ -107,7 +107,7 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # plan or free-trial rules, and can reach the admin tools.
 # Complimentary accounts (below) also skip payment, but are NOT admins and get
 # none of the admin tooling.
-ADMIN_EMAILS = ['typemywordz@gmail.com']
+ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordz.ai']
 # Dedicated OpenAI Whisper tester. This account used to be the AssemblyAI
 # tester; the owner moved it to OpenAI so OpenAI can be exercised on its own.
 # Like the Deepgram tester it never falls back, so an OpenAI failure shows up
@@ -1355,7 +1355,7 @@ def credits_exempt(user_email: str) -> bool:
 # never grants the app-wide admin dashboard, never bypasses the paywall for
 # AI transcription or Ask TypeMyworDz, and never exempts anything except the
 # human-transcription jobs these accounts personally own as the "client".
-HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai', 'gracenyaitara@gmail.com']
+HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai', 'gracenyaitara@gmail.com', 'donotgrowweary95@gmail.com']
 USER_NOTIFICATION_COLLECTION = "user_notifications"
 
 
@@ -6346,7 +6346,7 @@ HUMAN_SHIFT_ONLINE_TTL_SECONDS = 150
 HUMAN_SHIFT_CALL_TTL_HOURS = 4
 HUMAN_SHIFT_COLLECTION = "human_worker_shifts"
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
-PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com"}
+PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"}
 HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
 TEXT_MESSAGES_DEFAULT_INSTRUCTION = "Text Messages job: transcribe the screenshot following the Text Messages guidelines."
 GENERAL_JOB_DEFAULT_INSTRUCTION = (
@@ -6386,7 +6386,7 @@ def human_image_tat_seconds(image_count=1):
 PDF_JOB_DEFAULT_INSTRUCTION = "Always use Gemini for image transcription"
 PDF_JOB_WORD_EXTENSIONS = (".docx", ".doc", ".rtf", ".odt")
 PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "jpg", "jpeg", "png", "webp", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
-LETTER_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com"}
+LETTER_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"}
 LETTER_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 LETTER_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac", "mov", "mkv", "avi"}
 HUMAN_JOB_STATUSES = {
@@ -13313,6 +13313,80 @@ TRAINING_LEVELS = [
     {"level": 5, "name": "Practical: speakers and timestamps", "kind": "practical", "description": "Complete a speaker and timestamp review exercise, checking difficult audio carefully."},
     {"level": 6, "name": "Final practical: Human Job audio", "kind": "practical", "description": "Transcribe the attached recording using the supplied TypeMyworDz guidelines and formatting reference. The admin reviews this with your other five modules."},
 ]
+def _redo_module_lines(levels):
+    names = {int(item["level"]): item["name"] for item in TRAINING_LEVELS}
+    return ["Module %d: %s" % (level, names.get(level, "Training module")) for level in levels]
+
+
+def build_trainee_redo_email(name: str, levels, message: str = ""):
+    """Subject, HTML and text telling a trainee which modules to redo and why."""
+    raw_name = (name or "").strip()
+    first = raw_name.split(" ")[0] if raw_name else "there"
+    lines = _redo_module_lines(levels)
+    note = (message or "").strip()
+    subject = "Action needed: please redo %s" % ("module %d" % levels[0] if len(levels) == 1 else "%d training modules" % len(levels))
+    items_html = "".join('<li style="margin:0 0 4px 0;">%s</li>' % escape(line) for line in lines)
+    note_html = ""
+    if note:
+        note_html = (
+            '<tr><td style="font-size:13px;font-weight:700;color:#14161a;padding-bottom:6px;">Comments from the reviewer</td></tr>'
+            '<tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding:12px 14px;background:#f4f1ff;border-left:3px solid #5b44cf;margin-bottom:16px;">%s</td></tr>'
+            '<tr><td style="padding-bottom:16px;"></td></tr>'
+        ) % escape(note).replace("\n", "<br>")
+    html = (
+        '<!doctype html><html><body style="margin:0;padding:0;background:#f8f8f9;">'
+        '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="background:#f8f8f9;padding:32px 16px;"><tr><td align="center">'
+        '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border:1px solid #e5e6ea;border-radius:10px;padding:32px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;">'
+        '<tr><td style="font-size:20px;font-weight:700;color:#14161a;padding-bottom:20px;"><span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span></td></tr>'
+        '<tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">Hi %s, you have been invited to redo training</td></tr>'
+        '<tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:12px;">Your reviewer asked you to redo the following in the Training Room:</td></tr>'
+        '<tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:16px;"><ul style="margin:0;padding-left:20px;">%s</ul></td></tr>'
+        '%s'
+        '<tr><td style="padding-bottom:24px;"><a href="%s" style="display:inline-block;background:#28a745;color:#ffffff;text-decoration:none;font-size:15px;font-weight:600;padding:12px 22px;border-radius:8px;">Open the Training Room</a></td></tr>'
+        '<tr><td style="font-size:12px;color:#858a95;padding-top:20px;border-top:1px solid #e5e6ea;">Questions? Reply to this email or write to %s.</td></tr>'
+        '</table></td></tr></table></body></html>'
+    ) % (escape(first), items_html, note_html, APP_URL, SUPPORT_EMAIL)
+    text = "Hi %s,\n\nYour reviewer asked you to redo the following in the Training Room:\n%s\n\n" % (first, "\n".join("- " + line for line in lines))
+    if note:
+        text += "Comments from the reviewer:\n%s\n\n" % note
+    text += "Open the Training Room: %s\n\nQuestions? Reply to this email or write to %s.\n" % (APP_URL, SUPPORT_EMAIL)
+    return subject, html, text
+
+
+async def _notify_trainee_redo_invite(uid: str, profile: dict, levels, message: str):
+    """Tell a trainee about a redo invite in the app and by email.
+
+    Each channel is independent and failures are logged, never raised, so a
+    notification problem can never undo the admin's decision.
+    """
+    levels = sorted({int(level) for level in levels})
+    lines = _redo_module_lines(levels)
+    body = "; ".join(lines)
+    if message:
+        body = "%s. Reviewer comments: %s" % (body, message)
+    try:
+        await _create_user_notification(
+            uid, "trainee-redo-invite:%s" % uuid.uuid4().hex[:12], "trainee_redo",
+            "You have been invited to redo %s" % ("module %d" % levels[0] if len(levels) == 1 else "%d modules" % len(levels)),
+            body, route="trainee", requires_action=True,
+        )
+    except Exception as exc:
+        logger.warning("Trainee redo notification failed for %s: %s", uid, exc)
+    email = str((profile or {}).get("email") or "").strip()
+    if not email:
+        try:
+            record = await asyncio.to_thread(firebase_auth.get_user, uid)
+            email = str(record.email or "").strip()
+        except Exception as exc:
+            logger.warning("Could not look up the trainee email for %s: %s", uid, exc)
+    if email:
+        try:
+            subject, html, text = build_trainee_redo_email((profile or {}).get("name") or (profile or {}).get("officialIdName") or "", levels, message)
+            await _send_resend_message(email, subject, html, text, "Trainee redo invite email")
+        except Exception as exc:
+            logger.warning("Trainee redo email failed for %s: %s", uid, exc)
+
+
 TRAINING_CHECKLIST_COUNTS = {1: 5, 2: 5, 3: 5, 4: 3, 5: 3, 6: 3}
 TRAINING_QUIZ_ANSWERS = {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1}
 TRAINING_REVIEW_CONTENT = {
@@ -17883,6 +17957,8 @@ async def admin_trainee_decision(uid: str, request: Request):
             "humanShiftCallInExpiresAt": "", "humanShiftReinstatedAt": firestore.SERVER_TIMESTAMP,
         })
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
+    if decision == "invite_redo":
+        await _notify_trainee_redo_invite(uid, profile, levels, message)
     return {"status": "updated", "uid": uid, "decision": decision}
 
 
@@ -18847,7 +18923,7 @@ FORMAT_SYSTEM_PROMPT = (
 async def format_transcript_with_guidelines(request: Request):
     decoded = _verified_user(request)
     email = (decoded.get("email") or "").strip().lower()
-    allowed_formatters = {PDF_JOB_ADMIN_EMAIL, "typemywordz@gmail.com", "gracenyaitara@gmail.com"}
+    allowed_formatters = {PDF_JOB_ADMIN_EMAIL, "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"}
     if email not in allowed_formatters:
         raise HTTPException(status_code=403, detail="This option is not available on your account.")
     payload = await request.json()
