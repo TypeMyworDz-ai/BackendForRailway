@@ -43,7 +43,7 @@ class BackgroundProofreadState(unittest.TestCase):
     def test_forced_research_searches_unconfirmed_terms(self):
         research = ast.unparse(_fn("_human_ai_agent_research"))
         self.assertIn("_human_review_candidate_terms", research)
-        self.assertIn("MANDATORY WEB SEARCH", research)
+        self.assertIn("_RESEARCH_SCOPE_RULES", research)
         self.assertIn("_human_research_blocking", research)
 
 

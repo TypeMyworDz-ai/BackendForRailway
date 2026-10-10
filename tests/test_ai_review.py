@@ -12,7 +12,7 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_client_word_list_entries", "_human_client_word_list_matches", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
@@ -360,8 +360,8 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("immediately and unmistakably corrects that same wording", prompt)
         self.assertIn("very, very hot", prompt)
         self.assertIn("Never treat emphasis", prompt)
-        self.assertIn("application will append one consolidated client-spellings line", prompt)
-        self.assertIn("Do not add a closing spellings line or `Research Notes:` section to an individual batch", prompt)
+        self.assertIn("the application appends one consolidated, client-ready footer after all parts are combined", prompt)
+        self.assertIn("Do not add a footer to an individual batch", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
         self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
@@ -429,19 +429,19 @@ class AiModelRouting(unittest.TestCase):
     def test_research_footer_uses_only_grounded_terms_sources_and_explicit_no_search_note(self):
         footer = NS["_human_ai_agent_research_footer"]
         no_search = footer("Transcript body.", "")
-        self.assertIn("Research Notes:\nNo external searches were needed for this transcript.", no_search)
+        self.assertEqual(no_search, "Transcript body.")
         self.assertNotIn("I researched:", no_search)
         ungrounded = footer("Transcript body.\nI researched: Example Org.", "")
         self.assertNotIn("I researched:", ungrounded)
-        self.assertIn("No external searches were needed for this transcript.", ungrounded)
+        self.assertNotIn("Research Notes", ungrounded)
         malformed = footer("Transcript body.\nI researched: Example Org.", "A result without structured findings.")
         self.assertTrue(malformed.startswith("Transcript body."))
-        self.assertIn("Research Notes:\nOnline research did not confirm a reliable finding", malformed)
+        self.assertNotIn("Research Notes", malformed)
         unverified = footer(
             "Transcript body.",
             "UNVERIFIED TERMS (do not correct from memory): Walden Park, Summit Clinic",
         )
-        self.assertIn("could not confidently verify these terms; they were left as dictated: Walden Park, Summit Clinic.", unverified)
+        self.assertNotIn("Walden Park", unverified)
         table = footer(
             "Transcript body about Family to Family.",
             "| Dictated form | Verified spelling | Meaning | Confident |\n| --- | --- | --- | --- |\n"
@@ -480,7 +480,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("ModelOnly", result)
         self.assertEqual(result.count("Client spellings:"), 1)
         self.assertIn("Research Notes:\n- Woodward Park: A local park named as the meeting place in the transcript. (confidence: yes)", result)
-        self.assertIn("Online research could not confidently verify: Summit Psych. These terms were left as dictated.", result)
+        self.assertNotIn("Summit Psych", result)
         self.assertNotIn("UNVERIFIED TERMS", result)
 
     def test_candidate_terms_skip_sentence_start_words_and_titles(self):
@@ -518,7 +518,7 @@ class AiModelRouting(unittest.TestCase):
 
     def test_worker_draft_charges_audio_minutes_plus_format_and_proofreading_costs_five(self):
         formatter_calls = {node.func.id for node in ast.walk(self.functions["_human_worker_format_ai_draft"]) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertTrue({"_admin_guidelines_text", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent", "_human_ai_agent_research_footer"}.issubset(formatter_calls))
+        self.assertTrue({"_guidelines_for_job", "_human_review_context", "_human_ai_agent_research", "_human_call_model_chain", "_human_worker_ai_draft_system", "_review_normalise_sentence_spacing", "_review_enforce_indent", "_human_ai_agent_research_footer"}.issubset(formatter_calls))
         route = self.functions["human_worker_ai_draft"]
         route_source = ast.unparse(route)
         self.assertIn("_human_worker_ai_draft_credit_cost", route_source)
@@ -532,7 +532,7 @@ class AiModelRouting(unittest.TestCase):
         proofread = self.functions["human_worker_ai_proofread_draft"]
         proofread_source = ast.unparse(proofread)
         self.assertIn("WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", proofread_source)
-        self.assertIn("_admin_guidelines_text", proofread_source)
+        self.assertIn("_guidelines_for_job", proofread_source)
         self.assertIn("_human_review_context", proofread_source)
         self.assertIn("_human_review_spelling_notes", proofread_source)
         self.assertIn("_human_review_full_audio_deepgram", proofread_source)
@@ -549,7 +549,6 @@ class AiModelRouting(unittest.TestCase):
 
         admin_proofread = ast.unparse(self.functions["human_admin_ai_review"])
         self.assertIn("HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin", admin_proofread)
-        self.assertIn("research_status = 'partial'", admin_proofread)
         self.assertIn("research_status = 'unavailable'", admin_proofread)
         self.assertNotIn("Required proper-noun web research did not complete", admin_proofread)
         self.assertIn("Claude Sonnet 5.5", admin_proofread)
@@ -578,7 +577,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Dublin Granville-East Dublin Granville Children's Close To Home.", prompt_text)
         self.assertIn("East Dublin Granville Children's Close To Home.", prompt_text)
         self.assertIn("Do not remove ordinary repetition", prompt_text)
-        self.assertIn("non-semantic spoken fillers such as `um`, `uh`, or `you know`", prompt_text)
+        self.assertIn("Remove unmistakable non-semantic fillers such as `um` and `uh`", prompt_text)
         self.assertIn("only if that name or term was actually spoken", prompt_text)
         self.assertIn("Use quotation marks only when quotation was dictated or to mark actual reported speech", prompt_text)
 
@@ -658,6 +657,10 @@ class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
             node for node in cls.tree.body if isinstance(node, ast.Assign)
             and any(getattr(target, "id", None) == "HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE" for target in node.targets)
         )
+        audio_node = next(
+            node for node in cls.tree.body if isinstance(node, ast.Assign)
+            and any(getattr(target, "id", None) == "HUMAN_AUDIO_TRANSCRIPTION_RULES" for target in node.targets)
+        )
         date_node = next(
             node for node in cls.tree.body if isinstance(node, ast.Assign)
             and any(getattr(target, "id", None) == "HUMAN_DATE_FIDELITY_RULES" for target in node.targets)
@@ -665,6 +668,7 @@ class TemplateAgentGuidelinesAndPrivateReferences(unittest.TestCase):
         namespace = {
             "os": __import__("os"), "HUMAN_AI_AGENTS": ast.literal_eval(agent_node.value),
             "HUMAN_DATE_FIDELITY_RULES": ast.literal_eval(date_node.value),
+            "HUMAN_AUDIO_TRANSCRIPTION_RULES": ast.literal_eval(audio_node.value),
             "HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE": ast.literal_eval(correction_node.value),
             "__file__": str(source_path),
         }

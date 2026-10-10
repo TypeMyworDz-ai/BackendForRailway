@@ -41,7 +41,7 @@ def load_helpers():
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted_functions:
             body.append(node)
-        elif isinstance(node, ast.Assign) and any(getattr(target, 'id', '') in ('HUMAN_AI_AGENTS', 'HUMAN_DATE_FIDELITY_RULES') for target in node.targets):
+        elif isinstance(node, ast.Assign) and any(getattr(target, 'id', '') in ('HUMAN_AI_AGENTS', 'HUMAN_DATE_FIDELITY_RULES', 'HUMAN_AUDIO_TRANSCRIPTION_RULES') for target in node.targets):
             body.append(node)
     namespace = {
         'base64': base64, 'hashlib': hashlib, 'os': os, 're': re, 'datetime': datetime,
