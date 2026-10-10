@@ -15,7 +15,7 @@
 # nothing about our own code or dependency versions changes. The retry loop
 # below is kept anyway, because a genuinely flaky download is still possible
 # and a deploy should not fail for that.
-FROM python:3.10-slim-bookworm
+FROM public.ecr.aws/docker/library/python:3.10-slim-bookworm
 
 # Set the working directory in the container
 WORKDIR /app
