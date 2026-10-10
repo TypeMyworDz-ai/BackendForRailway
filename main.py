@@ -13845,8 +13845,8 @@ MODEL_ROUTES = {
     "letter": ("Letter Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "pdf": ("PDF and image Jobs agent", lambda: HUMAN_PDF_AGENT_MODEL_CHAIN),
     "text_messages": ("Text Messages Jobs agent", lambda: HUMAN_TEXT_MESSAGES_MODEL_CHAIN),
-    "worker_format": ("Worker formatted draft", lambda: WORKER_DRAFT_FORMAT_MODEL_CHAIN),
-    "worker_proofread": ("Worker AI proofread", lambda: WORKER_DRAFT_PROOFREAD_MODEL_CHAIN),
+    "worker_format": ("Worker AI draft formatter", lambda: WORKER_DRAFT_FORMAT_MODEL_CHAIN),
+    "worker_proofread": ("Worker AI proofreader", lambda: WORKER_DRAFT_PROOFREAD_MODEL_CHAIN),
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
 MODEL_ROUTE_EXTRA_MODELS = {"claude-sonnet-5-5": ("claude", "Claude Sonnet 5.5")}
@@ -17980,6 +17980,7 @@ async def trainee_submit_training(level: int, request: Request):
     if str(prior_submissions.get(str(level)) or "").lower() == "submitted":
         raise HTTPException(status_code=409, detail="This module has already been submitted and saved.")
     is_redo = str(prior_submissions.get(str(level)) or "").lower() == "redo_requested"
+    prior_redo_message = str(profile.get("trainingRedoMessage") or "")
     if level != current_level and not is_redo:
         raise HTTPException(status_code=409, detail="Finish the open module first; the next module unlocks automatically after a complete submission.")
     payload = await request.json()
@@ -18040,6 +18041,7 @@ async def trainee_submit_training(level: int, request: Request):
     next_level = level if final_module else min(remaining)
     updates = {
         "trainingRedoLevels": [item for item in remaining if str(submissions.get(str(item)) or "").lower() == "redo_requested"],
+        "trainingRedoMessage": prior_redo_message if any(str(submissions.get(str(item)) or "").lower() == "redo_requested" for item in remaining) else "",
         "trainingSubmissions": submissions,
         "trainingLevel": next_level,
         "trainingStatus": "pending_final_review" if final_module else "active",
