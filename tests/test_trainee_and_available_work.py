@@ -90,7 +90,7 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
     def test_prices_trial_allowance_and_worker_threshold_match_product_policy(self):
         self.assertEqual(self.namespace["TRAINEE_PRICE_USD"], 1.0)
         self.assertEqual(self.namespace["FREE_TRIAL_CREDITS"], 30)
-        self.assertEqual(self.namespace["HUMAN_AVAILABLE_SLICE_MINUTES"], 5)
+        self.assertEqual(self.namespace["HUMAN_AVAILABLE_SLICE_MINUTES"], 2)
         self.assertEqual(self.namespace["MIN_HUMAN_WORKER_RATING"], 3.5)
 
     def test_every_new_account_gets_exactly_30_credits_and_old_5_grants_are_corrected(self):
@@ -143,11 +143,13 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
     def test_long_recording_is_split_into_open_balanced_slices(self):
         build = self.namespace["_human_build_available_segments"]
         segments = build({"seconds": 780, "minutes": 13}, None)
-        self.assertEqual(len(segments), 3)
-        self.assertEqual([item["minutes"] for item in segments], [5, 4, 4])
+        self.assertEqual(len(segments), 7)
+        self.assertEqual([item["minutes"] for item in segments], [2, 2, 2, 2, 2, 2, 1])
         self.assertTrue(all(item["status"] == "available" for item in segments))
         self.assertTrue(all(item["worker_uid"] is None and item["deadlineAt"] is None for item in segments))
-        self.assertEqual(build({"seconds": 300, "minutes": 5}, None), [])
+        self.assertEqual(build({"seconds": 119, "minutes": 2}, None), [])
+        self.assertEqual([item["minutes"] for item in build({"seconds": 120, "minutes": 2}, None)], [1, 1])
+        self.assertEqual(len(build({"seconds": 300, "minutes": 5}, None)), 3)
 
     def test_available_job_serializer_hides_files_and_drafts_until_claimed(self):
         serialize = self.namespace["_human_available_public_for"]
