@@ -6331,7 +6331,7 @@ HUMAN_WORKER_DEADLINE_EVENT_COLLECTION = "human_worker_deadline_events"
 HUMAN_WORKER_MAX_CLAIMS_PER_ITEM = 1
 HUMAN_WORKER_DEADLINE_WARNING_RETURNS = 10
 HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS = 11
-HUMAN_AVAILABLE_SLICE_MINUTES = 5
+HUMAN_AVAILABLE_SLICE_MINUTES = 2
 HUMAN_JOB_DASHBOARD_RETENTION_DAYS = 3
 
 # Human Work's regular weekday shift runs 3:00–8:00 p.m. East Africa Time.
@@ -6672,7 +6672,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         # Preserve only the authorized worker-facing draft text above; never
         # return raw draft records that include provider/model metadata.
         out.pop("ai_drafts", None)
-        for key in ("ai_review", "ai_review_run", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "audio_unlocked"):
+        for key in ("ai_review", "ai_review_run", "proofreading_run", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "audio_unlocked"):
             out.pop(key, None)
         for key in (
             "worker_minutes", "worker_amount_kes", "worker_gross_amount_kes", "worker_deduction_kes", "worker_deduction_reason",
@@ -6695,7 +6695,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         out.pop("proofreader_payout_status", None)
         out.pop("proofreader_payout_period_id", None)
     elif actor_role == "client":
-        for key in ("ai_drafts", "ai_review", "ai_review_run", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "ai_agent_docx", "ai_agent_scope", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "proofreader_use_combined_transcript"):
+        for key in ("ai_drafts", "ai_review", "ai_review_run", "proofreading_run", "ai_agent_status", "ai_agent_id", "ai_agent_name", "ai_agent_model_ids", "ai_agent_run_id", "ai_agent_error", "ai_agent_completedAt", "ai_agent_docx", "ai_agent_scope", "ai_agent_paused_segments", "ai_agent_previous_split_mode", "ai_agent_previous_status", "part_ratings", "whole_job_assignment", "proofreader_suggested_ratings", "proofreader_parts_override", "proofreader_use_combined_transcript"):
             out.pop(key, None)
         out.pop("last_message", None)
         out.pop("last_message_by_thread", None)
@@ -11728,7 +11728,7 @@ async def human_worker_claim(job_id: str, request: Request):
 
 
 def _human_build_available_segments(job, now):
-    """Split approved long recordings into open, approximately five-minute slices."""
+    """Split approved recordings of two minutes or more into open slices of about two minutes."""
     try:
         total_seconds = float(job.get("seconds") or 0)
         total_minutes = max(1, int(job.get("minutes") or math.ceil(total_seconds / 60.0)))
@@ -11736,7 +11736,11 @@ def _human_build_available_segments(job, now):
         raise ValueError("The audio length could not be read. Please review the job before approving it.")
     if total_seconds <= 0:
         raise ValueError("The audio length is missing. Please review the job before approving it.")
-    count = int(math.ceil(total_minutes / float(HUMAN_AVAILABLE_SLICE_MINUTES)))
+    # Anything under two minutes stays whole. Everything else is cut into short
+    # parts (about two minutes each, never fewer than two) so more workers can earn.
+    if total_seconds < 120:
+        return []
+    count = min(total_minutes, max(2, int(math.ceil(total_minutes / float(HUMAN_AVAILABLE_SLICE_MINUTES)))))
     if count <= 1:
         return []
     minutes_per_part, extra_minutes = divmod(total_minutes, count)
@@ -13847,6 +13851,7 @@ MODEL_ROUTES = {
     "text_messages": ("Text Messages Jobs agent", lambda: HUMAN_TEXT_MESSAGES_MODEL_CHAIN),
     "worker_format": ("Worker AI draft formatter", lambda: WORKER_DRAFT_FORMAT_MODEL_CHAIN),
     "worker_proofread": ("Worker AI proofreader", lambda: WORKER_DRAFT_PROOFREAD_MODEL_CHAIN),
+    "proofreading_agent": ("Proofreading Agent", lambda: HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN),
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
 MODEL_ROUTE_EXTRA_MODELS = {"claude-sonnet-5-5": ("claude", "Claude Sonnet 5.5")}
@@ -14818,7 +14823,7 @@ def _human_collapse_duplicate_image_page_blocks(answer, page_image_hashes, page_
     return text
 
 
-async def _human_image_review_draft(job, agent_id, system, reference_images):
+async def _human_image_review_draft(job, agent_id, system, reference_images, chain_override=None):
     """AI reviewer: reads every page image plus the per-page drafts and returns one checked, combined transcript."""
     review = job.get("pdf_review") or {}
     bucket = _human_bucket()
@@ -14865,7 +14870,7 @@ async def _human_image_review_draft(job, agent_id, system, reference_images):
         + drafts[:300000]
         + (_human_text_messages_reminder(bool(example_images)) if is_text else "")
     )
-    chain = _route_chain("pdf", HUMAN_PDF_AGENT_MODEL_CHAIN) if job.get("pdf_review") else _route_chain("text_messages", HUMAN_TEXT_MESSAGES_MODEL_CHAIN)
+    chain = chain_override or (_route_chain("pdf", HUMAN_PDF_AGENT_MODEL_CHAIN) if job.get("pdf_review") else _route_chain("text_messages", HUMAN_TEXT_MESSAGES_MODEL_CHAIN))
     async with _IMAGE_AGENT_SEMAPHORE:
         answer, model_used = await _human_call_model_chain(
             chain, system, question, images + list(reference_images or []) + example_images,
@@ -15349,6 +15354,10 @@ async def _human_resume_orphans_after_start():
         await human_resume_orphaned_ai_reviews()
     except Exception as exc:
         logger.warning("Resuming interrupted AI proofreads failed: %s", exc)
+    try:
+        await human_resume_orphaned_proofreading_runs()
+    except Exception as exc:
+        logger.warning("Resuming interrupted Proofreading Agent runs failed: %s", exc)
 
 
 @app.post("/human-transcription/jobs/{job_id}/routing")
@@ -17643,6 +17652,367 @@ async def human_resume_orphaned_ai_reviews():
             continue
         logger.info("Resuming interrupted AI proofread %s for job %s", run_id, snap.id)
         asyncio.create_task(_human_run_ai_review_background(snap.id, dict(run["actor"]), run_id))
+        resumed += 1
+    return resumed
+
+
+# ---- Proofreading Agent ---------------------------------------------------
+# One agent for General Jobs (audio), Text Messages and PDF jobs.  Admins never
+# see the individual parts in the editor; once every part is submitted they run
+# this agent, which builds the whole job as one client-ready transcript and puts
+# it in the editor.  The Super admin picks its models under Model routing.
+_PROOFREADING_AGENT_ADDENDUM = (
+    "\n\nPROOFREADING AGENT MODE (these instructions add to the rules above and win wherever they differ)\n"
+    "A. You receive every part of ONE job, written by human workers or AI agents, together with the Deepgram transcript of the complete original audio. "
+    "Produce the whole job as one final, client-ready transcript, in order.\n"
+    "B. PARAGRAPHS AND TABS. Wherever the speaker used paragraph language (next paragraph, new paragraph, enter, next line, new line, drop down, line break) the final transcript must have that break, "
+    "and every body paragraph starts with one real TAB. Use the list of dictated commands in the prompt as a checklist, and delete the command words themselves.\n"
+    "C. SEAMS BETWEEN PARTS. The recording was cut into parts by time, so a sentence can be cut off, doubled or missing where one part ends and the next begins. "
+    "Join every seam so that no sentence is half-finished, repeated or lost, using the Deepgram transcript at that point to see what was said. Do not start a new paragraph at a seam unless the speaker dictated one.\n"
+    "D. MINIMAL CONTEXTUAL CORRECTIONS. Change a worker's word only when you are one hundred percent certain, from the sentence and from the Deepgram transcript, that the worker's word is wrong "
+    "(for example the worker's word makes no sense in context and Deepgram's word clearly does). Make the smallest possible change, never rewrite, smooth or reorder, and when there is any doubt keep the worker's wording. "
+    "Never take a date, number, time, name spelling or formatting from Deepgram. List every such change in `changes`.\n"
+    "E. NAMES AND PROPER NOUNS. Make every explicitly spelled word or name identical across the whole transcript, and write every proper noun exactly as dictated and confirmed by client spellings, the client word list or research. "
+    "Never reword a name, never expand it and never add anything that was not dictated.\n"
+    "F. Do not write a Client spellings, My spellings, I researched or Research Notes section. Remove any such section found at the end of a part; "
+    "the application adds one consolidated spellings section and one consolidated Research Notes section at the very end.\n"
+    "G. The result must be client-ready: no part labels, no leftover worker notes, no duplicated headings or footers, consistent formatting from the first line to the last."
+)
+
+_PROOFREADING_AGENT_IMAGE_ADDENDUM = (
+    "\n\nPROOFREADING AGENT MODE. You are given every page image of the whole file and the page drafts written by workers or AI agents. "
+    "Transcribe the whole file from the images yourself, compare it with the page drafts, and produce ONE final, client-ready transcript. "
+    "Use the page drafts only where they are right; fix wrong words, missed content and formatting. Join pages smoothly so nothing is cut, doubled or lost where one page ends and the next begins, "
+    "keep names and labels identical from the first page to the last, never add anything that is not in the images, and do not write spellings or research sections (the application adds one consolidated section)."
+)
+
+_PROOFREADING_RUN_STALE_SECONDS = 30 * 60
+
+
+def _proofreading_agent_scope(job):
+    """audio for General Jobs, image for whole-file Text Messages / PDF reviews, else empty."""
+    job_type = str((job or {}).get("job_type") or "").strip().lower()
+    if job_type == "general_job":
+        return "audio"
+    if job_type == "pdf_job" and (job or {}).get("pdf_review"):
+        return "image"
+    return ""
+
+
+def _proofreading_agent_blocker(job):
+    """Plain-language reason the agent cannot run yet, or an empty string."""
+    scope = _proofreading_agent_scope(job)
+    if not scope:
+        return "The Proofreading Agent handles General Jobs, Text Messages and PDF jobs only."
+    if (job or {}).get("proofreader_status") in {"assigned", "in_progress"}:
+        return "A human proofreader is already working on this job. Take it back first."
+    if scope == "audio":
+        if _human_is_split_job(job):
+            segments = job.get("segments") or []
+            if not segments or not all((item or {}).get("status") == "submitted" for item in segments):
+                return "Every part must be submitted before the Proofreading Agent can run."
+            if not any(str((item or {}).get("transcript") or "").strip() for item in segments):
+                return "The submitted parts have no typed text for the agent to proofread."
+        else:
+            if job.get("status") != "submitted" or not str(job.get("transcript") or "").strip():
+                return "The job has not been submitted yet."
+    else:
+        if job.get("status") not in {"approved", "submitted"} or job.get("worker_uid") and job.get("status") != "submitted":
+            return "The whole-file job must be finished by its workers or AI agent first."
+        if not list((job.get("pdf_review") or {}).get("page_texts") or []):
+            return "The page drafts are not ready yet."
+    return ""
+
+
+def _proofreading_run_active(job):
+    run = (job or {}).get("proofreading_run") or {}
+    if str(run.get("status") or "") not in {"queued", "processing"}:
+        return False
+    started = _as_dt(run.get("startedAt"))
+    if started is not None and getattr(started, "tzinfo", None):
+        started = started.astimezone(timezone.utc).replace(tzinfo=None)
+    if started is None:
+        return False
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - started).total_seconds() < _PROOFREADING_RUN_STALE_SECONDS
+
+
+async def _proofreading_write_run(job_id, **fields):
+    updates = {f"proofreading_run.{key}": value for key, value in fields.items()}
+    updates["proofreading_run.updatedAt"] = datetime.now(timezone.utc).isoformat()
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, updates)
+    _human_list_cache_bump()
+
+
+async def _proofreading_agent_audio(job_id, job, progress):
+    """Build one client-ready transcript from every submitted part, checked against the whole-audio Deepgram transcript."""
+    review_system = _REVIEW_SYSTEM + "\n\n" + HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE + _PROOFREADING_AGENT_ADDENDUM
+    if _human_is_split_job(job):
+        parts = [
+            {"id": str(item.get("id")), "label": str(item.get("label") or f"Part {i + 1}"), "text": str(item.get("transcript") or ""),
+             "start_seconds": item.get("start_seconds"), "end_seconds": item.get("end_seconds")}
+            for i, item in enumerate(job.get("segments") or [])
+        ]
+    else:
+        parts = [{"id": "main", "label": "Full transcript", "text": str(job.get("transcript") or "")}]
+    guidelines = await _guidelines_for_job(job)
+    context_data = await _human_review_context(job_id, job)
+    context = context_data["text"]
+    reference_images = context_data["images"]
+    texts = [p["text"] for p in parts]
+    first_text = parts[0]["text"]
+    worker_transcript = "\n\n".join(texts)
+
+    await progress("Transcribing the whole recording with Deepgram", 15)
+    try:
+        deepgram_data = await _human_review_full_audio_deepgram(job_id, job)
+    except Exception as exc:
+        logger.warning("Full-audio Deepgram transcript failed for the Proofreading Agent %s: %s", job_id, exc)
+        raise HTTPException(status_code=502, detail="The Deepgram transcript of the whole recording could not be made. Please try again.")
+    deepgram_text = str(deepgram_data.get("text") or "").strip()
+    if not deepgram_text:
+        raise HTTPException(status_code=502, detail="Deepgram returned no transcript for the whole recording. Please try again.")
+
+    await progress("Checking unfamiliar names and terms", 40)
+    research_text, research_status = "", "not_needed"
+    issues = list(context_data["issues"])
+    try:
+        research_text = await _human_ai_agent_research(worker_transcript, context)
+        research_status = "completed" if research_text else "not_needed"
+    except Exception as exc:
+        logger.warning("Proofreading Agent research failed for %s; continuing without it: %s", job_id, str(exc)[:300])
+        research_text, research_status = "", "unavailable"
+
+    await progress("Proofreading and joining the parts", 55)
+    shared = (
+        f"COMPANY GUIDELINES:\n{guidelines[:50000]}\n\n{context or 'NO EXTRA JOB INSTRUCTIONS WERE SUPPLIED.'}\n\n"
+        "GROUNDED RESEARCH (spelling/context evidence only): use only findings marked confidence yes; treat every unverified term or failed search as unresolved and keep the dictated wording.\n"
+        f"RESEARCH RESULTS:\n{research_text[:12000] or 'None available.'}\n\n"
+        "FORMAT: every body paragraph starts with one real TAB; headings stay flush left; use exactly two spaces after every sentence.\n\n"
+    )
+    batches, current, size = [], [], 0
+    for index, part in enumerate(parts):
+        length = len(part["text"])
+        if current and size + length > 45000:
+            batches.append(current)
+            current, size = [], 0
+        current.append(index)
+        size += length
+    if current:
+        batches.append(current)
+
+    chain = _route_chain("proofreading_agent", HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN)
+    final_chunks, all_changes, all_parts, summary_bits, models_used = [], [], [], [], []
+    for batch_number, batch in enumerate(batches, 1):
+        if len(batches) > 1:
+            await progress(f"Proofreading section {batch_number} of {len(batches)}", 55 + int(35 * (batch_number - 1) / len(batches)))
+        blocks = []
+        if 0 not in batch:
+            blocks.append(f"=== FIRST PART (spelling authority only, do not repeat it in your transcript) ===\n{first_text[:30000]}")
+        for index in batch:
+            blocks.append(f"=== {parts[index]['label'].upper()} (id: {parts[index]['id']}) ===\n{parts[index]['text']}")
+        excerpt = _review_deepgram_reference_for_batch(deepgram_text, parts, batch, deepgram_data.get("duration_seconds"))
+        question = (
+            shared
+            + "DEEPGRAM TRANSCRIPT OF THE COMPLETE ORIGINAL AUDIO. Use it to confirm paragraphs, to join the seams between parts and, only when you are completely certain, to correct a clearly wrong word. "
+            "Never take dates, numbers, times or formatting from it.\n"
+            + _review_dictated_boundary_digest(excerpt)
+            + "\n\nDEEPGRAM TRANSCRIPT:\n" + excerpt
+            + "\n\nWORKER PARTS (preserve their wording and order; their own paragraph breaks are not authoritative, the dictated commands are):\n\n"
+            + "\n\n".join(blocks)
+        )
+        try:
+            answer, model_used = await _human_call_model_chain(
+                chain, review_system, question[:450000], reference_images, 16000, response_validator=_review_validate_output,
+            )
+            text, data = _review_validate_output(answer)
+            models_used.append(model_used)
+        except Exception as exc:
+            logger.warning("Proofreading Agent failed for %s: %s", job_id, exc)
+            reason = str(exc).replace("All configured AI models failed or returned unusable output.", "").strip()[:420]
+            raise HTTPException(status_code=502, detail="The Proofreading Agent could not finish" + (f" ({reason})" if reason else "") + ". Please try again.")
+        final_chunks.append(text)
+        all_parts.extend(data.get("parts") or [])
+        all_changes.extend(data.get("changes") or [])
+        issues.extend(str(x)[:600] for x in (data.get("issues") or []))
+        if data.get("summary"):
+            summary_bits.append(str(data["summary"]))
+
+    await progress("Tidying the formatting and adding the spellings and research notes", 92)
+    combined = "\n\n".join(chunk.strip("\n") for chunk in final_chunks)
+    combined, restored_boundaries = _review_restore_dictation_boundaries(combined, deepgram_text)
+    combined = _review_enforce_indent(combined, texts)
+    combined = _review_normalise_sentence_spacing(combined)
+    combined = _human_restore_dictated_dates(combined, texts)
+    combined = _human_ai_agent_research_footer(
+        combined, research_text if research_status in {"completed", "partial", "unavailable"} else "",
+        source_parts=parts, client_word_list=context, dictated_text=worker_transcript,
+    )
+    clean_changes = []
+    for item in all_changes[:400]:
+        if isinstance(item, dict) and (item.get("why") or item.get("after")):
+            clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
+    return {
+        "combined_text": combined, "changes": clean_changes, "issues": issues[:40], "research": research_text[:12000],
+        "research_status": research_status, "summary": " ".join(summary_bits)[:2000],
+        "models_used": list(dict.fromkeys(models_used)),
+        "deepgram_comparison": {
+            "provider": "Deepgram", "scope": "complete_original_audio", "duration_seconds": deepgram_data.get("duration_seconds"),
+            "transcript_characters": len(deepgram_text), "dictation_boundaries": restored_boundaries[:100],
+        },
+    }
+
+
+async def _proofreading_agent_image(job_id, job, progress):
+    """Whole-file Text Messages / PDF proofread: every page image against the page drafts."""
+    is_text = str(job.get("job_category") or "") == "text_messages"
+    agent_id = "text-messages-gemini" if is_text else "pdf-gemini"
+    guidelines = await _guidelines_for_job(job)
+    context_data = await _human_review_context(job_id, job)
+    context = context_data["text"]
+    if context_data["issues"]:
+        context += "\n\nREFERENCE FILE ALERTS (do not guess at unreadable reference content):\n" + "\n".join(context_data["issues"])
+    system = _human_text_messages_system(guidelines, context) if is_text else _human_ai_agent_system(agent_id, "transcription and formatting", guidelines, context, "")
+    system += _PROOFREADING_AGENT_IMAGE_ADDENDUM
+    await progress("Reading every page and checking it against the drafts", 25)
+    text, models = await _human_image_review_draft(
+        job, agent_id, system, context_data["images"],
+        chain_override=_route_chain("proofreading_agent", HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN),
+    )
+    if not str(text or "").strip():
+        raise HTTPException(status_code=502, detail="The Proofreading Agent returned an empty transcript. Please try again.")
+    await progress("Adding the spellings and research notes", 80)
+    research = await _human_ai_agent_research(text, context)
+    text = _human_ai_agent_research_footer(text, research, client_word_list=context, dictated_text=text)
+    if is_text:
+        text = re.sub(r"<tab>|\[tab\]", "\t", str(text), flags=re.IGNORECASE)
+        text = _review_normalise_sentence_spacing(text)
+        text = _human_collapse_duplicate_image_page_blocks(text, [], (job.get("pdf_review") or {}).get("page_texts"))
+        html = _sanitize_editor_html(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _review_text_to_html(text)))
+        text = text.replace("**", "")
+    else:
+        text = _review_enforce_indent(_review_normalise_sentence_spacing(text), [text])
+        html = _sanitize_editor_html(_review_text_to_html(text))
+    return {
+        "combined_text": text, "combined_html": html, "changes": [], "issues": [], "research": str(research or "")[:12000],
+        "research_status": "completed" if research else "not_needed", "summary": "", "models_used": list(dict.fromkeys(models or [])),
+    }
+
+
+async def human_proofreading_agent(job_id, actor, progress):
+    """Run the Proofreading Agent and put the finished transcript into the job's editor."""
+    job = await _human_job(job_id)
+    blocker = _proofreading_agent_blocker(job)
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    scope = _proofreading_agent_scope(job)
+    result = await (_proofreading_agent_audio(job_id, job, progress) if scope == "audio" else _proofreading_agent_image(job_id, job, progress))
+    combined = result["combined_text"][:1000000]
+    html = result.get("combined_html") or _sanitize_editor_html(_review_text_to_html(combined))
+    names = {
+        "claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.5-flash": "Gemini 3.5 Flash",
+        "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra",
+        "gpt-5.6-sol": "GPT-5.6 Sol", "claude-haiku-5-5": "Claude Haiku 5.5",
+    }
+    used = [names.get(str(m).strip().casefold(), str(m)) for m in result.get("models_used") or []]
+    saved = {
+        "combined_text": combined, "combined_html": html, "parts": [], "changes": result.get("changes") or [],
+        "issues": result.get("issues") or [], "research": result.get("research") or "", "research_status": result.get("research_status"),
+        "deepgram_comparison": result.get("deepgram_comparison"), "summary": result.get("summary") or "",
+        "whole_job": scope != "audio" or not _human_is_split_job(job), "model": " then ".join(dict.fromkeys(used)) or "Proofreading Agent",
+        "models_used": result.get("models_used") or [], "agent": "proofreading_agent", "createdAt": datetime.now().isoformat(),
+    }
+    await progress("Putting the transcript in the editor", 97)
+    ref = db.collection(HUMAN_JOB_COLLECTION).document(job_id)
+    current_snapshot = await asyncio.to_thread(ref.get)
+    current = current_snapshot.to_dict() or {}
+    if current.get("proofreader_status") in {"assigned", "in_progress"}:
+        raise HTTPException(status_code=409, detail="A human proofreader started on this job while the agent was working, so nothing was changed.")
+    updates = {
+        "ai_review": saved, "ai_review_applied": True, "ai_review_appliedAt": firestore.SERVER_TIMESTAMP,
+        "transcript": combined, "transcript_html": html, "ai_combined": True,
+        "reviewer_choice": "ai", "reviewer_status": "completed",
+        "proofreading_agent_completedAt": datetime.now(timezone.utc).isoformat(),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    if scope == "audio" and _human_is_split_job(job):
+        updates.update({"status": "submitted", "proofreader_status": "skipped", "submittedAt": firestore.SERVER_TIMESTAMP})
+    elif scope == "image":
+        updates.update({
+            "status": "submitted", "split_mode": "single", "segments": [], "ai_agent_status": "submitted",
+            "ai_agent_name": "Proofreading Agent", "ai_agent_completedAt": firestore.SERVER_TIMESTAMP,
+        })
+    await asyncio.to_thread(ref.update, updates)
+    _human_list_cache_bump()
+    return saved
+
+
+async def _human_run_proofreading_background(job_id, actor, run_id):
+    _AI_RUNS_ACTIVE.add(run_id)
+
+    async def progress(stage, percent):
+        await _proofreading_write_run(job_id, status="processing", stage=stage, progress=int(percent))
+
+    try:
+        await _proofreading_write_run(job_id, status="processing", stage="Starting", progress=3)
+        await human_proofreading_agent(job_id, actor, progress)
+        await _proofreading_write_run(job_id, status="completed", stage="Done", progress=100, error="")
+    except HTTPException as exc:
+        await _proofreading_write_run(job_id, status="failed", stage="Stopped", error=str(exc.detail)[:600])
+    except Exception:
+        logger.exception("Proofreading Agent failed for %s", job_id)
+        await _proofreading_write_run(job_id, status="failed", stage="Stopped", error="The Proofreading Agent could not finish. Please try again.")
+    finally:
+        _AI_RUNS_ACTIVE.discard(run_id)
+
+
+@app.post("/human-transcription/jobs/{job_id}/proofreading-agent")
+async def human_proofreading_agent_start(job_id: str, request: Request, background_tasks: BackgroundTasks):
+    actor = _require_human_job_admin(request)
+    job = await _human_job(job_id)
+    if not _human_admin_can_see_job(actor, job):
+        raise HTTPException(status_code=403, detail="You can only run the Proofreading Agent on your own jobs.")
+    if _proofreading_run_active(job):
+        return {"started": False, "proofreading_run": job.get("proofreading_run")}
+    blocker = _proofreading_agent_blocker(job)
+    if blocker:
+        raise HTTPException(status_code=409, detail=blocker)
+    run_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    run = {
+        "run_id": run_id, "status": "queued", "stage": "Waiting to start", "progress": 1, "error": "",
+        "startedAt": now, "updatedAt": now, "resume_count": 0,
+        "actor": {"uid": str(actor.get("uid") or ""), "email": str(actor.get("email") or ""), "role": "admin"},
+    }
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"proofreading_run": run})
+    _human_list_cache_bump()
+    background_tasks.add_task(_human_run_proofreading_background, job_id, run["actor"], run_id)
+    return {"started": True, "proofreading_run": {key: value for key, value in run.items() if key != "actor"}}
+
+
+async def human_resume_orphaned_proofreading_runs():
+    """Restart Proofreading Agent runs that a deploy or restart interrupted."""
+    if not db:
+        return 0
+    try:
+        snapshots = await asyncio.to_thread(
+            lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("proofreading_run.status", "in", ["queued", "processing"])).stream())
+        )
+    except Exception as exc:
+        logger.warning("Could not look for interrupted Proofreading Agent runs: %s", exc)
+        return 0
+    resumed = 0
+    for snap in snapshots:
+        run = (snap.to_dict() or {}).get("proofreading_run") or {}
+        run_id = str(run.get("run_id") or "")
+        if not run_id or run_id in _AI_RUNS_ACTIVE or not run.get("actor"):
+            continue
+        if not _proofreading_run_active({"proofreading_run": run}) or int(run.get("resume_count") or 0) >= 2:
+            continue
+        try:
+            await _proofreading_write_run(snap.id, resume_count=int(run.get("resume_count") or 0) + 1, stage="Restarting after a server update")
+        except Exception:
+            continue
+        asyncio.create_task(_human_run_proofreading_background(snap.id, dict(run["actor"]), run_id))
         resumed += 1
     return resumed
 
