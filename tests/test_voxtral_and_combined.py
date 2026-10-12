@@ -97,6 +97,25 @@ class VoxtralParsingTests(unittest.TestCase):
         self.assertIn('"Authorization": f"Bearer {MISTRAL_API_KEY}"', SRC)
         self.assertIn("api.mistral.ai/v1/audio/transcriptions", SRC)
 
+    def test_form_data_is_a_dict_so_the_async_client_accepts_it(self):
+        self.assertIn('form = {"model": VOXTRAL_TRANSCRIPTION_MODEL', SRC)
+        self.assertNotIn('form = [("model"', SRC)
+
+    def test_async_client_really_accepts_multipart_with_dict_data(self):
+        import asyncio
+        import httpx
+
+        async def go():
+            def handler(request):
+                body = request.read()
+                assert b'name="model"' in body and b'name="file"' in body and b'name="diarize"' in body
+                return httpx.Response(200, json={"text": "ok"})
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                r = await client.post("https://x.test/v1", files={"file": ("a.mp3", b"abc", "audio/mpeg")},
+                                      data={"model": "m", "timestamp_granularities": "segment", "diarize": "true"})
+                return r.status_code
+        self.assertEqual(asyncio.run(go()), 200)
+
 
 class RatingFenceTests(unittest.TestCase):
     def test_fenced_json_is_accepted_when_a_validator_exists(self):
