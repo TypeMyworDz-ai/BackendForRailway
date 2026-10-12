@@ -140,26 +140,54 @@ class CombinedPartsTests(unittest.TestCase):
         self.assertIn("Every part must be submitted", body)
         self.assertIn("/human-transcription/jobs/{job_id}/combined-parts.docx", SRC)
 
-    def test_single_part_rule_is_hardcoded(self):
-        self.assertIn("SINGLE-PART JOBS. If the job contains only one part", SRC)
-        self.assertIn("skip the 'combining parts' step", SRC)
+    def test_proofreader_specific_rules_are_no_longer_hardcoded(self):
+        start = SRC.index("_PROOFREADING_AGENT_SYSTEM = (")
+        end = SRC.index("_PROOFREADING_RESEARCH_RULES = (", start)
+        prompt = SRC[start:end]
+        self.assertIn("paragraph breaks", prompt)
+        self.assertIn("minimal contextual corrections", prompt)
+        self.assertIn("follow only the super-admin", prompt.lower())
+        for removed_rule in ("SINGLE-PART JOBS", "STREETS, ADDRESSES AND LOCATIONS", "INDENTATION:", "A. You receive every part"):
+            self.assertNotIn(removed_rule, prompt)
 
 
 class HumanWorkSttAndCreditTests(unittest.TestCase):
     def test_orders_are_as_specified(self):
-        ns = _load({"HUMAN_WORKER_STT_ORDER", "HUMAN_AGENT_STT_ORDER"}, {})
+        ns = _load({"HUMAN_WORKER_STT_ORDER", "HUMAN_AGENT_STT_ORDER", "HUMAN_PROOFREADING_STT_ORDER",
+                    "HUMAN_WORK_STT_PROVIDERS", "HUMAN_WORK_STT_DEFAULTS", "_human_work_stt_config", "_MODEL_ROUTE_CACHE"}, {})
         self.assertEqual(ns["HUMAN_WORKER_STT_ORDER"], ("deepgram", "voxtral", "openai"))
-        self.assertEqual(ns["HUMAN_AGENT_STT_ORDER"], ("voxtral", "assemblyai", "deepgram", "openai"))
+        self.assertEqual(ns["HUMAN_AGENT_STT_ORDER"], ("assemblyai",))
+        self.assertEqual(ns["HUMAN_PROOFREADING_STT_ORDER"], ("deepgram",))
         self.assertNotIn("assemblyai", ns["HUMAN_WORKER_STT_ORDER"])
+        self.assertEqual(ns["_human_work_stt_config"]("audio_agent"), {"order": ("assemblyai",), "comparison": ""})
+        self.assertEqual(ns["_human_work_stt_config"]("proofreading_agent"), {"order": ("deepgram",), "comparison": ""})
 
-    def test_worker_draft_uses_worker_order_and_agents_use_agent_order(self):
-        draft = SRC[SRC.index("async def human_worker_ai_draft") if "async def human_worker_ai_draft" in SRC else 0:]
-        self.assertIn("_human_stt_chain(tmp_path, HUMAN_WORKER_STT_ORDER", SRC)
-        self.assertIn("_human_stt_chain(tmp_path, HUMAN_AGENT_STT_ORDER", SRC)
+    def test_each_audio_stage_reads_super_admin_stt_settings(self):
+        worker = SRC[SRC.index("async def human_worker_ai_draft"):SRC.index("async def human_worker_ai_proofread_draft")]
+        agent_start = SRC.index("async def _human_ai_transcribe_audio")
+        agent = SRC[agent_start:SRC.index("def _human_term_snippets", agent_start)]
+        proofreader = SRC[SRC.index("async def _proofreading_agent_full_audio_transcripts"):SRC.index("async def _proofreading_agent_audio")]
+        self.assertIn('_human_work_stt_config("worker_draft")', worker)
+        self.assertIn('_human_work_stt_config(stage)', agent)
+        self.assertIn('_human_work_stt_config("proofreading_agent")', proofreader)
+        self.assertIn('stage="audio_agent"', SRC)
+        self.assertIn('stage="letter_review"', SRC)
 
-    def test_proofreading_agent_reference_is_still_assemblyai(self):
-        start = SRC.index("async def _proofreading_agent_full_audio_assemblyai")
-        self.assertIn("transcribe_with_assemblyai", SRC[start:start + 2500])
+    def test_stage_settings_allow_one_primary_and_optional_comparison(self):
+        ns = _load({"HUMAN_WORKER_STT_ORDER", "HUMAN_AGENT_STT_ORDER", "HUMAN_PROOFREADING_STT_ORDER", "HUMAN_WORK_STT_PROVIDERS", "HUMAN_WORK_STT_DEFAULTS", "_human_work_stt_config", "_MODEL_ROUTE_CACHE"}, {})
+        ns["_MODEL_ROUTE_CACHE"]["human_work_stt"] = {
+            "audio_agent": {"order": ["assemblyai", "deepgram"], "comparison": "voxtral"},
+            "proofreading_agent": {"order": ["deepgram"], "comparison": "assemblyai"},
+        }
+        self.assertEqual(ns["_human_work_stt_config"]("audio_agent"), {"order": ("assemblyai", "deepgram"), "comparison": "voxtral"})
+        self.assertEqual(ns["_human_work_stt_config"]("proofreading_agent"), {"order": ("deepgram",), "comparison": "assemblyai"})
+
+    def test_stage_routing_api_is_admin_controlled(self):
+        self.assertIn("/api/admin/human-work-stt-routing", SRC)
+        route = SRC[SRC.index("async def admin_put_human_work_stt_routing"):SRC.index('@app.put("/api/admin/model-routing")')]
+        self.assertIn("_require_admin(request)", route)
+        self.assertIn("primary provider and up to two fallbacks", route)
+        self.assertIn("comparison provider must differ", route)
 
     def test_chain_falls_through_and_labels_provider(self):
         import asyncio
@@ -230,7 +258,7 @@ class SpellingSectionAuthorityTests(unittest.TestCase):
 
     def test_worker_search_terms_and_standing_instructions_still_reach_the_agent(self):
         self.assertIn("I researched: Main Street", self.footer("\tBody.\n\nClient spellings: None; My spellings: Tucker.", "", source_parts=self.parts, thorough=True, model_spellings_authoritative=True))
-        self.assertIn("they override any rule above where they differ", SRC)
+        self.assertIn("only standing proofreading rules", SRC)
         self.assertIn("model_spellings_authoritative=True", SRC[SRC.index("async def _proofreading_agent_audio"):][:9000])
         self.assertIn("model_spellings_authoritative=True", SRC[SRC.index("async def _proofreading_agent_image"):][:7000])
 

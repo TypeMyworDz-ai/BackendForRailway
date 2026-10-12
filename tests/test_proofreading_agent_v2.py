@@ -116,21 +116,23 @@ class ResearchTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
-    def test_prompts_name_assemblyai_not_deepgram_authority(self):
+    def test_only_brief_transcript_comparison_instruction_is_hardcoded(self):
         a = SRC.index("_PROOFREADING_AGENT_SYSTEM = (")
-        b = SRC.index("_PROOFREADING_RUN_STALE_SECONDS")
+        b = SRC.index("_PROOFREADING_RESEARCH_RULES = (", a)
         block = SRC[a:b]
-        self.assertIn("AssemblyAI", block)
-        self.assertNotIn("Deepgram", block)
-        for needle in ("STREETS, ADDRESSES AND LOCATIONS", "FORMATTING COMMANDS", "INSTRUCTION AUDIT", "INDENTATION", "go back to"):
-            self.assertIn(needle, block)
+        self.assertIn("comparison-only", block.lower())
+        self.assertIn("paragraph breaks", block)
+        self.assertIn("minimal contextual corrections", block)
+        self.assertIn("follow only the super-admin", block.lower())
+        for needle in ("STREETS, ADDRESSES AND LOCATIONS", "FORMATTING COMMANDS", "INSTRUCTION AUDIT", "INDENTATION", "SINGLE-PART JOBS"):
+            self.assertNotIn(needle, block)
 
-    def test_agent_uses_assemblyai_and_custom_instructions(self):
+    def test_agent_uses_configured_speech_and_custom_instructions(self):
         start = SRC.index("async def _proofreading_agent_audio(")
         end = SRC.index("async def _proofreading_agent_image(")
         body = SRC[start:end]
-        self.assertIn("_proofreading_agent_full_audio_assemblyai", body)
-        self.assertNotIn("_human_review_full_audio_deepgram", body)
+        self.assertIn("_proofreading_agent_full_audio_transcripts", body)
+        self.assertIn('_human_work_stt_config("proofreading_agent")', body)
         self.assertIn("_proofreading_custom_instructions_block", body)
         self.assertIn("safe=True", body)
         self.assertIn("thorough=True", body)
@@ -151,7 +153,7 @@ class WiringTests(unittest.TestCase):
     def test_custom_block(self):
         f = NS["_proofreading_custom_instructions_block"]
         self.assertEqual(f("  "), "")
-        self.assertIn("SUPER ADMIN", f("Always bold the heading."))
+        self.assertIn("SUPER-ADMIN PROOFREADING INSTRUCTIONS", f("Always bold the heading."))
 
     def test_thorough_footer_keeps_streets(self):
         tree = ast.parse(SRC)

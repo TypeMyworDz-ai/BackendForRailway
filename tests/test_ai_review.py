@@ -379,22 +379,23 @@ class AiModelRouting(unittest.TestCase):
         transcriber = self.functions["_human_ai_transcribe_audio"]
         calls = {node.func.id for node in ast.walk(transcriber) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
         self.assertIn("_human_stt_chain", calls)
-        self.assertIn("HUMAN_AGENT_STT_ORDER", ast.unparse(transcriber))
+        self.assertIn("_human_work_stt_config", calls)
+        self.assertIn("stage='audio_agent'", ast.unparse(self.functions["_human_ai_agent_generate"]))
+        self.assertIn("_human_work_stt_config", calls)
         self.assertIn("_human_ai_assembly_transcript", calls)
-        # Deepgram is only a comparison transcript, requested by the audio agents, never the primary.
-        self.assertIn("transcribe_with_deepgram", calls)
-        self.assertIn("compare_with_deepgram", ast.unparse(transcriber))
+        self.assertNotIn("transcribe_with_deepgram", calls)
+        self.assertNotIn("compare_with_deepgram", ast.unparse(transcriber))
         agent_source = "".join(node.value for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Constant) and isinstance(node.value, str))
         self.assertIn("Format the PRIMARY transcript below", agent_source)
         self.assertIn("COMPARISON ONLY", agent_source)
-        self.assertIn("compare_with_deepgram=True", ast.unparse(self.functions["_human_ai_agent_generate"]))
+        self.assertIn("_human_work_stt_config", self.source)
 
         helper = self.functions["_human_ai_assembly_transcript"]
         namespace = {"asyncio": asyncio}
         exec(compile(ast.Module(body=[helper], type_ignores=[]), "main.py", "exec"), namespace)
         single = namespace["_human_ai_assembly_transcript"]
         self.assertEqual(single({"status": "completed", "transcription": "Assembly words."}), {"AssemblyAI": "Assembly words."})
-        with self.assertRaisesRegex(RuntimeError, "AssemblyAI transcript is required"):
+        with self.assertRaisesRegex(RuntimeError, "configured speech transcript is required"):
             single({"status": "failed"})
 
     def test_admin_proofreader_pulls_only_deepgram_as_structure_check(self):
