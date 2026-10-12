@@ -395,6 +395,15 @@ else:
 ASK_MODEL_CATALOGUE = [
     # -- standard: included with any paid plan ------------------------------
     {
+        "id": "gpt-6-luna",
+        "provider": "openai",
+        "label": "ChatGPT 6 Luna",
+        "blurb": "OpenAI's efficient model for fast, high-volume questions and long documents.",
+        "tier": "standard",
+        "credits": 1,
+        "transcript_only": False,
+    },
+    {
         "id": "gpt-5.6-luna",
         "provider": "openai",
         "label": "ChatGPT 5.6 Luna",
@@ -412,15 +421,18 @@ ASK_MODEL_CATALOGUE = [
         "credits": 1,
         "transcript_only": False,
     },
-    # Mistral is wired up and working, but their free tier rejects calls from
-    # this server's address with "Invalid API Key" even though the same key
-    # succeeds elsewhere. Until a payment method is added to the Mistral
-    # account, the entry stays out of the catalogue so no client is offered a
-    # model that cannot answer. To switch it back on, restore this block:
-    #   {"id": "mistral-small-latest", "provider": "mistral",
-    #    "label": "Mistral Small 4",
-    #    "blurb": "A capable European model. Good for summaries and everyday questions.",
-    #    "tier": "standard", "credits": 1, "transcript_only": False},
+    # A Mistral API key is already required by the provider integration. The
+    # account must have working API access; a previous free-tier key returned
+    # "Invalid API Key" from the production server.
+    {
+        "id": "mistral-small-2603",
+        "provider": "mistral",
+        "label": "Mistral Small 4",
+        "blurb": "A capable, economical model for summaries and everyday questions.",
+        "tier": "standard",
+        "credits": 1,
+        "transcript_only": False,
+    },
     {
         "id": "claude-haiku-5-5",
         "provider": "claude",
@@ -537,6 +549,8 @@ def _ask_provider_ready(provider: str) -> bool:
     """
     if provider == "deepseek":
         return bool(os.environ.get("DEEPSEEK_API_KEY"))
+    if provider == "mistral":
+        return bool(os.environ.get("MISTRAL_API_KEY"))
     return True
 
 
@@ -14713,6 +14727,52 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
             found.append(item)
         return found
 
+    worker_research_notes = []
+    worker_research_seen = set()
+    worker_researched_terms = []
+    worker_generic_terms = {"caseworker", "social worker", "worker", "supervisor", "client", "mother", "father", "none", "n a", "na"}
+    worker_private_contact = re.compile(r"(?i)(?:@|\b(?:e-?mail|handle|username|user name|gmail|yahoo|outlook|icloud|hotmail)\b)")
+    worker_private_handle = re.compile(r"(?i)\b[a-z][a-z0-9]*[._][a-z0-9._-]*\d[a-z0-9._-]*\b")
+
+    def collect_worker_research_notes(text):
+        in_notes = False
+        current = []
+
+        def save_note():
+            if not current:
+                return
+            note = re.sub(r"\s+", " ", " ".join(current)).strip()
+            note = re.sub(r"^(?:[-•*]|\d+[.)])\s*", "", note).strip()
+            key = normalized(note)
+            current.clear()
+            if (not key or key in worker_research_seen
+                    or worker_private_contact.search(note) or worker_private_handle.search(note)):
+                return
+            worker_research_seen.add(key)
+            worker_research_notes.append(note)
+
+        for line in str(text or "").splitlines():
+            heading = re.match(r"(?i)^\s*Research Notes\s*:\s*(.*)$", line)
+            if heading:
+                save_note()
+                in_notes = True
+                if heading.group(1).strip():
+                    current.append(heading.group(1).strip())
+                continue
+            if not in_notes:
+                continue
+            if re.match(r"(?i)^\s*(?:Client spellings|My spellings|I searched|I researched)\s*:", line):
+                save_note()
+                in_notes = False
+                continue
+            if not line.strip():
+                save_note()
+                continue
+            if re.match(r"^\s*(?:[-•*]|\d+[.)])\s+", line):
+                save_note()
+            current.append(line.strip())
+        save_note()
+
     # Gather every client/name spelling footer from the model output and each
     # submitted part.  Then remove all those model-written footer lines so the
     # final job contains exactly one authoritative consolidated line.
@@ -14721,7 +14781,7 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
     footer_line_pattern = re.compile(r"(?i)^\s*(?:Client spellings|My spellings|I searched|I researched)\s*:")
     client_spellings, my_spellings = [], []
 
-    def collect_spellings(text, include_client=True):
+    def collect_spellings(text, include_client=True, worker_source=False):
         source = re.split(r"(?im)^\s*Research Notes\s*:", str(text or ""), maxsplit=1)[0]
         for line in source.splitlines():
             line = line.strip()
@@ -14735,13 +14795,22 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
                 target = client_spellings if section_name == "client spellings" and include_client else my_spellings if section_name == "my spellings" else None
                 if target is not None:
                     target.extend(values)
+                elif section_name in {"i searched", "i researched"} and worker_source:
+                    worker_researched_terms.extend(
+                        value for value in values
+                        if normalized(value) not in worker_generic_terms
+                        and not worker_private_contact.search(value)
+                        and not worker_private_handle.search(value)
+                    )
 
     collect_spellings(body, include_client=not bool(source_parts))
     for part in source_parts or []:
         if isinstance(part, dict):
-            collect_spellings(part.get("text") or part.get("transcript") or "")
+            part_text = part.get("text") or part.get("transcript") or ""
         else:
-            collect_spellings(part)
+            part_text = part
+        collect_spellings(part_text, worker_source=True)
+        collect_worker_research_notes(part_text)
 
     def unique_items(values):
         result, seen = [], set()
@@ -14779,16 +14848,39 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
     dictated_source = body if dictated_text is None else dictated_text
     matched_client_words = _human_client_word_list_matches(dictated_source, client_word_list)
 
+    def add_researched_terms(extra_terms=None):
+        terms_to_add = []
+        for term in unique_items(worker_researched_terms + list(extra_terms or [])):
+            key = normalized(term)
+            tokens = key.split()
+            if (not key or key in client_keys
+                    or (tokens and all(token in client_tokens for token in tokens))):
+                continue
+            terms_to_add.append(term)
+        if terms_to_add:
+            footer_parts.append("I researched: " + ", ".join(terms_to_add) + ".")
+
     def notes_section(findings):
-        note_lines = list(findings)
+        note_lines, seen_notes = [], set()
+        for note in worker_research_notes:
+            key = normalized(note)
+            if key and key not in seen_notes:
+                note_lines.append("- " + note)
+                seen_notes.add(key)
+        for finding in findings:
+            key = normalized(finding)
+            if key and key not in seen_notes:
+                note_lines.append(finding)
+                seen_notes.add(key)
         if matched_client_words:
             note_lines.append("Client Word List: " + ", ".join(matched_client_words))
         return "Research Notes:\n" + "\n".join(note_lines) if note_lines else ""
 
     research = str(research or "").strip()
     if not research:
-        # Do not add research labels without grounded findings. A dictated
-        # client-word-list match is the only reason to keep a notes section.
+        # Keep submitted worker notes and search terms even when no new
+        # app-generated research was needed.
+        add_researched_terms()
         return finish(body, footer_parts, notes_section([]))
 
     findings = []
@@ -14855,13 +14947,15 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
     if not parsed_findings:
         # Unstructured or ungrounded model prose is not client-ready research.
         # Never turn it into a generic placeholder section.
+        add_researched_terms()
         return finish(body, footer_parts, notes_section([]))
     if not terms:
+        add_researched_terms()
         return finish(body, footer_parts, notes_section([]))
 
     # Keep search queries and source URLs internal. Show concise explanations
     # for verified terms and explicitly disclose any terms left unresolved.
-    footer_parts.append("I researched: " + ", ".join(terms) + ".")
+    add_researched_terms(terms)
     return finish(body, footer_parts, notes_section(findings))
 
 
@@ -17791,16 +17885,16 @@ _PROOFREADING_AGENT_ADDENDUM = (
     "Never take a date, number, time, name spelling or formatting from Deepgram. List every such change in `changes`.\n"
     "E. NAMES AND PROPER NOUNS. Make every explicitly spelled word or name identical across the whole transcript, and write every proper noun exactly as dictated and confirmed by client spellings, the client word list or research. "
     "Never reword a name, never expand it and never add anything that was not dictated.\n"
-    "F. Do not write a Client spellings, My spellings, I researched or Research Notes section. Remove any such section found at the end of a part; "
-    "the application adds one consolidated spellings section and one consolidated Research Notes section at the very end.\n"
-    "G. The result must be client-ready: no part labels, no leftover worker notes, no duplicated headings or footers, consistent formatting from the first line to the last."
+    "F. Preserve every distinct worker entry under Client spellings, My spellings, I searched, I researched, and Research Notes. "
+    "Consolidate them into one closing spelling/search paragraph and one Research Notes block; remove duplicates only. Do not omit, replace with [Omitted], or discard information because it will be consolidated later. The application may add independently grounded research, but must retain the worker-provided entries.\n"
+    "G. The result must be client-ready: no part labels or duplicated headings; preserve the worker's spelling and research information in the consolidated closing sections, with consistent formatting from the first line to the last."
 )
 
 _PROOFREADING_AGENT_IMAGE_ADDENDUM = (
     "\n\nPROOFREADING AGENT MODE. You are given every page image of the whole file and the page drafts written by workers or AI agents. "
     "Transcribe the whole file from the images yourself, compare it with the page drafts, and produce ONE final, client-ready transcript. "
     "Use the page drafts only where they are right; fix wrong words, missed content and formatting. Join pages smoothly so nothing is cut, doubled or lost where one page ends and the next begins, "
-    "keep names and labels identical from the first page to the last, never add anything that is not in the images, and do not write spellings or research sections (the application adds one consolidated section)."
+    "keep names and labels identical from the first page to the last, never add anything that is not in the images, and preserve all distinct worker Client spellings, My spellings, I searched, I researched, and Research Notes entries in one closing spelling/search paragraph and one Research Notes block. Remove duplicates only; do not omit them."
 )
 
 _PROOFREADING_RUN_STALE_SECONDS = 30 * 60
@@ -17985,6 +18079,13 @@ async def _proofreading_agent_image(job_id, job, progress):
     agent_id = "text-messages-gemini" if is_text else "pdf-gemini"
     guidelines = await _guidelines_for_job(job)
     context_data = await _human_review_context(job_id, job)
+    source_parts = [
+        {"label": (item or {}).get("label") or f"Part {index + 1}", "text": (item or {}).get("transcript") or ""}
+        for index, item in enumerate(job.get("segments") or [])
+        if str((item or {}).get("status") or "") == "submitted" and str((item or {}).get("transcript") or "").strip()
+    ]
+    if not source_parts and str(job.get("transcript") or "").strip():
+        source_parts = [{"label": "Full transcript", "text": job.get("transcript")}]
     context = context_data["text"]
     if context_data["issues"]:
         context += "\n\nREFERENCE FILE ALERTS (do not guess at unreadable reference content):\n" + "\n".join(context_data["issues"])
@@ -17999,7 +18100,9 @@ async def _proofreading_agent_image(job_id, job, progress):
         raise HTTPException(status_code=502, detail="The Proofreading Agent returned an empty transcript. Please try again.")
     await progress("Adding the spellings and research notes", 80)
     research = await _human_ai_agent_research(text, context)
-    text = _human_ai_agent_research_footer(text, research, client_word_list=context, dictated_text=text)
+    text = _human_ai_agent_research_footer(
+        text, research, source_parts=source_parts, client_word_list=context, dictated_text=text
+    )
     if is_text:
         text = re.sub(r"<tab>|\[tab\]", "\t", str(text), flags=re.IGNORECASE)
         text = _review_normalise_sentence_spacing(text)
