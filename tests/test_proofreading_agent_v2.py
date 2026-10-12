@@ -115,6 +115,22 @@ class ResearchTests(unittest.TestCase):
         self.assertIsNotNone(merged)
 
 
+class ResearchPolicyTests(unittest.TestCase):
+    def test_research_pass_only_runs_when_admin_instructions_request_it(self):
+        should_research = NS["_proofreading_research_requested"]
+        self.assertFalse(should_research(""))
+        self.assertFalse(should_research("Follow the job-specific formatting instructions."))
+        self.assertFalse(should_research("Do not research names or locations."))
+        self.assertTrue(should_research("Research street names and verify agency spellings."))
+        self.assertTrue(should_research("Do not research client-supplied terms; research street names."))
+        start = SRC.index("async def _proofreading_agent_research(")
+        end = SRC.index("async def _proofreading_agent_custom_instructions(", start)
+        research_pass = SRC[start:end].lower()
+        self.assertIn("custom_instructions", research_pass)
+        self.assertNotIn("research every street", research_pass)
+        self.assertIn('_proofreading_research_requested(custom_instructions)', research_pass)
+
+
 class WiringTests(unittest.TestCase):
     def test_only_brief_transcript_comparison_instruction_is_hardcoded(self):
         a = SRC.index("_PROOFREADING_AGENT_SYSTEM = (")
