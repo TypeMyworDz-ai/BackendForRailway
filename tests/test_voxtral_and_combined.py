@@ -29,7 +29,7 @@ def _routing(**overrides):
     base = {
         "MISTRAL_API_KEY": "k", "ASSEMBLYAI_API_KEY": "k", "OPENAI_WHISPER_SERVICE_RAILWAY_URL": "u", "DEEPGRAM_SERVICE_RAILWAY_URL": "u",
         "ADMIN_EMAILS": ["typemywordz@gmail.com"], "VOXTRAL_TESTER_EMAIL": "njokigituku@gmail.com",
-        "DEEPGRAM_TESTER_EMAIL": "info@typemywordz.ai", "VOXTRAL_PRIMARY": True,
+        "DEEPGRAM_TESTER_EMAIL": "info@typemywordz.ai",
     }
     base.update(overrides)
     ns = _load({"is_admin_user", "get_transcription_services"}, base)
@@ -37,13 +37,13 @@ def _routing(**overrides):
 
 
 class RoutingTests(unittest.TestCase):
-    def test_everyone_gets_voxtral_then_assemblyai_deepgram_openai(self):
+    def test_clients_get_assemblyai_then_voxtral_openai_deepgram(self):
         f = _routing()
         for plan in ("free", "Monthly Plan", "Yearly Plan", "One-Week Plan"):
-            r = f(plan, False, "client@example.com")
-            self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]], ["voxtral", "assemblyai", "deepgram", "openai_whisper"], plan)
-        admin = f("free", True, "typemywordz@gmail.com")
-        self.assertEqual(admin["tier_1"], "voxtral")
+            for labels in (False, True):
+                r = f(plan, labels, "client@example.com")
+                self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]], ["assemblyai", "voxtral", "openai_whisper", "deepgram"], plan)
+        self.assertEqual(f("free", True, "typemywordz@gmail.com")["tier_1"], "assemblyai")
 
     def test_voxtral_tester_has_no_fallback(self):
         r = _routing()("Monthly Plan", True, "NjokiGituku@gmail.com")
@@ -53,15 +53,9 @@ class RoutingTests(unittest.TestCase):
         r = _routing()("free", False, "info@typemywordz.ai")
         self.assertEqual((r["tier_1"], r["tier_2"]), ("deepgram", "openai_whisper"))
 
-    def test_missing_mistral_key_skips_voxtral_for_everyone_else(self):
+    def test_missing_mistral_key_skips_voxtral(self):
         r = _routing(MISTRAL_API_KEY=None)("free", False, "client@example.com")
-        self.assertEqual(r["tier_1"], "assemblyai")
-        self.assertNotIn("voxtral", [r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]])
-
-    def test_switch_off_restores_plan_order(self):
-        f = _routing(VOXTRAL_PRIMARY=False)
-        self.assertEqual(f("Monthly Plan", False, "c@example.com")["tier_1"], "openai_whisper")
-        self.assertEqual(f("free", False, "c@example.com")["tier_1"], "assemblyai")
+        self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]], ["assemblyai", "openai_whisper", "deepgram", None])
 
 
 class VoxtralParsingTests(unittest.TestCase):
@@ -149,6 +143,57 @@ class CombinedPartsTests(unittest.TestCase):
     def test_single_part_rule_is_hardcoded(self):
         self.assertIn("SINGLE-PART JOBS. If the job contains only one part", SRC)
         self.assertIn("skip the 'combining parts' step", SRC)
+
+
+class HumanWorkSttAndCreditTests(unittest.TestCase):
+    def test_orders_are_as_specified(self):
+        ns = _load({"HUMAN_WORKER_STT_ORDER", "HUMAN_AGENT_STT_ORDER"}, {})
+        self.assertEqual(ns["HUMAN_WORKER_STT_ORDER"], ("deepgram", "voxtral", "openai"))
+        self.assertEqual(ns["HUMAN_AGENT_STT_ORDER"], ("voxtral", "assemblyai", "deepgram", "openai"))
+        self.assertNotIn("assemblyai", ns["HUMAN_WORKER_STT_ORDER"])
+
+    def test_worker_draft_uses_worker_order_and_agents_use_agent_order(self):
+        draft = SRC[SRC.index("async def human_worker_ai_draft") if "async def human_worker_ai_draft" in SRC else 0:]
+        self.assertIn("_human_stt_chain(tmp_path, HUMAN_WORKER_STT_ORDER", SRC)
+        self.assertIn("_human_stt_chain(tmp_path, HUMAN_AGENT_STT_ORDER", SRC)
+
+    def test_proofreading_agent_reference_is_still_assemblyai(self):
+        start = SRC.index("async def _proofreading_agent_full_audio_assemblyai")
+        self.assertIn("transcribe_with_assemblyai", SRC[start:start + 2500])
+
+    def test_chain_falls_through_and_labels_provider(self):
+        import asyncio
+        calls = []
+
+        async def voxtral(*a):
+            calls.append("voxtral"); return {"status": "failed", "error": "boom"}
+
+        async def assembly(*a):
+            calls.append("assemblyai"); raise RuntimeError("down")
+
+        async def deepgram(*a):
+            calls.append("deepgram"); return {"status": "completed", "transcription": "hello there"}
+
+        ns = _load({"_human_stt_chain"}, {
+            "asyncio": asyncio, "logger": __import__("logging").getLogger("t"), "ASSEMBLYAI_API_KEY": "k", "DEEPGRAM_SERVICE_RAILWAY_URL": "u",
+            "transcribe_with_voxtral": voxtral, "transcribe_with_assemblyai": assembly, "transcribe_with_deepgram": deepgram,
+        })
+        out = asyncio.run(ns["_human_stt_chain"]("x.mp3", ("voxtral", "assemblyai", "deepgram", "openai"), "id"))
+        self.assertEqual(calls, ["voxtral", "assemblyai", "deepgram"])
+        self.assertEqual((out["status"], out["provider"]), ("completed", "deepgram"))
+        failed = asyncio.run(ns["_human_stt_chain"]("x.mp3", ("voxtral",), "id"))
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("voxtral: boom", failed["error"])
+
+    def test_proofreading_agent_charges_three_credits_after_success_and_checks_first(self):
+        self.assertIn("HUMAN_PROOFREADING_AGENT_CREDIT_COST = 3", SRC)
+        self.assertIn("HUMAN_WORKER_DRAFT_FORMATTING_CREDITS = 3", SRC)
+        start = SRC.index("async def human_proofreading_agent(")
+        body = SRC[start:start + 4200]
+        self.assertIn('_human_charge_ai_call(actor, job_id, "Proofreading Agent", credit_cost=HUMAN_PROOFREADING_AGENT_CREDIT_COST)', body)
+        self.assertLess(body.index("_human_charge_ai_call"), body.index('"transcript": combined'))
+        endpoint = SRC[SRC.index("async def human_proofreading_agent_start"):][:1500]
+        self.assertIn("_human_require_ai_call_credits(actor, HUMAN_PROOFREADING_AGENT_CREDIT_COST)", endpoint)
 
 
 if __name__ == "__main__":

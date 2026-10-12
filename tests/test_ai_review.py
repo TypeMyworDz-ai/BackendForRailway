@@ -378,7 +378,8 @@ class AiModelRouting(unittest.TestCase):
     def test_audio_agents_use_only_the_assemblyai_transcript(self):
         transcriber = self.functions["_human_ai_transcribe_audio"]
         calls = {node.func.id for node in ast.walk(transcriber) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
-        self.assertIn("transcribe_with_assemblyai", calls)
+        self.assertIn("_human_stt_chain", calls)
+        self.assertIn("HUMAN_AGENT_STT_ORDER", ast.unparse(transcriber))
         self.assertIn("_human_ai_assembly_transcript", calls)
         self.assertNotIn("transcribe_with_deepgram", calls)
         agent_source = "".join(node.value for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Constant) and isinstance(node.value, str))
@@ -578,12 +579,12 @@ class AiModelRouting(unittest.TestCase):
 
     def test_worker_draft_cost_rounds_up_assigned_audio_minutes(self):
         function = self.functions["_human_worker_ai_draft_credit_cost"]
-        namespace = {"math": math}
+        namespace = {"math": math, "HUMAN_WORKER_DRAFT_FORMATTING_CREDITS": 3}
         exec(compile(ast.Module(body=[function], type_ignores=[]), "main.py", "exec"), namespace)
         cost = namespace["_human_worker_ai_draft_credit_cost"]
-        self.assertEqual(cost({"seconds": 60}), {"audio_minutes": 1, "audio_credits": 1, "formatting_credits": 1, "total_credits": 2})
-        self.assertEqual(cost({"seconds": 61}), {"audio_minutes": 2, "audio_credits": 2, "formatting_credits": 1, "total_credits": 3})
-        self.assertEqual(cost({"seconds": 900}, {"start_seconds": 300, "end_seconds": 361}), {"audio_minutes": 2, "audio_credits": 2, "formatting_credits": 1, "total_credits": 3})
+        self.assertEqual(cost({"seconds": 60}), {"audio_minutes": 1, "audio_credits": 1, "formatting_credits": 3, "total_credits": 4})
+        self.assertEqual(cost({"seconds": 61}), {"audio_minutes": 2, "audio_credits": 2, "formatting_credits": 3, "total_credits": 5})
+        self.assertEqual(cost({"seconds": 900}, {"start_seconds": 300, "end_seconds": 361}), {"audio_minutes": 2, "audio_credits": 2, "formatting_credits": 3, "total_credits": 5})
 
     def test_non_admin_job_serializer_hides_internal_model_metadata(self):
         serializer = ast.unparse(self.functions["_human_public_for"])
