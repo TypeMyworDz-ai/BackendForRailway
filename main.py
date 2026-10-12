@@ -843,6 +843,7 @@ HUMAN_RUSH_PAYOUT_KES = 38
 HUMAN_PROOFREADING_PAYOUT_KES = 10
 HUMAN_RATE_SETTINGS_COLLECTION = "system_settings"
 HUMAN_RATE_SETTINGS_DOCUMENT = "human_transcription_rates"
+HUMAN_WORKER_RATE_OVERRIDES_COLLECTION = "human_worker_rate_overrides"
 HUMAN_MIN_TRANSCRIBER_RATE_KES = 1
 HUMAN_MAX_TRANSCRIBER_RATE_KES = 500
 
@@ -877,6 +878,25 @@ async def _get_human_transcriber_rate():
     except Exception as exc:
         logger.warning("Could not load Human Work rate settings: %s", exc)
         return HUMAN_STANDARD_PAYOUT_KES
+
+async def _human_worker_transcriber_rate_kes(worker_uid, default_rate):
+    """Use a worker-specific audio-minute override when present; otherwise keep the job quote rate."""
+    uid = str(worker_uid or "").strip()
+    if not uid or not db:
+        return _validate_human_transcriber_rate(default_rate or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+    try:
+        ref = db.collection(HUMAN_WORKER_RATE_OVERRIDES_COLLECTION).document(uid)
+        snapshot = await asyncio.to_thread(ref.get)
+        data = (snapshot.to_dict() or {}) if snapshot.exists else {}
+        override = data.get("transcriber_rate_kes_per_minute")
+        if override is None:
+            return _validate_human_transcriber_rate(default_rate or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+        return _validate_human_transcriber_rate(override)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not load Human Work rate for worker %s", uid)
+        raise HTTPException(status_code=503, detail="The worker's audio-minute rate could not be checked. Please retry the submission.") from exc
 
 # TMWD_HUMAN_TAT_V2
 # Jobs of one minute or less receive a six-minute minimum TAT. Longer jobs
@@ -4778,6 +4798,98 @@ async def human_admin_update_transcriber_rate(
         "rush_rate_kes_per_minute": HUMAN_RUSH_PAYOUT_KES,
         "proofreading_rate_kes_per_minute": HUMAN_PROOFREADING_PAYOUT_KES,
         "applies_to": "new_jobs_only",
+    }
+
+
+@app.get("/human-transcription/admin/worker-rates")
+async def human_admin_get_worker_rate_overrides(request: Request):
+    """List approved workers and their optional individual audio-minute rates."""
+    _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    try:
+        user_snapshots, override_snapshots = await asyncio.gather(
+            asyncio.to_thread(lambda: list(db.collection("users").stream())),
+            asyncio.to_thread(lambda: list(db.collection(HUMAN_WORKER_RATE_OVERRIDES_COLLECTION).stream())),
+        )
+        overrides = {snapshot.id: (snapshot.to_dict() or {}) for snapshot in override_snapshots}
+        workers = []
+        for snapshot in user_snapshots:
+            data = snapshot.to_dict() or {}
+            if data.get("workerApproved") is not True:
+                continue
+            uid = str(data.get("uid") or snapshot.id).strip()
+            override = overrides.get(uid) or {}
+            rate = override.get("transcriber_rate_kes_per_minute")
+            if rate is not None:
+                rate = _validate_human_transcriber_rate(rate)
+            workers.append({
+                "uid": uid,
+                "name": str(data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker"),
+                "email": str(data.get("email") or ""),
+                "rate_kes_per_minute": rate,
+            })
+        workers.sort(key=lambda item: (item["name"].casefold(), item["email"].casefold()))
+        return {
+            "workers": workers,
+            "standard_rate_kes_per_minute": await _get_human_transcriber_rate(),
+            "minimum_rate_kes_per_minute": HUMAN_MIN_TRANSCRIBER_RATE_KES,
+            "maximum_rate_kes_per_minute": HUMAN_MAX_TRANSCRIBER_RATE_KES,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Main admin could not list individual Human Work rates")
+        raise HTTPException(status_code=500, detail="Individual worker rates could not be loaded.") from exc
+
+
+@app.put("/human-transcription/admin/worker-rates/{worker_uid}")
+async def human_admin_update_worker_rate_override(
+    worker_uid: str,
+    request: Request,
+    transcriber_rate_kes_per_minute: str = Form(""),
+):
+    """Set an individual whole-number audio-minute rate, or clear it to use standard job rates."""
+    admin = _require_admin(request)
+    uid = str(worker_uid or "").strip()
+    if not uid or "/" in uid:
+        raise HTTPException(status_code=400, detail="Choose a valid worker.")
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    try:
+        worker_snapshot = await asyncio.to_thread(db.collection("users").document(uid).get)
+    except Exception as exc:
+        logger.exception("Main admin could not verify worker %s before changing their rate", uid)
+        raise HTTPException(status_code=503, detail="The worker could not be verified. Please retry.") from exc
+    worker = (worker_snapshot.to_dict() or {}) if worker_snapshot.exists else {}
+    if worker.get("workerApproved") is not True:
+        raise HTTPException(status_code=404, detail="That approved worker could not be found.")
+    ref = db.collection(HUMAN_WORKER_RATE_OVERRIDES_COLLECTION).document(uid)
+    value = str(transcriber_rate_kes_per_minute or "").strip()
+    try:
+        if not value:
+            await asyncio.to_thread(ref.delete)
+            rate = None
+        else:
+            rate = _validate_human_transcriber_rate(value)
+            await asyncio.to_thread(ref.set, {
+                "worker_uid": uid,
+                "transcriber_rate_kes_per_minute": rate,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "updatedBy": str(admin.get("email") or "").strip().lower(),
+            }, merge=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Main admin could not save individual Human Work rate for %s", uid)
+        raise HTTPException(status_code=500, detail="The individual worker rate could not be saved.") from exc
+    return {
+        "worker_uid": uid,
+        "rate_kes_per_minute": rate,
+        "uses_standard_rate": rate is None,
+        "standard_rate_kes_per_minute": await _get_human_transcriber_rate(),
     }
 
 
@@ -12241,7 +12353,8 @@ async def human_worker_submit(
                 raise HTTPException(status_code=400, detail="Add your part of the transcript, or attach the finished file, before submitting.")
             quote = job.get("quote") or {}
             minutes = int(target.get("minutes") or 0)
-            rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+            default_rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+            rate = await _human_worker_transcriber_rate_kes(actor["uid"], default_rate)
             target.update({
                 "status": "submitted",
                 "transcript": transcript_text[:1000000],
@@ -12377,7 +12490,11 @@ async def human_worker_submit(
     quote = job.get("quote") or {}
     is_pdf_job = str(job.get("job_type") or "").strip().lower() == "pdf_job"
     minutes = int(job.get("minutes") or quote.get("minutes") or 0)
-    rate = _human_pdf_job_pay_kes(job) if is_pdf_job else int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+    if is_pdf_job:
+        rate = _human_pdf_job_pay_kes(job)
+    else:
+        default_rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
+        rate = await _human_worker_transcriber_rate_kes(actor["uid"], default_rate)
     worker_amount_kes = _human_pdf_job_pay_kes(job) if is_pdf_job else max(0, minutes * rate)
     if is_pdf_job and job.get("pdf_review"):
         worker_amount_kes = PDF_JOB_REVIEW_PAY_KES_PER_PAGE * max(1, int((job.get("pdf_review") or {}).get("page_count") or 1))
