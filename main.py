@@ -114,7 +114,17 @@ ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordz.ai']
 # in testing instead of being quietly masked by another provider. It is
 # deliberately NOT a complimentary account: it must hold a plan or credits
 # like any paying client, so it exercises the real billing path too.
-OPENAI_TESTER_EMAIL = 'njokigituku@gmail.com'
+OPENAI_TESTER_EMAIL = ''
+# Dedicated Voxtral (Mistral) tester. This account used to be the OpenAI
+# tester. It runs Voxtral only, with no fallback, so a Voxtral failure shows up
+# in testing instead of being masked by another provider. It is not
+# payment-exempt.
+VOXTRAL_TESTER_EMAIL = 'njokigituku@gmail.com'
+# For the testing period every ordinary account tries Voxtral first, then
+# AssemblyAI, Deepgram and OpenAI. Set VOXTRAL_PRIMARY=false in Railway to go
+# back to the plan-based order without a code change.
+VOXTRAL_PRIMARY = os.environ.get("VOXTRAL_PRIMARY", "true").strip().lower() not in {"0", "false", "no", "off"}
+VOXTRAL_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
 # Dedicated Deepgram test account. It pays through the normal plan/credit
 # path, starts on Deepgram, and falls back to OpenAI so both services can be
 # tested without changing the experience for ordinary paying clients.
@@ -210,7 +220,7 @@ logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}")
 logger.info(f"DEBUG: DEEPGRAM_SERVICE_RAILWAY_URL loaded value: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"DEBUG: OpenAI Tester email: {OPENAI_TESTER_EMAIL}")
+logger.info(f"DEBUG: Voxtral Tester email: {VOXTRAL_TESTER_EMAIL}; Voxtral primary: {VOXTRAL_PRIMARY}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -1898,135 +1908,81 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     - OpenAI: First option for weekly subscribers, yearly, and Admins (Admins gets this logic no matter what plans they have subscribed to). Fallback is Assembly > Deepgram.
     - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
     - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
-    - njokigituku@gmail.com is the dedicated OpenAI tester: OpenAI only, no fallback, and it pays like any client.
+    - njokigituku@gmail.com is the dedicated Voxtral tester: Voxtral only, no fallback, and it pays like any client.
+    - While VOXTRAL_PRIMARY is on (testing period) everyone else gets Voxtral > AssemblyAI > Deepgram > OpenAI.
     - info@typemywordz.ai is the dedicated Deepgram tester: Deepgram first,
       OpenAI fallback, and normal plan/credit requirements.
     """
     
     is_admin = is_admin_user(user_email) if user_email else False
-    is_openai_tester = (user_email and user_email.lower().strip() == OPENAI_TESTER_EMAIL.lower())
+    is_voxtral_tester = (user_email and user_email.lower().strip() == VOXTRAL_TESTER_EMAIL.lower())
     is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
 
     # --- Initialize tiers ---
     tier_1 = None
     tier_2 = None
     tier_3 = None
+    tier_4 = None
     reason = "default_logic"
 
-    # --- Dedicated OpenAI Tester Logic ---
+    # --- Dedicated Voxtral Tester Logic ---
     # Placed before the speaker-label override on purpose: this account exists
-    # to exercise OpenAI and nothing else, so even a speaker-tag request stays
-    # on it rather than being handed to AssemblyAI.
-    if is_openai_tester:
+    # to exercise Voxtral and nothing else, with no fallback.
+    if is_voxtral_tester:
         return {
-            "tier_1": "openai_whisper",
+            "tier_1": "voxtral",
             "tier_2": None,
             "tier_3": None,
-            "reason": "dedicated_openai_tester"
+            "tier_4": None,
+            "reason": "dedicated_voxtral_tester"
         }
 
     # --- Dedicated Deepgram Tester Logic ---
-    # Placed before the speaker-label override on purpose: this account exists to
-    # exercise Deepgram first, while still exposing the configured OpenAI
-    # fallback if Deepgram is unavailable. It is not payment-exempt.
+    # This account exercises Deepgram first, while still exposing the
+    # configured OpenAI fallback if Deepgram is unavailable. It is not
+    # payment-exempt.
     if is_deepgram_tester:
         return {
             "tier_1": "deepgram",
             "tier_2": "openai_whisper",
             "tier_3": None,
+            "tier_4": None,
             "reason": "dedicated_deepgram_tester_with_openai_fallback"
         }
 
+    available = {
+        "voxtral": bool(MISTRAL_API_KEY),
+        "assemblyai": bool(ASSEMBLYAI_API_KEY),
+        "openai_whisper": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
+        "deepgram": bool(DEEPGRAM_SERVICE_RAILWAY_URL),
+    }
+
+    # --- Testing period: Voxtral first for everyone else ---
+    if VOXTRAL_PRIMARY:
+        order = ["voxtral", "assemblyai", "deepgram", "openai_whisper"]
+        reason = "voxtral_primary_testing_period"
     # --- Speaker Labels Logic (Global Override) ---
     # AssemblyAI first, because it diarizes well. OpenAI sits second and Deepgram
-    # last. OpenAI does not return speaker tags, so a job that falls through to it
-    # comes back as continuous text rather than empty: measured against a real
-    # 8 kHz meeting recording, Deepgram returned 8 characters where AssemblyAI
-    # returned 7,343, so it is no longer trusted as the first fallback.
-    if speaker_labels_enabled:
-        tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = "deepgram"
+    # last (Deepgram returned almost nothing on a real 8 kHz meeting recording).
+    elif speaker_labels_enabled:
+        order = ["assemblyai", "openai_whisper", "deepgram"]
         reason = "speaker_labels_requested_prioritizing_assemblyai"
-
-    # --- Plan-based logic ---
-    # Note the elif: when speaker labels are requested the rule above wins
-    # and none of these run. Between April and now this was an "if", which
-    # quietly overrode the speaker-label rule for admins and yearly users.
-
-    # AssemblyAI first for admins, One-Day, Three-Day and One-Week plans.
-    elif is_admin or user_plan in ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan']:
-        tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = "deepgram"
-        reason = "admin_or_short_plan_prioritizing_assemblyai"
-
-    # Yearly is the most expensive plan, so it gets the same order as admins.
-    elif user_plan == 'Yearly Plan':
-        tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = "deepgram"
-        reason = "yearly_plan_prioritizing_assemblyai"
-
-    # Monthly subscribers start on OpenAI.
-    elif user_plan == 'Monthly Plan':
-        tier_1 = "openai_whisper"
-        tier_2 = "assemblyai"
-        tier_3 = "deepgram"
-        reason = "monthly_plan_prioritizing_openai"
-
-    # Free trial. Best model, so the first transcript someone ever sees
-    # is the most accurate one we can produce.
-    elif user_plan == 'free':
-        tier_1 = "assemblyai"
-        tier_2 = "openai_whisper"
-        tier_3 = "deepgram"
-        reason = "free_trial_prioritizing_assemblyai"
-
-    # Safety net: any plan name that does not match one of the branches
-    # above (a new plan added on the frontend, a naming mismatch, a
-    # credit-only account with no active plan label, etc.) used to leave
-    # every tier as None, which meant zero services were attempted and the
-    # job failed instantly for a paying client. Never let an unrecognised
-    # plan name produce an empty service list again.
+    # AssemblyAI first for admins, One-Day, Three-Day, One-Week, Yearly and free.
+    elif is_admin or user_plan in ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Yearly Plan', 'free']:
+        order = ["assemblyai", "openai_whisper", "deepgram"]
+        reason = "admin_or_plan_prioritizing_assemblyai"
+    # Monthly subscribers start on OpenAI. Any unrecognised plan name gets the
+    # same safe order, so a new plan never produces an empty service list.
     else:
-        tier_1 = "openai_whisper"
-        tier_2 = "assemblyai"
-        tier_3 = "deepgram"
-        reason = f"unmatched_plan_fallback_openai ('{user_plan}')"
+        order = ["openai_whisper", "assemblyai", "deepgram"]
+        reason = f"monthly_or_unmatched_plan_prioritizing_openai ('{user_plan}')"
 
-    # --- Dynamic adjustment based on service availability ---
-    final_tiers_list = []
-    
-    # Tier 1
-    if tier_1 == "assemblyai" and ASSEMBLYAI_API_KEY:
-        final_tiers_list.append("assemblyai")
-    elif tier_1 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL:
-        final_tiers_list.append("openai_whisper")
-    elif tier_1 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL:
-        final_tiers_list.append("deepgram")
-
-    # Tier 2 (only if not already in Tier 1 and is available)
-    if tier_2 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list:
-        final_tiers_list.append("assemblyai")
-    elif tier_2 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
-        final_tiers_list.append("openai_whisper")
-    elif tier_2 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL and "deepgram" not in final_tiers_list:
-        final_tiers_list.append("deepgram")
-
-    # Tier 3 (only if not already in Tier 1 or 2 and is available)
-    if tier_3 == "assemblyai" and ASSEMBLYAI_API_KEY and "assemblyai" not in final_tiers_list:
-        final_tiers_list.append("assemblyai")
-    elif tier_3 == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL and "openai_whisper" not in final_tiers_list:
-        final_tiers_list.append("openai_whisper")
-    elif tier_3 == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL and "deepgram" not in final_tiers_list:
-        final_tiers_list.append("deepgram")
-
-    # Ensure the list does not exceed 3 tiers and fills Nones if less than 3
+    final_tiers_list = [name for name in order if available.get(name)]
     return {
         "tier_1": final_tiers_list[0] if len(final_tiers_list) > 0 else None,
         "tier_2": final_tiers_list[1] if len(final_tiers_list) > 1 else None,
         "tier_3": final_tiers_list[2] if len(final_tiers_list) > 2 else None,
+        "tier_4": final_tiers_list[3] if len(final_tiers_list) > 3 else None,
         "reason": reason
     }
 
@@ -3066,6 +3022,92 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
             "error": "Transcription failed. Please try again later."
         }
 
+async def transcribe_with_voxtral(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
+    """Mistral Voxtral Mini Transcribe 2 through the /v1/audio/transcriptions endpoint.
+
+    Segment timestamps are requested so the editor can seek by time. Mistral
+    does not accept an explicit language together with timestamps, so the
+    language is detected from the audio."""
+    if not MISTRAL_API_KEY:
+        logger.error(f"Voxtral is not configured (MISTRAL_API_KEY missing) for job {job_id}")
+        return {"status": "failed", "error": "Voxtral is not configured (the Mistral API key is missing)."}
+    try:
+        with open(audio_path, "rb") as f:
+            audio_content = f.read()
+        form = [("model", VOXTRAL_TRANSCRIPTION_MODEL), ("timestamp_granularities", "segment")]
+        if speaker_labels_enabled:
+            form.append(("diarize", "true"))
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.mistral.ai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {MISTRAL_API_KEY}"},
+                files={"file": (os.path.basename(audio_path), audio_content, "audio/mpeg")},
+                data=form,
+                timeout=900.0,
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"Voxtral returned HTTP {response.status_code}: {response.text[:300]}")
+        return _voxtral_result_from_payload(response.json(), speaker_labels_enabled)
+    except asyncio.CancelledError:
+        logger.info(f"Voxtral transcription cancelled for job {job_id}")
+        raise
+    except Exception as e:
+        logger.error(f"Voxtral transcription failed for job {job_id}: {str(e)[:400]}")
+        return {"status": "failed", "error": f"Voxtral transcription failed: {str(e)[:200]}"}
+
+
+def _voxtral_result_from_payload(payload: dict, speaker_labels_enabled: bool) -> dict:
+    """Turn a Voxtral response into the transcript shape every other service returns."""
+    payload = payload or {}
+    text = str(payload.get("text") or "").strip()
+    raw_segments = [seg for seg in (payload.get("segments") or []) if isinstance(seg, dict) and str(seg.get("text") or "").strip()]
+    if not text and raw_segments:
+        text = " ".join(str(seg.get("text")).strip() for seg in raw_segments)
+    if not text:
+        raise RuntimeError("Voxtral returned an empty transcript")
+
+    def seconds(value):
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return 0.0
+
+    segments = []
+    has_speakers = bool(speaker_labels_enabled and any(seg.get("speaker_id") not in (None, "") for seg in raw_segments))
+    if has_speakers:
+        speaker_numbers, lines = {}, []
+        for seg in raw_segments:
+            key = str(seg.get("speaker_id") if seg.get("speaker_id") not in (None, "") else "unknown")
+            number = speaker_numbers.setdefault(key, len(speaker_numbers) + 1)
+            label = f"Speaker {number}"
+            piece = str(seg.get("text")).strip()
+            if segments and segments[-1]["speaker"] == label:
+                segments[-1]["text"] += " " + piece
+                segments[-1]["end"] = seconds(seg.get("end"))
+                lines[-1] = f"<strong>{label}:</strong> {segments[-1]['text']}"
+            else:
+                segments.append({"start": seconds(seg.get("start")), "end": seconds(seg.get("end")), "speaker": label, "text": piece, "confidence": None})
+                lines.append(f"<strong>{label}:</strong> {piece}")
+        text = "\n".join(lines)
+    else:
+        for seg in raw_segments:
+            segments.append({"start": seconds(seg.get("start")), "end": seconds(seg.get("end")), "speaker": None,
+                             "text": str(seg.get("text")).strip(), "confidence": None})
+    usage = payload.get("usage") or {}
+    duration = usage.get("prompt_audio_seconds") or (segments[-1]["end"] if segments else 0)
+    return {
+        "status": "completed",
+        "transcription": text,
+        "language": payload.get("language") or "en",
+        "duration": duration,
+        "word_count": len(text.split()),
+        "has_speaker_labels": has_speakers,
+        "segments": segments,
+        "timings_source": "Voxtral",
+        "model_used": payload.get("model") or VOXTRAL_TRANSCRIPTION_MODEL,
+    }
+
+
 async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Calls the dedicated Deepgram service deployed on Render."""
     if not DEEPGRAM_SERVICE_RAILWAY_URL:
@@ -3155,8 +3197,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         tier_1_service = service_config["tier_1"]
         tier_2_service = service_config["tier_2"]
         tier_3_service = service_config["tier_3"]
+        tier_4_service = service_config.get("tier_4")
 
-        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service} ({service_config['reason']})")
+        logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service}, Tier4={tier_4_service} ({service_config['reason']})")
 
         def get_assemblyai_model(plan: str) -> list:
             # Everyone, including free-trial users, gets the highest
@@ -3171,6 +3214,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             "tier_1_service": tier_1_service,
             "tier_2_service": tier_2_service,
             "tier_3_service": tier_3_service,
+            "tier_4_service": tier_4_service,
             "assemblyai_model": assemblyai_model,
             "duration_minutes": duration_minutes,
             "selection_reason": service_config["reason"],
@@ -3180,6 +3224,34 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         transcription_result = None
         services_attempted = []
+
+        async def attempt_voxtral(tier_number):
+            """Run Voxtral for any tier and record the outcome like the other services do."""
+            label = f"tier_{tier_number}"
+            if not MISTRAL_API_KEY:
+                job_data[f"{label}_error"] = "Voxtral is not configured (the Mistral API key is missing)"
+                return None
+            try:
+                logger.info(f"Attempting Voxtral (Tier {tier_number}) for job {job_id}")
+                path, stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                logger.info(f"Audio compressed for Voxtral: {stats}")
+                result = await transcribe_with_voxtral(path, language_code, speaker_labels_enabled, job_id)
+                if result.get("status") == "failed":
+                    job_data[f"{label}_error"] = str(result.get("error") or "Voxtral failed")
+                    job_data[f"{label}_success"] = False
+                else:
+                    job_data[f"{label}_used"] = "voxtral"
+                    job_data[f"{label}_success"] = True
+                services_attempted.append(f"Voxtral_tier{tier_number}")
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(f"Voxtral (Tier {tier_number}) failed: {error}")
+                job_data[f"{label}_error"] = str(error)
+                job_data[f"{label}_success"] = False
+                services_attempted.append(f"Voxtral_tier{tier_number}")
+                return None
 
         # --- ATTEMPT TIER 1 SERVICE ---
         if tier_1_service == "assemblyai":
@@ -3218,6 +3290,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_1_success"] = False
             services_attempted.append(f"{TYPEMYWORDZ2_NAME}_tier1")
         
+        elif tier_1_service == "voxtral":
+            transcription_result = await attempt_voxtral(1)
+
         elif tier_1_service is not None and tier_1_service not in ("assemblyai", "openai_whisper", "deepgram"):
             # Belt and braces. If the router ever names a service the runner
             # does not know, say so loudly instead of falling through every
@@ -3249,7 +3324,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         if (not transcription_result or transcription_result.get("status") == "failed") and tier_2_service:
             logger.warning(f"⚠️ Tier 1 service failed, trying Tier 2 fallback ({tier_2_service}) for job {job_id}")
             
-            if tier_2_service == "assemblyai":
+            if tier_2_service == "voxtral":
+                transcription_result = await attempt_voxtral(2)
+
+            elif tier_2_service == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
                     logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
                     job_data["tier_2_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
@@ -3312,7 +3390,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         if (not transcription_result or transcription_result.get("status") == "failed") and tier_3_service:
             logger.warning(f"⚠️ Tier 2 service failed, trying Tier 3 fallback ({tier_3_service}) for job {job_id}")
             
-            if tier_3_service == "assemblyai":
+            if tier_3_service == "voxtral":
+                transcription_result = await attempt_voxtral(3)
+
+            elif tier_3_service == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
                     logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
                     job_data["tier_3_error"] = f"{TYPEMYWORDZ1_NAME} API Key not configured"
@@ -3369,6 +3450,31 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                         job_data["tier_3_success"] = False
                 services_attempted.append(f"{DEEPGRAM_NAME}_tier3")
             
+        # --- ATTEMPT TIER 4 SERVICE (FALLBACK 3) ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_4_service:
+            logger.warning(f"Tier 3 service failed, trying Tier 4 fallback ({tier_4_service}) for job {job_id}")
+            if tier_4_service == "voxtral":
+                transcription_result = await attempt_voxtral(4)
+            else:
+                try:
+                    if compressed_path is None:
+                        compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                    if tier_4_service == "assemblyai" and ASSEMBLYAI_API_KEY:
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                    elif tier_4_service == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
+                    elif tier_4_service == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL:
+                        transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
+                    else:
+                        raise RuntimeError(f"{tier_4_service} is not configured")
+                    job_data["tier_4_used"] = tier_4_service
+                    job_data["tier_4_success"] = bool(transcription_result and transcription_result.get("status") != "failed")
+                except Exception as error:
+                    logger.error(f"Tier 4 ({tier_4_service}) failed: {error}")
+                    job_data["tier_4_error"] = str(error)
+                    job_data["tier_4_success"] = False
+                services_attempted.append(f"{tier_4_service}_tier4")
+
         check_cancellation()
 
         # Final result processing
@@ -3382,7 +3488,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             })
         else:
             logger.info(f"✅ Transcription completed successfully for job {job_id}")
-            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used"))
+            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used"))
             model_used = "N/A"
 
             if service_used_name == "assemblyai":
@@ -3392,6 +3498,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 model_used = transcription_result.get("model_used") or "whisper-1"
             elif service_used_name == "deepgram":
                 model_used = "deepgram-nova"
+            elif service_used_name == "voxtral":
+                model_used = transcription_result.get("model_used") or VOXTRAL_TRANSCRIPTION_MODEL
 
             logger.info(f"📊 Job {job_id} for user {user_email} completed. Service: {service_used_name}, Model: {model_used}")
 
@@ -3524,7 +3632,7 @@ async def root():
             "yearly_plan_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "admin_transcription": f"Primary={TYPEMYWORDZ1_NAME} → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={TYPEMYWORDZ2_NAME} → Fallback2={DEEPGRAM_NAME}",
-            "openai_tester_transcription": f"Always use {TYPEMYWORDZ2_NAME} (no fallback for {OPENAI_TESTER_EMAIL})",
+            "voxtral_tester_transcription": f"Always use Voxtral (no fallback for {VOXTRAL_TESTER_EMAIL})",
             "deepgram_tester_transcription": f"Primary=Deepgram → Fallback=OpenAI for {DEEPGRAM_TESTER_EMAIL}",
             "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
@@ -5905,7 +6013,7 @@ async def list_jobs():
             "user_email": job_data.get("user_email", ""),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("tier_1_service"),
-            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used")),
+            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used")),
             "model_used": job_data.get("model_used", "N/A"),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
@@ -16829,6 +16937,11 @@ async def _human_call_model_chain(model_chain, system_prompt, question, images=N
             if not answer:
                 raise ValueError("empty model response")
             stray = _human_draft_stray_message(answer)
+            # A structured (JSON) reply is often wrapped in a code fence; the
+            # validator below decides whether it is usable. Only a plain draft,
+            # with no validator, is rejected for being fenced.
+            if stray == "the whole draft wrapped in a code block" and response_validator:
+                stray = ""
             if stray:
                 raise ValueError(f"model output contained {stray}")
             if response_validator:
@@ -17937,6 +18050,7 @@ _PROOFREADING_AGENT_ADDENDUM = (
     "A. You receive every part of ONE job, written by human workers or AI agents, together with an AssemblyAI transcript of the complete original audio. Produce the whole job as one final, client-ready transcript, in order, with no part labels.\n"
     "B. PARAGRAPHS AND TABS. Wherever the speaker used paragraph language (next paragraph, new paragraph, enter, next line, new line, drop down, line break) the final transcript must have that break, and every body paragraph starts with one real TAB unless an instruction says not to indent (rule J). Use the list of dictated commands in the prompt as a checklist and delete the command words themselves. "
     "Never split a paragraph anywhere except at a place the speaker dictated: never in the middle of a sentence, never in the middle of a word, number, hyphenated word, abbreviation or address.\n"
+    "C0. SINGLE-PART JOBS. If the job contains only one part (the whole job was done by one worker), skip the 'combining parts' step completely: there are no seams to join. Proofread that one part against the rules below.\n"
     "C. SEAMS BETWEEN PARTS. The recording was cut into parts by time, so a sentence can be cut off, doubled or missing where one part ends and the next begins. Join every seam so that no sentence is half-finished, repeated or lost, using the AssemblyAI transcript at that point to see what was said. Do not start a new paragraph at a seam unless the speaker dictated one.\n"
     "D. MINIMAL CONTEXTUAL CORRECTIONS. Change a worker's word only when you are one hundred percent certain, from the sentence and from the AssemblyAI transcript, that the worker's word is wrong (for example it makes no sense in context and the machine's word clearly does). Make the smallest possible change; never rewrite, smooth, reorder or professionalise; when there is any doubt keep the worker's wording. Never take a date, number, time, name spelling or formatting from the machine transcript. Never change a worker's spelling of a name or place to match the machine transcript.\n"
     "E. NAMES AND PROPER NOUNS. Make every explicitly spelled word or name identical across the whole transcript, and write every proper noun exactly as dictated and confirmed by client spellings, the client word list or verified research. Standardise each person's name to one spelling throughout. Never reword a name, never expand it and never add anything that was not dictated.\n"
@@ -18773,6 +18887,78 @@ async def _human_run_proofreading_background(job_id, actor, run_id):
         await _proofreading_write_run(job_id, status="failed", stage="Stopped", error="The Proofreading Agent could not finish. Please try again.")
     finally:
         _AI_RUNS_ACTIVE.discard(run_id)
+
+
+def _proofreading_combined_marked_text(job):
+    """Every submitted part joined in order, keeping the formatting the workers applied."""
+    pieces = []
+    if _human_is_split_job(job):
+        for item in job.get("segments") or []:
+            plain = str((item or {}).get("transcript") or "")
+            if plain.strip():
+                pieces.append(_proofreading_marked_text(plain, (item or {}).get("transcript_html")).strip("\n"))
+    else:
+        plain = str(job.get("transcript") or "")
+        if plain.strip():
+            pieces.append(_proofreading_marked_text(plain, job.get("transcript_html")).strip("\n"))
+    return _proofreading_heal_paragraph_cuts("\n\n".join(pieces))
+
+
+def _proofreading_marked_text_to_docx(text):
+    """Word document with one paragraph per line, tabs kept and bold/underline/italics applied."""
+    document = Document()
+    for section in document.sections:
+        section.left_margin = section.right_margin = section.top_margin = section.bottom_margin = Inches(1)
+    normal = document.styles["Normal"]
+    normal.paragraph_format.space_before = 0
+    normal.paragraph_format.space_after = 0
+    active = {"b": False, "u": False, "i": False}
+    for line in str(text or "").split("\n"):
+        paragraph = document.add_paragraph()
+        pos = 0
+
+        def add(chunk):
+            if not chunk:
+                return
+            run = paragraph.add_run(chunk)
+            run.bold = active["b"] or None
+            run.underline = active["u"] or None
+            run.italic = active["i"] or None
+
+        for match in _PR_MARK_TOKEN_RE.finditer(line):
+            add(line[pos:match.start()])
+            active[match.group(2)] = match.group(1) != "/"
+            pos = match.end()
+        add(line[pos:])
+        # Formatting never runs on past the end of a line unless the next line reopens it.
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+@app.get("/human-transcription/jobs/{job_id}/combined-parts.docx")
+async def human_combined_parts_docx(job_id: str, request: Request):
+    """Backup copy: every submitted part combined into one Word document, before any proofreading."""
+    actor = _require_human_job_admin(request)
+    job = await _human_job(job_id)
+    if not _human_admin_can_see_job(actor, job):
+        raise HTTPException(status_code=403, detail="You can only download your own jobs.")
+    if not _proofreading_agent_scope(job):
+        raise HTTPException(status_code=409, detail="The combined download is available for General, Text Messages and PDF jobs.")
+    if _human_is_split_job(job):
+        segments = job.get("segments") or []
+        if not segments or not all((item or {}).get("status") == "submitted" for item in segments):
+            raise HTTPException(status_code=409, detail="Every part must be submitted before the parts can be combined.")
+    text = _proofreading_combined_marked_text(job)
+    if not text.strip():
+        raise HTTPException(status_code=409, detail="The submitted parts have no typed text to combine.")
+    content = await asyncio.to_thread(_proofreading_marked_text_to_docx, text)
+    filename = f"combined-parts-{str(job_id)[:8]}.docx"
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"', "Cache-Control": "no-store"},
+    )
 
 
 @app.post("/human-transcription/jobs/{job_id}/proofreading-agent")
