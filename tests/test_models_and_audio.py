@@ -75,6 +75,25 @@ class ModelsAndAudioTests(unittest.TestCase):
         finally:
             os.environ.pop("DEEPSEEK_API_KEY", None)
 
+    def test_gpt6_luna_and_mistral_small4_are_standard_and_key_gated(self):
+        catalogue = {model["id"]: model for model in self.ns["ASK_MODEL_CATALOGUE"]}
+        self.assertEqual((catalogue["gpt-6-luna"]["provider"], catalogue["gpt-6-luna"]["tier"], catalogue["gpt-6-luna"]["credits"]), ("openai", "standard", 1))
+        self.assertEqual((catalogue["mistral-small-2603"]["provider"], catalogue["mistral-small-2603"]["tier"], catalogue["mistral-small-2603"]["credits"]), ("mistral", "standard", 1))
+        import os
+        previous = os.environ.pop("MISTRAL_API_KEY", None)
+        try:
+            ids = [model["id"] for model in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
+            self.assertIn("gpt-6-luna", ids)
+            self.assertNotIn("mistral-small-2603", ids)
+            os.environ["MISTRAL_API_KEY"] = "test-key"
+            ids = [model["id"] for model in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
+            self.assertIn("mistral-small-2603", ids)
+        finally:
+            if previous is None:
+                os.environ.pop("MISTRAL_API_KEY", None)
+            else:
+                os.environ["MISTRAL_API_KEY"] = previous
+
     def test_standard_plan_does_not_get_premium_models(self):
         ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
         self.assertIn("gpt-5.6-luna", ids)

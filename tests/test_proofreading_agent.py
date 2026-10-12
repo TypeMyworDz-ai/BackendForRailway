@@ -46,6 +46,19 @@ class ProofreadingAgentTests(unittest.TestCase):
         self.assertIn('"ai_review_run", "proofreading_run"', SRC)
         self.assertIn("/proofreading-agent", SRC)
 
+    def test_worker_notes_are_preserved_by_both_agent_prompts(self):
+        audio_start = SRC.index("_PROOFREADING_AGENT_ADDENDUM = (")
+        image_start = SRC.index("_PROOFREADING_AGENT_IMAGE_ADDENDUM = (")
+        audio_prompt = SRC[audio_start:image_start]
+        image_prompt = SRC[image_start:SRC.index("_PROOFREADING_RUN_STALE_SECONDS", image_start)]
+        for prompt in (audio_prompt, image_prompt):
+            self.assertIn("preserve", prompt.lower())
+            self.assertIn("Research Notes", prompt)
+            self.assertIn("I searched", prompt)
+            self.assertIn("do not omit", prompt.lower())
+        self.assertNotIn("Do not write a Client spellings", audio_prompt)
+        self.assertNotIn("do not write spellings or research sections", image_prompt)
+
     def test_stale_run_not_active(self):
         f = _ns()["_proofreading_run_active"]
         self.assertTrue(f({"proofreading_run": {"status": "processing", "startedAt": datetime.now(timezone.utc).isoformat()}}))

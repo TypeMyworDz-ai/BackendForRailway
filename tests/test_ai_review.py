@@ -483,6 +483,28 @@ class AiModelRouting(unittest.TestCase):
         self.assertNotIn("Summit Psych", result)
         self.assertNotIn("UNVERIFIED TERMS", result)
 
+    def test_admin_final_footer_preserves_and_consolidates_worker_notes(self):
+        footer = NS["_human_ai_agent_research_footer"]
+        transcript = "Summit Psych and Woodward Park were named in the transcript.\nClient spellings: ModelOnly."
+        parts = [
+            {"label": "Part 1", "text": "Opening text.\nClient spellings: Alia; My spellings: Renee; I searched: Summit Psych\nResearch Notes:\n- Summit Psych is the provider named in the recording."},
+            {"label": "Part 2", "text": "Second text.\nClient spellings: Zaliah; My spellings: Renee, Chris; I searched: Summit Psych, Old Town Clinic\nResearch Notes:\n- Summit Psych is the provider named in the recording.\n- Old Town Clinic was the clinic checked for this transcript."},
+        ]
+        worker_only = footer(transcript, "", source_parts=parts, dictated_text=transcript)
+        self.assertIn("Client spellings: Alia, Zaliah; My spellings: Renee, Chris; I researched: Summit Psych, Old Town Clinic.", worker_only)
+        self.assertEqual(worker_only.count("Research Notes:"), 1)
+        self.assertEqual(worker_only.count("Summit Psych is the provider named in the recording."), 1)
+        self.assertIn("Old Town Clinic was the clinic checked for this transcript.", worker_only)
+        self.assertNotIn("ModelOnly", worker_only)
+        self.assertNotIn("Part 1", worker_only)
+
+        research = "Woodward Park | Woodward Park | A local park named as the meeting place in the transcript. | confidence: yes"
+        with_app_research = footer(transcript, research, source_parts=parts, dictated_text=transcript)
+        self.assertIn("I researched: Summit Psych, Old Town Clinic, Woodward Park.", with_app_research)
+        self.assertIn("Summit Psych is the provider named in the recording.", with_app_research)
+        self.assertIn("- Woodward Park: A local park named as the meeting place in the transcript. (confidence: yes)", with_app_research)
+        self.assertEqual(with_app_research.count("Research Notes:"), 1)
+
     def test_candidate_terms_skip_sentence_start_words_and_titles(self):
         text = "Present at the home was Ms. Wade. Both children were home. They visited Woodward Park. Then Ohio came up. Historically Owens lived there. If Aaliyah came later."
         terms = NS["_human_review_candidate_terms"]([{"text": text}], "", "")
