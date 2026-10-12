@@ -3567,12 +3567,14 @@ async def lifespan(app: FastAPI):
     logger.info("Health monitor task created")
     human_expiry_task = asyncio.create_task(human_expiry_monitor())
     human_payout_task = asyncio.create_task(human_payout_monitor())
+    auto_finish_task = asyncio.create_task(_human_auto_finish_monitor())
     logger.info("Human worker TAT and payout monitor tasks created")
     yield
     logger.info("Application lifespan shutdown")
     health_task.cancel()
     human_expiry_task.cancel()
     human_payout_task.cancel()
+    auto_finish_task.cancel()
     for job_id, task in active_background_tasks.items():
         if not task.done():
             logger.info(f"Cancelling background task for job {job_id}")
@@ -8108,6 +8110,53 @@ def _human_ai_draft_finish_eligible(job):
     return bool(job.get("pdf_review") and str(job.get("transcript") or "").strip())
 
 
+HUMAN_AUTO_FINISH_HOURS = 12
+
+
+def _human_job_is_internal(job):
+    job = job or {}
+    return bool(job.get("admin_uploaded") is True or str(job.get("job_type") or "").strip().lower() in {"pdf_job", "letter_job"})
+
+
+def _human_job_proofread_done(job):
+    """True once proofreading (agent, human, AI review, or the admin) has been completed."""
+    job = job or {}
+    return bool(
+        job.get("ai_review_applied") is True
+        or job.get("proofreader_status") == "submitted"
+        or job.get("reviewer_status") == "completed"
+        or job.get("letter_ai_review_status") == "completed"
+        or job.get("admin_proofread_at")
+    )
+
+
+def _human_submitted_at(job):
+    """When the job last became Submitted (latest proofreading or submission time)."""
+    job = job or {}
+    latest = None
+    for key in ("submittedAt", "ai_review_appliedAt", "proofreader_completedAt", "admin_proofread_at", "letter_ai_review_completedAt"):
+        value = _as_dt(job.get(key))
+        if value is not None and (latest is None or value > latest):
+            latest = value
+    if latest is None:
+        latest = _as_dt(job.get("updatedAt")) or _as_dt(job.get("createdAt"))
+    return latest
+
+
+def _human_auto_finish_due(job, now=None, hours=HUMAN_AUTO_FINISH_HOURS):
+    """Internal jobs that are proofread and have sat in Submitted for 12 hours finish by themselves."""
+    job = job or {}
+    if job.get("status") != "submitted" or not _human_job_is_internal(job):
+        return False
+    if not _human_job_proofread_done(job) or not _human_admin_finish_job_eligible(job):
+        return False
+    since = _human_submitted_at(job)
+    if since is None:
+        return False
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    return (now - since) >= timedelta(hours=hours)
+
+
 def _human_admin_finish_job_eligible(job):
     """Allow an admin to finish only complete submitted work, never live assignments."""
     job = job or {}
@@ -8892,6 +8941,12 @@ def _human_subadmin_assignment_metadata(job, segment=None, ai_used=None):
                 uid = str(source.get(f"{prefix}_assigned_by_uid") or source.get(f"{prefix}_assigned_by") or "").strip()
                 assigned_at = source.get(f"{prefix}_assignedAt") or source.get(f"{prefix}_assigned_at")
                 return email, uid, assigned_at
+    # Admin-uploaded jobs are released to workers without a separate approval record,
+    # so the sub-admin who uploaded (owns) the job is the one who earns from it.
+    owner_uid, owner_email = _human_job_owner_of(job)
+    if is_human_subadmin(owner_email):
+        owner_at = job.get("routingDecidedAt") or job.get("approvedAt") or job.get("approved_at") or job.get("createdAt")
+        return owner_email, owner_uid, owner_at
     if ai_used is False:
         configured = sorted({str(value or "").strip().lower() for value in HUMAN_JOB_ADMIN_EMAILS if is_human_subadmin(value)})
         approved_at = job.get("approvedAt") or job.get("approved_at")
@@ -11085,6 +11140,108 @@ async def human_admin_update_subadmin_rates(request: Request):
     return _human_subadmin_rate_public(values)
 
 
+async def _human_auto_finish_submitted_jobs():
+    """Move proofread internal jobs from Submitted to Finished (released) after 12 hours."""
+    if not db:
+        return 0
+    snapshots = await asyncio.to_thread(
+        lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("status", "==", "submitted")).stream())
+    )
+    finished = 0
+    for snap in snapshots:
+        job = snap.to_dict() or {}
+        if not _human_auto_finish_due(job):
+            continue
+        job_ref = db.collection(HUMAN_JOB_COLLECTION).document(snap.id)
+        transaction = db.transaction()
+
+        @firestore.transactional
+        def release(tx, job_ref=job_ref):
+            current_snapshot = job_ref.get(transaction=tx)
+            current = current_snapshot.to_dict() or {}
+            if not _human_auto_finish_due(current):
+                return None
+            tx.update(job_ref, {
+                "status": "released", "admin_finishedAt": firestore.SERVER_TIMESTAMP, "admin_finishedBy": "system",
+                "auto_finished": True, "releasedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+            })
+            return current
+
+        try:
+            current = await asyncio.to_thread(release, transaction)
+        except Exception:
+            logger.exception("Could not auto-finish Human Work job %s", snap.id)
+            continue
+        if current is None:
+            continue
+        finished += 1
+        try:
+            await _human_subadmin_accrue_job_earnings(snap.id, current, _human_subadmin_submission_actor(current))
+        except Exception:
+            logger.exception("Could not accrue sub-admin earnings for auto-finished job %s", snap.id)
+        try:
+            await _complete_human_admin_notifications(snap.id, {"job_submitted"})
+        except Exception:
+            logger.warning("Could not clear notifications for auto-finished job %s", snap.id)
+    if finished:
+        _human_list_cache_bump()
+        logger.info("Auto-finished %s submitted Human Work jobs", finished)
+    return finished
+
+
+async def _human_auto_finish_monitor():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await _human_auto_finish_submitted_jobs()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Auto-finish check failed")
+        await asyncio.sleep(900)
+
+
+async def _human_subadmin_backfill_recent(days=3):
+    """Accrue any sub-admin earnings that were missed for recent jobs. Safe to repeat:
+    every earning has a deterministic ID, so existing ones are never duplicated."""
+    if not db:
+        return {"scanned": 0, "created": 0, "by_subadmin": {}}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, min(int(days or 3), 14)))
+    snapshots = await asyncio.to_thread(
+        lambda: list(db.collection(HUMAN_JOB_COLLECTION).where(filter=FieldFilter("updatedAt", ">=", cutoff)).stream())
+    )
+    scanned = created = 0
+    by_subadmin = {}
+    for snap in snapshots:
+        job = snap.to_dict() or {}
+        owner_uid, owner_email = _human_job_owner_of(job)
+        actor = _human_subadmin_submission_actor(job)
+        email = str(actor.get("email") or owner_email or "").strip().lower()
+        if not is_human_subadmin(email):
+            continue
+        scanned += 1
+        try:
+            count = await _human_subadmin_accrue_job_earnings(snap.id, job, actor)
+        except Exception:
+            logger.exception("Sub-admin earnings backfill failed for job %s", snap.id)
+            continue
+        if count:
+            created += count
+            by_subadmin[email] = by_subadmin.get(email, 0) + count
+    return {"scanned": scanned, "created": created, "by_subadmin": by_subadmin}
+
+
+@app.post("/api/admin/subadmin-earnings/backfill")
+async def human_admin_backfill_subadmin_earnings(request: Request):
+    """Main admin only: re-check recent jobs and accrue any missing sub-admin earnings."""
+    _require_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await _human_subadmin_backfill_recent((payload or {}).get("days") or 3)
+
+
 @app.post("/api/admin/subadmin-earnings/recalculate-images")
 async def human_admin_recalculate_image_earnings(request: Request):
     """Re-price image earnings that are still accruing at the current rates.
@@ -12753,16 +12910,26 @@ async def human_admin_finish_job(job_id: str, request: Request):
             )
         job_type = str(current.get("job_type") or "").strip().lower()
         internal_release = job_type in {"pdf_job", "letter_job"} or current.get("admin_uploaded") is True
-        finished_status = "released" if internal_release else "client_review"
-        updates = {
-            "status": finished_status,
-            "admin_finishedAt": firestore.SERVER_TIMESTAMP,
-            "admin_finishedBy": str(actor.get("email") or "").strip().lower(),
-            "reviewedAt": firestore.SERVER_TIMESTAMP,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        }
         if internal_release:
-            updates["releasedAt"] = firestore.SERVER_TIMESTAMP
+            # Internal work is not finished by hand any more: marking it proofread moves it to
+            # Submitted, and the system finishes it automatically after 12 hours.
+            finished_status = "submitted"
+            updates = {
+                "status": "submitted",
+                "admin_proofread_at": firestore.SERVER_TIMESTAMP,
+                "admin_proofread_by": str(actor.get("email") or "").strip().lower(),
+                "submittedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
+        else:
+            finished_status = "client_review"
+            updates = {
+                "status": finished_status,
+                "admin_finishedAt": firestore.SERVER_TIMESTAMP,
+                "admin_finishedBy": str(actor.get("email") or "").strip().lower(),
+                "reviewedAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }
         tx.update(job_ref, updates)
         return current, finished_status, internal_release
 
@@ -15791,6 +15958,11 @@ async def _human_resume_orphans_after_start():
         await human_resume_orphaned_proofreading_runs()
     except Exception as exc:
         logger.warning("Resuming interrupted Proofreading Agent runs failed: %s", exc)
+    try:
+        result = await _human_subadmin_backfill_recent(3)
+        logger.info("Sub-admin earnings backfill: %s", result)
+    except Exception as exc:
+        logger.warning("Sub-admin earnings backfill failed: %s", exc)
 
 
 @app.post("/human-transcription/jobs/{job_id}/routing")
@@ -16133,7 +16305,11 @@ async def _human_run_letter_ai_review(job_id):
             text = str(answer_text or "")
             has_label = bool(re.search(r"\bI researched\s*:", text, re.IGNORECASE))
             has_notes = bool(re.search(r"^\s*Research Notes\s*:", text, re.IGNORECASE | re.MULTILINE))
-            if not research and (has_label or has_notes):
+            # The worker's own submitted letter may legitimately carry its research sections; only
+            # reject research the reviewer invented when no new results exist and the submission had none.
+            submitted_has_label = bool(re.search(r"\bI researched\s*:|\bI searched\s*:", letter_text, re.IGNORECASE))
+            submitted_has_notes = bool(re.search(r"^\s*Research Notes\s*:", letter_text, re.IGNORECASE | re.MULTILINE))
+            if not research and ((has_label and not submitted_has_label) or (has_notes and not submitted_has_notes)):
                 raise ValueError("The reviewed letter must not claim research when no results were returned.")
         question = (
             "Independently review the entire submitted letter against both full-recording transcripts and all applicable Letter Job guidelines. "
