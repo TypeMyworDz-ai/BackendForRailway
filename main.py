@@ -18416,13 +18416,28 @@ _PROOFREADING_AGENT_ADDENDUM = (
 
 _PROOFREADING_AGENT_IMAGE_ADDENDUM = ""
 
+# Research policy comes only from the saved super-admin instructions.  Keep this
+# empty marker for source-based tests and compatibility with older test loaders.
 _PROOFREADING_RESEARCH_RULES = (
-    "RESEARCH SCOPE FOR THE PROOFREADING AGENT (THOROUGH): Research EVERY street name, street address (including the dictated number), road, highway, intersection, neighbourhood, city, town, county, park, school, hospital, clinic, shelter, business, landmark, agency, organisation, program, facility and other location that appears in the transcript. "
-    "Do NOT skip a place because it looks familiar: familiar-looking street and place names are exactly where transcribers go wrong. Also research distinctive proper nouns such as companies, programs, databases and software. Do not research ordinary personal names, everyday words, generic roles, terms the client spelled out, or client word-list entries.\n"
-    "For each term, run real web searches. Use the city, county or state mentioned or implied elsewhere in the transcript to choose the right place, and say how it fits the context (for example the city and state it belongs to, or what the organisation is and why it fits what the speaker was describing). "
-    "If the dictated spelling differs from the verified one, give the verified spelling. If you cannot verify a term, say so with confidence no. Never invent a place, and never add, expand, shorten or replace the dictated information.\n"
-    "Output one line per term, in exactly this form: dictated form | verified spelling | one or two sentences saying what or where it is and why it fits this transcript | confidence yes/no. No headings, no extra prose. If nothing qualifies, return exactly NO_SEARCHED_TERMS.\n\n"
+    ""
 )
+
+
+def _proofreading_research_requested(instructions):
+    """Only run the separate research pass when the super-admin asks for it."""
+    text = str(instructions or "").strip()
+    if not text:
+        return False
+    clauses = re.split(r"(?<=[.!?;])\s+|\n|\s+but\s+|,\s+", text, flags=re.IGNORECASE)
+    for clause in clauses:
+        match = re.search(r"\b(?:research|web\s+search|search\s+online|look\s+up)\b", clause, flags=re.IGNORECASE)
+        if not match:
+            continue
+        before = clause[:match.start()]
+        if re.search(r"\b(?:do\s+not|don't|never|avoid|no\s+need\s+to)\b", before, flags=re.IGNORECASE):
+            continue
+        return True
+    return False
 
 _PROOFREADING_RUN_STALE_SECONDS = 30 * 60
 
@@ -18808,10 +18823,10 @@ def _proofreading_merge_research(results):
     return "\n".join(rows) + ("\n\n" + "\n\n".join(evidence) if evidence else "")
 
 
-async def _proofreading_agent_research(worker_text, context="", extra_terms=None):
-    """Thorough research of every street, location and distinctive name.
-
-    Returns {"text": str, "status": completed|partial|unavailable|not_needed, "terms": int}."""
+async def _proofreading_agent_research(worker_text, context="", extra_terms=None, custom_instructions=""):
+    """Run only the research requested in the saved super-admin instructions."""
+    if not _proofreading_research_requested(custom_instructions):
+        return {"text": "", "status": "not_needed", "terms": 0}
     worker_text = str(worker_text or "")
     windows = _proofreading_split_windows(worker_text)
     jobs = []
@@ -18840,15 +18855,17 @@ async def _proofreading_agent_research(worker_text, context="", extra_terms=None
         except Exception:
             snippets = ""
         prompt = (
-            _PROOFREADING_RESEARCH_RULES
-            + "TRANSCRIPT OPENING (for the overall setting, city and state):\n" + head
-            + "\n\nEXCERPT TO RESEARCH (research every street, address, location and distinctive name in it):\n" + window[:14000]
-            + "\n\nTERMS THE APPLICATION ALREADY SPOTTED (not exhaustive; also research every other one you find):\n"
+            "SUPER-ADMIN RESEARCH INSTRUCTIONS:\n" + str(custom_instructions or "").strip()[:12000]
+            + "\n\nUse those saved instructions to decide what, if anything, to research. Do not add research outside their scope.\n"
+            + "TRANSCRIPT OPENING (context only):\n" + head
+            + "\n\nEXCERPT FOR THE REQUESTED RESEARCH:\n" + window[:14000]
+            + "\n\nCANDIDATE TERMS SPOTTED BY THE APPLICATION (review only as directed above):\n"
             + ("\n".join("- " + t for t in terms[:60]) or "(none spotted)")
             + ("\n\nWHERE THEY APPEAR:\n" + snippets if snippets else "")
+            + "\n\nFor each applicable finding, return one line in this technical format: dictated form | verified form | concise context | confidence yes/no. If none apply, return exactly NO_SEARCHED_TERMS."
         )
         if context.strip():
-            prompt += "\n\nJOB CONTEXT AND CLIENT SPELLINGS (do not research terms the client spelled):\n" + context[:4000]
+            prompt += "\n\nJOB CONTEXT AND CLIENT SPELLING REFERENCE:\n" + context[:4000]
         async with semaphore:
             try:
                 result = str(await asyncio.to_thread(_human_research_blocking, prompt) or "").strip()
@@ -19018,13 +19035,14 @@ async def _proofreading_agent_audio(job_id, job, progress):
     digest, digest_count = _proofreading_instruction_digest(reference_text)
     no_indent = _proofreading_no_indent_requested([reference_text, context, custom_instructions])
 
-    await progress("Researching streets, locations and names", 40)
     issues = list(context_data["issues"])
-    research = {"text": "", "status": "unavailable", "terms": 0}
-    try:
-        research = await _proofreading_agent_research(worker_transcript, context)
-    except Exception as exc:
-        logger.warning("Proofreading Agent research failed for %s; continuing without it: %s", job_id, str(exc)[:300])
+    research = {"text": "", "status": "not_needed", "terms": 0}
+    if _proofreading_research_requested(custom_instructions):
+        await progress("Researching as requested in admin instructions", 40)
+        try:
+            research = await _proofreading_agent_research(worker_transcript, context, custom_instructions=custom_instructions)
+        except Exception as exc:
+            logger.warning("Proofreading Agent research failed for %s; continuing without it: %s", job_id, str(exc)[:300])
     research_text, research_status = research["text"], research["status"]
     if research_status in {"unavailable", "partial"}:
         issues.append("Online research could not be fully completed; street and location names that were not verified keep the dictated spelling.")
@@ -19146,12 +19164,13 @@ async def _proofreading_agent_image(job_id, job, progress):
     )
     if not str(text or "").strip():
         raise HTTPException(status_code=502, detail="The Proofreading Agent returned an empty transcript. Please try again.")
-    await progress("Researching streets, locations and names", 70)
-    research_result = {"text": "", "status": "unavailable", "terms": 0}
-    try:
-        research_result = await _proofreading_agent_research(text, context)
-    except Exception as exc:
-        logger.warning("Proofreading Agent image research failed for %s: %s", job_id, str(exc)[:300])
+    research_result = {"text": "", "status": "not_needed", "terms": 0}
+    if _proofreading_research_requested(custom_instructions):
+        await progress("Researching as requested in admin instructions", 70)
+        try:
+            research_result = await _proofreading_agent_research(text, context, custom_instructions=custom_instructions)
+        except Exception as exc:
+            logger.warning("Proofreading Agent image research failed for %s: %s", job_id, str(exc)[:300])
     research = research_result["text"]
     image_issues = []
     if research_result["status"] in {"unavailable", "partial"}:
