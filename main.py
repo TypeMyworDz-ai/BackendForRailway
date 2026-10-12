@@ -19055,6 +19055,29 @@ async def admin_trainee_submissions(uid: str, request: Request):
     return {"uid": uid, "complete": complete and final_transcript_present, "modules": modules}
 
 
+@app.post("/api/admin/trainees/{uid}/rename")
+async def admin_rename_trainee(uid: str, request: Request):
+    """Correct a trainee's registered name (for example when an ID number was entered as the name)."""
+    _require_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    name = " ".join(str((payload or {}).get("name") or "").split())
+    if len(name) < 2 or len(name) > 120:
+        raise HTTPException(status_code=400, detail="Enter the trainee's full name (2 to 120 characters).")
+    profile = await _load_profile(uid)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="That trainee account was not found.")
+    await asyncio.to_thread(
+        db.collection("users").document(uid).set,
+        {"name": name, "officialIdName": name, "updatedAt": firestore.SERVER_TIMESTAMP},
+        merge=True,
+    )
+    _human_list_cache_bump()
+    return {"status": "renamed", "name": name}
+
+
 @app.post("/api/admin/trainees/{uid}/decision")
 async def admin_trainee_decision(uid: str, request: Request):
     _require_admin(request)
