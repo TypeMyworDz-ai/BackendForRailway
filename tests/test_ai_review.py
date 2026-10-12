@@ -381,10 +381,13 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("_human_stt_chain", calls)
         self.assertIn("HUMAN_AGENT_STT_ORDER", ast.unparse(transcriber))
         self.assertIn("_human_ai_assembly_transcript", calls)
-        self.assertNotIn("transcribe_with_deepgram", calls)
+        # Deepgram is only a comparison transcript, requested by the audio agents, never the primary.
+        self.assertIn("transcribe_with_deepgram", calls)
+        self.assertIn("compare_with_deepgram", ast.unparse(transcriber))
         agent_source = "".join(node.value for node in ast.walk(self.functions["_human_ai_agent_generate"]) if isinstance(node, ast.Constant) and isinstance(node.value, str))
-        self.assertIn("Format the AssemblyAI transcript below, which is the only transcript of this audio", agent_source)
-        self.assertNotIn("Deepgram", agent_source)
+        self.assertIn("Format the PRIMARY transcript below", agent_source)
+        self.assertIn("COMPARISON ONLY", agent_source)
+        self.assertIn("compare_with_deepgram=True", ast.unparse(self.functions["_human_ai_agent_generate"]))
 
         helper = self.functions["_human_ai_assembly_transcript"]
         namespace = {"asyncio": asyncio}

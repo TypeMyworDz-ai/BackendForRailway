@@ -196,5 +196,61 @@ class HumanWorkSttAndCreditTests(unittest.TestCase):
         self.assertIn("_human_require_ai_call_credits(actor, HUMAN_PROOFREADING_AGENT_CREDIT_COST)", endpoint)
 
 
+class SpellingSectionAuthorityTests(unittest.TestCase):
+    def setUp(self):
+        import logging
+        names = {"_human_ai_agent_research_footer", "_human_research_parse_findings", "_human_research_unverified_terms",
+                 "_human_client_word_list_matches", "_human_client_word_list_entries"}
+        self.footer = _load(names, {"re": re, "logger": logging.getLogger("t")})["_human_ai_agent_research_footer"]
+        self.parts = [{"label": "Part 1", "text": "\tBody one.\n\nClient spellings: Redden; My spellings: Tucker, Ronan, Jason, Becker.\nI searched: Main Street."},
+                      {"label": "Part 2", "text": "\tBody two.\n\nMy spellings: Emma, Redden."}]
+
+    def test_agent_spelling_paragraph_is_used_exactly_as_written(self):
+        model_text = "\tBody one.  Body two.\n\nClient spellings: None; My spellings: Tucker, Ronan, Jason, Emma."
+        out = self.footer(model_text, "", source_parts=self.parts, thorough=True, model_spellings_authoritative=True)
+        self.assertIn("Client spellings: None; My spellings: Tucker, Ronan, Jason, Emma", out)
+        self.assertNotIn("Becker", out)
+        self.assertNotIn("Redden", out)
+
+    def test_old_behaviour_kept_for_other_callers(self):
+        model_text = "\tBody.\n\nClient spellings: None; My spellings: Tucker."
+        out = self.footer(model_text, "", source_parts=self.parts, thorough=True)
+        self.assertIn("Becker", out)
+        self.assertIn("Redden", out)
+
+    def test_worker_entries_used_when_agent_wrote_no_spelling_lines(self):
+        out = self.footer("\tBody one.  Body two.", "", source_parts=self.parts, thorough=True, model_spellings_authoritative=True)
+        self.assertIn("Becker", out)
+        self.assertIn("Emma", out)
+
+    def test_client_spelling_moves_when_agent_says_so(self):
+        model_text = "\tBody.\n\nClient spellings: Redden; My spellings: Tucker, Emma."
+        out = self.footer(model_text, "", source_parts=self.parts, thorough=True, model_spellings_authoritative=True)
+        self.assertIn("Client spellings: Redden; My spellings: Tucker, Emma", out)
+
+    def test_worker_search_terms_and_standing_instructions_still_reach_the_agent(self):
+        self.assertIn("I researched: Main Street", self.footer("\tBody.\n\nClient spellings: None; My spellings: Tucker.", "", source_parts=self.parts, thorough=True, model_spellings_authoritative=True))
+        self.assertIn("they override any rule above where they differ", SRC)
+        self.assertIn("model_spellings_authoritative=True", SRC[SRC.index("async def _proofreading_agent_audio"):][:9000])
+        self.assertIn("model_spellings_authoritative=True", SRC[SRC.index("async def _proofreading_agent_image"):][:7000])
+
+
+class AgentDeepgramComparisonTests(unittest.TestCase):
+    def test_prompt_helpers_label_primary_and_comparison(self):
+        ns = _load({"_human_asr_prompt_text", "_human_asr_primary_text"}, {})
+        data = {"Voxtral": "primary words", "Deepgram": "other words"}
+        text = ns["_human_asr_prompt_text"](data)
+        self.assertTrue(text.startswith("VOXTRAL TRANSCRIPT (PRIMARY):"))
+        self.assertIn("DEEPGRAM TRANSCRIPT (COMPARISON ONLY", text)
+        self.assertEqual(ns["_human_asr_primary_text"](data), "primary words")
+
+    def test_label_follows_the_provider_that_produced_the_transcript(self):
+        import asyncio
+        ns = _load({"_human_ai_assembly_transcript"}, {"asyncio": asyncio})
+        f = ns["_human_ai_assembly_transcript"]
+        self.assertEqual(f({"status": "completed", "transcription": "x", "provider": "voxtral"}), {"Voxtral": "x"})
+        self.assertEqual(f({"status": "completed", "transcription": "x"}), {"AssemblyAI": "x"})
+
+
 if __name__ == "__main__":
     unittest.main()
