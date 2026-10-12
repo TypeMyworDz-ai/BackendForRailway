@@ -30,7 +30,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "_human_subadmin_rate_defaults", "_human_subadmin_rate_values", "_human_subadmin_image_milli_rate", "_human_subadmin_image_agent_used",
             "_human_subadmin_rate_public", "_human_subadmin_parse_rate_update",
             "_human_subadmin_word_count", "_human_subadmin_audio_minutes",
-            "_human_subadmin_ai_used", "_human_subadmin_assignment_metadata",
+            "_human_subadmin_ai_used", "_human_job_owner_of", "_human_subadmin_assignment_metadata",
             "_human_subadmin_submission_actor",
             "_human_subadmin_earning_specs", "_human_admin_finish_job_eligible", "_human_shift_local_now",
             "_human_shift_parse_datetime", "_human_shift_is_scheduled",
@@ -161,6 +161,32 @@ class SubadminPaymentTests(unittest.TestCase):
         self.assertEqual(metadata(approved, ai_used=False), ("info@typemywordz.ai", "", self.shift_time))
         actor = self.namespace["_human_subadmin_submission_actor"](approved)
         self.assertEqual(actor, {"uid": "", "email": "info@typemywordz.ai"})
+
+    def test_uploading_subadmin_earns_from_worker_submissions_when_several_subadmins_exist(self):
+        original = list(self.namespace["HUMAN_JOB_ADMIN_EMAILS"])
+        self.namespace["HUMAN_JOB_ADMIN_EMAILS"][:] = ["info@typemywordz.ai", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"]
+        try:
+            build = self.namespace["_human_subadmin_earning_specs"]
+            actor_of = self.namespace["_human_subadmin_submission_actor"]
+            for job_type, extra in (("general_job", {"seconds": 120}), ("pdf_job", {"transcript": "one two three four"})):
+                job = {
+                    "job_type": job_type, "admin_uploaded": True, "created_by_uid": "uid-dg", "created_by_email": "donotgrowweary95@gmail.com",
+                    "routingDecidedAt": self.shift_time, "worker_uid": "worker-1", "workerCompletedAt": "x", "status": "submitted", **extra,
+                }
+                actor = actor_of(job)
+                self.assertEqual(actor, {"uid": "uid-dg", "email": "donotgrowweary95@gmail.com"})
+                specs = build("job-1", job, actor, now=self.shift_time)
+                self.assertEqual(len(specs), 1)
+                self.assertEqual(specs[0]["subadmin_email"], "donotgrowweary95@gmail.com")
+            main_admin_job = {"job_type": "general_job", "created_by_uid": "main", "created_by_email": "typemywordz@gmail.com", "worker_uid": "w", "seconds": 60}
+            self.assertEqual(actor_of(main_admin_job), {})
+        finally:
+            self.namespace["HUMAN_JOB_ADMIN_EMAILS"][:] = original
+
+    def test_backfill_runs_on_startup_and_is_idempotent(self):
+        src = MAIN_PATH.read_text(encoding="utf-8")
+        self.assertIn("_human_subadmin_backfill_recent(3)", src)
+        self.assertIn("/api/admin/subadmin-earnings/backfill", src)
 
     def test_approval_route_records_the_admin_and_shift_timestamp(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
@@ -328,7 +354,7 @@ class SubadminPaymentTests(unittest.TestCase):
         self.assertIn("_human_admin_finish_job_eligible", calls)
         self.assertIn("_human_subadmin_accrue_job_earnings", calls)
         self.assertIn("client_review", route_text)
-        self.assertIn("released", route_text)
+        self.assertIn("admin_proofread_at", route_text)
         self.assertNotIn("charge_credits", route_text)
 
 
