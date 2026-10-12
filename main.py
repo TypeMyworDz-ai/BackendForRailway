@@ -14266,12 +14266,12 @@ async def _rating_agent_run(rating_id):
             raise RuntimeError("The worker's submission has no typed text to assess (it may be an attached file).")
         guidelines = await _guidelines_for_job(job)
         context_data = await _human_review_context(str(record.get("job_id")), job)
-        source_note = "No AssemblyAI source transcript was available for this assignment, so accuracy against the audio could not be checked."
+        source_note = "No machine source transcript was available for this assignment, so accuracy against the audio could not be checked."
         try:
             transcripts, _seconds = await _human_ai_transcribe_audio(str(record.get("job_id")), job, segment)
             source = "\n\n".join(str(text) for text in (transcripts or {}).values() if str(text or "").strip())
             if source.strip():
-                source_note = "ASSEMBLYAI SOURCE TRANSCRIPT OF THE AUDIO:\n" + source[:120000]
+                source_note = "MACHINE SOURCE TRANSCRIPT OF THE AUDIO:\n" + source[:120000]
         except Exception as exc:
             logger.info("Rating Agent could not get a source transcript for %s: %s", rating_id, str(exc)[:200])
         question = (
@@ -14659,16 +14659,37 @@ def _human_ai_assembly_transcript(assembly_result):
     if isinstance(assembly_result, asyncio.CancelledError):
         raise assembly_result
     if isinstance(assembly_result, Exception):
-        raise RuntimeError("The AssemblyAI transcript is required for the AI agent but could not be produced.") from assembly_result
+        raise RuntimeError("The source transcript (AssemblyAI) is required for the AI agent but could not be produced.") from assembly_result
     if not isinstance(assembly_result, dict) or str(assembly_result.get("status") or "").casefold() != "completed":
-        raise RuntimeError("The AssemblyAI transcript is required for the AI agent but did not complete.")
+        detail = str((assembly_result or {}).get("error") or "") if isinstance(assembly_result, dict) else ""
+        raise RuntimeError("The AssemblyAI transcript is required for the AI agent but did not complete." + (f" {detail[:300]}" if detail else ""))
     text = str(assembly_result.get("transcription") or assembly_result.get("transcript") or assembly_result.get("text") or "").strip()
     if not text:
         raise RuntimeError("The AssemblyAI transcript is required for the AI agent but came back empty.")
-    return {"AssemblyAI": text}
+    label = {"voxtral": "Voxtral", "assemblyai": "AssemblyAI", "deepgram": "Deepgram", "openai": "OpenAI"}.get(str(assembly_result.get("provider") or ""), "AssemblyAI")
+    return {label: text}
 
 
-async def _human_ai_transcribe_audio(job_id, job, segment):
+def _human_asr_primary_text(transcripts):
+    """The primary machine transcript (the first one), whichever service made it."""
+    for text in (transcripts or {}).values():
+        if str(text or "").strip():
+            return str(text)
+    return ""
+
+
+def _human_asr_prompt_text(transcripts):
+    """Prompt text: the primary transcript first, any extra transcript labelled comparison-only."""
+    blocks = []
+    for index, (provider, text) in enumerate((transcripts or {}).items()):
+        if index == 0:
+            blocks.append(f"{str(provider).upper()} TRANSCRIPT (PRIMARY):\n{text}")
+        else:
+            blocks.append(f"{str(provider).upper()} TRANSCRIPT (COMPARISON ONLY; not an authority for spellings of names or places, numbers, dates, times, capitalisation or formatting):\n{text}")
+    return "\n\n".join(blocks)
+
+
+async def _human_ai_transcribe_audio(job_id, job, segment, compare_with_deepgram=False):
     meta = job.get("audio") or {}
     path = meta.get("storage_path")
     bucket = _human_bucket()
@@ -14693,11 +14714,30 @@ async def _human_ai_transcribe_audio(job_id, job, segment):
             tmp_path = handle.name
         await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
         agent_audio_id = f"ai-agent-{job_id}-{segment.get('id') if segment else 'main'}"
+        async def deepgram_comparison():
+            if not compare_with_deepgram or not DEEPGRAM_SERVICE_RAILWAY_URL:
+                return None
+            try:
+                result = await transcribe_with_deepgram(tmp_path, "en", False, agent_audio_id + "-deepgram")
+                text = str((result or {}).get("transcription") or (result or {}).get("transcript") or (result or {}).get("text") or "").strip()
+                return text if str((result or {}).get("status") or "").casefold() == "completed" and text else None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.info("Deepgram comparison transcript unavailable for %s: %s", agent_audio_id, str(exc)[:200])
+                return None
+
+        primary_task = asyncio.create_task(_human_stt_chain(tmp_path, HUMAN_AGENT_STT_ORDER, agent_audio_id))
+        comparison_task = asyncio.create_task(deepgram_comparison())
         try:
-            assembly_result = await _human_stt_chain(tmp_path, HUMAN_AGENT_STT_ORDER, agent_audio_id)
+            assembly_result = await primary_task
         except Exception as exc:
             assembly_result = exc
+        comparison_text = await comparison_task
         transcripts = _human_ai_assembly_transcript(assembly_result)
+        # Deepgram is added only as a comparison and only when it is not already the primary transcript.
+        if comparison_text and "Deepgram" not in transcripts:
+            transcripts["Deepgram"] = comparison_text
     finally:
         if tmp_path:
             try:
@@ -14838,8 +14878,12 @@ def _human_research_unverified_terms(research):
     return [item.strip(" .") for item in re.split(r"[,;]", match.group(1)) if item.strip(" .")][:40]
 
 
-def _human_ai_agent_research_footer(transcript, research, source_parts=None, client_word_list=None, dictated_text=None, thorough=False):
-    """Append one consolidated, client-ready spellings and research footer."""
+def _human_ai_agent_research_footer(transcript, research, source_parts=None, client_word_list=None, dictated_text=None, thorough=False, model_spellings_authoritative=False):
+    """Append one consolidated, client-ready spellings and research footer.
+
+    With model_spellings_authoritative (the Proofreading Agent), the Client spellings and My spellings the
+    agent wrote are final: the agent reads the workers' lists, the standing instructions and the guidelines
+    and decides. Worker lists are only used when the agent wrote no spelling lines at all."""
     raw = str(transcript or "").strip()
     body = re.split(r"(?im)^\s*Research Notes\s*:\s*$", raw, maxsplit=1)[0]
     body = re.sub(r"(?i)(?:[.;]?[ \t]*)I\s+(?:researched|searched)\s*:\s*[^\n]*", "", body)
@@ -14935,6 +14979,25 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
                         and not worker_private_handle.search(value)
                     )
 
+    # What the model itself wrote (only used when it is authoritative).
+    model_client, model_my = [], []
+    model_client_header = model_my_header = False
+    for line in body_lines:
+        if not footer_line_pattern.match(line.strip()):
+            continue
+        line = line.strip()
+        sections = list(section_pattern.finditer(line))
+        for index, section in enumerate(sections):
+            end = sections[index + 1].start() if index + 1 < len(sections) else len(line)
+            values = items(line[section.end():end].strip(" ;."))
+            name = section.group(1).casefold()
+            if name == "client spellings":
+                model_client_header = True
+                model_client.extend(values)
+            elif name == "my spellings":
+                model_my_header = True
+                model_my.extend(values)
+
     collect_spellings(body, include_client=not bool(source_parts))
     for part in source_parts or []:
         if isinstance(part, dict):
@@ -14955,6 +15018,14 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
 
     client_spellings = unique_items(client_spellings)
     my_spellings = unique_items(my_spellings)
+    use_model_spellings = bool(model_spellings_authoritative and (model_client_header or model_my_header))
+    if use_model_spellings:
+        dropped = [item for item in client_spellings + my_spellings
+                   if normalized(item) not in {normalized(x) for x in model_client + model_my}]
+        if dropped:
+            logger.info("Proofreading Agent dropped worker spelling entries: %s", ", ".join(dropped)[:500])
+        client_spellings = unique_items(model_client)
+        my_spellings = unique_items(model_my)
     client_keys = {normalized(item) for item in client_spellings}
     client_tokens = {token for item in client_keys for token in item.split()}
     my_spellings = [
@@ -14967,8 +15038,12 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
     footer_parts = []
     if client_spellings:
         footer_parts.append("Client spellings: " + ", ".join(client_spellings))
+    elif use_model_spellings and model_client_header:
+        footer_parts.append("Client spellings: None")
     if my_spellings:
         footer_parts.append("My spellings: " + ", ".join(my_spellings))
+    elif use_model_spellings and model_my_header:
+        footer_parts.append("My spellings: None")
 
     def finish(body_text, footer_sections, notes_text):
         output = str(body_text or "").rstrip()
@@ -15439,20 +15514,21 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         draft = _human_ai_agent_research_footer(draft, research, client_word_list=context, dictated_text=draft)
         return draft, 0.0, agent["models"]
 
-    asr_transcripts, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment)
-    raw_text = "\n\n".join(f"{provider.upper()} TRANSCRIPT:\n{text}" for provider, text in asr_transcripts.items())
+    asr_transcripts, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment, compare_with_deepgram=True)
+    raw_text = _human_asr_prompt_text(asr_transcripts)
+    primary_asr_text = _human_asr_primary_text(asr_transcripts)
     research = await _human_ai_agent_research(raw_text, context)
     if research:
         system += "\n\nWEB RESEARCH RESULTS FOR SPELLINGS ONLY:\n" + research[:12000]
     first_question = (
-        "Format the AssemblyAI transcript below, which is the only transcript of this audio. Keep every date as dictated. Do not invent words, smooth awkward phrasing, or combine alternatives. Preserve the dictated wording and order, and apply the supplied job notes, reference images, and guidelines. Use attached images only as job references. Return only the formatted transcript.\n\n"
+        "Format the PRIMARY transcript below; it is the transcript the draft's wording comes from. A second transcript marked COMPARISON ONLY may follow: use it only to compare, to catch words or passages the primary one dropped, garbled or invented and to see where paragraph or line breaks were dictated. Never take the spelling of a name or place, a number, a date, a time, capitalisation or formatting from the comparison transcript, never mix the two wordings together, and when they differ and you are not certain keep the primary wording. Keep every date as dictated. Do not invent words, smooth awkward phrasing, or combine alternatives. Preserve the dictated wording and order, and apply the supplied job notes, reference images, and guidelines. Use attached images only as job references. Return only the formatted transcript.\n\n"
         "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
     )
     if letter_agent:
         first_question = (
             "Format this entire recording as one complete letter using the bundled Letter Standard Indentation layout and the permanent Letter Agent guidelines. "
             "This is correspondence and must be formatted; do not refuse or return TEMPLATE_JOB_BLOCKED_LETTER. "
-            "Use the AssemblyAI transcript; preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
+            "Use the PRIMARY transcript (a COMPARISON ONLY transcript, if present, is only a cross-check); preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
     audio_agent_chain = _route_chain(
@@ -15480,8 +15556,8 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         audio_agent_chain, second_system, second_question, reference_images, 16000,
     )
     if agent_id == "general-gpt":
-        answer = _human_restore_dictated_dates(answer, [asr_transcripts.get("AssemblyAI", "")])
-    answer = _human_ai_agent_research_footer(answer, research, client_word_list=context, dictated_text=asr_transcripts.get("AssemblyAI", ""))
+        answer = _human_restore_dictated_dates(answer, [primary_asr_text])
+    answer = _human_ai_agent_research_footer(answer, research, client_word_list=context, dictated_text=primary_asr_text)
     return answer, audio_seconds, agent["models"]
 
 
@@ -16072,7 +16148,7 @@ async def _human_run_letter_ai_review(job_id):
             response_validator=validate_research,
         )
         reviewed_text = re.sub(r"\n{3,}", "\n\n", _review_normalise_sentence_spacing(str(reviewed_text or "").strip()))
-        reviewed_text = _human_ai_agent_research_footer(reviewed_text, research, client_word_list=context, dictated_text=source_transcripts.get("AssemblyAI", ""))
+        reviewed_text = _human_ai_agent_research_footer(reviewed_text, research, client_word_list=context, dictated_text=_human_asr_primary_text(source_transcripts))
         if not reviewed_text:
             raise RuntimeError("The AI reviewer returned an empty Word document.")
         reviewed_docx = await asyncio.to_thread(_human_letter_render_docx, template_bytes, reviewed_text)
@@ -18078,7 +18154,7 @@ _PROOFREADING_AGENT_ADDENDUM = (
     "C. SEAMS BETWEEN PARTS. The recording was cut into parts by time, so a sentence can be cut off, doubled or missing where one part ends and the next begins. Join every seam so that no sentence is half-finished, repeated or lost, using the AssemblyAI transcript at that point to see what was said. Do not start a new paragraph at a seam unless the speaker dictated one.\n"
     "D. MINIMAL CONTEXTUAL CORRECTIONS. Change a worker's word only when you are one hundred percent certain, from the sentence and from the AssemblyAI transcript, that the worker's word is wrong (for example it makes no sense in context and the machine's word clearly does). Make the smallest possible change; never rewrite, smooth, reorder or professionalise; when there is any doubt keep the worker's wording. Never take a date, number, time, name spelling or formatting from the machine transcript. Never change a worker's spelling of a name or place to match the machine transcript.\n"
     "E. NAMES AND PROPER NOUNS. Make every explicitly spelled word or name identical across the whole transcript, and write every proper noun exactly as dictated and confirmed by client spellings, the client word list or verified research. Standardise each person's name to one spelling throughout. Never reword a name, never expand it and never add anything that was not dictated.\n"
-    "F. SPELLINGS AND RESEARCH SECTIONS. Preserve every distinct worker entry under Client spellings, My spellings, I searched, I researched, and Research Notes. Consolidate them into one closing spelling/search paragraph and one Research Notes block; remove duplicates only. Do not omit, replace with [Omitted], or discard information because it will be consolidated later. The application may add independently grounded research, but must retain the worker-provided entries.\n"
+    "F. SPELLINGS AND RESEARCH SECTIONS. Read every worker's Client spellings, My spellings, I searched, I researched and Research Notes. Write ONE closing spelling paragraph in your transcript, directly after the body, in the form 'Client spellings: ...; My spellings: ...' (write 'Client spellings: None' when no client spellings were supplied). YOU decide its content and it is used exactly as you write it: keep every worker entry that is a real name or term in the final transcript, and take out entries that are misheard, misspelled or do not appear in the transcript; list each name token once; a client-supplied spelling (instructions, word list, spelled out in the dictation) goes under Client spellings and never under My spellings; follow the standing instructions from the super admin about this section. Preserve every valid worker entry; do not omit one merely because it is repeated or because the sections are being consolidated. Keep the 'I searched' and 'I researched' terms and every worker Research Note: the application consolidates them into one block and adds the grounded research.\n"
     "G. STREETS, ADDRESSES AND LOCATIONS. Every street, road, address, intersection, neighbourhood, city, county, park, school, hospital, business, agency or other location named in the dictation must be checked against the RESEARCH RESULTS. Where the research confirms (confidence yes) a spelling that fits the context of this transcript (the city, county or state mentioned or implied elsewhere), write the verified spelling and capitalisation. Where the research could not confirm it, keep the worker's dictated form and list it under issues. Never replace a dictated place with a different place, never add a city or state that was not dictated, and never alter a dictated street number.\n"
     "H. INSTRUCTIONS IN THE DICTATION. Spoken instructions to the transcriptionist are NOT content. Find every one in the AssemblyAI transcript and in the written instructions (the prompt lists the ones it detected) and carry each out exactly, then remove the instruction words. Examples: 'go back to the second paragraph and add ...' or 'add this to the section ...' means place that text in that exact location and nowhere else; 'delete that', 'scratch that', 'replace X with Y' and 'move this to ...' mean do exactly that. When an instruction cannot be located or is ambiguous, do the most literal reading and record it under issues.\n"
     "I. FORMATTING COMMANDS. Confirm and apply every dictated or written formatting instruction: bold, underline, italics, ALL CAPS (write the affected words in capitals), lower case, headings, centred text, bullets or numbered lists, spacing, and anything similar. Apply it only to the words the instruction covers. If a worker applied formatting that nobody asked for, remove it; if a worker missed a requested format, add it. Record each in changes.\n"
@@ -18091,7 +18167,7 @@ _PROOFREADING_AGENT_IMAGE_ADDENDUM = (
     "\n\nPROOFREADING AGENT MODE. You are given every page image of the whole file and the page drafts written by workers or AI agents. "
     "Transcribe the whole file from the images yourself, compare it with the page drafts, and produce ONE final, client-ready transcript. "
     "Use the page drafts only where they are right; fix wrong words, missed content and formatting. Join pages smoothly so nothing is cut, doubled or lost where one page ends and the next begins, "
-    "never split a paragraph in the middle of a sentence or word, keep names and labels identical from the first page to the last, never add anything that is not in the images, and preserve all distinct worker Client spellings, My spellings, I searched, I researched, and Research Notes entries in one closing spelling/search paragraph and one Research Notes block. Remove duplicates only; do not omit them. "
+    "never split a paragraph in the middle of a sentence or word, keep names and labels identical from the first page to the last, never add anything that is not in the images, and preserve every valid worker Client spellings, My spellings, I searched, I researched, and Research Notes entry in one closing paragraph written as 'Client spellings: ...; My spellings: ...' (write 'Client spellings: None' if there are none) plus one Research Notes block. That spelling paragraph is used exactly as you write it, so take out only entries that are misheard or do not appear in the transcript, follow the standing instructions about it, and do not omit valid entries. "
     "Follow every written job instruction and every instruction visible on the pages (bold, underline, italics, ALL CAPS, indentation, layout, edits such as adding text to a named section) exactly, and report any instruction you could not follow. "
     "Every street, address, location, agency, business and place named must be checked against the RESEARCH RESULTS and written with the verified spelling when the research confirms it in this context; otherwise keep the dictated form."
 )
@@ -18571,7 +18647,7 @@ def _proofreading_custom_instructions_block(text):
     if not text:
         return ""
     return (
-        "\n\nSTANDING INSTRUCTIONS FROM THE SUPER ADMIN (mandatory on every job; written instructions in the job itself win if they conflict):\n"
+        "\n\nSTANDING INSTRUCTIONS FROM THE SUPER ADMIN (mandatory on every job; they override any rule above where they differ, including how the spellings section is written; written instructions in the job itself win over them if they conflict):\n"
         + text + "\n"
     )
 
@@ -18767,6 +18843,7 @@ async def _proofreading_agent_audio(job_id, job, progress):
     combined = _human_ai_agent_research_footer(
         combined, research_text,
         source_parts=parts, client_word_list=context, dictated_text=worker_transcript, thorough=True,
+        model_spellings_authoritative=True,
     )
     plain_combined = _proofreading_strip_markup(combined)
     html = _sanitize_editor_html(_proofreading_markup_to_html(combined))
@@ -18778,6 +18855,7 @@ async def _proofreading_agent_audio(job_id, job, progress):
         "provider": "AssemblyAI", "scope": "complete_original_audio", "duration_seconds": reference_data.get("duration_seconds"),
         "transcript_characters": len(reference_text), "dictation_boundaries": restored_boundaries[:100],
         "instructions_detected": digest_count, "no_indent": no_indent,
+        "standing_instructions_applied": bool(custom_instructions),
     }
     return {
         "combined_text": plain_combined, "combined_html": html, "changes": clean_changes, "issues": issues[:40], "research": research_text[:16000],
@@ -18829,7 +18907,8 @@ async def _proofreading_agent_image(job_id, job, progress):
         image_issues.append("Online research could not be fully completed; street and location names that were not verified keep the dictated spelling.")
     await progress("Adding the spellings and research notes", 85)
     text = _human_ai_agent_research_footer(
-        text, research, source_parts=source_parts, client_word_list=context, dictated_text=text, thorough=True
+        text, research, source_parts=source_parts, client_word_list=context, dictated_text=text, thorough=True,
+        model_spellings_authoritative=True,
     )
     if is_text:
         text = re.sub(r"<tab>|\[tab\]", "\t", str(text), flags=re.IGNORECASE)
