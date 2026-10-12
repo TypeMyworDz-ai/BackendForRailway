@@ -3034,9 +3034,10 @@ async def transcribe_with_voxtral(audio_path: str, language_code: str, speaker_l
     try:
         with open(audio_path, "rb") as f:
             audio_content = f.read()
-        form = [("model", VOXTRAL_TRANSCRIPTION_MODEL), ("timestamp_granularities", "segment")]
+        # A dict (not a list of tuples): httpx's async client rejects list form data alongside files.
+        form = {"model": VOXTRAL_TRANSCRIPTION_MODEL, "timestamp_granularities": "segment"}
         if speaker_labels_enabled:
-            form.append(("diarize", "true"))
+            form["diarize"] = "true"
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 "https://api.mistral.ai/v1/audio/transcriptions",
