@@ -120,10 +120,6 @@ OPENAI_TESTER_EMAIL = ''
 # in testing instead of being masked by another provider. It is not
 # payment-exempt.
 VOXTRAL_TESTER_EMAIL = 'njokigituku@gmail.com'
-# For the testing period every ordinary account tries Voxtral first, then
-# AssemblyAI, Deepgram and OpenAI. Set VOXTRAL_PRIMARY=false in Railway to go
-# back to the plan-based order without a code change.
-VOXTRAL_PRIMARY = os.environ.get("VOXTRAL_PRIMARY", "true").strip().lower() not in {"0", "false", "no", "off"}
 VOXTRAL_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
 # Dedicated Deepgram test account. It pays through the normal plan/credit
 # path, starts on Deepgram, and falls back to OpenAI so both services can be
@@ -220,7 +216,7 @@ logger.info(f"DEBUG: GEMINI_API_KEY loaded value: {bool(GEMINI_API_KEY)}")
 logger.info(f"DEBUG: FIREBASE_ADMIN_SDK_CONFIG_BASE64 loaded value: {bool(FIREBASE_ADMIN_SDK_CONFIG_BASE64)}")
 logger.info(f"DEBUG: DEEPGRAM_SERVICE_RAILWAY_URL loaded value: {bool(DEEPGRAM_SERVICE_RAILWAY_URL)}")
 logger.info(f"DEBUG: Admin emails configured: {ADMIN_EMAILS}")
-logger.info(f"DEBUG: Voxtral Tester email: {VOXTRAL_TESTER_EMAIL}; Voxtral primary: {VOXTRAL_PRIMARY}")
+logger.info(f"DEBUG: Voxtral Tester email: {VOXTRAL_TESTER_EMAIL}")
 logger.info(f"DEBUG: --- End Environment Variable Check (main.py) ---")
 
 if not ASSEMBLYAI_API_KEY:
@@ -856,6 +852,14 @@ HUMAN_STANDARD_CREDITS_PER_MINUTE = 40
 HUMAN_RUSH_CREDITS_PER_MINUTE = 55
 HUMAN_WORK_AI_CREDIT_COST = 2
 HUMAN_WORK_AI_PROOFREAD_CREDIT_COST = 5
+# Credits for the formatting step of a worker's AI draft (audio minutes are charged on top, 1 per minute),
+# and for one run of the admin Proofreading Agent.
+HUMAN_WORKER_DRAFT_FORMATTING_CREDITS = 3
+HUMAN_PROOFREADING_AGENT_CREDIT_COST = 3
+# Speech-to-text order inside Human Work. Workers and trainees: Deepgram first (never AssemblyAI).
+# Admin category agents: Voxtral first. The Proofreading Agent's whole-audio reference stays AssemblyAI.
+HUMAN_WORKER_STT_ORDER = ("deepgram", "voxtral", "openai")
+HUMAN_AGENT_STT_ORDER = ("voxtral", "assemblyai", "deepgram", "openai")
 # Standard transcription starts at 30 KES per completed audio minute. The
 # main admin can change the rate for new jobs from Human Work > Worker rates.
 # Existing jobs keep the rate stored in their original quote; legacy jobs with
@@ -1904,16 +1908,14 @@ def is_admin_user(user_email: str) -> bool:
 
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
-    Logic for service selection based on new rules, including Deepgram.
-    - OpenAI: First option for weekly subscribers, yearly, and Admins (Admins gets this logic no matter what plans they have subscribed to). Fallback is Assembly > Deepgram.
-    - Assembly: First option for free users. Fallback Deepgram only (free users don't get TypeMyworDz Assistant) All instances of speaker tags requests: First option Deepgram, fallback Assembly.
-    - Deepgram: First option for three-day and monthly plans users. Fallback is OpenAI > Assembly. All instances of speaker tags requests: First option Assembly, fallback Deepgram.
-    - njokigituku@gmail.com is the dedicated Voxtral tester: Voxtral only, no fallback, and it pays like any client.
-    - While VOXTRAL_PRIMARY is on (testing period) everyone else gets Voxtral > AssemblyAI > Deepgram > OpenAI.
-    - info@typemywordz.ai is the dedicated Deepgram tester: Deepgram first,
-      OpenAI fallback, and normal plan/credit requirements.
+    Speech-to-text order for the transcription page.
+    - njokigituku@gmail.com: dedicated Voxtral tester, Voxtral only with no fallback (pays like any client).
+    - info@typemywordz.ai: dedicated Deepgram tester, Deepgram then OpenAI.
+    - Everyone else (every plan, with or without speaker labels): AssemblyAI > Voxtral > OpenAI > Deepgram.
+    Human Work (workers, trainees and admin agents) has its own orders: see HUMAN_WORKER_STT_ORDER and
+    HUMAN_AGENT_STT_ORDER.
     """
-    
+
     is_admin = is_admin_user(user_email) if user_email else False
     is_voxtral_tester = (user_email and user_email.lower().strip() == VOXTRAL_TESTER_EMAIL.lower())
     is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
@@ -1957,25 +1959,10 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         "deepgram": bool(DEEPGRAM_SERVICE_RAILWAY_URL),
     }
 
-    # --- Testing period: Voxtral first for everyone else ---
-    if VOXTRAL_PRIMARY:
-        order = ["voxtral", "assemblyai", "deepgram", "openai_whisper"]
-        reason = "voxtral_primary_testing_period"
-    # --- Speaker Labels Logic (Global Override) ---
-    # AssemblyAI first, because it diarizes well. OpenAI sits second and Deepgram
-    # last (Deepgram returned almost nothing on a real 8 kHz meeting recording).
-    elif speaker_labels_enabled:
-        order = ["assemblyai", "openai_whisper", "deepgram"]
-        reason = "speaker_labels_requested_prioritizing_assemblyai"
-    # AssemblyAI first for admins, One-Day, Three-Day, One-Week, Yearly and free.
-    elif is_admin or user_plan in ['One-Day Plan', 'Three-Day Plan', 'One-Week Plan', 'Yearly Plan', 'free']:
-        order = ["assemblyai", "openai_whisper", "deepgram"]
-        reason = "admin_or_plan_prioritizing_assemblyai"
-    # Monthly subscribers start on OpenAI. Any unrecognised plan name gets the
-    # same safe order, so a new plan never produces an empty service list.
-    else:
-        order = ["openai_whisper", "assemblyai", "deepgram"]
-        reason = f"monthly_or_unmatched_plan_prioritizing_openai ('{user_plan}')"
+    # Clients (and admins using the transcription page): AssemblyAI first, then Voxtral,
+    # OpenAI and Deepgram. Any plan, any speaker-label setting.
+    order = ["assemblyai", "voxtral", "openai_whisper", "deepgram"]
+    reason = "assemblyai_primary_with_voxtral_openai_deepgram_fallbacks"
 
     final_tiers_list = [name for name in order if available.get(name)]
     return {
@@ -14629,6 +14616,44 @@ def _human_worker_ai_draft_system(guidelines, context):
     )
 
 
+async def _human_stt_chain(audio_path, order, audio_id):
+    """Transcribe with each provider in order and return the first completed, non-empty result.
+
+    The result carries `provider` (which service produced it). If every provider fails,
+    a failed result listing what was tried is returned so callers can show a clear message."""
+    errors = []
+    for provider in order:
+        try:
+            if provider == "voxtral":
+                result = await transcribe_with_voxtral(audio_path, "en", False, audio_id)
+            elif provider == "assemblyai":
+                if not ASSEMBLYAI_API_KEY:
+                    errors.append("assemblyai: not configured")
+                    continue
+                result = await transcribe_with_assemblyai(audio_path, "en", False, ["universal-3-5-pro", "universal-2"], audio_id)
+            elif provider == "deepgram":
+                if not DEEPGRAM_SERVICE_RAILWAY_URL:
+                    errors.append("deepgram: not configured")
+                    continue
+                result = await transcribe_with_deepgram(audio_path, "en", False, audio_id)
+            elif provider == "openai":
+                result = await transcribe_with_openai_whisper(audio_path, "en", audio_id)
+            else:
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors.append(f"{provider}: {str(exc)[:120]}")
+            logger.warning("Human Work STT provider %s failed for %s: %s", provider, audio_id, str(exc)[:200])
+            continue
+        text = str((result or {}).get("transcription") or (result or {}).get("transcript") or (result or {}).get("text") or "").strip()
+        if isinstance(result, dict) and str(result.get("status") or "").casefold() == "completed" and text:
+            return {**result, "provider": provider}
+        errors.append(f"{provider}: {str((result or {}).get('error') or 'no transcript')[:120]}")
+        logger.warning("Human Work STT provider %s gave no transcript for %s", provider, audio_id)
+    return {"status": "failed", "error": "No transcription service could transcribe this audio (" + "; ".join(errors) + ").", "provider": ""}
+
+
 def _human_ai_assembly_transcript(assembly_result):
     """Require one completed, non-empty AssemblyAI transcript as the agent's only source text."""
     if isinstance(assembly_result, asyncio.CancelledError):
@@ -14669,9 +14694,7 @@ async def _human_ai_transcribe_audio(job_id, job, segment):
         await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
         agent_audio_id = f"ai-agent-{job_id}-{segment.get('id') if segment else 'main'}"
         try:
-            assembly_result = await transcribe_with_assemblyai(
-                tmp_path, "en", False, ["universal-3-5-pro", "universal-2"], agent_audio_id,
-            )
+            assembly_result = await _human_stt_chain(tmp_path, HUMAN_AGENT_STT_ORDER, agent_audio_id)
         except Exception as exc:
             assembly_result = exc
         transcripts = _human_ai_assembly_transcript(assembly_result)
@@ -16331,7 +16354,7 @@ def _human_worker_ai_draft_cache_clear(cache_key):
 
 
 def _human_worker_ai_draft_credit_cost(job, segment=None):
-    """Charge one credit per started audio minute plus one formatting credit."""
+    """Charge one credit per started audio minute plus the formatting credits (3)."""
     duration_seconds = 0.0
     if segment is not None:
         start_seconds = float(segment.get("start_seconds") or 0)
@@ -16351,8 +16374,8 @@ def _human_worker_ai_draft_credit_cost(job, segment=None):
     return {
         "audio_minutes": audio_minutes,
         "audio_credits": audio_minutes,
-        "formatting_credits": 1,
-        "total_credits": audio_minutes + 1,
+        "formatting_credits": HUMAN_WORKER_DRAFT_FORMATTING_CREDITS,
+        "total_credits": audio_minutes + HUMAN_WORKER_DRAFT_FORMATTING_CREDITS,
     }
 
 
@@ -16439,7 +16462,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
     if available < cost["total_credits"]:
         raise HTTPException(
             status_code=402,
-            detail=f"AI draft generation needs {cost['total_credits']} credits: {cost['audio_minutes']} per started audio minute plus 1 formatting credit. Your spendable balance is {available}.",
+            detail=f"AI draft generation needs {cost['total_credits']} credits: {cost['audio_minutes']} per started audio minute plus {cost['formatting_credits']} credits for formatting. Your spendable balance is {available}.",
         )
 
     cache_key = hashlib.sha256(f"{uid}:{job_id}:{key}".encode("utf-8")).hexdigest()
@@ -16475,7 +16498,7 @@ async def human_worker_ai_draft(job_id: str, request: Request):
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as handle:
                 tmp_path = handle.name
             await asyncio.to_thread(lambda: source.export(tmp_path, format="mp3", bitrate="64k"))
-            result = await transcribe_with_assemblyai(tmp_path, "en", False, ["universal-3-5-pro", "universal-2"], f"draft-{job_id}-{key}")
+            result = await _human_stt_chain(tmp_path, HUMAN_WORKER_STT_ORDER, f"draft-{job_id}-{key}")
         finally:
             if tmp_path:
                 try:
@@ -17656,7 +17679,7 @@ _REVIEW_SYSTEM = (
     "4. Use the RESEARCH RESULTS to correct spelling or capitalisation of proper nouns that the client did not spell. Change a term only when the research is confident. Research never permits changing the dictated wording, adding words or replacing one entity with another.\n"
     "5. Do NOT paraphrase, rearrange, professionalise or add or remove meaning. Only fix spelling, capitalisation, numbers, dates, times, punctuation, spacing and formatting to the rules above. Keep the dictated wording and word order.\n"
     "5a. Remove an abandoned spoken word or phrase only when the speaker immediately and unmistakably corrects that same wording; keep the corrected version. Preserve repetitions used for emphasis exactly, including phrases such as `very, very hot`. Never treat emphasis, hesitation, an incomplete thought, or an ambiguous alternative as a self-correction.\n"
-    "5b. DATES STAY AS DICTATED. Keep every date in the form the speaker said it: `May 1, 2026` stays `May 1, 2026` and is never converted to `05/01/2026`, `5/1/26` or `2026-05-01`; a date dictated in numbers stays numeric. Change a date's form only when a TypeMyworDz guideline, the client's rules or the job notes explicitly require it, and then follow that rule exactly. Deepgram often rewrites spoken dates into numeric form, so NEVER take a date, time or number format from the Deepgram transcript. Use the worker parts (which come from the AssemblyAI-based transcript) for date wording and format the date according to the TypeMyworDz guidelines.\n"
+    "5b. DATES STAY AS DICTATED. Keep every date in the form the speaker said it: `May 1, 2026` stays `May 1, 2026` and is never converted to `05/01/2026`, `5/1/26` or `2026-05-01`; a date dictated in numbers stays numeric. Change a date's form only when a TypeMyworDz guideline, the client's rules or the job notes explicitly require it, and then follow that rule exactly. Deepgram often rewrites spoken dates into numeric form, so NEVER take a date, time or number format from the Deepgram transcript. Use the worker parts (which come from a speech-recognition draft) for date wording and format the date according to the TypeMyworDz guidelines.\n"
     "6. The submitted worker parts are the PRIMARY transcript for wording and word order. The complete Deepgram transcript made from the WHOLE original audio is a STRUCTURE CHECK only: always compare against it to make sure no dictated paragraph or content was omitted and no paragraph or content was added that was never dictated. Restore a clearly dictated omission and remove clearly undictated insertions, but never take wording, dates, numbers or formatting from Deepgram, never replace the worker transcript wholesale, paraphrase, or smooth the speaker's grammar.\n"
     "7. PARAGRAPHS COME FROM THE DICTATION, NOT FROM THE WORKERS. A paragraph or line break belongs in the final transcript only where the speaker dictated it (`next paragraph`, `new paragraph`, `paragraph break`, `next line`, `new line`, `line break`), plus headings and list items, plus anything the job instructions or guidelines explicitly require. The prompt lists every dictated command found in the audio. For each one, make sure the break is present at the matching place (a blank line for a paragraph command, a single line break for a line command) and delete the command words, which are instructions, not content. Where a worker started a new paragraph that the speaker never dictated, join it back into the surrounding paragraph. Never leave a worker's own paragraph breaks in just because they were already there. Record every paragraph added or removed in `changes`.\n"
     "8. Research only unfamiliar, distinctive proper nouns actually dictated and not already covered by client spellings, word lists, job references, or prior research. Do not research ordinary names, common/everyday terms, familiar agencies/places, generic roles, or specialist vocabulary. Use actual grounded search results only to confirm spelling/capitalization of the exact dictated term; do not add facts, expand, replace, or reword it. If no qualifying term is found, omit research sections. Do not add a footer to an individual batch; the application appends one consolidated, client-ready footer after all parts are combined. Never list a client-confirmed spelling among researched terms.\n"
@@ -18852,6 +18875,8 @@ async def human_proofreading_agent(job_id, actor, progress):
     current = current_snapshot.to_dict() or {}
     if current.get("proofreader_status") in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="A human proofreader started on this job while the agent was working, so nothing was changed.")
+    # Charged only after the run succeeded, so a failed run costs nothing.
+    await _human_charge_ai_call(actor, job_id, "Proofreading Agent", credit_cost=HUMAN_PROOFREADING_AGENT_CREDIT_COST)
     updates = {
         "ai_review": saved, "ai_review_applied": True, "ai_review_appliedAt": firestore.SERVER_TIMESTAMP,
         "transcript": combined, "transcript_html": html, "ai_combined": True,
@@ -18973,6 +18998,7 @@ async def human_proofreading_agent_start(job_id: str, request: Request, backgrou
     blocker = _proofreading_agent_blocker(job)
     if blocker:
         raise HTTPException(status_code=409, detail=blocker)
+    await _human_require_ai_call_credits(actor, HUMAN_PROOFREADING_AGENT_CREDIT_COST)
     run_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
     run = {
