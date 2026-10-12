@@ -141,6 +141,13 @@ class WiringTests(unittest.TestCase):
         start = SRC.index("async def put_proofreading_agent_instructions")
         self.assertIn("_require_admin(request)", SRC[start:start + 300])
 
+    def test_trainee_rename_endpoint_is_admin_only(self):
+        start = SRC.index("async def admin_rename_trainee")
+        body = SRC[start:start + 900]
+        self.assertIn("_require_admin(request)", body)
+        self.assertIn("officialIdName", body)
+        self.assertIn("/api/admin/trainees/{uid}/rename", SRC)
+
     def test_custom_block(self):
         f = NS["_proofreading_custom_instructions_block"]
         self.assertEqual(f("  "), "")
