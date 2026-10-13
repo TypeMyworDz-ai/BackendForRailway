@@ -14144,6 +14144,7 @@ AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemi
 HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai"))
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
+HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -14246,7 +14247,8 @@ _IMAGE_AGENT_SEMAPHORE = asyncio.Semaphore(4)
 # Firestore and is read through a short cache, so any failure falls back to the
 # defaults and never blocks a job.
 MODEL_ROUTES = {
-    "general": ("General Jobs agent", lambda: HUMAN_GENERAL_AGENT_MODEL_CHAIN),
+    "general": ("General Jobs agent (Super Admin)", lambda: HUMAN_GENERAL_AGENT_MODEL_CHAIN),
+    "general_subadmin": ("General Jobs agent (Sub-admins)", lambda: HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN),
     "template": ("Template Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "letter": ("Letter Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "pdf": ("PDF and image Jobs agent", lambda: HUMAN_PDF_AGENT_MODEL_CHAIN),
@@ -14293,6 +14295,13 @@ def _route_chain(key, default_chain):
         if model_id in options and all(model_id != c[0] for c in chain):
             chain.append((model_id, options[model_id][0]))
     return tuple(chain) or default_chain
+
+
+def _human_ai_agent_model_route_key(agent_id, assigning_email):
+    """General Jobs routing is split by the verified Human Work assigner role."""
+    if agent_id != "general-gpt":
+        return ""
+    return "general_subadmin" if is_human_subadmin(assigning_email) else "general"
 
 
 @app.get("/api/admin/model-routing")
@@ -15674,7 +15683,7 @@ async def _human_image_batch_drafts(system, agent_id, job_ids, reference_images)
     return await future
 
 
-async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_profile="", job_specific_guidelines="", private_reference_files=None, batch_job_ids=None):
+async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_profile="", job_specific_guidelines="", private_reference_files=None, batch_job_ids=None, model_route_key=""):
     agent = HUMAN_AI_AGENTS[agent_id]
     guidelines = await _guidelines_for_job(job)
     template_agent = agent_id == "template-claude"
@@ -15786,10 +15795,19 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Use the PRIMARY transcript (a COMPARISON ONLY transcript, if present, is only a cross-check); preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
-    audio_agent_chain = _route_chain(
-        {"general-gpt": "general", "letter-opus": "letter"}.get(agent_id, "template"),
-        HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == "general-gpt" else HUMAN_AUDIO_AGENT_MODEL_CHAIN,
+    general_route_key = model_route_key if model_route_key in {"general", "general_subadmin"} else "general"
+    general_default_chain = (
+        HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN
+        if general_route_key == "general_subadmin"
+        else HUMAN_GENERAL_AGENT_MODEL_CHAIN
     )
+    if agent_id == "general-gpt":
+        audio_agent_chain = _route_chain(general_route_key, general_default_chain)
+    else:
+        audio_agent_chain = _route_chain(
+            {"letter-opus": "letter"}.get(agent_id, "template"),
+            HUMAN_AUDIO_AGENT_MODEL_CHAIN,
+        )
     first, _first_model = await _human_call_model_chain(
         audio_agent_chain, system, first_question, reference_images, 16000,
     )
@@ -15832,6 +15850,9 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             raise RuntimeError("The saved AI run does not match this agent assignment.")
         job_specific_guidelines = str(run_data.get("template_job_guidelines") or "") if agent_id == "template-claude" else ""
         private_reference_files = list(run_data.get("template_reference_files") or []) if agent_id == "template-claude" else []
+        model_route_key = str(run_data.get("model_route_key") or "") if agent_id == "general-gpt" else ""
+        if agent_id == "general-gpt" and model_route_key not in {"general", "general_subadmin"}:
+            model_route_key = "general"
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         segment = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
         if not segment:
@@ -15851,6 +15872,7 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             job_specific_guidelines=job_specific_guidelines,
             private_reference_files=private_reference_files,
             batch_job_ids=list(run_data.get("batch_job_ids") or []),
+            model_route_key=model_route_key,
         )
         if agent_id == "template-claude" and str(answer or "").strip() == "TEMPLATE_JOB_BLOCKED_LETTER":
             raise RuntimeError("The template agent identified this as letter/correspondence and did not format it. The original parts remain available for review.")
@@ -16227,6 +16249,7 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
     assignment_at = _human_shift_local_now()
     assignment_email = str(actor.get("email") or "").strip().lower()
     assignment_uid = str(actor.get("uid") or "").strip()
+    model_route_key = _human_ai_agent_model_route_key(agent_id, assignment_email)
     target.update({
         "status": "in_progress", "worker_uid": None, "worker_email": None,
         "worker_name": "Worker 1", "ai_agent_id": agent_id,
@@ -16270,6 +16293,7 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
         await asyncio.to_thread(run_ref.set, {
             "run_id": run_id, "job_id": job_id, "segment_id": segment_id,
             "agent_id": agent_id, "agent_name": agent["name"], "model_ids": agent["models"],
+            "model_route_key": model_route_key,
             "scope": "whole_job" if whole_job_requested else ("part" if split_job else "single_job"),
             "assigned_by_uid": assignment_uid, "assigned_by_email": assignment_email,
             "assignedAt": assignment_at,
