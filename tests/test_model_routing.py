@@ -11,7 +11,11 @@ def load():
     end = SRC.index('@app.get("/api/admin/model-routing")')
     ns = {
         "time": __import__("time"),
-        "ASK_MODEL_CATALOGUE": [{"id": "gemini-3.8-flash", "provider": "gemini", "label": "G"}, {"id": "gpt-5.6-terra", "provider": "openai", "label": "T"}],
+        "ASK_MODEL_CATALOGUE": [
+            {"id": "gemini-3.8-flash", "provider": "gemini", "label": "G"},
+            {"id": "gpt-5.6-terra", "provider": "openai", "label": "T"},
+            {"id": "mistral-large-4", "provider": "mistral", "label": "Mistral Large 4 (Preview)"},
+        ],
         "HUMAN_GENERAL_AGENT_MODEL_CHAIN": (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")),
         "HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN": (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")),
         "is_human_subadmin": lambda email: str(email or "").strip().lower().startswith("subadmin@"),
@@ -50,10 +54,11 @@ class ModelRouting(unittest.TestCase):
         }})
         self.assertEqual(ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"]), (("mistral-large-4", "mistral"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"])
+        self.assertNotIn("mistral-large-4", ns["_model_route_options"]())
         tree = ast.parse(SRC)
         catalogue_node = next(node for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "ASK_MODEL_CATALOGUE" for target in node.targets))
-        catalogue = ast.literal_eval(catalogue_node.value)
-        self.assertNotIn("mistral-large-4", {model["id"] for model in catalogue})
+        catalogue = {model["id"]: model for model in ast.literal_eval(catalogue_node.value)}
+        self.assertEqual((catalogue["mistral-large-4"]["provider"], catalogue["mistral-large-4"]["tier"]), ("mistral", "premium"))
 
     def test_only_verified_general_job_assigner_role_selects_subadmin_route(self):
         ns = load()

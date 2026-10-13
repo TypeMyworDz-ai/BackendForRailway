@@ -22,7 +22,7 @@ class ModelsAndAudioTests(unittest.TestCase):
     def setUpClass(cls):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        wanted_funcs = {"_human_audio_response", "_ask_provider_ready", "ask_models_for", "resolve_ask_model"}
+        wanted_funcs = {"_human_audio_response", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text"}
         wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS"}
         body = []
         for node in tree.body:
@@ -85,6 +85,7 @@ class ModelsAndAudioTests(unittest.TestCase):
             ids = [model["id"] for model in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
             self.assertIn("gpt-6-luna", ids)
             self.assertNotIn("mistral-small-2603", ids)
+            self.assertNotIn("mistral-large-4", ids)
             os.environ["MISTRAL_API_KEY"] = "test-key"
             ids = [model["id"] for model in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
             self.assertIn("mistral-small-2603", ids)
@@ -93,6 +94,37 @@ class ModelsAndAudioTests(unittest.TestCase):
                 os.environ.pop("MISTRAL_API_KEY", None)
             else:
                 os.environ["MISTRAL_API_KEY"] = previous
+
+    def test_mistral_large4_is_premium_and_uses_existing_plan_gates(self):
+        import os
+        catalogue = {model["id"]: model for model in self.ns["ASK_MODEL_CATALOGUE"]}
+        large4 = catalogue["mistral-large-4"]
+        self.assertEqual((large4["provider"], large4["tier"], large4["credits"]), ("mistral", "premium", 10))
+        previous = os.environ.get("MISTRAL_API_KEY")
+        os.environ["MISTRAL_API_KEY"] = "test-key"
+        try:
+            monthly_ids = {model["id"] for model in self.ns["ask_models_for"]("Monthly Plan", "a@b.c", True, True)}
+            weekly_ids = {model["id"] for model in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)}
+            self.assertIn("mistral-large-4", monthly_ids)
+            self.assertNotIn("mistral-large-4", weekly_ids)
+        finally:
+            if previous is None:
+                os.environ.pop("MISTRAL_API_KEY", None)
+            else:
+                os.environ["MISTRAL_API_KEY"] = previous
+
+    def test_openai_compatible_parser_handles_block_based_model_content(self):
+        parse = self.ns["_openai_format_content_text"]
+        self.assertEqual(parse("  A plain response.  "), "A plain response.")
+        self.assertEqual(parse([
+            {"type": "text", "text": "Mistral Large "},
+            {"type": "text", "text": "4 is ready."},
+        ]), "Mistral Large 4 is ready.")
+        self.assertEqual(parse([
+            {"type": "thinking", "thinking": "private reasoning"},
+            {"type": "text", "text": "Visible answer."},
+        ]), "Visible answer.")
+        self.assertEqual(parse(None), "")
 
     def test_standard_plan_does_not_get_premium_models(self):
         ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
