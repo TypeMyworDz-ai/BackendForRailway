@@ -12,6 +12,27 @@ class FakeResponse:
         self.content, self.status_code, self.media_type, self.headers = content, status_code, media_type, headers or {}
 
 
+class FakeStreamResponse:
+    def __init__(self, lines, status_code=200):
+        self.lines, self.status_code, self.closed = lines, status_code, False
+        self.text = ""
+
+    def iter_lines(self, decode_unicode=True):
+        return iter(self.lines)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeRequests:
+    def __init__(self, response):
+        self.response, self.calls = response, []
+
+    def post(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.response
+
+
 class FakeRequest:
     def __init__(self, range_header=""):
         self.headers = {"range": range_header} if range_header else {}
@@ -22,7 +43,7 @@ class ModelsAndAudioTests(unittest.TestCase):
     def setUpClass(cls):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        wanted_funcs = {"_human_audio_response", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text"}
+        wanted_funcs = {"_human_audio_response", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text", "_openai_format_stream_text", "_ask_openai_format"}
         wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS"}
         body = []
         for node in tree.body:
@@ -31,7 +52,11 @@ class ModelsAndAudioTests(unittest.TestCase):
             elif isinstance(node, ast.Assign) and any(getattr(t, "id", "") in wanted_assigns for t in node.targets):
                 body.append(node)
         namespace = {
-            "re": re, "os": __import__("os"), "Response": FakeResponse, "Request": FakeRequest,
+            "re": re, "os": __import__("os"), "json": __import__("json"),
+            "logger": __import__("logging").getLogger("test.models"),
+            "TYPEMYWORDZ_AI_NAME": "TypeMyworDz",
+            "OPENAI_FORMAT_ENDPOINTS": {"mistral": ("https://api.mistral.ai/v1/chat/completions", lambda: "test-key")},
+            "requests": None, "Response": FakeResponse, "Request": FakeRequest,
             "is_ai_allowed": lambda plan, email, credits: True,
             "is_admin_user": lambda email: email == "admin@example.com",
             "is_comp_access_user": lambda email: False,
@@ -125,6 +150,36 @@ class ModelsAndAudioTests(unittest.TestCase):
             {"type": "text", "text": "Visible answer."},
         ]), "Visible answer.")
         self.assertEqual(parse(None), "")
+
+    def test_mistral_auto_continue_uses_streaming_chat_and_closes_response(self):
+        response = FakeStreamResponse([
+            b'data: {"choices":[{"delta":{"content":"A "},"finish_reason":null}]}',
+            b'data: {"choices":[{"delta":{"content":"complete draft"},"finish_reason":"stop"}]}',
+            b"data: [DONE]",
+        ])
+        fake_requests = FakeRequests(response)
+        self.ns["requests"] = fake_requests
+        try:
+            answer = self.ns["_ask_openai_format"](
+                "mistral", "mistral-large-4", "system", [], "format this transcript", [], 16000,
+                auto_continue=True,
+            )
+        finally:
+            self.ns["requests"] = None
+        self.assertEqual(answer, "A complete draft")
+        args, kwargs = fake_requests.calls[0]
+        self.assertEqual(args[0], "https://api.mistral.ai/v1/chat/completions")
+        self.assertTrue(kwargs["stream"])
+        self.assertTrue(kwargs["json"]["stream"])
+        self.assertEqual(kwargs["timeout"], (15, 300))
+        self.assertTrue(response.closed)
+
+    def test_mistral_stream_requires_completion_marker(self):
+        response = FakeStreamResponse([
+            b'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}'
+        ])
+        with self.assertRaisesRegex(RuntimeError, "completion marker"):
+            self.ns["_openai_format_stream_text"](response)
 
     def test_standard_plan_does_not_get_premium_models(self):
         ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]

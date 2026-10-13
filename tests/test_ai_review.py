@@ -12,13 +12,14 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_client_word_list_entries", "_human_client_word_list_matches", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_client_word_list_entries", "_human_client_word_list_matches", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output", "_review_normalize_note_list", "_review_validate_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
         nxt = src.index("\n\n\n", start)
         chunks.append(src[start:nxt])
-    ns = {"re": re, "math": math, "_parse_json_object": __import__("json").loads}
+    json = __import__("json")
+    ns = {"re": re, "math": math, "json": json, "logger": __import__("logging").getLogger("test.review"), "_parse_json_object": json.loads}
     exec("\n\n".join(chunks), ns)
     return ns
 
@@ -59,6 +60,26 @@ class ReviewHelpers(unittest.TestCase):
         text, data = NS["_review_split_output"]('<<<TRANSCRIPT>>>\n\tHello.  World.\n<<<NOTES>>>\n{"summary": "ok"}')
         self.assertEqual(text, "\tHello.  World.")
         self.assertEqual(data["summary"], "ok")
+
+    def test_malformed_auxiliary_notes_do_not_discard_valid_transcript(self):
+        answer = (
+            "<<<TRANSCRIPT>>>\nThe transcript remains available.\n<<<NOTES>>>\n"
+            '{"parts":"not a list","changes":[{"part":"Part 1"},"bad item"],'
+            '"issues":{"unexpected":true},"summary":null}'
+        )
+        text, notes = NS["_review_validate_output"](answer)
+        self.assertEqual(text, "The transcript remains available.")
+        self.assertEqual(notes["parts"], [])
+        self.assertEqual(notes["changes"], [{"part": "Part 1"}])
+        self.assertEqual(notes["issues"], [])
+        self.assertEqual(notes["summary"], "")
+
+    def test_validator_still_rejects_empty_transcript_and_incomplete_notes(self):
+        validate = NS["_review_validate_output"]
+        with self.assertRaisesRegex(ValueError, "empty transcript"):
+            validate('<<<TRANSCRIPT>>>\n  \n<<<NOTES>>>\n{"parts":[],"changes":[],"issues":[],"summary":""}')
+        with self.assertRaisesRegex(ValueError, "complete JSON object"):
+            validate('<<<TRANSCRIPT>>>\nTranscript text.\n<<<NOTES>>>\n{"parts":[]}')
 
     def test_batch_footer_is_removed_without_losing_transcript(self):
         strip_footer = NS["_review_strip_model_footer"]
