@@ -21,7 +21,8 @@ def load():
         "is_human_subadmin": lambda email: str(email or "").strip().lower().startswith("subadmin@"),
         "HUMAN_AUDIO_AGENT_MODEL_CHAIN": (("a", "x"),), "HUMAN_PDF_AGENT_MODEL_CHAIN": (("a", "x"),),
         "HUMAN_TEXT_MESSAGES_MODEL_CHAIN": (("a", "x"),), "WORKER_DRAFT_FORMAT_MODEL_CHAIN": (("a", "x"),),
-        "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN": (("a", "x"),), "AI_REVIEW_MODEL_CHAIN": (("a", "x"),),
+        "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN": (("a", "x"),), "HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN": (("a", "x"),),
+        "AI_REVIEW_MODEL_CHAIN": (("a", "x"),),
         "logger": __import__("logging").getLogger("t"),
     }
     exec(SRC[start:end], ns)
@@ -42,19 +43,24 @@ class ModelRouting(unittest.TestCase):
         self.assertEqual(ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"]), (("gemini-3.8-flash", "gemini"),))
         self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), (("gpt-5.6-terra", "openai"),))
 
-    def test_mistral_large_4_is_scoped_to_super_admin_general_jobs(self):
+    def test_mistral_large_4_is_available_to_every_human_work_route(self):
         ns = load()
-        general = ns["_model_route_options"]("general")
-        self.assertEqual(general["mistral-large-4"], ("mistral", "Mistral Large 4 (Preview)"))
-        for route_key in ("general_subadmin", "template", "letter", "pdf", "text_messages", "worker_format", "worker_proofread", "proofreading_agent", "letter_review"):
-            self.assertNotIn("mistral-large-4", ns["_model_route_options"](route_key))
+        options = ns["_model_route_options"]()
+        self.assertEqual(options["mistral-large-4"], ("mistral", "Mistral Large 4 (Preview)"))
+        route_keys = ("general", "general_subadmin", "template", "letter", "pdf", "text_messages", "worker_format", "worker_proofread", "proofreading_agent", "letter_review")
+        for route_key in route_keys:
+            self.assertIn(route_key, ns["MODEL_ROUTES"])
+            ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {route_key: ["mistral-large-4"]}})
+            _, default_chain = ns["MODEL_ROUTES"][route_key]
+            self.assertEqual(ns["_route_chain"](route_key, default_chain()), (("mistral-large-4", "mistral"),))
         ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {
             "general": ["mistral-large-4", "gemini-3.8-flash"],
             "general_subadmin": ["mistral-large-4"],
+            "proofreading_agent": ["mistral-large-4"],
         }})
         self.assertEqual(ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"]), (("mistral-large-4", "mistral"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"])
-        self.assertNotIn("mistral-large-4", ns["_model_route_options"]())
+        self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), (("mistral-large-4", "mistral"),))
+        self.assertEqual(ns["_route_chain"]("proofreading_agent", ns["AI_REVIEW_MODEL_CHAIN"]), (("mistral-large-4", "mistral"),))
         tree = ast.parse(SRC)
         catalogue_node = next(node for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "ASK_MODEL_CATALOGUE" for target in node.targets))
         catalogue = {model["id"]: model for model in ast.literal_eval(catalogue_node.value)}
@@ -78,12 +84,12 @@ class ModelRouting(unittest.TestCase):
         ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {}})
         self.assertEqual(ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"]), ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"])
 
-    def test_endpoints_require_super_admin_and_validate_route_scoped_models(self):
+    def test_endpoints_require_super_admin_and_validate_all_model_options(self):
         for name in ("admin_get_model_routing", "admin_put_model_routing"):
             body = SRC.split("async def " + name)[1][:300]
             self.assertIn("_require_admin(request)", body)
         self.assertIn('"available_models": [{"id": model_id', SRC)
-        self.assertIn("options = _model_route_options(key)", SRC.split("async def admin_put_model_routing")[1][:400])
+        self.assertIn("options = _model_route_options()", SRC.split("async def admin_put_model_routing")[1][:400])
 
 
 if __name__ == "__main__":
