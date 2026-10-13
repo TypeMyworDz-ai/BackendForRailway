@@ -14285,24 +14285,15 @@ MODEL_ROUTES = {
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
 MODEL_ROUTE_EXTRA_MODELS = {"claude-sonnet-5-5": ("claude", "Claude Sonnet 5.5")}
-# Human Work model exposure is intentionally narrower than the client Ask
-# catalogue: Large 4 remains selectable only for Super Admin General Jobs.
-MODEL_ROUTE_SCOPED_EXTRA_MODELS = {
-    "general": {"mistral-large-4": ("mistral", "Mistral Large 4 (Preview)")},
-}
+# Every model in the shared catalogue is available on each independently
+# configured Human Work agent route; each route still keeps its own saved chain.
 _MODEL_ROUTE_CACHE = {"at": 0.0, "routes": {}, "human_work_stt": {}}
 _MODEL_ROUTE_TTL_SECONDS = 30
 
 
-def _model_route_options(route_key=None):
-    scoped_ids = {model_id for route_models in MODEL_ROUTE_SCOPED_EXTRA_MODELS.values() for model_id in route_models}
-    options = {
-        m["id"]: (m["provider"], m.get("label") or m["id"])
-        for m in ASK_MODEL_CATALOGUE if m["id"] not in scoped_ids
-    }
+def _model_route_options():
+    options = {m["id"]: (m["provider"], m.get("label") or m["id"]) for m in ASK_MODEL_CATALOGUE}
     options.update(MODEL_ROUTE_EXTRA_MODELS)
-    if route_key:
-        options.update(MODEL_ROUTE_SCOPED_EXTRA_MODELS.get(route_key, {}))
     return options
 
 
@@ -14325,7 +14316,7 @@ def _model_route_overrides():
 
 
 def _route_chain(key, default_chain):
-    options = _model_route_options(key)
+    options = _model_route_options()
     ids = (_model_route_overrides() or {}).get(key)
     chain = []
     for model_id in ids if isinstance(ids, list) else []:
@@ -14348,7 +14339,7 @@ async def admin_get_model_routing(request: Request):
     overrides = await asyncio.to_thread(lambda: _model_route_overrides_fresh())
     routes = []
     for key, (label, default_fn) in MODEL_ROUTES.items():
-        route_options = _model_route_options(key)
+        route_options = _model_route_options()
         default_ids = [c[0] for c in default_fn()]
         chosen = [m for m in (overrides.get(key) or []) if m in route_options] if isinstance(overrides.get(key), list) else []
         routes.append({
@@ -14449,7 +14440,7 @@ async def admin_put_model_routing(request: Request):
     key = str(payload.get("key") or "")
     if key not in MODEL_ROUTES:
         raise HTTPException(status_code=400, detail="Unknown job type.")
-    options = _model_route_options(key)
+    options = _model_route_options()
     reset = bool(payload.get("reset"))
     ids = []
     for model_id in payload.get("models") or []:
