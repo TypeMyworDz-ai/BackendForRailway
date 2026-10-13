@@ -486,6 +486,15 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
+        "id": "mistral-large-4",
+        "provider": "mistral",
+        "label": "Mistral Large 4 (Preview)",
+        "blurb": "Mistral's Large 4 model is in preview. Try it for complex questions and long documents; each request uses 10 credits.",
+        "tier": "premium",
+        "credits": 10,
+        "transcript_only": False,
+    },
+    {
         "id": "claude-opus-5-5",
         "provider": "claude",
         "label": "Claude Opus 5.5",
@@ -4588,6 +4597,23 @@ OPENAI_FORMAT_ENDPOINTS = {
 _DEEPSEEK_DOWN_UNTIL = [0.0]
 
 
+def _openai_format_content_text(content):
+    """Extract visible text from either plain or block-based chat responses."""
+    def collect(value):
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            block_type = value.get("type")
+            if block_type and block_type not in {"text", "output_text"}:
+                return ""
+            return collect(value.get("text"))
+        if isinstance(value, list):
+            return "".join(collect(block) for block in value)
+        return ""
+
+    return collect(content).strip()
+
+
 def _ask_openai_format(provider, model_id, system_prompt, turns, question, images, max_tokens, auto_continue=False):
     """Call OpenAI or Mistral and return the answer text."""
     url, get_key = OPENAI_FORMAT_ENDPOINTS[provider]
@@ -4646,7 +4672,7 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
         data = r.json()
         choice = (data.get("choices") or [{}])[0]
-        text = ((choice.get("message") or {}).get("content") or "").strip()
+        text = _openai_format_content_text((choice.get("message") or {}).get("content"))
         if text:
             chunks.append(text)
         if choice.get("finish_reason") == "length":
@@ -14259,8 +14285,8 @@ MODEL_ROUTES = {
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
 MODEL_ROUTE_EXTRA_MODELS = {"claude-sonnet-5-5": ("claude", "Claude Sonnet 5.5")}
-# Preview models can be opened to a single admin route without adding them to
-# the shared Ask catalogue or other Human Work routes.
+# Human Work model exposure is intentionally narrower than the client Ask
+# catalogue: Large 4 remains selectable only for Super Admin General Jobs.
 MODEL_ROUTE_SCOPED_EXTRA_MODELS = {
     "general": {"mistral-large-4": ("mistral", "Mistral Large 4 (Preview)")},
 }
@@ -14269,7 +14295,11 @@ _MODEL_ROUTE_TTL_SECONDS = 30
 
 
 def _model_route_options(route_key=None):
-    options = {m["id"]: (m["provider"], m.get("label") or m["id"]) for m in ASK_MODEL_CATALOGUE}
+    scoped_ids = {model_id for route_models in MODEL_ROUTE_SCOPED_EXTRA_MODELS.values() for model_id in route_models}
+    options = {
+        m["id"]: (m["provider"], m.get("label") or m["id"])
+        for m in ASK_MODEL_CATALOGUE if m["id"] not in scoped_ids
+    }
     options.update(MODEL_ROUTE_EXTRA_MODELS)
     if route_key:
         options.update(MODEL_ROUTE_SCOPED_EXTRA_MODELS.get(route_key, {}))
