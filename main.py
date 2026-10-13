@@ -4597,7 +4597,7 @@ OPENAI_FORMAT_ENDPOINTS = {
 _DEEPSEEK_DOWN_UNTIL = [0.0]
 
 
-def _openai_format_content_text(content):
+def _openai_format_content_text(content, strip=True):
     """Extract visible text from either plain or block-based chat responses."""
     def collect(value):
         if isinstance(value, str):
@@ -4611,7 +4611,49 @@ def _openai_format_content_text(content):
             return "".join(collect(block) for block in value)
         return ""
 
-    return collect(content).strip()
+    text = collect(content)
+    return text.strip() if strip else text
+
+
+def _openai_format_stream_text(response):
+    """Read an OpenAI-compatible SSE stream, preserving its completion reason."""
+    chunks = []
+    finish_reason = None
+    completed = False
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            completed = True
+            break
+        try:
+            event = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("The model returned an unreadable streaming event.") from exc
+        if isinstance(event, dict) and event.get("error"):
+            raise RuntimeError("The model returned an error while streaming its response.")
+        for choice in (event.get("choices") or []) if isinstance(event, dict) else []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if content is None:
+                content = (choice.get("message") or {}).get("content")
+            chunk = _openai_format_content_text(content, strip=False)
+            if chunk:
+                chunks.append(chunk)
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+    if not completed:
+        raise RuntimeError("The model stream ended before its completion marker.")
+    text = "".join(chunks).strip()
+    if not text:
+        raise ValueError("The model stream returned no text.")
+    return text, finish_reason
 
 
 def _ask_openai_format(provider, model_id, system_prompt, turns, question, images, max_tokens, auto_continue=False):
@@ -4641,8 +4683,11 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
 
     chunks = []
     max_attempts = 12 if auto_continue else 1
+    use_stream = provider == "mistral" and auto_continue
     for attempt in range(max_attempts):
         payload = {"model": model_id, "messages": messages}
+        if use_stream:
+            payload["stream"] = True
         if provider == "deepseek":
             # The retired v4 names are still accepted, but the current name is
             # deepseek-flash. Reasoning is switched off: its tokens are billed as
@@ -4662,20 +4707,29 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             url,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
-            timeout=300 if auto_continue else 180,
+            timeout=(15, 300) if use_stream else (300 if auto_continue else 180),
+            stream=use_stream,
         )
         if r.status_code != 200:
             logger.error(f"{provider} returned {r.status_code}: {r.text[:400]}")
+            r.close()
             if provider == "deepseek":
                 _DEEPSEEK_DOWN_UNTIL[0] = time.time() + 300
                 return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
             raise HTTPException(status_code=502, detail=f"{TYPEMYWORDZ_AI_NAME} could not reach that model. Please try again.")
-        data = r.json()
-        choice = (data.get("choices") or [{}])[0]
-        text = _openai_format_content_text((choice.get("message") or {}).get("content"))
+        if use_stream:
+            try:
+                text, finish_reason = _openai_format_stream_text(r)
+            finally:
+                r.close()
+        else:
+            data = r.json()
+            choice = (data.get("choices") or [{}])[0]
+            text = _openai_format_content_text((choice.get("message") or {}).get("content"))
+            finish_reason = choice.get("finish_reason")
         if text:
             chunks.append(text)
-        if choice.get("finish_reason") == "length":
+        if finish_reason == "length":
             if not auto_continue:
                 if text:
                     return text + "\n\n[The answer was cut short because it reached its length limit.  Ask me to continue and I will pick up where I stopped.]"
@@ -17380,7 +17434,13 @@ async def _human_call_model_chain(model_chain, system_prompt, question, images=N
             return answer, model_id
         except Exception as exc:
             last_error = exc
-            failures.append(f"{model_id}: {str(exc)[:200]}")
+            if isinstance(exc, requests.exceptions.Timeout):
+                failure_summary = f"{model_id}: the model response timed out"
+            elif isinstance(exc, requests.exceptions.ConnectionError):
+                failure_summary = f"{model_id}: could not connect to the model provider"
+            else:
+                failure_summary = f"{model_id}: {str(exc)[:200]}"
+            failures.append(failure_summary)
             logger.warning("AI model %s failed or returned unusable output; trying the next model: %s", model_id, str(exc)[:300])
     raise RuntimeError("All configured AI models failed or returned unusable output. " + " | ".join(failures)) from last_error
 
@@ -18131,15 +18191,46 @@ def _review_split_output(answer):
     return text, data
 
 
+def _review_normalize_note_list(value, field):
+    """Safely normalize auxiliary model notes without rejecting a valid transcript."""
+    parsed = value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            parsed = value
+    if isinstance(parsed, dict):
+        items = [parsed]
+    elif isinstance(parsed, list):
+        items = parsed
+    elif field == "issues" and isinstance(parsed, str) and parsed.strip():
+        items = [parsed.strip()]
+    else:
+        items = []
+    if field in {"parts", "changes"}:
+        return [item for item in items if isinstance(item, dict)]
+    return [item.strip() for item in items if isinstance(item, str) and item.strip()]
+
+
 def _review_validate_output(answer):
+    """Validate transcript content and normalize non-critical review metadata."""
     text, data = _review_split_output(answer)
     text = _review_strip_model_footer(text)
     if not text.strip():
         raise ValueError("empty transcript in AI review response")
     if not isinstance(data, dict) or not {"parts", "changes", "issues", "summary"}.issubset(data):
         raise ValueError("AI review notes were not a complete JSON object")
-    if not isinstance(data.get("parts"), list) or not isinstance(data.get("changes"), list) or not isinstance(data.get("issues"), list):
-        raise ValueError("AI review notes have invalid field types")
+    malformed = []
+    for field in ("parts", "changes", "issues"):
+        original = data.get(field)
+        normalized = _review_normalize_note_list(original, field)
+        if not isinstance(original, list) or len(normalized) != len(original):
+            malformed.append(field)
+        data[field] = normalized
+    summary = data.get("summary")
+    data["summary"] = summary.strip() if isinstance(summary, str) else (str(summary) if isinstance(summary, (int, float)) else "")
+    if malformed:
+        logger.warning("AI review returned malformed %s notes; keeping the transcript and safely normalizing those notes", ", ".join(malformed))
     return text, data
 
 
@@ -18291,9 +18382,9 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
     ids = {p["id"] for p in parts}
     clean_parts = []
     for item in all_parts:
-        sid = str((item or {}).get("segment_id") or "")
         if not isinstance(item, dict):
             continue
+        sid = str(item.get("segment_id") or "")
         if sid in ids:
             clean_parts.append({"segment_id": sid, "accuracy": str(item.get("accuracy") or "")[:600], "notes": str(item.get("notes") or "")[:1200]})
     clean_changes = []
