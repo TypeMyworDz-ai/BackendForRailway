@@ -347,7 +347,7 @@ class AiModelRouting(unittest.TestCase):
             target.id: ast.literal_eval(node.value)
             for node in cls.tree.body if isinstance(node, ast.Assign)
             for target in node.targets if isinstance(target, ast.Name)
-            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "HUMAN_PDF_AGENT_MODEL_CHAIN", "HUMAN_TEXT_MESSAGES_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", "ASK_MODEL_CATALOGUE"}
+            and target.id in {"AI_REVIEW_MODEL_CHAIN", "HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN", "HUMAN_AUDIO_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_AGENT_MODEL_CHAIN", "HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN", "HUMAN_PDF_AGENT_MODEL_CHAIN", "HUMAN_TEXT_MESSAGES_MODEL_CHAIN", "WORKER_DRAFT_FORMAT_MODEL_CHAIN", "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN", "ASK_MODEL_CATALOGUE"}
         }
 
     def test_ai_review_preserves_emphatic_repetition_and_limits_self_corrections(self):
@@ -368,6 +368,7 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")))
+        self.assertEqual(self.assignments["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"], (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_TEXT_MESSAGES_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
@@ -420,8 +421,15 @@ class AiModelRouting(unittest.TestCase):
         self.assertEqual(len(image_calls), 1)
         self.assertEqual(len(pdf_calls), 2)
         self.assertEqual(len(agent_calls), 5)
-        self.assertIn("HUMAN_GENERAL_AGENT_MODEL_CHAIN if agent_id == 'general-gpt'", agent_source)
+        self.assertIn("general_route_key", agent_source)
+        self.assertIn("HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN", agent_source)
         self.assertIn("_route_chain", agent_source)
+        assignment_source = ast.unparse(self.functions["human_admin_assign_ai_agent"])
+        run_source = ast.unparse(self.functions["_human_run_ai_agent"])
+        self.assertIn("_human_ai_agent_model_route_key(agent_id, assignment_email)", assignment_source)
+        self.assertIn("'model_route_key': model_route_key", assignment_source)
+        self.assertIn("run_data.get('model_route_key')", run_source)
+        self.assertIn("model_route_key=model_route_key", run_source)
         self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN)", ast.unparse(self.functions["_human_image_review_draft"]))
         image_batch = ast.unparse(self.functions["_human_image_batch_compute"])
         self.assertIn("HUMAN_PDF_AGENT_MODEL_CHAIN", image_batch)

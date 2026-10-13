@@ -12,6 +12,8 @@ def load():
         "time": __import__("time"),
         "ASK_MODEL_CATALOGUE": [{"id": "gemini-3.8-flash", "provider": "gemini", "label": "G"}, {"id": "gpt-5.6-terra", "provider": "openai", "label": "T"}],
         "HUMAN_GENERAL_AGENT_MODEL_CHAIN": (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")),
+        "HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN": (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")),
+        "is_human_subadmin": lambda email: str(email or "").strip().lower().startswith("subadmin@"),
         "HUMAN_AUDIO_AGENT_MODEL_CHAIN": (("a", "x"),), "HUMAN_PDF_AGENT_MODEL_CHAIN": (("a", "x"),),
         "HUMAN_TEXT_MESSAGES_MODEL_CHAIN": (("a", "x"),), "WORKER_DRAFT_FORMAT_MODEL_CHAIN": (("a", "x"),),
         "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN": (("a", "x"),), "AI_REVIEW_MODEL_CHAIN": (("a", "x"),),
@@ -22,8 +24,25 @@ def load():
 
 
 class ModelRouting(unittest.TestCase):
-    def test_general_default_is_gemini_then_terra(self):
+    def test_general_defaults_are_separate_for_super_admin_and_sub_admins(self):
         self.assertIn('HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))', SRC)
+        self.assertIn('HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"))', SRC)
+        self.assertIn('"general_subadmin": ("General Jobs agent (Sub-admins)"', SRC)
+
+    def test_general_route_overrides_are_independent(self):
+        ns = load()
+        ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {
+            "general": ["gemini-3.8-flash"], "general_subadmin": ["gpt-5.6-terra"],
+        }})
+        self.assertEqual(ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"]), (("gemini-3.8-flash", "gemini"),))
+        self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), (("gpt-5.6-terra", "openai"),))
+
+    def test_only_verified_general_job_assigner_role_selects_subadmin_route(self):
+        ns = load()
+        route_key = ns["_human_ai_agent_model_route_key"]
+        self.assertEqual(route_key("general-gpt", "subadmin@example.com"), "general_subadmin")
+        self.assertEqual(route_key("general-gpt", "admin@example.com"), "general")
+        self.assertEqual(route_key("template-claude", "subadmin@example.com"), "")
 
     def test_override_used_and_unknown_ignored(self):
         ns = load()
