@@ -43,8 +43,8 @@ class ModelsAndAudioTests(unittest.TestCase):
     def setUpClass(cls):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
-        wanted_funcs = {"_human_audio_response", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text", "_openai_format_stream_text", "_ask_openai_format"}
-        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS"}
+        wanted_funcs = {"_human_audio_response", "_normalize_human_job_instructions", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text", "_openai_format_stream_text", "_ask_openai_format"}
+        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS", "MISTRAL_API_MODEL_ALIASES", "MISTRAL_PLAIN_TEXT_MODELS", "MAX_HUMAN_JOB_INSTRUCTIONS_CHARS"}
         body = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
@@ -169,10 +169,36 @@ class ModelsAndAudioTests(unittest.TestCase):
         self.assertEqual(answer, "A complete draft")
         args, kwargs = fake_requests.calls[0]
         self.assertEqual(args[0], "https://api.mistral.ai/v1/chat/completions")
+        self.assertEqual(kwargs["json"]["model"], "mistral-large-4-0")
+        self.assertEqual(kwargs["json"]["reasoning_effort"], "none")
         self.assertTrue(kwargs["stream"])
         self.assertTrue(kwargs["json"]["stream"])
         self.assertEqual(kwargs["timeout"], (15, 300))
         self.assertTrue(response.closed)
+
+    def test_human_job_instructions_allow_thirty_thousand_characters(self):
+        normalize = self.ns["_normalize_human_job_instructions"]
+        self.assertEqual(len(normalize("x" * 30000)), 30000)
+        with self.assertRaisesRegex(ValueError, "30,000 characters"):
+            normalize("x" * 30001)
+
+    def test_mistral_large4_stream_reads_text_after_reasoning_chunks(self):
+        response = FakeStreamResponse([
+            b'data: {"choices":[{"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"private reasoning"}]},{"type":"text","text":"Visible"}]},"finish_reason":null}]}',
+            b'data: {"choices":[{"delta":{"content":" answer"},"finish_reason":"stop"}]}',
+            b"data: [DONE]",
+        ])
+        text, finish_reason = self.ns["_openai_format_stream_text"](response)
+        self.assertEqual(text, "Visible answer")
+        self.assertEqual(finish_reason, "stop")
+
+    def test_completed_empty_mistral_stream_is_reported(self):
+        response = FakeStreamResponse([
+            b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            b"data: [DONE]",
+        ])
+        with self.assertRaisesRegex(ValueError, "no text"):
+            self.ns["_openai_format_stream_text"](response)
 
     def test_mistral_stream_requires_completion_marker(self):
         response = FakeStreamResponse([
