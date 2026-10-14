@@ -495,6 +495,24 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
+        "id": "gpt-6.1-sol",
+        "provider": "openai",
+        "label": "ChatGPT 6.1 Sol",
+        "blurb": "OpenAI's newest flagship, with a 1M-token window. Stronger than 5.6 Terra at a similar cost; good for difficult reasoning and long documents.",
+        "tier": "premium",
+        "credits": 10,
+        "transcript_only": False,
+    },
+    {
+        "id": "deepseek-v4-pro",
+        "provider": "deepseek",
+        "label": "DeepSeek V4 Pro",
+        "blurb": "DeepSeek's deeper reasoning model at a fraction of Western flagship prices. Pictures are read by ChatGPT Luna automatically.",
+        "tier": "premium",
+        "credits": 5,
+        "transcript_only": False,
+    },
+    {
         "id": "claude-opus-5-5",
         "provider": "claude",
         "label": "Claude Opus 5.5",
@@ -3585,6 +3603,7 @@ async def lifespan(app: FastAPI):
     human_expiry_task = asyncio.create_task(human_expiry_monitor())
     human_payout_task = asyncio.create_task(human_payout_monitor())
     auto_finish_task = asyncio.create_task(_human_auto_finish_monitor())
+    declined_terms_task = asyncio.create_task(_declined_terms_monitor())
     logger.info("Human worker TAT and payout monitor tasks created")
     yield
     logger.info("Application lifespan shutdown")
@@ -3592,6 +3611,7 @@ async def lifespan(app: FastAPI):
     human_expiry_task.cancel()
     human_payout_task.cancel()
     auto_finish_task.cancel()
+    declined_terms_task.cancel()
     for job_id, task in active_background_tasks.items():
         if not task.done():
             logger.info(f"Cancelling background task for job {job_id}")
@@ -4704,7 +4724,7 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             # The retired v4 names are still accepted, but the current name is
             # deepseek-flash. Reasoning is switched off: its tokens are billed as
             # output and a chat answer does not need them.
-            payload["model"] = "deepseek-flash"
+            payload["model"] = "deepseek-v4-pro" if model_id == "deepseek-v4-pro" else "deepseek-flash"
             payload["thinking"] = {"type": "disabled"}
         budget = max(max_tokens, 16000 if auto_continue else 4000)
         if provider == "openai":
@@ -7497,32 +7517,30 @@ def _human_deadline_assignment_token(item):
 
 
 def _human_worker_retraining_updates(profile, deadline_return_count, now):
+    """Flag a worker for an admin retraining decision.
+
+    The system never moves a worker back to the Training Room by itself. It only
+    raises a review flag; the super admin then chooses between retraining
+    (Module 6 only) and a supervised job to rebuild the worker's rating.
+    """
     profile = profile or {}
     if deadline_return_count < HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS or profile.get("workerApproved") is not True:
         return {}
-    levels = list(range(1, len(TRAINING_LEVELS) + 1))
+    if profile.get("worker_retraining_review_required") is True:
+        return {}
     return {
-        "role": "trainee",
-        "workerApproved": False,
-        "trainingRoomAccess": True,
-        "trainingStatus": "active",
-        "traineeStatus": "enrolled",
-        "trainingLevel": 1,
-        "trainingSubmissions": {str(level): "redo_requested" for level in levels},
-        "trainingRedoLevels": levels,
-        "trainingRedoMessage": "Your available-work access is paused after repeated missed deadlines. Please retake the six Training Room modules and typing practice; your prior training and payout history remain on record.",
-        "trainingRedoInvitedAt": now,
-        "worker_retraining_required": True,
-        "worker_retraining_required_at": now,
+        "worker_retraining_review_required": True,
+        "worker_retraining_review_at": now,
+        "worker_retraining_review_reason": "Repeated missed deadlines (%d returned jobs)." % int(deadline_return_count),
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
 
 
-async def _human_archive_retraining_attempts(worker_uid):
-    """Move each saved module into redo mode without losing its prior attempt."""
+async def _human_archive_retraining_attempts(worker_uid, levels=None):
+    """Move the chosen saved modules into redo mode without losing the prior attempt."""
     if not db or not worker_uid:
         return
-    for level in range(1, len(TRAINING_LEVELS) + 1):
+    for level in (levels or [len(TRAINING_LEVELS)]):
         ref = db.collection("training_submissions").document(f"{worker_uid}-{level}")
         try:
             snapshot = await asyncio.to_thread(ref.get)
@@ -7537,7 +7555,8 @@ async def _human_archive_retraining_attempts(worker_uid):
                 })
             await asyncio.to_thread(ref.set, {
                 "uid": worker_uid, "level": level, "status": "redo_requested",
-                "previous_attempts": history[-10:], "redoRequestedAt": previous.get("redoRequestedAt") or datetime.now().isoformat(),
+                "transcript": "", "notes": "", "answers": {},
+                "previous_attempts": history[-10:], "redoRequestedAt": datetime.now().isoformat(),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             }, merge=True)
         except Exception as exc:
@@ -7636,19 +7655,14 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
         if consecutive >= HUMAN_SHIFT_LOCKOUT_MISSES:
             retraining = _human_worker_retraining_updates(profile, HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS, local_now)
             if retraining:
-                retraining["trainingRedoMessage"] = (
-                    "Your work access is paused after six consecutive missed shifts. Please retake the Training Room modules and typing practice. "
-                    "Your earlier training and payout history are preserved, and you do not need to pay for training again."
-                )
+                retraining["worker_retraining_review_reason"] = "Six consecutive missed shifts."
                 retraining["humanShiftMissesConsecutive"] = consecutive
                 retraining["humanShiftLastEvaluatedDate"] = current_date.isoformat()
                 retraining["humanShiftWarning"] = True
                 retraining["humanShiftLockoutAt"] = firestore.SERVER_TIMESTAMP
                 await asyncio.to_thread(user_ref.set, retraining, merge=True)
                 profile.update({key: value for key, value in retraining.items() if key != "updatedAt"})
-                await _human_archive_retraining_attempts(uid)
                 locked = True
-                break
         current_date += timedelta(days=1)
     await asyncio.to_thread(user_ref.set, {
         "humanShiftMissesConsecutive": consecutive,
@@ -8123,8 +8137,6 @@ async def _human_reclaim_expired_job(job_id: str, job: dict, split_expected=None
     except Exception as exc:
         logger.warning("Could not transactionally return expired Human Work %s: %s", job_id, exc)
         return job
-    for uid in result.get("locked_workers") or []:
-        await _human_archive_retraining_attempts(uid)
     for event in result.get("events") or []:
         worker_uid = str(event.get("worker_uid") or "")
         role = str(event.get("role") or "transcriber")
@@ -9376,7 +9388,7 @@ async def _human_actor(request: Request):
     profile = await _heal_profile_identity(uid, email, profile)
     # A trainee belongs in the private Training Room until an admin explicitly
     # promotes them.  Only approved workers may see assigned human jobs.
-    if profile.get("workerApproved") is True:
+    if profile.get("workerApproved") is True and str(profile.get("workerTermsStatus") or "") not in {"pending", "declined"}:
         role = "worker"
     return {"uid": uid, "email": email, "role": role, "profile": profile}
 
@@ -14208,6 +14220,10 @@ async def admin_workers(request: Request):
         return {"workers": []}
     snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
     rows = []
+    try:
+        alias_map, _needles = await _human_worker_aliases([snap.id for snap in snapshots])
+    except Exception:
+        alias_map = {}
     for snap in snapshots:
         data = snap.to_dict() or {}
         try:
@@ -14217,6 +14233,12 @@ async def admin_workers(request: Request):
         data = await _admin_fill_identity(snap.id, data)
         rows.append({
             "uid": snap.id,
+            "alias": alias_map.get(snap.id) or "",
+            "retraining_review_required": data.get("worker_retraining_review_required") is True,
+            "retraining_review_reason": data.get("worker_retraining_review_reason") or "",
+            "retraining_review_at": _human_iso(data.get("worker_retraining_review_at")),
+            "supervised_job_required": data.get("supervisedJobRequired") is True,
+            "terms_status": data.get("workerTermsStatus") or "",
             "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
             "email": data.get("email") or "",
             "country": data.get("country") or "Kenya",
@@ -14229,7 +14251,7 @@ async def admin_workers(request: Request):
             "approved_at": _human_iso(data.get("workerApprovedAt")),
             "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
-    rows.sort(key=lambda item: (-(item["rating"] or 0), item["name"].lower()))
+    rows.sort(key=lambda item: (not item["retraining_review_required"], -(item["rating"] or 0), item["name"].lower()))
     return {"workers": rows, "min_claim_rating": MIN_HUMAN_WORKER_RATING, "min_proofread_rating": MIN_PROOFREADER_RATING}
 
 
@@ -19650,8 +19672,6 @@ async def _advance_legacy_training_progress(uid, profile):
 @app.get("/human-transcription/trainee/status")
 async def trainee_status(request: Request):
     actor = await _trainee_actor(request)
-    if (actor.get("profile") or {}).get("worker_retraining_required") is True:
-        await _human_archive_retraining_attempts(actor["uid"])
     profile = await _advance_legacy_training_progress(actor["uid"], actor["profile"])
     actor["profile"] = profile
     results = await _load_training_submissions(actor["uid"])
@@ -19675,6 +19695,8 @@ async def trainee_status(request: Request):
         },
         "levels": TRAINING_LEVELS,
         "guidelines": TRAINING_GUIDELINES,
+        "terms_declined": str(profile.get("workerTermsStatus") or "") == "declined",
+        "deletion_scheduled_at": _human_iso(profile.get("accountDeletionScheduledAt")),
         "is_worker": bool(profile.get("workerApproved") or str(profile.get("role") or "").lower() == "worker"),
     }
 
@@ -19808,7 +19830,7 @@ async def admin_trainee_decision(uid: str, request: Request):
     payload = await request.json()
     decision = str(payload.get("decision") or "").strip().lower()
     payment_status = str(payload.get("payment_status") or "").strip().lower()
-    if decision not in {"reject", "promote_worker", "approve_level", "invite_redo", "waitlist"}:
+    if decision not in {"reject", "promote_worker", "reinstate", "approve_level", "invite_redo", "waitlist"}:
         raise HTTPException(status_code=400, detail="That trainee decision is not supported.")
     if decision == "approve_level":
         raise HTTPException(status_code=409, detail="Module progression is automatic; admins review only after all six modules are submitted.")
@@ -19868,25 +19890,182 @@ async def admin_trainee_decision(uid: str, request: Request):
             "trainingWaitlistedAt": firestore.SERVER_TIMESTAMP,
             "workerApproved": False,
         })
-    elif decision == "promote_worker":
+    elif decision in {"promote_worker", "reinstate"}:
         results = await _load_training_submissions(uid)
-        complete = all(str(results.get(str(level), {}).get("status") or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
-        final_transcript = str((results.get(str(len(TRAINING_LEVELS))) or {}).get("transcript") or "").strip()
-        if not complete or not final_transcript:
-            raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
+        returning = profile.get("worker_retraining_required") is True or decision == "reinstate"
+        final_level = len(TRAINING_LEVELS)
+        final_transcript = str((results.get(str(final_level)) or {}).get("transcript") or "").strip()
+        if returning:
+            # A returning worker only retakes the final module; modules 1-5 always stay passed.
+            final_done = str((results.get(str(final_level)) or {}).get("status") or "").lower() == "submitted" and final_transcript
+            if decision == "promote_worker" and not final_done:
+                raise HTTPException(status_code=409, detail="The returning worker must submit Module 6 before reinstatement.")
+            for level in range(1, final_level):
+                await asyncio.to_thread(db.collection("training_submissions").document(f"{uid}-{level}").set, {
+                    "uid": uid, "level": level, "status": "submitted", "updatedAt": firestore.SERVER_TIMESTAMP,
+                }, merge=True)
+        else:
+            complete = all(str(results.get(str(level), {}).get("status") or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
+            if not complete or not final_transcript:
+                raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
         updates.update({
             "role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed",
             "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP,
+            "trainingSubmissions": {str(level): "submitted" for level in range(1, final_level + 1)},
             "trainingRedoLevels": [], "trainingRedoMessage": "", "worker_retraining_required": False,
+            "worker_retraining_review_required": False,
             "deadline_return_count": 0, "worker_qualification_cycle": uuid.uuid4().hex,
             "humanShiftMissesConsecutive": 0, "humanShiftWarning": False,
             "humanShiftLastEvaluatedDate": _human_shift_local_now().date().isoformat(),
             "humanShiftCallInExpiresAt": "", "humanShiftReinstatedAt": firestore.SERVER_TIMESTAMP,
+            "workerTermsStatus": "pending", "workerTermsVersion": WORKER_TERMS_VERSION,
         })
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     if decision == "invite_redo":
         await _notify_trainee_redo_invite(uid, profile, levels, message)
     return {"status": "updated", "uid": uid, "decision": decision}
+
+
+WORKER_TERMS_VERSION = "2026-10"
+WORKER_TERMS_DECLINE_DELETE_DAYS = 3
+
+
+@app.post("/api/admin/workers/{uid}/retraining-decision")
+async def admin_worker_retraining_decision(uid: str, request: Request):
+    """Super admin decides what happens to a worker flagged for retraining.
+
+    retrain: back to the Training Room, Module 6 only (modules 1-5 stay passed).
+    supervised_job: stay a worker; the admin assigns one supervised job to rebuild the rating.
+    dismiss: keep working, clear the flag and counters.
+    """
+    _require_admin(request)
+    payload = await request.json()
+    decision = str(payload.get("decision") or "").strip().lower()
+    if decision not in {"retrain", "supervised_job", "dismiss"}:
+        raise HTTPException(status_code=400, detail="Choose retrain, supervised_job or dismiss.")
+    profile = await _load_profile(uid)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="That worker account was not found.")
+    if profile.get("workerApproved") is not True:
+        raise HTTPException(status_code=409, detail="This account is not currently an approved worker.")
+    message = str(payload.get("message") or "").strip()[:1000]
+    final_level = len(TRAINING_LEVELS)
+    updates = {"updatedAt": firestore.SERVER_TIMESTAMP, "worker_retraining_review_required": False}
+    if decision == "retrain":
+        for level in range(1, final_level):
+            await asyncio.to_thread(db.collection("training_submissions").document(f"{uid}-{level}").set, {
+                "uid": uid, "level": level, "status": "submitted", "updatedAt": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+        await _human_archive_retraining_attempts(uid, [final_level])
+        note = message or "Your work access is paused. Please retake Module %d only; your other modules stay passed and you do not pay for training again." % final_level
+        updates.update({
+            "role": "trainee", "workerApproved": False, "trainingRoomAccess": True,
+            "trainingStatus": "active", "traineeStatus": "enrolled", "trainingPaymentStatus": "paid",
+            "trainingLevel": final_level,
+            "trainingSubmissions": {**{str(level): "submitted" for level in range(1, final_level)}, str(final_level): "redo_requested"},
+            "trainingRedoLevels": [final_level], "trainingRedoMessage": note,
+            "trainingRedoInvitedAt": firestore.SERVER_TIMESTAMP,
+            "worker_retraining_required": True, "worker_retraining_required_at": firestore.SERVER_TIMESTAMP,
+            "is_available": False, "workerTermsStatus": firestore.DELETE_FIELD,
+        })
+    else:
+        updates.update({
+            "deadline_return_count": 0, "humanShiftMissesConsecutive": 0, "humanShiftWarning": False,
+            "humanShiftLastEvaluatedDate": _human_shift_local_now().date().isoformat(),
+            "worker_qualification_cycle": uuid.uuid4().hex,
+        })
+        if decision == "supervised_job":
+            updates.update({"supervisedJobRequired": True, "supervisedJobRequestedAt": firestore.SERVER_TIMESTAMP, "supervisedJobNote": message})
+    await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
+    _human_list_cache_bump()
+    if decision == "retrain":
+        await _notify_trainee_redo_invite(uid, profile, [final_level], updates["trainingRedoMessage"])
+    elif decision == "supervised_job":
+        try:
+            await _create_user_notification(
+                uid, "supervised-job:%s" % uuid.uuid4().hex[:12], "worker_notice",
+                "Your next job will be supervised",
+                message or "An admin will assign you one supervised job to rebuild your rating. You keep your worker access.",
+                route="human", requires_action=False,
+            )
+        except Exception as exc:
+            logger.warning("Supervised-job notification failed for %s: %s", uid, exc)
+    return {"status": "updated", "uid": uid, "decision": decision}
+
+
+@app.post("/api/admin/workers/{uid}/supervised-job-done")
+async def admin_worker_supervised_job_done(uid: str, request: Request):
+    _require_admin(request)
+    await asyncio.to_thread(db.collection("users").document(uid).set, {
+        "supervisedJobRequired": False, "supervisedJobCompletedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return {"status": "updated", "uid": uid}
+
+
+@app.post("/human-transcription/worker/terms")
+async def worker_terms_response(request: Request):
+    """A newly promoted worker accepts or declines the work terms before entering the Work Room."""
+    decoded = _verified_user(request)
+    uid = str(decoded.get("uid") or decoded.get("user_id") or decoded.get("sub") or "")
+    payload = await request.json()
+    accept = payload.get("accept") is True
+    profile = await _load_profile(uid)
+    if profile is None or str(profile.get("workerTermsStatus") or "") != "pending":
+        raise HTTPException(status_code=409, detail="There are no worker terms waiting for your response.")
+    if accept:
+        await asyncio.to_thread(db.collection("users").document(uid).set, {
+            "workerTermsStatus": "accepted", "workerTermsAcceptedAt": firestore.SERVER_TIMESTAMP,
+            "workerTermsAcceptedVersion": WORKER_TERMS_VERSION, "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        return {"status": "accepted"}
+    delete_at = datetime.now(timezone.utc) + timedelta(days=WORKER_TERMS_DECLINE_DELETE_DAYS)
+    await asyncio.to_thread(db.collection("users").document(uid).set, {
+        "role": "trainee", "workerApproved": False, "trainingRoomAccess": False, "is_available": False,
+        "traineeStatus": "enrolled", "trainingStatus": "terms_declined",
+        "workerTermsStatus": "declined", "workerTermsDeclinedAt": firestore.SERVER_TIMESTAMP,
+        "accountDeletionScheduledAt": delete_at.isoformat(), "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    _human_list_cache_bump()
+    return {"status": "declined", "deletion_scheduled_at": delete_at.isoformat()}
+
+
+async def _purge_declined_terms_accounts():
+    """Delete accounts whose owners declined the worker terms once the 3 day window ends."""
+    if not db:
+        return 0
+    snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerTermsStatus", "==", "declined")).stream()))
+    now = datetime.now(timezone.utc)
+    removed = 0
+    admin_emails = {item.lower() for item in ADMIN_EMAILS}
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        due = _human_shift_parse_datetime(data.get("accountDeletionScheduledAt"))
+        if not due or due.astimezone(timezone.utc) > now:
+            continue
+        if str(data.get("email") or "").lower() in admin_emails:
+            continue
+        try:
+            try:
+                await asyncio.to_thread(firebase_auth.delete_user, snap.id)
+            except firebase_auth.UserNotFoundError:
+                pass
+            await asyncio.to_thread(_delete_matching_documents, "transcriptions", "userId", snap.id)
+            await asyncio.to_thread(_delete_matching_documents, "askChats", "userId", snap.id)
+            await asyncio.to_thread(db.collection("users").document(snap.id).delete)
+            removed += 1
+            logger.warning("Deleted account %s after worker terms were declined", snap.id)
+        except Exception as exc:
+            logger.warning("Could not delete declined-terms account %s: %s", snap.id, exc)
+    return removed
+
+
+async def _declined_terms_monitor():
+    while True:
+        try:
+            await _purge_declined_terms_accounts()
+        except Exception as exc:
+            logger.warning("Declined-terms cleanup failed: %s", exc)
+        await asyncio.sleep(3600)
 
 
 @app.post("/human-transcription/trainee/training/{level}/submit")
