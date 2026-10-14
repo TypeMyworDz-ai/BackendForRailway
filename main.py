@@ -4593,6 +4593,12 @@ OPENAI_FORMAT_ENDPOINTS = {
     "deepseek": ("https://api.deepseek.com/chat/completions", lambda: os.environ.get("DEEPSEEK_API_KEY")),
 }
 
+# Keep the admin-facing selector stable while sending Mistral's canonical API id.
+MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}
+# Large 4's plain-text mode avoids reasoning-only SSE chunks in job drafts.
+MISTRAL_PLAIN_TEXT_MODELS = {"mistral-large-4", "mistral-large-4-0"}
+MAX_HUMAN_JOB_INSTRUCTIONS_CHARS = 30000
+
 
 _DEEPSEEK_DOWN_UNTIL = [0.0]
 
@@ -4652,6 +4658,10 @@ def _openai_format_stream_text(response):
         raise RuntimeError("The model stream ended before its completion marker.")
     text = "".join(chunks).strip()
     if not text:
+        logger.warning(
+            "OpenAI-compatible stream completed without visible text (finish_reason=%s, content_chunks=%s)",
+            finish_reason, len(chunks),
+        )
         raise ValueError("The model stream returned no text.")
     return text, finish_reason
 
@@ -4684,8 +4694,11 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
     chunks = []
     max_attempts = 12 if auto_continue else 1
     use_stream = provider == "mistral" and auto_continue
+    api_model_id = MISTRAL_API_MODEL_ALIASES.get(model_id, model_id) if provider == "mistral" else model_id
     for attempt in range(max_attempts):
-        payload = {"model": model_id, "messages": messages}
+        payload = {"model": api_model_id, "messages": messages}
+        if provider == "mistral" and model_id in MISTRAL_PLAIN_TEXT_MODELS:
+            payload["reasoning_effort"] = "none"
         if use_stream:
             payload["stream"] = True
         if provider == "deepseek":
@@ -10696,6 +10709,16 @@ async def human_admin_create_letter_job(
         raise
 
 
+def _normalize_human_job_instructions(value):
+    """Trim uploaded job notes and enforce the shared Human Work size limit."""
+    note = str(value or "").strip()
+    if len(note) > MAX_HUMAN_JOB_INSTRUCTIONS_CHARS:
+        raise ValueError(
+            f"Job-specific instructions must be {MAX_HUMAN_JOB_INSTRUCTIONS_CHARS:,} characters or fewer."
+        )
+    return note
+
+
 @app.post("/human-transcription/admin/audio-jobs")
 async def human_admin_create_audio_job(
     request: Request,
@@ -10746,9 +10769,10 @@ async def human_admin_create_audio_job(
     if len([item for item in (attachments or []) if getattr(item, "filename", "")]) > max_reference_count:
         raise HTTPException(status_code=413, detail=f"Attach no more than {max_reference_count} supporting reference files.")
 
-    note = str(instructions or "").strip()
-    if len(note) > 12000:
-        raise HTTPException(status_code=413, detail="Job-specific instructions must be 12,000 characters or fewer.")
+    try:
+        note = _normalize_human_job_instructions(instructions)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     default_instruction = GENERAL_JOB_DEFAULT_INSTRUCTION if job_category == "general" else TEMPLATE_JOB_DEFAULT_INSTRUCTION
     job_instructions = default_instruction + (f"\n\nADMIN JOB NOTES:\n{note}" if note else "")
     raw_references = []
