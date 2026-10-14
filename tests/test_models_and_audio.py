@@ -44,7 +44,7 @@ class ModelsAndAudioTests(unittest.TestCase):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         wanted_funcs = {"_human_audio_response", "_normalize_human_job_instructions", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text", "_openai_format_stream_text", "_ask_openai_format"}
-        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS", "MISTRAL_API_MODEL_ALIASES", "MISTRAL_PLAIN_TEXT_MODELS", "MAX_HUMAN_JOB_INSTRUCTIONS_CHARS"}
+        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS", "MISTRAL_API_MODEL_ALIASES", "MISTRAL_PLAIN_TEXT_MODELS"}
         body = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
@@ -176,11 +176,11 @@ class ModelsAndAudioTests(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], (15, 300))
         self.assertTrue(response.closed)
 
-    def test_human_job_instructions_allow_thirty_thousand_characters(self):
+    def test_human_job_instructions_have_no_application_character_cap(self):
         normalize = self.ns["_normalize_human_job_instructions"]
-        self.assertEqual(len(normalize("x" * 30000)), 30000)
-        with self.assertRaisesRegex(ValueError, "30,000 characters"):
-            normalize("x" * 30001)
+        large_note = "x" * 100000
+        self.assertEqual(normalize(large_note), large_note)
+        self.assertEqual(normalize(f"  {large_note}  "), large_note)
 
     def test_mistral_large4_stream_reads_text_after_reasoning_chunks(self):
         response = FakeStreamResponse([
