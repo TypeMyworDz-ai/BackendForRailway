@@ -361,3 +361,27 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetrainingFlowRegressionTests(unittest.TestCase):
+    """Guards for the retraining loop bug: viewing the Training Room must never reset passed modules."""
+
+    def setUp(self):
+        import ast, pathlib
+        self.tree = ast.parse((pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text())
+
+    def _src(self, name):
+        import ast
+        node = next(item for item in self.tree.body if isinstance(item, (ast.AsyncFunctionDef, ast.FunctionDef)) and item.name == name)
+        return ast.unparse(node)
+
+    def test_trainee_status_does_not_reset_modules(self):
+        self.assertNotIn("_human_archive_retraining_attempts", self._src("trainee_status"))
+
+    def test_retrain_decision_only_reopens_module_six(self):
+        source = self._src("admin_worker_retraining_decision")
+        self.assertIn("[final_level]", source)
+        self.assertIn("trainingLevel': final_level", source)
+
+    def test_promotion_requires_terms(self):
+        self.assertIn("workerTermsStatus': 'pending'", self._src("admin_trainee_decision"))

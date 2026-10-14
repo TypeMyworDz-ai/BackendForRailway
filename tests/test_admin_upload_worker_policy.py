@@ -85,18 +85,18 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         lockout = self.namespace["_human_worker_retraining_updates"]
         self.assertEqual(lockout({"workerApproved": True}, 10, datetime(2026, 10, 5)), {})
 
-    def test_eleventh_deadline_return_routes_worker_to_existing_paid_training(self):
+    def test_eleventh_deadline_return_only_flags_worker_for_admin_review(self):
         updates = self.namespace["_human_worker_retraining_updates"](
             {"workerApproved": True, "trainingPaymentStatus": "paid"}, 11, datetime(2026, 10, 5)
         )
-        self.assertEqual(updates["role"], "trainee")
-        self.assertIs(updates["workerApproved"], False)
-        self.assertIs(updates["trainingRoomAccess"], True)
-        self.assertEqual(updates["trainingLevel"], 1)
-        self.assertEqual(updates["trainingRedoLevels"], [1, 2, 3, 4, 5, 6])
-        self.assertTrue(all(value == "redo_requested" for value in updates["trainingSubmissions"].values()))
-        self.assertNotIn("trainingPaymentStatus", updates)
-        self.assertTrue(updates["worker_retraining_required"])
+        # The system must never demote a worker by itself.
+        self.assertTrue(updates["worker_retraining_review_required"])
+        for key in ("role", "workerApproved", "trainingRoomAccess", "trainingSubmissions", "worker_retraining_required"):
+            self.assertNotIn(key, updates)
+
+    def test_already_flagged_worker_is_not_flagged_again(self):
+        flagged = {"workerApproved": True, "worker_retraining_review_required": True}
+        self.assertEqual(self.namespace["_human_worker_retraining_updates"](flagged, 12, datetime(2026, 10, 5)), {})
 
     def test_shift_window_uses_nairobi_time_and_excludes_8pm(self):
         scheduled = self.namespace["_human_shift_is_scheduled"]
