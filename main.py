@@ -4597,7 +4597,6 @@ OPENAI_FORMAT_ENDPOINTS = {
 MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}
 # Large 4's plain-text mode avoids reasoning-only SSE chunks in job drafts.
 MISTRAL_PLAIN_TEXT_MODELS = {"mistral-large-4", "mistral-large-4-0"}
-MAX_HUMAN_JOB_INSTRUCTIONS_CHARS = 30000
 
 
 _DEEPSEEK_DOWN_UNTIL = [0.0]
@@ -10710,13 +10709,8 @@ async def human_admin_create_letter_job(
 
 
 def _normalize_human_job_instructions(value):
-    """Trim uploaded job notes and enforce the shared Human Work size limit."""
-    note = str(value or "").strip()
-    if len(note) > MAX_HUMAN_JOB_INSTRUCTIONS_CHARS:
-        raise ValueError(
-            f"Job-specific instructions must be {MAX_HUMAN_JOB_INSTRUCTIONS_CHARS:,} characters or fewer."
-        )
-    return note
+    """Normalize uploaded Human Work notes without imposing a character limit."""
+    return str(value or "").strip()
 
 
 @app.post("/human-transcription/admin/audio-jobs")
@@ -10769,10 +10763,7 @@ async def human_admin_create_audio_job(
     if len([item for item in (attachments or []) if getattr(item, "filename", "")]) > max_reference_count:
         raise HTTPException(status_code=413, detail=f"Attach no more than {max_reference_count} supporting reference files.")
 
-    try:
-        note = _normalize_human_job_instructions(instructions)
-    except ValueError as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    note = _normalize_human_job_instructions(instructions)
     default_instruction = GENERAL_JOB_DEFAULT_INSTRUCTION if job_category == "general" else TEMPLATE_JOB_DEFAULT_INSTRUCTION
     job_instructions = default_instruction + (f"\n\nADMIN JOB NOTES:\n{note}" if note else "")
     raw_references = []
