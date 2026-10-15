@@ -3651,6 +3651,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS middleware configured successfully")
+
+class _JsonGzipMiddleware:
+    """Gzip plain JSON API replies only.
+
+    Skipped on purpose: audio/video, files, Word/PDF downloads, event streams,
+    Range requests, partial content, HEAD requests, anything already encoded,
+    anything that is not application/json, and small bodies. Streaming bodies
+    are passed through untouched.
+    """
+    MIN_BYTES = 1024
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("method") == "HEAD":
+            return await self.app(scope, receive, send)
+        req = {k.lower(): v for k, v in scope.get("headers", [])}
+        if b"gzip" not in req.get(b"accept-encoding", b"").lower() or b"range" in req:
+            return await self.app(scope, receive, send)
+
+        held = {"start": None, "body": b"", "mode": None}  # mode: None=undecided, "gzip", "pass"
+
+        async def passthrough_start():
+            await send(held["start"])
+
+        async def wrapped_send(message):
+            if message["type"] == "http.response.start":
+                headers = {k.lower(): v for k, v in message.get("headers", [])}
+                ctype = headers.get(b"content-type", b"").split(b";")[0].strip().lower()
+                eligible = (
+                    message.get("status") == 200
+                    and ctype == b"application/json"
+                    and b"content-encoding" not in headers
+                    and b"content-range" not in headers
+                )
+                held["start"] = message
+                held["mode"] = "gzip" if eligible else "pass"
+                if not eligible:
+                    await send(message)
+                return
+            if message["type"] != "http.response.body" or held["mode"] == "pass":
+                return await send(message)
+            if held["mode"] == "done":
+                return await send(message)
+            # Eligible JSON: buffer only a single complete body.
+            more = message.get("more_body", False)
+            if more and not held["body"]:
+                # Streaming JSON: do not compress, send what we hold untouched.
+                held["mode"] = "done"
+                await send(held["start"])
+                return await send(message)
+            held["body"] += message.get("body", b"")
+            if more:
+                return
+            body = held["body"]
+            start = held["start"]
+            held["mode"] = "done"
+            if len(body) < self.MIN_BYTES:
+                await send(start)
+                return await send({"type": "http.response.body", "body": body})
+            import gzip as _gzip
+            packed = _gzip.compress(body, compresslevel=5)
+            if len(packed) >= len(body):
+                await send(start)
+                return await send({"type": "http.response.body", "body": body})
+            out = [(k, v) for k, v in start.get("headers", []) if k.lower() not in (b"content-length", b"etag")]
+            out.append((b"content-encoding", b"gzip"))
+            out.append((b"content-length", str(len(packed)).encode()))
+            vary = [v for k, v in out if k.lower() == b"vary"]
+            if not any(b"accept-encoding" in v.lower() for v in vary):
+                out.append((b"vary", b"Accept-Encoding"))
+            await send({**start, "headers": out})
+            await send({"type": "http.response.body", "body": packed})
+
+        await self.app(scope, receive, wrapped_send)
+
+app.add_middleware(_JsonGzipMiddleware)
+logger.info("JSON gzip middleware configured")
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
