@@ -1779,8 +1779,8 @@ def _require_human_subadmin(request: Request) -> dict:
 def _require_human_shift_admin(request: Request) -> dict:
     decoded = _verified_user(request)
     email = (decoded.get("email") or "").strip().lower()
-    if email != HUMAN_SHIFT_ADMIN_EMAIL:
-        raise HTTPException(status_code=403, detail="Shift attendance is available only to the main admin.")
+    if email != HUMAN_SHIFT_ADMIN_EMAIL and not is_human_job_admin(email):
+        raise HTTPException(status_code=403, detail="Shift attendance is available only to the admin team.")
     return decoded
 
 
@@ -8476,6 +8476,20 @@ async def _human_worker_job_snapshots(worker_uid, include_legacy_segments=False)
     return list(found.values())
 
 
+HUMAN_STARTER_JOBS_REQUIRED = 3  # a new worker is rated by the Rating Agent on their 3rd submitted job
+
+
+async def _human_worker_submitted_jobs(worker_uid):
+    """How many jobs this worker has submitted (the Rating Agent's counter)."""
+    if not db or not worker_uid:
+        return 0
+    try:
+        snap = await asyncio.to_thread(db.collection("human_worker_rating_counters").document(str(worker_uid)).get)
+        return max(0, int(((snap.to_dict() or {}) if snap.exists else {}).get("count") or 0))
+    except Exception:
+        return 0
+
+
 async def _human_worker_rating_summary(worker_uid, profile=None, force_refresh=False):
     profile = profile or {}
     if not force_refresh and "worker_rating_count" in profile:
@@ -10050,7 +10064,7 @@ async def human_list_jobs(request: Request, scope: str = "mine", owner: str = ""
             claim_block_reason = (
                 f"Your current average is {average:.2f}/5; a rating of at least 3.5/5 is required to see Available Jobs."
                 if average is not None else
-                "A rating of at least 3.5/5 is required to see Available Jobs. Ask an admin about a supervised starter assignment."
+                "New workers complete 3 supervised starter jobs assigned by an admin. The Rating Agent rates you after the third, and a rating of at least 3.5/5 opens Available Jobs."
             )
         elif worker_active_assignment:
             claim_block_reason = "Finish your current assignment before claiming another."
@@ -11880,6 +11894,8 @@ async def human_list_workers(request: Request):
             "available": data.get("is_available") is True,
             "rating": rating.get("average"),
             "rating_count": rating.get("count") or 0,
+            "submitted_jobs": await _human_worker_submitted_jobs(snap.id),
+            "starter_jobs_required": HUMAN_STARTER_JOBS_REQUIRED,
             "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
     return {
@@ -13406,6 +13422,19 @@ async def human_admin_delete(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail="The job could not be fully removed. Worker payment history is protected; please retry, and contact support if the issue continues.")
 
 
+def _human_conversation_closed(job):
+    """The worker conversation is read-only once the job has moved to Submitted
+    (or beyond) and no worker has live work on it. History stays visible."""
+    job = job or {}
+    if str(job.get("status") or "") not in {"submitted", "proofreading_available", "client_review", "client_approved", "released", "cancelled"}:
+        return False
+    if str(job.get("proofreader_status") or "") in {"assigned", "in_progress"}:
+        return False
+    if any(str((item or {}).get("status") or "") in {"assigned", "in_progress"} for item in (job.get("segments") or [])):
+        return False
+    return True
+
+
 def _human_assert_job_conversation_access(job, actor):
     if actor.get("role") == "admin":
         return
@@ -13496,7 +13525,28 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
             batch.update(message_ref, {"readBy": firestore.ArrayUnion([actor["uid"]])})
         await asyncio.to_thread(batch.commit)
     await _update_user_notification_states(actor["uid"], thread_id=f"job:{job_id}:{target_thread}", kinds={"job_message"}, read=True)
-    return {"messages": messages, "thread": target_thread}
+    if actor.get("role") == "admin":
+        # Super admins see the worker's real name; sub-admins only the Human Worker number.
+        sender_uids = sorted({str(m.get("sender_uid") or "") for m in messages if m.get("sender_role") == "worker" and m.get("sender_uid")})
+        names = {}
+        try:
+            aliases, _needles = await _human_worker_aliases(sender_uids) if sender_uids else ({}, [])
+        except Exception:
+            aliases = {}
+        subadmin_view = is_human_subadmin(str(actor.get("email") or ""))
+        for uid in sender_uids:
+            if subadmin_view:
+                names[uid] = aliases.get(uid) or "Assigned worker"
+                continue
+            try:
+                profile = await _load_profile(uid) or {}
+            except Exception:
+                profile = {}
+            names[uid] = str(profile.get("name") or profile.get("full_name") or profile.get("displayName") or aliases.get(uid) or "Assigned worker")
+        for m in messages:
+            if m.get("sender_role") == "worker":
+                m["sender_name"] = names.get(str(m.get("sender_uid") or ""), "Assigned worker")
+    return {"messages": messages, "thread": target_thread, "closed": _human_conversation_closed(job)}
 
 
 @app.post("/human-transcription/jobs/{job_id}/messages")
@@ -13508,6 +13558,8 @@ async def human_send_message(job_id: str, request: Request, attachment: UploadFi
     target_thread = _human_thread_for(actor, thread)
     if not _human_job_worker_uids(job):
         raise HTTPException(status_code=409, detail="The worker conversation opens after a worker claims a job or part.")
+    if _human_conversation_closed(job):
+        raise HTTPException(status_code=409, detail="This job has moved to Submitted, so its conversation is closed. Earlier messages stay visible.")
     text = (message or "").strip()
     attachment_meta = await _human_store_upload(job_id, attachment, "chat") if attachment else None
     if not text and not attachment_meta:
@@ -14354,6 +14406,8 @@ async def admin_workers(request: Request):
             "phone": data.get("mpesaNumber") or data.get("phone") or "",
             "rating": rating.get("average"),
             "rating_count": rating.get("count") or 0,
+            "submitted_jobs": await _human_worker_submitted_jobs(snap.id),
+            "starter_jobs_required": HUMAN_STARTER_JOBS_REQUIRED,
             "is_available": data.get("is_available") is True,
             "approved_at": _human_iso(data.get("workerApprovedAt")),
             "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
