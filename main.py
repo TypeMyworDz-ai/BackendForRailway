@@ -513,6 +513,24 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
+        "id": "claude-sonnet-5-5",
+        "provider": "claude",
+        "label": "Claude Sonnet 5.5",
+        "blurb": "Claude's best balance of speed and intelligence. Strong for careful writing, long documents and difficult reading.",
+        "tier": "premium",
+        "credits": 10,
+        "transcript_only": False,
+    },
+    {
+        "id": "zai-glm-5-3",
+        "provider": "mistral",
+        "label": "GLM 5.3 (Z.ai)",
+        "blurb": "A Chinese open-weight reasoning model with a 1M-token window, served by Mistral. Strong at long documents, coding and step-by-step problems; it always thinks before it answers.",
+        "tier": "premium",
+        "credits": 10,
+        "transcript_only": False,
+    },
+    {
         "id": "claude-opus-5-5",
         "provider": "claude",
         "label": "Claude Opus 5.5",
@@ -544,8 +562,7 @@ ASK_MODEL_CATALOGUE = [
 # Model ids that were renamed or replaced. A client who saved one in Settings
 # is moved to its successor instead of being dropped back to the default.
 ASK_MODEL_ALIASES = {
-    "claude-sonnet-5": "claude-haiku-5-5",
-    "claude-sonnet-5-5": "claude-haiku-5-5",
+    "claude-sonnet-5": "claude-sonnet-5-5",
     "claude-opus-4-6": "claude-opus-5-5",
     "gemini-3.6-flash": "gemini-3.8-flash",
 }
@@ -4614,9 +4631,13 @@ OPENAI_FORMAT_ENDPOINTS = {
 }
 
 # Keep the admin-facing selector stable while sending Mistral's canonical API id.
-MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}
+MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}  # zai-glm-5-3 is sent as-is
 # Large 4's plain-text mode avoids reasoning-only SSE chunks in job drafts.
-MISTRAL_PLAIN_TEXT_MODELS = {"mistral-large-4", "mistral-large-4-0"}
+MISTRAL_PLAIN_TEXT_MODELS = set()
+# Reasoning effort sent to Mistral-hosted models. Large 4 now reasons (high).
+# GLM 5.3 cannot switch reasoning off, so it runs at "low" to keep answers quick.
+MISTRAL_REASONING_EFFORT = {"mistral-large-4": "high", "mistral-large-4-0": "high", "zai-glm-5-3": "low"}
+MISTRAL_REASONING_MODELS = set(MISTRAL_REASONING_EFFORT)
 
 
 _DEEPSEEK_DOWN_UNTIL = [0.0]
@@ -4697,6 +4718,9 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         # unavailable (for example an empty balance), so clients see no error.
         if images or time.time() < _DEEPSEEK_DOWN_UNTIL[0]:
             return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
+    if model_id == "zai-glm-5-3" and images:
+        # GLM 5.3 reads text only; pictures go to Mistral Large 4, which sees images.
+        return _ask_openai_format("mistral", "mistral-large-4", system_prompt, turns, question, images, max_tokens, auto_continue)
     content = []
     for img in images:
         content.append({
@@ -4718,6 +4742,8 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         payload = {"model": api_model_id, "messages": messages}
         if provider == "mistral" and model_id in MISTRAL_PLAIN_TEXT_MODELS:
             payload["reasoning_effort"] = "none"
+        elif provider == "mistral" and model_id in MISTRAL_REASONING_EFFORT:
+            payload["reasoning_effort"] = MISTRAL_REASONING_EFFORT[model_id]
         if use_stream:
             payload["stream"] = True
         if provider == "deepseek":
@@ -4727,6 +4753,8 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             payload["model"] = "deepseek-v4-pro" if model_id == "deepseek-v4-pro" else "deepseek-flash"
             payload["thinking"] = {"type": "disabled"}
         budget = max(max_tokens, 16000 if auto_continue else 4000)
+        if provider == "mistral" and model_id in MISTRAL_REASONING_MODELS:
+            budget = max(budget, 32000)
         if provider == "openai":
             # These models count reasoning tokens against the output budget, so
             # keep reasoning light for chat and give the answer room to finish.
@@ -14257,11 +14285,11 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
-HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai"))
-HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
-HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"))
+AI_REVIEW_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
+HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("claude-opus-5-5", "claude"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
+HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -14332,17 +14360,17 @@ HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
         "display": "Set by the Super admin in Admin > Model routing", "job_types": ["audio", "general_job"],
-        "models": ["gemini-3.8-flash", "gpt-5.6-terra"],
+        "models": ["gemini-3.8-flash", "gpt-6.1-sol"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
-        "display": "GPT-5.6 Sol + Claude Opus 5.5 fallback", "job_types": ["audio", "template_job"],
-        "models": ["gpt-5.6-sol", "claude-opus-5-5"],
+        "display": "GPT-6.1 Sol + Claude Opus 5.5 fallback", "job_types": ["audio", "template_job"],
+        "models": ["gpt-6.1-sol", "claude-opus-5-5"],
     },
     "letter-opus": {
         "id": "letter-opus", "name": "Letter Agent",
-        "display": "GPT-5.6 Sol + Claude Opus 5.5 fallback", "job_types": ["letter_job"],
-        "models": ["gpt-5.6-sol", "claude-opus-5-5"],
+        "display": "GPT-6.1 Sol + Claude Opus 5.5 fallback", "job_types": ["letter_job"],
+        "models": ["gpt-6.1-sol", "claude-opus-5-5"],
     },
     "pdf-gemini": {
         "id": "pdf-gemini", "name": "PDF and Image Agent",
@@ -18429,7 +18457,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-sol": "GPT-5.6 Sol", "claude-haiku-5-5": "Claude Haiku 5.5"}
+    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "deepseek-v4-pro": "DeepSeek V4 Pro", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5"}
     ordered = [names[m] for m in names if m in used_model_ids]
     if len(ordered) > 1:
         model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
@@ -19392,7 +19420,7 @@ async def human_proofreading_agent(job_id, actor, progress):
     names = {
         "claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.5-flash": "Gemini 3.5 Flash",
         "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra",
-        "gpt-5.6-sol": "GPT-5.6 Sol", "claude-haiku-5-5": "Claude Haiku 5.5",
+        "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "deepseek-v4-pro": "DeepSeek V4 Pro", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5",
     }
     used = [names.get(str(m).strip().casefold(), str(m)) for m in result.get("models_used") or []]
     saved = {
