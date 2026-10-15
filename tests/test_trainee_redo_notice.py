@@ -75,7 +75,7 @@ class TraineeRedoNoticeTests(unittest.TestCase):
         src = MAIN_PATH.read_text(encoding="utf-8")
         decision = next(n for n in self.tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "admin_trainee_decision")
         self.assertIn("_notify_trainee_redo_invite(uid, profile, levels, message)", ast.unparse(decision))
-        self.assertIn("ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordz.ai']", src)
+        self.assertIn("ADMIN_EMAILS = ['typemywordz@gmail.com']", src)
         self.assertIn("'donotgrowweary95@gmail.com'", src)
 
 
