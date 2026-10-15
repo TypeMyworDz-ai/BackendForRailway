@@ -107,7 +107,7 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # plan or free-trial rules, and can reach the admin tools.
 # Complimentary accounts (below) also skip payment, but are NOT admins and get
 # none of the admin tooling.
-ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordz.ai']
+ADMIN_EMAILS = ['typemywordz@gmail.com']
 # Dedicated OpenAI Whisper tester. This account used to be the AssemblyAI
 # tester; the owner moved it to OpenAI so OpenAI can be exercised on its own.
 # Like the Deepgram tester it never falls back, so an OpenAI failure shows up
