@@ -44,7 +44,7 @@ class ModelsAndAudioTests(unittest.TestCase):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tree = ast.parse(source)
         wanted_funcs = {"_human_audio_response", "_normalize_human_job_instructions", "_ask_provider_ready", "ask_models_for", "resolve_ask_model", "_openai_format_content_text", "_openai_format_stream_text", "_ask_openai_format"}
-        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS", "MISTRAL_API_MODEL_ALIASES", "MISTRAL_PLAIN_TEXT_MODELS"}
+        wanted_assigns = {"ASK_MODEL_CATALOGUE", "ASK_MODEL_ALIASES", "ASK_DEFAULT_MODEL", "ASK_LUNA_MODEL", "ASK_TRANSCRIPT_DEFAULT_MODEL", "ASK_FALLBACK_MODEL", "PREMIUM_AI_PLANS", "MISTRAL_API_MODEL_ALIASES", "MISTRAL_PLAIN_TEXT_MODELS", "MISTRAL_REASONING_EFFORT", "MISTRAL_REASONING_MODELS"}
         body = []
         for node in tree.body:
             if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
@@ -67,7 +67,7 @@ class ModelsAndAudioTests(unittest.TestCase):
     def test_old_model_ids_move_to_their_successors(self):
         resolve = self.ns["resolve_ask_model"]
         self.assertEqual(resolve("claude-opus-4-6", "Monthly Plan", "a@b.c", True, True)[0], "claude-opus-5-5")
-        self.assertEqual(resolve("claude-sonnet-5", "Monthly Plan", "a@b.c", True, True)[0], "claude-haiku-5-5")
+        self.assertEqual(resolve("claude-sonnet-5", "Monthly Plan", "a@b.c", True, True)[0], "claude-sonnet-5-5")
         self.assertEqual(resolve("gemini-3.6-flash", "Monthly Plan", "a@b.c", True, True)[0], "gemini-3.8-flash")
 
     def test_unknown_model_falls_back_to_default(self):
@@ -170,7 +170,7 @@ class ModelsAndAudioTests(unittest.TestCase):
         args, kwargs = fake_requests.calls[0]
         self.assertEqual(args[0], "https://api.mistral.ai/v1/chat/completions")
         self.assertEqual(kwargs["json"]["model"], "mistral-large-4-0")
-        self.assertEqual(kwargs["json"]["reasoning_effort"], "none")
+        self.assertEqual(kwargs["json"]["reasoning_effort"], "high")
         self.assertTrue(kwargs["stream"])
         self.assertTrue(kwargs["json"]["stream"])
         self.assertEqual(kwargs["timeout"], (15, 300))
@@ -241,3 +241,22 @@ class ModelsAndAudioTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NewModelConfigTests(unittest.TestCase):
+    def setUp(self):
+        import pathlib
+        self.src = (pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text()
+
+    def test_catalogue_has_new_models(self):
+        for model_id in ("gpt-6.1-sol", "claude-sonnet-5-5", "zai-glm-5-3", "deepseek-v4-pro", "mistral-large-4"):
+            self.assertIn('"id": "%s"' % model_id, self.src)
+
+    def test_reasoning_settings(self):
+        self.assertIn('"mistral-large-4": "high"', self.src)
+        self.assertIn('"zai-glm-5-3": "low"', self.src)
+        self.assertIn("MISTRAL_PLAIN_TEXT_MODELS = set()", self.src)
+
+    def test_internal_chains_use_gpt_61_sol(self):
+        self.assertIn('HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai")', self.src)
+        self.assertNotIn('("gpt-5.6-sol", "openai")', self.src)
