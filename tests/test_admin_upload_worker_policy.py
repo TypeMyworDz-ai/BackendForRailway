@@ -392,6 +392,7 @@ class ShiftAuthorizationRules(unittest.TestCase):
             "Request": object,
             "HUMAN_SHIFT_ADMIN_EMAIL": "typemywordz@gmail.com",
             "_verified_user": lambda request: request,
+            "is_human_job_admin": lambda email: email in {"info@typemywordz.ai", "gracenyaitara@gmail.com"},
             "_human_shift_reconcile": reconcile,
             "_human_shift_current_record": current_record,
             "_human_shift_status_payload": status_payload,
@@ -401,8 +402,9 @@ class ShiftAuthorizationRules(unittest.TestCase):
         }
         exec(compile(ast.Module(body=[functions["_require_human_shift_admin"], functions["_human_shift_assert_can_start_assigned"], functions["_human_require_worker_online_for_overtime"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
         self.assertEqual(namespace["_require_human_shift_admin"]({"email": "typemywordz@gmail.com"}), {"email": "typemywordz@gmail.com"})
+        self.assertEqual(namespace["_require_human_shift_admin"]({"email": "info@typemywordz.ai"}), {"email": "info@typemywordz.ai"})
         with self.assertRaises(RequestError):
-            namespace["_require_human_shift_admin"]({"email": "info@typemywordz.ai"})
+            namespace["_require_human_shift_admin"]({"email": "stranger@example.com"})
 
         actor = {"uid": "worker-1", "profile": {"workerApproved": True}}
         result = asyncio.run(namespace["_human_shift_assert_can_start_assigned"](actor))
