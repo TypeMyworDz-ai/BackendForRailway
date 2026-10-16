@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
 import secrets
-from datetime import datetime, timedelta, time as datetime_time, timezone
+from datetime import datetime, timedelta, time as datetime_time, timezone, date as datetime_date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from html import unescape
@@ -1001,6 +1001,44 @@ def human_tat_seconds(audio_seconds):
         return HUMAN_SHORT_AUDIO_TAT_MINUTES * 60
     minutes = max(1, int(math.ceil(seconds / 60.0)))
     return minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
+
+
+def human_worker_extension_minutes(audio_seconds, allocated_tat_seconds=None):
+    """Self-service extension a worker may take on one split-job part.
+
+    1 audio minute: one more standard one-minute TAT (4 minutes).
+    2-3 audio minutes: half of the standard TAT (4 and 6 minutes).
+    4+ audio minutes: a quarter of the TAT allocated to the part.
+    Whole-job and proofreading assignments never get this extension.
+    """
+    try:
+        seconds = float(audio_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0
+    audio_minutes = max(1, int(math.ceil(seconds / 60.0))) if seconds > 0 else 1
+    standard_minutes = audio_minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE
+    if audio_minutes == 1:
+        return standard_minutes
+    if audio_minutes <= 3:
+        return int(standard_minutes // 2)
+    allocated = float(allocated_tat_seconds or 0) or standard_minutes * 60.0
+    return max(1, int(round(allocated / 60.0 / 4.0)))
+
+
+def _human_part_worker_extension_offer(job, part):
+    """Minutes the part's worker could still self-extend, or 0 if none."""
+    if not _human_is_split_job(job) or not isinstance(part, dict):
+        return 0
+    if (job or {}).get("whole_job_assignment") is True:
+        return 0
+    if part.get("status") not in {"assigned", "in_progress"} or part.get("worker_tat_extended_at"):
+        return 0
+    deadline = _as_dt(part.get("deadlineAt"))
+    if not deadline or deadline <= datetime.now():
+        return 0
+    seconds = max(0.0, float(part.get("end_seconds") or 0) - float(part.get("start_seconds") or 0))
+    original = int(part.get("tat_seconds") or 0) - int(part.get("tat_extension_minutes") or 0) * 60
+    return human_worker_extension_minutes(seconds, original if original > 0 else None)
 
 
 def human_proofreading_tat_seconds(audio_seconds):
@@ -3603,6 +3641,26 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
 
+async def _human_weekly_shift_monitor():
+    """Hourly sweep so a worker who stops logging in is still demoted
+    automatically when a week ends with fewer than the required shifts."""
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            if not db:
+                continue
+            snaps = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
+            for snap in snaps:
+                try:
+                    await _human_shift_reconcile(snap.id, snap.to_dict() or {})
+                except Exception as exc:
+                    logger.warning("Weekly shift check failed for %s: %s", snap.id, exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Weekly shift monitor error: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
@@ -3621,6 +3679,7 @@ async def lifespan(app: FastAPI):
     human_payout_task = asyncio.create_task(human_payout_monitor())
     auto_finish_task = asyncio.create_task(_human_auto_finish_monitor())
     declined_terms_task = asyncio.create_task(_declined_terms_monitor())
+    weekly_shift_task = asyncio.create_task(_human_weekly_shift_monitor())
     logger.info("Human worker TAT and payout monitor tasks created")
     yield
     logger.info("Application lifespan shutdown")
@@ -3629,6 +3688,7 @@ async def lifespan(app: FastAPI):
     human_payout_task.cancel()
     auto_finish_task.cancel()
     declined_terms_task.cancel()
+    weekly_shift_task.cancel()
     for job_id, task in active_background_tasks.items():
         if not task.done():
             logger.info(f"Cancelling background task for job {job_id}")
@@ -6794,6 +6854,12 @@ HUMAN_SHIFT_ADMIN_EMAIL = "typemywordz@gmail.com"
 HUMAN_SHIFT_WARNING_MISSES = 5
 HUMAN_SHIFT_LOCKOUT_MISSES = 6
 HUMAN_SHIFT_ONLINE_TTL_SECONDS = 150
+# A worker must clock in to at least this many weekday shifts (Mon-Fri) each
+# week. Missing it demotes the worker to the Training Room automatically.
+HUMAN_SHIFT_MIN_WEEKLY = 4
+# First Monday the weekly rule counts from, so nobody is penalised for weeks
+# before it was announced.
+HUMAN_SHIFT_WEEKLY_RULE_START = datetime_date(2026, 10, 19)
 HUMAN_SHIFT_CALL_TTL_HOURS = 4
 HUMAN_SHIFT_COLLECTION = "human_worker_shifts"
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
@@ -7052,6 +7118,7 @@ def _human_public_for(data, actor_role, actor_uid=""):
         if assignment is not None:
             assignment["time_remaining_seconds"] = remaining(assignment.get("deadlineAt"), assignment.get("status"))
             assignment["role"] = "transcriber"
+            assignment["worker_extension_minutes_available"] = _human_part_worker_extension_offer(data, owned_segment)
         if assignment is None and data.get("worker_uid") == actor_uid:
             assignment = {
                 "id": "transcriber", "label": "Full transcript", "role": "transcriber",
@@ -7703,6 +7770,77 @@ def _human_shift_doc_id(uid, shift_date):
     return f"{uid}_{shift_date}"
 
 
+async def _human_shift_week_attended(uid, week_monday):
+    """Number of Mon-Fri shifts in the week starting week_monday with a clock-in."""
+    async def one(day):
+        snap = await asyncio.to_thread(db.collection(HUMAN_SHIFT_COLLECTION).document(_human_shift_doc_id(uid, day.isoformat())).get)
+        data = snap.to_dict() if snap.exists else {}
+        return bool(data.get("clockedInAt"))
+    results = await asyncio.gather(*[one(week_monday + timedelta(days=i)) for i in range(5)])
+    return sum(1 for item in results if item)
+
+
+def _human_shift_tracking_start(profile):
+    """Date from which the worker is accountable for weekly shifts."""
+    for key in ("workerApprovedAt", "humanShiftReinstatedAt", "humanShiftTrackingStartedAt"):
+        value = (profile or {}).get(key)
+        if hasattr(value, "astimezone"):
+            return value.astimezone(HUMAN_SHIFT_TIMEZONE).date()
+        parsed = _human_shift_parse_datetime(value)
+        if parsed:
+            return parsed.date()
+    return None
+
+
+async def _human_shift_demote_worker(uid, profile, reason):
+    """Automatically return a worker to the Training Room (Module 6 only).
+
+    Same outcome as the super admin's 'retrain' decision, without admin action."""
+    final_level = len(TRAINING_LEVELS)
+    for level in range(1, final_level):
+        await asyncio.to_thread(db.collection("training_submissions").document(f"{uid}-{level}").set, {
+            "uid": uid, "level": level, "status": "submitted", "updatedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+    await _human_archive_retraining_attempts(uid, [final_level])
+    note = "Your work access was paused automatically: %s Please retake Module %d only; your other modules stay passed and you do not pay for training again." % (reason, final_level)
+    updates = {
+        "role": "trainee", "workerApproved": False, "trainingRoomAccess": True,
+        "trainingStatus": "active", "traineeStatus": "enrolled", "trainingPaymentStatus": "paid",
+        "trainingLevel": final_level,
+        "trainingSubmissions": {**{str(level): "submitted" for level in range(1, final_level)}, str(final_level): "redo_requested"},
+        "trainingRedoLevels": [final_level], "trainingRedoMessage": note,
+        "trainingRedoInvitedAt": firestore.SERVER_TIMESTAMP,
+        "worker_retraining_required": True, "worker_retraining_required_at": firestore.SERVER_TIMESTAMP,
+        "worker_retraining_review_required": False,
+        "worker_retraining_review_reason": reason,
+        "humanShiftLockoutAt": firestore.SERVER_TIMESTAMP,
+        "humanShiftAutoDemotedAt": firestore.SERVER_TIMESTAMP,
+        "is_available": False, "workerTermsStatus": firestore.DELETE_FIELD,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
+    try:
+        _human_list_cache_bump()
+    except Exception:
+        pass
+    try:
+        await _notify_trainee_redo_invite(uid, profile, [final_level], note)
+    except Exception as exc:
+        logger.warning("Weekly-shift demotion notice failed for %s: %s", uid, exc)
+    logger.info("Worker %s demoted to the Training Room automatically: %s", uid, reason)
+
+
+async def _human_shift_week_summary(uid, now=None):
+    local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    monday = local_now.date() - timedelta(days=local_now.weekday())
+    attended = await _human_shift_week_attended(uid, monday)
+    return {
+        "week_start": monday.isoformat(), "shifts_this_week": attended,
+        "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
+        "weekly_requirement_met": attended >= HUMAN_SHIFT_MIN_WEEKLY,
+    }
+
+
 async def _human_shift_reconcile(uid, profile=None, now=None):
     """Record each completed daily shift once and return the latest worker profile."""
     if not db or not uid:
@@ -7770,6 +7908,20 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
                 await asyncio.to_thread(user_ref.set, retraining, merge=True)
                 profile.update({key: value for key, value in retraining.items() if key != "updatedAt"})
                 locked = True
+        if current_date.weekday() == 4 and profile.get("workerApproved") is True:
+            # Friday's shift is over: judge the whole Mon-Fri week.
+            week_monday = current_date - timedelta(days=4)
+            tracking_start = _human_shift_tracking_start(profile)
+            if tracking_start and tracking_start <= week_monday and week_monday >= HUMAN_SHIFT_WEEKLY_RULE_START:
+                attended_count = await _human_shift_week_attended(uid, week_monday)
+                if attended_count < HUMAN_SHIFT_MIN_WEEKLY:
+                    reason = "You clocked in to %d shift%s in the week of %s; at least %d are required every week." % (
+                        attended_count, "" if attended_count == 1 else "s", week_monday.strftime("%d %b %Y"), HUMAN_SHIFT_MIN_WEEKLY)
+                    await _human_shift_demote_worker(uid, profile, reason)
+                    profile.update({"workerApproved": False, "role": "trainee", "worker_retraining_required": True, "is_available": False})
+                    profile["humanShiftLastEvaluatedDate"] = current_date.isoformat()
+                    await asyncio.to_thread(user_ref.set, {"humanShiftLastEvaluatedDate": current_date.isoformat(), "humanShiftMissesConsecutive": consecutive}, merge=True)
+                    return profile
         current_date += timedelta(days=1)
     await asyncio.to_thread(user_ref.set, {
         "humanShiftMissesConsecutive": consecutive,
@@ -7924,6 +8076,7 @@ async def human_worker_shift_status(request: Request):
     _, shift = await _human_shift_current_record(actor["uid"])
     result = _human_shift_status_payload(actor["uid"], profile, shift)
     result["has_active_assignment"] = await _human_worker_has_active_assignment(actor["uid"])
+    result.update(await _human_shift_week_summary(actor["uid"]))
     return result
 
 
@@ -8038,6 +8191,8 @@ async def human_admin_shift_attendance(request: Request):
         row = _human_shift_status_payload(uid, profile, shift, now)
         if profile.get("workerApproved") is not True:
             row.update({"status": "retraining", "online": False, "can_clock_in": False, "can_claim": False, "message": "This worker has returned to the Training Room for shift retraining."})
+        if profile.get("workerApproved") is True:
+            row.update(await _human_shift_week_summary(uid, now))
         row.update({
             "name": profile.get("name") or profile.get("displayName") or profile.get("email") or "Worker",
             "email": profile.get("email") or "", "rating": profile.get("workerRating"),
@@ -8051,6 +8206,7 @@ async def human_admin_shift_attendance(request: Request):
         "shift_start": "15:00", "shift_end": "20:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
         "scheduled_now": _human_shift_is_scheduled(now), "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
         "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
+        "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
     }
 
 
@@ -11928,6 +12084,15 @@ async def human_worker_set_availability(request: Request):
         "is_available": available,
         "availability_updated_at": firestore.SERVER_TIMESTAMP,
     }, merge=True)
+    if available:
+        # Show the worker as online to admins immediately, not on the next heartbeat.
+        try:
+            now = _human_shift_local_now()
+            ref, shift = await _human_shift_current_record(actor["uid"], now)
+            clocked_in = bool(shift.get("clockedInAt") and not shift.get("clockedOutAt"))
+            await asyncio.to_thread(ref.set, {"uid": actor["uid"], "shift_date": now.date().isoformat(), "lastPresenceAt": now.isoformat(), **({} if clocked_in else {"status": "online"})}, merge=True)
+        except Exception as exc:
+            logger.warning("Could not record immediate presence for %s: %s", actor["uid"], exc)
     return {"saved": True, "available": available}
 
 
@@ -12770,6 +12935,46 @@ async def human_admin_extend_tat(job_id: str, request: Request):
     return {"status": "extended", "job_id": job_id, "minutes_added": extra_minutes}
 
 
+@app.post("/human-transcription/jobs/{job_id}/worker-extend-tat")
+async def human_worker_extend_own_tat(job_id: str, request: Request):
+    """A worker extends the deadline of their own split-job part, once.
+
+    Not available for whole-job or proofreading assignments."""
+    actor = await _human_actor(request)
+    if actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="Worker access is required.")
+    job = await _human_job(job_id)
+    await _human_assert_access(job, actor, allow_admin=False)
+    if not _human_is_split_job(job) or job.get("whole_job_assignment") is True:
+        raise HTTPException(status_code=409, detail="Deadline extensions are only available on job parts, not whole jobs or proofreading.")
+    segments = [dict(item or {}) for item in (job.get("segments") or [])]
+    target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
+    if not target:
+        raise HTTPException(status_code=409, detail="You have no active part on this job to extend.")
+    if target.get("worker_tat_extended_at"):
+        raise HTTPException(status_code=409, detail="You have already extended this part's deadline once.")
+    now = datetime.now()
+    deadline = _as_dt(target.get("deadlineAt"))
+    if not deadline or deadline <= now:
+        raise HTTPException(status_code=409, detail="This part's deadline has already passed, so it can no longer be extended.")
+    extra_minutes = _human_part_worker_extension_offer(job, target)
+    if extra_minutes <= 0:
+        raise HTTPException(status_code=409, detail="This part cannot be extended.")
+    target["deadlineAt"] = deadline + timedelta(minutes=extra_minutes)
+    target["tat_seconds"] = int(target.get("tat_seconds") or 0) + extra_minutes * 60
+    target["tat_extension_minutes"] = int(target.get("tat_extension_minutes") or 0) + extra_minutes
+    target["worker_tat_extended_at"] = now
+    target["worker_tat_extension_minutes"] = extra_minutes
+    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "updatedAt": firestore.SERVER_TIMESTAMP})
+    claim_ref = db.collection(HUMAN_WORKER_CLAIM_COLLECTION).document(str(actor["uid"])) if "HUMAN_WORKER_CLAIM_COLLECTION" in globals() else None
+    if claim_ref is not None:
+        try:
+            await asyncio.to_thread(claim_ref.set, {"deadlineAt": target["deadlineAt"], "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+        except Exception:
+            logger.exception("Could not sync worker claim deadline after extension")
+    return {"status": "extended", "job_id": job_id, "segment_id": target.get("id"), "minutes_added": extra_minutes, "deadlineAt": target["deadlineAt"]}
+
+
 @app.post("/human-transcription/jobs/{job_id}/start")
 async def human_worker_start(job_id: str, request: Request):
     actor = await _human_actor(request)
@@ -13403,6 +13608,44 @@ async def human_admin_bulk_cleanup(request: Request):
         except Exception as exc:
             logger.error("Could not clean up human job %s: %s", job_id, exc)
             failures.append({"job_id": job_id, "error": "Cleanup did not finish; the job should be reviewed."})
+    return {"deleted": results, "failures": failures, "deleted_count": len(results), "failure_count": len(failures)}
+
+
+@app.post("/api/admin/human-jobs/delete-finished")
+async def human_admin_delete_finished(request: Request):
+    """Super admin: permanently delete the jobs shown in the Finished tab.
+
+    Worker earnings and payment history are preserved by _human_delete_job_safely.
+    Jobs that still have a live worker/proofreader assignment are skipped."""
+    _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    payload = await request.json()
+    job_ids = payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else []
+    job_ids = list(dict.fromkeys(str(item).strip() for item in job_ids if str(item).strip()))
+    if not job_ids:
+        raise HTTPException(status_code=400, detail="Select at least one finished job.")
+    if len(job_ids) > 1000:
+        raise HTTPException(status_code=400, detail="Delete at most 1000 jobs at a time.")
+    live = {"assigned", "in_progress"}
+    results, failures = [], []
+    for job_id in job_ids:
+        try:
+            snapshot = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
+            if not snapshot.exists:
+                failures.append({"job_id": job_id, "error": "Job no longer exists."})
+                continue
+            job = snapshot.to_dict() or {}
+            has_live_part = any((item or {}).get("status") in live for item in (job.get("segments") or []))
+            if str(job.get("status") or "") in live or str(job.get("proofreader_status") or "") in live or has_live_part:
+                failures.append({"job_id": job_id, "error": "A worker is still working on this job."})
+                continue
+            results.append(await _human_delete_job_safely(job_id, job))
+        except HTTPException as exc:
+            failures.append({"job_id": job_id, "error": exc.detail})
+        except Exception as exc:
+            logger.error("Could not delete finished human job %s: %s", job_id, exc)
+            failures.append({"job_id": job_id, "error": "Deletion did not finish; review this job."})
     return {"deleted": results, "failures": failures, "deleted_count": len(results), "failure_count": len(failures)}
 
 
