@@ -12874,6 +12874,10 @@ async def human_admin_take_back(job_id: str, request: Request):
 
 @app.post("/human-transcription/jobs/{job_id}/extend-tat")
 async def human_admin_extend_tat(job_id: str, request: Request):
+    """Admins may add time only to a whole job they assigned to a worker.
+
+    Part-level deadlines are worker self-service only. Proofreading deadlines
+    cannot be extended through this admin endpoint."""
     _require_human_job_admin(request)
     payload = await request.json()
     try:
@@ -12883,44 +12887,14 @@ async def human_admin_extend_tat(job_id: str, request: Request):
     if extra_minutes not in HUMAN_TAT_EXTENSION_OPTIONS:
         raise HTTPException(status_code=400, detail="Choose a 5, 10, 15, or 20 minute extension.")
     job = await _human_job(job_id)
+    if str(payload.get("target") or "").strip() or str(payload.get("segment_id") or "").strip():
+        raise HTTPException(status_code=409, detail="Admin extensions do not apply to part or proofreading deadlines.")
+    if _human_is_split_job(job) or bool(job.get("segments")) or job.get("whole_job_assignment") is not True:
+        raise HTTPException(status_code=409, detail="Admins can extend deadlines only for whole jobs they assigned. Part and proofreading deadlines cannot be extended by admins.")
     now = datetime.now()
-    segment_id = str(payload.get("segment_id") or "").strip()
-    if job.get("proofreader_uid") and str(payload.get("target") or "") == "proofreader":
-        deadline = _as_dt(job.get("proofreader_deadlineAt"))
-        if job.get("proofreader_status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
-            raise HTTPException(status_code=409, detail="The proofreader deadline is no longer active.")
-        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
-            "proofreader_deadlineAt": deadline + timedelta(minutes=extra_minutes),
-            "proofreader_tat_seconds": int(job.get("proofreader_tat_seconds") or 0) + extra_minutes * 60,
-            "proofreader_tat_extension_minutes": int(job.get("proofreader_tat_extension_minutes") or 0) + extra_minutes,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-        })
-        await _create_user_notification(
-            str(job.get("proofreader_uid") or ""), f"deadline-extended:{job_id}:proofreader:{now.isoformat()}",
-            "deadline_extended", "Proofreading time extended", f"Your deadline was extended by {extra_minutes} minutes.",
-            route="human_worker", job_id=job_id, target_id=job_id,
-        )
-        return {"status": "extended", "job_id": job_id, "target": "proofreader", "minutes_added": extra_minutes}
-    if _human_is_split_job(job):
-        segments = [dict(item or {}) for item in (job.get("segments") or [])]
-        target = next((item for item in segments if item.get("id") == segment_id), None) if segment_id else None
-        if not target:
-            raise HTTPException(status_code=400, detail="Choose the part whose deadline should be extended.")
-        if target.get("status") not in {"assigned", "in_progress"} or not _as_dt(target.get("deadlineAt")) or _as_dt(target.get("deadlineAt")) <= now:
-            raise HTTPException(status_code=409, detail="That part is no longer active, so its deadline cannot be extended.")
-        target["deadlineAt"] = _as_dt(target.get("deadlineAt")) + timedelta(minutes=extra_minutes)
-        target["tat_seconds"] = int(target.get("tat_seconds") or 0) + extra_minutes * 60
-        target["tat_extension_minutes"] = int(target.get("tat_extension_minutes") or 0) + extra_minutes
-        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "updatedAt": firestore.SERVER_TIMESTAMP})
-        await _create_user_notification(
-            str(target.get("worker_uid") or ""), f"deadline-extended:{job_id}:{segment_id}:{now.isoformat()}",
-            "deadline_extended", "Your job deadline was extended", f"Your deadline was extended by {extra_minutes} minutes.",
-            route="human_worker", job_id=job_id, target_id=job_id,
-        )
-        return {"status": "extended", "job_id": job_id, "segment_id": segment_id, "minutes_added": extra_minutes}
     deadline = _as_dt(job.get("deadlineAt"))
-    if job.get("status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
-        raise HTTPException(status_code=409, detail="This job's deadline is no longer active.")
+    if job.get("status") not in {"assigned", "in_progress"} or not job.get("worker_uid") or not deadline or deadline <= now:
+        raise HTTPException(status_code=409, detail="This whole-job assignment's deadline is no longer active.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
         "deadlineAt": deadline + timedelta(minutes=extra_minutes),
         "tat_seconds": int(job.get("tat_seconds") or 0) + extra_minutes * 60,
@@ -13611,12 +13585,43 @@ async def human_admin_bulk_cleanup(request: Request):
     return {"deleted": results, "failures": failures, "deleted_count": len(results), "failure_count": len(failures)}
 
 
+def _human_admin_finished_lane(job, now=None):
+    """Mirror adminQueueLaneFor() so Finished bulk deletion matches the UI."""
+    job = job or {}
+    now = (now or datetime.now()).replace(second=0, microsecond=0)
+    status = str(job.get("status") or "").lower()
+    if job.get("admin_finishedAt") or status in {"released", "cancelled"}:
+        return True
+
+    internal = job.get("admin_uploaded") is True or str(job.get("job_type") or "").lower() in {"pdf_job", "letter_job"}
+    proofread_done = bool(
+        job.get("ai_review_applied") is True or job.get("proofreader_status") == "submitted"
+        or job.get("reviewer_status") == "completed" or job.get("letter_ai_review_status") == "completed"
+        or job.get("admin_proofread_at")
+    )
+    limit = timedelta(hours=24)
+    entered_at = None
+    if status in {"submitted", "client_review"}:
+        if status == "submitted" and internal and not proofread_done:
+            return False
+        limit = timedelta(hours=12)
+        fields = ("submittedAt", "reviewedAt", "proofreader_completedAt", "ai_review_appliedAt", "admin_proofread_at", "workerCompletedAt")
+        entered_at = max((value for value in (_as_dt(job.get(field)) for field in fields) if value), default=None)
+        if not entered_at:
+            entered_at = max((value for value in (_as_dt(job.get(field)) for field in ("updatedAt", "createdAt")) if value), default=None)
+    elif status in {"assigned", "in_progress", "split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"} and job.get("routing_status") != "pending":
+        return False
+    else:
+        entered_at = max((value for value in (_as_dt(job.get(field)) for field in ("routingDecidedAt", "returnedToQueueAt", "createdAt")) if value), default=None)
+    return bool(entered_at and now - entered_at > limit)
+
+
 @app.post("/api/admin/human-jobs/delete-finished")
 async def human_admin_delete_finished(request: Request):
-    """Super admin: permanently delete the jobs shown in the Finished tab.
+    """Delete the selected jobs currently shown in Finished, regardless of status.
 
-    Worker earnings and payment history are preserved by _human_delete_job_safely.
-    Jobs that still have a live worker/proofreader assignment are skipped."""
+    Worker earnings and payment history are preserved. Finished-lane membership
+    is rechecked server-side to avoid deleting unrelated or stale selections."""
     _require_admin(request)
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
@@ -13627,7 +13632,6 @@ async def human_admin_delete_finished(request: Request):
         raise HTTPException(status_code=400, detail="Select at least one finished job.")
     if len(job_ids) > 1000:
         raise HTTPException(status_code=400, detail="Delete at most 1000 jobs at a time.")
-    live = {"assigned", "in_progress"}
     results, failures = [], []
     for job_id in job_ids:
         try:
@@ -13636,34 +13640,19 @@ async def human_admin_delete_finished(request: Request):
                 failures.append({"job_id": job_id, "error": "Job no longer exists."})
                 continue
             job = snapshot.to_dict() or {}
-            has_live_part = any((item or {}).get("status") in live for item in (job.get("segments") or []))
-            if str(job.get("status") or "") in live or str(job.get("proofreader_status") or "") in live or has_live_part:
-                failures.append({"job_id": job_id, "error": "A worker is still working on this job."})
+            if not _human_admin_finished_lane(job):
+                failures.append({"job_id": job_id, "error": "This job is no longer in the Finished tab."})
                 continue
-            status = str(job.get("status") or "").lower()
-            finished = job.get("admin_finishedAt") or status in {"released", "cancelled"}
-            if not finished and status in {"submitted", "client_review"}:
-                internal = job.get("admin_uploaded") is True or str(job.get("job_type") or "").lower() in {"pdf_job", "letter_job"}
-                proofread_done = bool(
-                    job.get("ai_review_applied") is True or job.get("proofreader_status") == "submitted"
-                    or job.get("reviewer_status") == "completed" or job.get("letter_ai_review_status") == "completed"
-                    or job.get("admin_proofread_at")
-                )
-                if not (internal and not proofread_done):
-                    candidates = [
-                        _as_dt(job.get(field)) for field in (
-                            "submittedAt", "reviewedAt", "proofreader_completedAt",
-                            "ai_review_appliedAt", "admin_proofread_at", "workerCompletedAt",
-                        )
-                    ]
-                    activity_date = max((item for item in candidates if item), default=None)
-                    if not activity_date:
-                        fallback = [_as_dt(job.get(field)) for field in ("updatedAt", "createdAt")]
-                        activity_date = max((item for item in fallback if item), default=None)
-                    finished = bool(activity_date and datetime.now() - activity_date > timedelta(hours=12))
-            if not finished:
-                failures.append({"job_id": job_id, "error": "Only completed jobs in the Finished tab can be deleted. This job is not complete yet."})
-                continue
+            # If a Finished item has an active claim (for example a job manually
+            # marked finished), release the worker lock before removing it.
+            for part in job.get("segments") or []:
+                part = part or {}
+                if part.get("worker_uid"):
+                    await _human_release_worker_claim(str(part["worker_uid"]), job_id, str(part.get("id") or ""), "transcriber")
+            if job.get("worker_uid"):
+                await _human_release_worker_claim(str(job["worker_uid"]), job_id, "", "transcriber")
+            if job.get("proofreader_uid"):
+                await _human_release_worker_claim(str(job["proofreader_uid"]), job_id, "proofreader", "proofreader")
             results.append(await _human_delete_job_safely(job_id, job))
         except HTTPException as exc:
             failures.append({"job_id": job_id, "error": exc.detail})
