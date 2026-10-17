@@ -980,11 +980,11 @@ async def _human_worker_transcriber_rate_kes(worker_uid, default_rate):
         raise HTTPException(status_code=503, detail="The worker's audio-minute rate could not be checked. Please retry the submission.") from exc
 
 # TMWD_HUMAN_TAT_V2
-# Jobs of one minute or less receive a six-minute minimum TAT. Longer jobs
-# receive four minutes for every rounded audio minute. If the worker has not
-# submitted by the deadline, the job is returned to the admin queue.
+# Jobs of one minute or less receive four minutes. Longer jobs receive four
+# minutes for every rounded audio minute. If the worker has not submitted by
+# the deadline, the job is returned to the admin queue.
 HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE = 4
-HUMAN_SHORT_AUDIO_TAT_MINUTES = 6
+HUMAN_SHORT_AUDIO_TAT_MINUTES = 4
 HUMAN_PROOFREADING_TAT_MINUTES_PER_AUDIO_MINUTE = 1.5
 HUMAN_PROOFREADING_SHORT_AUDIO_MINUTES = 3
 HUMAN_PROOFREADING_SHORT_TAT_MINUTES = 5
@@ -13639,6 +13639,30 @@ async def human_admin_delete_finished(request: Request):
             has_live_part = any((item or {}).get("status") in live for item in (job.get("segments") or []))
             if str(job.get("status") or "") in live or str(job.get("proofreader_status") or "") in live or has_live_part:
                 failures.append({"job_id": job_id, "error": "A worker is still working on this job."})
+                continue
+            status = str(job.get("status") or "").lower()
+            finished = job.get("admin_finishedAt") or status in {"released", "cancelled"}
+            if not finished and status in {"submitted", "client_review"}:
+                internal = job.get("admin_uploaded") is True or str(job.get("job_type") or "").lower() in {"pdf_job", "letter_job"}
+                proofread_done = bool(
+                    job.get("ai_review_applied") is True or job.get("proofreader_status") == "submitted"
+                    or job.get("reviewer_status") == "completed" or job.get("letter_ai_review_status") == "completed"
+                    or job.get("admin_proofread_at")
+                )
+                if not (internal and not proofread_done):
+                    candidates = [
+                        _as_dt(job.get(field)) for field in (
+                            "submittedAt", "reviewedAt", "proofreader_completedAt",
+                            "ai_review_appliedAt", "admin_proofread_at", "workerCompletedAt",
+                        )
+                    ]
+                    activity_date = max((item for item in candidates if item), default=None)
+                    if not activity_date:
+                        fallback = [_as_dt(job.get(field)) for field in ("updatedAt", "createdAt")]
+                        activity_date = max((item for item in fallback if item), default=None)
+                    finished = bool(activity_date and datetime.now() - activity_date > timedelta(hours=12))
+            if not finished:
+                failures.append({"job_id": job_id, "error": "Only completed jobs in the Finished tab can be deleted. This job is not complete yet."})
                 continue
             results.append(await _human_delete_job_safely(job_id, job))
         except HTTPException as exc:
