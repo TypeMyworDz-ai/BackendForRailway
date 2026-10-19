@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import uuid
 import secrets
-from datetime import datetime, timedelta, time as datetime_time, timezone, date as datetime_date
+from datetime import datetime, timedelta, time as datetime_time, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from html import unescape
@@ -107,7 +107,7 @@ TYPEMYWORDZ_AI_NAME = "TypeMyworDz AI" # Anthropic Claude / OpenAI GPT / Google 
 # plan or free-trial rules, and can reach the admin tools.
 # Complimentary accounts (below) also skip payment, but are NOT admins and get
 # none of the admin tooling.
-ADMIN_EMAILS = ['typemywordz@gmail.com']
+ADMIN_EMAILS = ['typemywordz@gmail.com', 'info@typemywordz.ai']
 # Dedicated OpenAI Whisper tester. This account used to be the AssemblyAI
 # tester; the owner moved it to OpenAI so OpenAI can be exercised on its own.
 # Like the Deepgram tester it never falls back, so an OpenAI failure shows up
@@ -124,7 +124,8 @@ VOXTRAL_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
 # Dedicated Deepgram test account. It pays through the normal plan/credit
 # path, starts on Deepgram, and falls back to OpenAI so both services can be
 # tested without changing the experience for ordinary paying clients.
-DEEPGRAM_TESTER_EMAIL = 'info@typemywordz.ai'
+DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
+OPENAI_TESTER_EMAIL = 'info@typemywordz.ai'
 
 # Complimentary accounts. Keep this list empty unless an account is explicitly
 # approved for free access. The Deepgram tester is intentionally a normal
@@ -495,42 +496,6 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "gpt-6.1-sol",
-        "provider": "openai",
-        "label": "ChatGPT 6.1 Sol",
-        "blurb": "OpenAI's newest flagship, with a 1M-token window. Stronger than 5.6 Terra at a similar cost; good for difficult reasoning and long documents.",
-        "tier": "premium",
-        "credits": 10,
-        "transcript_only": False,
-    },
-    {
-        "id": "deepseek-v4-pro",
-        "provider": "deepseek",
-        "label": "DeepSeek V4 Pro",
-        "blurb": "DeepSeek's deeper reasoning model at a fraction of Western flagship prices. Pictures are read by ChatGPT Luna automatically.",
-        "tier": "premium",
-        "credits": 5,
-        "transcript_only": False,
-    },
-    {
-        "id": "claude-sonnet-5-5",
-        "provider": "claude",
-        "label": "Claude Sonnet 5.5",
-        "blurb": "Claude's best balance of speed and intelligence. Strong for careful writing, long documents and difficult reading.",
-        "tier": "premium",
-        "credits": 10,
-        "transcript_only": False,
-    },
-    {
-        "id": "zai-glm-5-3",
-        "provider": "mistral",
-        "label": "GLM 5.3 (Z.ai)",
-        "blurb": "A Chinese open-weight reasoning model with a 1M-token window, served by Mistral. Strong at long documents, coding and step-by-step problems; it always thinks before it answers.",
-        "tier": "premium",
-        "credits": 10,
-        "transcript_only": False,
-    },
-    {
         "id": "claude-opus-5-5",
         "provider": "claude",
         "label": "Claude Opus 5.5",
@@ -562,7 +527,8 @@ ASK_MODEL_CATALOGUE = [
 # Model ids that were renamed or replaced. A client who saved one in Settings
 # is moved to its successor instead of being dropped back to the default.
 ASK_MODEL_ALIASES = {
-    "claude-sonnet-5": "claude-sonnet-5-5",
+    "claude-sonnet-5": "claude-haiku-5-5",
+    "claude-sonnet-5-5": "claude-haiku-5-5",
     "claude-opus-4-6": "claude-opus-5-5",
     "gemini-3.6-flash": "gemini-3.8-flash",
 }
@@ -740,6 +706,16 @@ MIN_HUMAN_WORKER_RATING = 3.5
 MIN_PROOFREADER_RATING = 4.5     # only top-rated workers may proofread
 TOPUP_VALID_DAYS = 365           # bought credits last a year
 REFILL_DAYS = 30                 # yearly plan tops up every 30 days
+# Bought credits expire sooner for these two accounts only (owner testing).
+SHORT_TOPUP_EXPIRY_EMAILS = {"typemywordz@gmail.com", "info@typemywordz.ai"}
+SHORT_TOPUP_VALID_DAYS = 15
+
+
+def topup_valid_days_for(email):
+    """Days bought credits stay valid: 15 for the two test accounts, else a year."""
+    if str(email or "").strip().lower() in SHORT_TOPUP_EXPIRY_EMAILS:
+        return SHORT_TOPUP_VALID_DAYS
+    return TOPUP_VALID_DAYS
 
 # Top-up bundles. Prices are set on the pricing page; the server only needs to
 # know how many credits each bundle id is worth, so that a client cannot ask
@@ -980,11 +956,11 @@ async def _human_worker_transcriber_rate_kes(worker_uid, default_rate):
         raise HTTPException(status_code=503, detail="The worker's audio-minute rate could not be checked. Please retry the submission.") from exc
 
 # TMWD_HUMAN_TAT_V2
-# Jobs of one minute or less receive four minutes. Longer jobs receive four
-# minutes for every rounded audio minute. If the worker has not submitted by
-# the deadline, the job is returned to the admin queue.
+# Jobs of one minute or less receive a six-minute minimum TAT. Longer jobs
+# receive four minutes for every rounded audio minute. If the worker has not
+# submitted by the deadline, the job is returned to the admin queue.
 HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE = 4
-HUMAN_SHORT_AUDIO_TAT_MINUTES = 4
+HUMAN_SHORT_AUDIO_TAT_MINUTES = 6
 HUMAN_PROOFREADING_TAT_MINUTES_PER_AUDIO_MINUTE = 1.5
 HUMAN_PROOFREADING_SHORT_AUDIO_MINUTES = 3
 HUMAN_PROOFREADING_SHORT_TAT_MINUTES = 5
@@ -1001,44 +977,6 @@ def human_tat_seconds(audio_seconds):
         return HUMAN_SHORT_AUDIO_TAT_MINUTES * 60
     minutes = max(1, int(math.ceil(seconds / 60.0)))
     return minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE * 60
-
-
-def human_worker_extension_minutes(audio_seconds, allocated_tat_seconds=None):
-    """Self-service extension a worker may take on one split-job part.
-
-    1 audio minute: one more standard one-minute TAT (4 minutes).
-    2-3 audio minutes: half of the standard TAT (4 and 6 minutes).
-    4+ audio minutes: a quarter of the TAT allocated to the part.
-    Whole-job and proofreading assignments never get this extension.
-    """
-    try:
-        seconds = float(audio_seconds or 0)
-    except (TypeError, ValueError):
-        seconds = 0
-    audio_minutes = max(1, int(math.ceil(seconds / 60.0))) if seconds > 0 else 1
-    standard_minutes = audio_minutes * HUMAN_TAT_MINUTES_PER_AUDIO_MINUTE
-    if audio_minutes == 1:
-        return standard_minutes
-    if audio_minutes <= 3:
-        return int(standard_minutes // 2)
-    allocated = float(allocated_tat_seconds or 0) or standard_minutes * 60.0
-    return max(1, int(round(allocated / 60.0 / 4.0)))
-
-
-def _human_part_worker_extension_offer(job, part):
-    """Minutes the part's worker could still self-extend, or 0 if none."""
-    if not _human_is_split_job(job) or not isinstance(part, dict):
-        return 0
-    if (job or {}).get("whole_job_assignment") is True:
-        return 0
-    if part.get("status") not in {"assigned", "in_progress"} or part.get("worker_tat_extended_at"):
-        return 0
-    deadline = _as_dt(part.get("deadlineAt"))
-    if not deadline or deadline <= datetime.now():
-        return 0
-    seconds = max(0.0, float(part.get("end_seconds") or 0) - float(part.get("start_seconds") or 0))
-    original = int(part.get("tat_seconds") or 0) - int(part.get("tat_extension_minutes") or 0) * 60
-    return human_worker_extension_minutes(seconds, original if original > 0 else None)
 
 
 def human_proofreading_tat_seconds(audio_seconds):
@@ -1267,7 +1205,7 @@ def grant_plan_credits(plan, now=None):
     return out
 
 
-def grant_topup_credits(profile, bundle_id, country_code='KE', now=None):
+def grant_topup_credits(profile, bundle_id, country_code='KE', now=None, email=None):
     """Add a bought bundle. Bought credits stack and the clock restarts.
 
     Restarting the 12 months on every purchase is deliberately generous: it is
@@ -1283,7 +1221,8 @@ def grant_topup_credits(profile, bundle_id, country_code='KE', now=None):
     bal = read_balance(profile, now)
     updates = dict(bal['updates'])
     updates['topUpCredits'] = bal['topUpCredits'] + credits
-    updates['topUpCreditsExpireAt'] = now + timedelta(days=TOPUP_VALID_DAYS)
+    owner_email = email or (profile or {}).get('email')
+    updates['topUpCreditsExpireAt'] = now + timedelta(days=topup_valid_days_for(owner_email))
     return {'updates': updates, 'added': credits,
             'newTotal': bal['planCredits'] + updates['topUpCredits']}
 
@@ -1494,7 +1433,7 @@ def credits_exempt(user_email: str) -> bool:
 # never grants the app-wide admin dashboard, never bypasses the paywall for
 # AI transcription or Ask TypeMyworDz, and never exempts anything except the
 # human-transcription jobs these accounts personally own as the "client".
-HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai', 'gracenyaitara@gmail.com', 'donotgrowweary95@gmail.com']
+HUMAN_JOB_ADMIN_EMAILS = ['info@typemywordz.ai', 'gracenyaitara@gmail.com', 'donotgrowweary95@gmail.com', 'priscillamuthoni010@gmail.com']
 USER_NOTIFICATION_COLLECTION = "user_notifications"
 
 
@@ -1817,8 +1756,8 @@ def _require_human_subadmin(request: Request) -> dict:
 def _require_human_shift_admin(request: Request) -> dict:
     decoded = _verified_user(request)
     email = (decoded.get("email") or "").strip().lower()
-    if email != HUMAN_SHIFT_ADMIN_EMAIL and not is_human_job_admin(email):
-        raise HTTPException(status_code=403, detail="Shift attendance is available only to the admin team.")
+    if email != HUMAN_SHIFT_ADMIN_EMAIL:
+        raise HTTPException(status_code=403, detail="Shift attendance is available only to the main admin.")
     return decoded
 
 
@@ -2001,7 +1940,8 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     """
     Speech-to-text order for the transcription page.
     - njokigituku@gmail.com: dedicated Voxtral tester, Voxtral only with no fallback (pays like any client).
-    - info@typemywordz.ai: dedicated Deepgram tester, Deepgram then OpenAI.
+    - info@typemywordz.ai: dedicated OpenAI STT tester, OpenAI only with no fallback.
+    - info@typemywordztest.com: dedicated Deepgram tester, Deepgram then OpenAI.
     - Everyone else (every plan, with or without speaker labels): AssemblyAI > Voxtral > OpenAI > Deepgram.
     Human Work stages use the Super-admin-editable human_work_stt settings; the constants below are defaults.
     """
@@ -2009,6 +1949,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     is_admin = is_admin_user(user_email) if user_email else False
     is_voxtral_tester = (user_email and user_email.lower().strip() == VOXTRAL_TESTER_EMAIL.lower())
     is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
+    is_openai_tester = (user_email and user_email.lower().strip() == OPENAI_TESTER_EMAIL.lower())
 
     # --- Initialize tiers ---
     tier_1 = None
@@ -2027,6 +1968,17 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
             "tier_3": None,
             "tier_4": None,
             "reason": "dedicated_voxtral_tester"
+        }
+
+    # --- Dedicated OpenAI Tester Logic ---
+    # Like the Voxtral tester: OpenAI speech-to-text only, no fallback.
+    if is_openai_tester:
+        return {
+            "tier_1": "openai_whisper",
+            "tier_2": None,
+            "tier_3": None,
+            "tier_4": None,
+            "reason": "dedicated_openai_tester"
         }
 
     # --- Dedicated Deepgram Tester Logic ---
@@ -2720,7 +2672,7 @@ async def update_user_credits_paystack(email: str, plan_name: str, amount: float
                 logger.info(f"Top-up {reference} for {email} already applied; ignoring the repeat.")
                 return {'success': True, 'email': email, 'plan': plan_name, 'amount': amount,
                         'currency': currency, 'already_applied': True}
-            result = grant_topup_credits(profile, plan_name, country_code=country_code or 'KE')
+            result = grant_topup_credits(profile, plan_name, country_code=country_code or 'KE', email=email)
             if not result:
                 return {'success': False, 'error': 'Unknown top-up bundle'}
             topup_updates = dict(result['updates'])
@@ -3641,26 +3593,6 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             
         logger.info(f"Transcription job completed for job ID: {job_id}")
 
-async def _human_weekly_shift_monitor():
-    """Hourly sweep so a worker who stops logging in is still demoted
-    automatically when a week ends with fewer than the required shifts."""
-    while True:
-        try:
-            await asyncio.sleep(3600)
-            if not db:
-                continue
-            snaps = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
-            for snap in snaps:
-                try:
-                    await _human_shift_reconcile(snap.id, snap.to_dict() or {})
-                except Exception as exc:
-                    logger.warning("Weekly shift check failed for %s: %s", snap.id, exc)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Weekly shift monitor error: %s", exc)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application lifespan startup")
@@ -3678,8 +3610,6 @@ async def lifespan(app: FastAPI):
     human_expiry_task = asyncio.create_task(human_expiry_monitor())
     human_payout_task = asyncio.create_task(human_payout_monitor())
     auto_finish_task = asyncio.create_task(_human_auto_finish_monitor())
-    declined_terms_task = asyncio.create_task(_declined_terms_monitor())
-    weekly_shift_task = asyncio.create_task(_human_weekly_shift_monitor())
     logger.info("Human worker TAT and payout monitor tasks created")
     yield
     logger.info("Application lifespan shutdown")
@@ -3687,8 +3617,6 @@ async def lifespan(app: FastAPI):
     human_expiry_task.cancel()
     human_payout_task.cancel()
     auto_finish_task.cancel()
-    declined_terms_task.cancel()
-    weekly_shift_task.cancel()
     for job_id, task in active_background_tasks.items():
         if not task.done():
             logger.info(f"Cancelling background task for job {job_id}")
@@ -3711,85 +3639,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 logger.info("CORS middleware configured successfully")
-
-class _JsonGzipMiddleware:
-    """Gzip plain JSON API replies only.
-
-    Skipped on purpose: audio/video, files, Word/PDF downloads, event streams,
-    Range requests, partial content, HEAD requests, anything already encoded,
-    anything that is not application/json, and small bodies. Streaming bodies
-    are passed through untouched.
-    """
-    MIN_BYTES = 1024
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http" or scope.get("method") == "HEAD":
-            return await self.app(scope, receive, send)
-        req = {k.lower(): v for k, v in scope.get("headers", [])}
-        if b"gzip" not in req.get(b"accept-encoding", b"").lower() or b"range" in req:
-            return await self.app(scope, receive, send)
-
-        held = {"start": None, "body": b"", "mode": None}  # mode: None=undecided, "gzip", "pass"
-
-        async def passthrough_start():
-            await send(held["start"])
-
-        async def wrapped_send(message):
-            if message["type"] == "http.response.start":
-                headers = {k.lower(): v for k, v in message.get("headers", [])}
-                ctype = headers.get(b"content-type", b"").split(b";")[0].strip().lower()
-                eligible = (
-                    message.get("status") == 200
-                    and ctype == b"application/json"
-                    and b"content-encoding" not in headers
-                    and b"content-range" not in headers
-                )
-                held["start"] = message
-                held["mode"] = "gzip" if eligible else "pass"
-                if not eligible:
-                    await send(message)
-                return
-            if message["type"] != "http.response.body" or held["mode"] == "pass":
-                return await send(message)
-            if held["mode"] == "done":
-                return await send(message)
-            # Eligible JSON: buffer only a single complete body.
-            more = message.get("more_body", False)
-            if more and not held["body"]:
-                # Streaming JSON: do not compress, send what we hold untouched.
-                held["mode"] = "done"
-                await send(held["start"])
-                return await send(message)
-            held["body"] += message.get("body", b"")
-            if more:
-                return
-            body = held["body"]
-            start = held["start"]
-            held["mode"] = "done"
-            if len(body) < self.MIN_BYTES:
-                await send(start)
-                return await send({"type": "http.response.body", "body": body})
-            import gzip as _gzip
-            packed = _gzip.compress(body, compresslevel=5)
-            if len(packed) >= len(body):
-                await send(start)
-                return await send({"type": "http.response.body", "body": body})
-            out = [(k, v) for k, v in start.get("headers", []) if k.lower() not in (b"content-length", b"etag")]
-            out.append((b"content-encoding", b"gzip"))
-            out.append((b"content-length", str(len(packed)).encode()))
-            vary = [v for k, v in out if k.lower() == b"vary"]
-            if not any(b"accept-encoding" in v.lower() for v in vary):
-                out.append((b"vary", b"Accept-Encoding"))
-            await send({**start, "headers": out})
-            await send({"type": "http.response.body", "body": packed})
-
-        await self.app(scope, receive, wrapped_send)
-
-app.add_middleware(_JsonGzipMiddleware)
-logger.info("JSON gzip middleware configured")
 @app.get("/")
 async def root():
     logger.info("Root endpoint called")
@@ -4770,13 +4619,9 @@ OPENAI_FORMAT_ENDPOINTS = {
 }
 
 # Keep the admin-facing selector stable while sending Mistral's canonical API id.
-MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}  # zai-glm-5-3 is sent as-is
+MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}
 # Large 4's plain-text mode avoids reasoning-only SSE chunks in job drafts.
-MISTRAL_PLAIN_TEXT_MODELS = set()
-# Reasoning effort sent to Mistral-hosted models. Large 4 now reasons (high).
-# GLM 5.3 cannot switch reasoning off, so it runs at "low" to keep answers quick.
-MISTRAL_REASONING_EFFORT = {"mistral-large-4": "high", "mistral-large-4-0": "high", "zai-glm-5-3": "low"}
-MISTRAL_REASONING_MODELS = set(MISTRAL_REASONING_EFFORT)
+MISTRAL_PLAIN_TEXT_MODELS = {"mistral-large-4", "mistral-large-4-0"}
 
 
 _DEEPSEEK_DOWN_UNTIL = [0.0]
@@ -4857,9 +4702,6 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         # unavailable (for example an empty balance), so clients see no error.
         if images or time.time() < _DEEPSEEK_DOWN_UNTIL[0]:
             return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
-    if model_id == "zai-glm-5-3" and images:
-        # GLM 5.3 reads text only; pictures go to Mistral Large 4, which sees images.
-        return _ask_openai_format("mistral", "mistral-large-4", system_prompt, turns, question, images, max_tokens, auto_continue)
     content = []
     for img in images:
         content.append({
@@ -4881,19 +4723,15 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         payload = {"model": api_model_id, "messages": messages}
         if provider == "mistral" and model_id in MISTRAL_PLAIN_TEXT_MODELS:
             payload["reasoning_effort"] = "none"
-        elif provider == "mistral" and model_id in MISTRAL_REASONING_EFFORT:
-            payload["reasoning_effort"] = MISTRAL_REASONING_EFFORT[model_id]
         if use_stream:
             payload["stream"] = True
         if provider == "deepseek":
             # The retired v4 names are still accepted, but the current name is
             # deepseek-flash. Reasoning is switched off: its tokens are billed as
             # output and a chat answer does not need them.
-            payload["model"] = "deepseek-v4-pro" if model_id == "deepseek-v4-pro" else "deepseek-flash"
+            payload["model"] = "deepseek-flash"
             payload["thinking"] = {"type": "disabled"}
         budget = max(max_tokens, 16000 if auto_continue else 4000)
-        if provider == "mistral" and model_id in MISTRAL_REASONING_MODELS:
-            budget = max(budget, 32000)
         if provider == "openai":
             # These models count reasoning tokens against the output budget, so
             # keep reasoning light for chat and give the answer room to finish.
@@ -5751,7 +5589,7 @@ async def credits_topup(
     if profile is None:
         raise HTTPException(status_code=404, detail="We could not find that account.")
 
-    result = grant_topup_credits(profile, bundle_id)
+    result = grant_topup_credits(profile, bundle_id, email=user_email)
     if not result:
         raise HTTPException(status_code=400, detail="That is not a top-up we sell.")
 
@@ -6854,16 +6692,10 @@ HUMAN_SHIFT_ADMIN_EMAIL = "typemywordz@gmail.com"
 HUMAN_SHIFT_WARNING_MISSES = 5
 HUMAN_SHIFT_LOCKOUT_MISSES = 6
 HUMAN_SHIFT_ONLINE_TTL_SECONDS = 150
-# A worker must clock in to at least this many weekday shifts (Mon-Fri) each
-# week. Missing it demotes the worker to the Training Room automatically.
-HUMAN_SHIFT_MIN_WEEKLY = 4
-# First Monday the weekly rule counts from, so nobody is penalised for weeks
-# before it was announced.
-HUMAN_SHIFT_WEEKLY_RULE_START = datetime_date(2026, 10, 19)
 HUMAN_SHIFT_CALL_TTL_HOURS = 4
 HUMAN_SHIFT_COLLECTION = "human_worker_shifts"
 PDF_JOB_ADMIN_EMAIL = "info@typemywordz.ai"
-PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"}
+PDF_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com", "priscillamuthoni010@gmail.com"}
 HUMAN_IMAGE_AGENT_IDS = {"pdf-gemini", "text-messages-gemini"}
 TEXT_MESSAGES_DEFAULT_INSTRUCTION = "Text Messages job: transcribe the screenshot following the Text Messages guidelines."
 GENERAL_JOB_DEFAULT_INSTRUCTION = (
@@ -6903,7 +6735,7 @@ def human_image_tat_seconds(image_count=1):
 PDF_JOB_DEFAULT_INSTRUCTION = "Always use Gemini for image transcription"
 PDF_JOB_WORD_EXTENSIONS = (".docx", ".doc", ".rtf", ".odt")
 PDF_JOB_ATTACHMENT_EXTENSIONS = {"pdf", "docx", "doc", "txt", "jpg", "jpeg", "png", "webp", "mp3", "wav", "m4a", "mp4", "ogg", "webm", "aac", "flac"}
-LETTER_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"}
+LETTER_JOB_ADMIN_EMAILS = {"info@typemywordz.ai", "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com", "priscillamuthoni010@gmail.com"}
 LETTER_JOB_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 LETTER_AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "mp4", "webm", "ogg", "flac", "aac", "mov", "mkv", "avi"}
 HUMAN_JOB_STATUSES = {
@@ -7118,7 +6950,6 @@ def _human_public_for(data, actor_role, actor_uid=""):
         if assignment is not None:
             assignment["time_remaining_seconds"] = remaining(assignment.get("deadlineAt"), assignment.get("status"))
             assignment["role"] = "transcriber"
-            assignment["worker_extension_minutes_available"] = _human_part_worker_extension_offer(data, owned_segment)
         if assignment is None and data.get("worker_uid") == actor_uid:
             assignment = {
                 "id": "transcriber", "label": "Full transcript", "role": "transcriber",
@@ -7691,30 +7522,32 @@ def _human_deadline_assignment_token(item):
 
 
 def _human_worker_retraining_updates(profile, deadline_return_count, now):
-    """Flag a worker for an admin retraining decision.
-
-    The system never moves a worker back to the Training Room by itself. It only
-    raises a review flag; the super admin then chooses between retraining
-    (Module 6 only) and a supervised job to rebuild the worker's rating.
-    """
     profile = profile or {}
     if deadline_return_count < HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS or profile.get("workerApproved") is not True:
         return {}
-    if profile.get("worker_retraining_review_required") is True:
-        return {}
+    levels = list(range(1, len(TRAINING_LEVELS) + 1))
     return {
-        "worker_retraining_review_required": True,
-        "worker_retraining_review_at": now,
-        "worker_retraining_review_reason": "Repeated missed deadlines (%d returned jobs)." % int(deadline_return_count),
+        "role": "trainee",
+        "workerApproved": False,
+        "trainingRoomAccess": True,
+        "trainingStatus": "active",
+        "traineeStatus": "enrolled",
+        "trainingLevel": 1,
+        "trainingSubmissions": {str(level): "redo_requested" for level in levels},
+        "trainingRedoLevels": levels,
+        "trainingRedoMessage": "Your available-work access is paused after repeated missed deadlines. Please retake the six Training Room modules and typing practice; your prior training and payout history remain on record.",
+        "trainingRedoInvitedAt": now,
+        "worker_retraining_required": True,
+        "worker_retraining_required_at": now,
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
 
 
-async def _human_archive_retraining_attempts(worker_uid, levels=None):
-    """Move the chosen saved modules into redo mode without losing the prior attempt."""
+async def _human_archive_retraining_attempts(worker_uid):
+    """Move each saved module into redo mode without losing its prior attempt."""
     if not db or not worker_uid:
         return
-    for level in (levels or [len(TRAINING_LEVELS)]):
+    for level in range(1, len(TRAINING_LEVELS) + 1):
         ref = db.collection("training_submissions").document(f"{worker_uid}-{level}")
         try:
             snapshot = await asyncio.to_thread(ref.get)
@@ -7729,8 +7562,7 @@ async def _human_archive_retraining_attempts(worker_uid, levels=None):
                 })
             await asyncio.to_thread(ref.set, {
                 "uid": worker_uid, "level": level, "status": "redo_requested",
-                "transcript": "", "notes": "", "answers": {},
-                "previous_attempts": history[-10:], "redoRequestedAt": datetime.now().isoformat(),
+                "previous_attempts": history[-10:], "redoRequestedAt": previous.get("redoRequestedAt") or datetime.now().isoformat(),
                 "updatedAt": firestore.SERVER_TIMESTAMP,
             }, merge=True)
         except Exception as exc:
@@ -7760,6 +7592,36 @@ def _human_shift_is_scheduled(now=None):
     return local_now.weekday() < 5 and HUMAN_SHIFT_START <= local_time < HUMAN_SHIFT_END
 
 
+# Paid shift windows (Nairobi time) for each sub-admin. Work finished outside
+# a sub-admin's own window never accrues pay. A sub-admin who is not listed
+# here (for example gracenyaitara@gmail.com for now) has full sub-admin access
+# but accrues no payments. A window that ends earlier than it starts runs past
+# midnight and belongs to the day it started on.
+HUMAN_SUBADMIN_PAYMENT_SHIFTS = {
+    "info@typemywordz.ai": (datetime_time(15, 0), datetime_time(20, 0)),
+    "donotgrowweary95@gmail.com": (datetime_time(15, 0), datetime_time(20, 0)),
+    "priscillamuthoni010@gmail.com": (datetime_time(22, 0), datetime_time(1, 0)),
+}
+
+
+def _human_subadmin_shift_active(email, when=None):
+    """True when `when` falls inside this sub-admin's own paid shift window."""
+    window = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(str(email or "").strip().lower())
+    if not window:
+        return False
+    when = when or _human_shift_local_now()
+    local = when.astimezone(HUMAN_SHIFT_TIMEZONE) if getattr(when, "tzinfo", None) else when.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
+    start, end = window
+    clock = local.timetz().replace(tzinfo=None)
+    if start < end:
+        shift_day = local
+        inside = start <= clock < end
+    else:
+        inside = clock >= start or clock < end
+        shift_day = local if clock >= start else local - timedelta(days=1)
+    return inside and shift_day.weekday() < 5
+
+
 def _human_shift_call_in_active(profile, now=None):
     now = now or _human_shift_local_now()
     expiry = _human_shift_parse_datetime((profile or {}).get("humanShiftCallInExpiresAt"))
@@ -7768,77 +7630,6 @@ def _human_shift_call_in_active(profile, now=None):
 
 def _human_shift_doc_id(uid, shift_date):
     return f"{uid}_{shift_date}"
-
-
-async def _human_shift_week_attended(uid, week_monday):
-    """Number of Mon-Fri shifts in the week starting week_monday with a clock-in."""
-    async def one(day):
-        snap = await asyncio.to_thread(db.collection(HUMAN_SHIFT_COLLECTION).document(_human_shift_doc_id(uid, day.isoformat())).get)
-        data = snap.to_dict() if snap.exists else {}
-        return bool(data.get("clockedInAt"))
-    results = await asyncio.gather(*[one(week_monday + timedelta(days=i)) for i in range(5)])
-    return sum(1 for item in results if item)
-
-
-def _human_shift_tracking_start(profile):
-    """Date from which the worker is accountable for weekly shifts."""
-    for key in ("workerApprovedAt", "humanShiftReinstatedAt", "humanShiftTrackingStartedAt"):
-        value = (profile or {}).get(key)
-        if hasattr(value, "astimezone"):
-            return value.astimezone(HUMAN_SHIFT_TIMEZONE).date()
-        parsed = _human_shift_parse_datetime(value)
-        if parsed:
-            return parsed.date()
-    return None
-
-
-async def _human_shift_demote_worker(uid, profile, reason):
-    """Automatically return a worker to the Training Room (Module 6 only).
-
-    Same outcome as the super admin's 'retrain' decision, without admin action."""
-    final_level = len(TRAINING_LEVELS)
-    for level in range(1, final_level):
-        await asyncio.to_thread(db.collection("training_submissions").document(f"{uid}-{level}").set, {
-            "uid": uid, "level": level, "status": "submitted", "updatedAt": firestore.SERVER_TIMESTAMP,
-        }, merge=True)
-    await _human_archive_retraining_attempts(uid, [final_level])
-    note = "Your work access was paused automatically: %s Please retake Module %d only; your other modules stay passed and you do not pay for training again." % (reason, final_level)
-    updates = {
-        "role": "trainee", "workerApproved": False, "trainingRoomAccess": True,
-        "trainingStatus": "active", "traineeStatus": "enrolled", "trainingPaymentStatus": "paid",
-        "trainingLevel": final_level,
-        "trainingSubmissions": {**{str(level): "submitted" for level in range(1, final_level)}, str(final_level): "redo_requested"},
-        "trainingRedoLevels": [final_level], "trainingRedoMessage": note,
-        "trainingRedoInvitedAt": firestore.SERVER_TIMESTAMP,
-        "worker_retraining_required": True, "worker_retraining_required_at": firestore.SERVER_TIMESTAMP,
-        "worker_retraining_review_required": False,
-        "worker_retraining_review_reason": reason,
-        "humanShiftLockoutAt": firestore.SERVER_TIMESTAMP,
-        "humanShiftAutoDemotedAt": firestore.SERVER_TIMESTAMP,
-        "is_available": False, "workerTermsStatus": firestore.DELETE_FIELD,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-    }
-    await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
-    try:
-        _human_list_cache_bump()
-    except Exception:
-        pass
-    try:
-        await _notify_trainee_redo_invite(uid, profile, [final_level], note)
-    except Exception as exc:
-        logger.warning("Weekly-shift demotion notice failed for %s: %s", uid, exc)
-    logger.info("Worker %s demoted to the Training Room automatically: %s", uid, reason)
-
-
-async def _human_shift_week_summary(uid, now=None):
-    local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
-    monday = local_now.date() - timedelta(days=local_now.weekday())
-    attended = await _human_shift_week_attended(uid, monday)
-    return {
-        "week_start": monday.isoformat(), "shifts_this_week": attended,
-        "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
-        "weekly_requirement_met": attended >= HUMAN_SHIFT_MIN_WEEKLY,
-    }
 
 
 async def _human_shift_reconcile(uid, profile=None, now=None):
@@ -7900,28 +7691,19 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
         if consecutive >= HUMAN_SHIFT_LOCKOUT_MISSES:
             retraining = _human_worker_retraining_updates(profile, HUMAN_WORKER_DEADLINE_LOCKOUT_RETURNS, local_now)
             if retraining:
-                retraining["worker_retraining_review_reason"] = "Six consecutive missed shifts."
+                retraining["trainingRedoMessage"] = (
+                    "Your work access is paused after six consecutive missed shifts. Please retake the Training Room modules and typing practice. "
+                    "Your earlier training and payout history are preserved, and you do not need to pay for training again."
+                )
                 retraining["humanShiftMissesConsecutive"] = consecutive
                 retraining["humanShiftLastEvaluatedDate"] = current_date.isoformat()
                 retraining["humanShiftWarning"] = True
                 retraining["humanShiftLockoutAt"] = firestore.SERVER_TIMESTAMP
                 await asyncio.to_thread(user_ref.set, retraining, merge=True)
                 profile.update({key: value for key, value in retraining.items() if key != "updatedAt"})
+                await _human_archive_retraining_attempts(uid)
                 locked = True
-        if current_date.weekday() == 4 and profile.get("workerApproved") is True:
-            # Friday's shift is over: judge the whole Mon-Fri week.
-            week_monday = current_date - timedelta(days=4)
-            tracking_start = _human_shift_tracking_start(profile)
-            if tracking_start and tracking_start <= week_monday and week_monday >= HUMAN_SHIFT_WEEKLY_RULE_START:
-                attended_count = await _human_shift_week_attended(uid, week_monday)
-                if attended_count < HUMAN_SHIFT_MIN_WEEKLY:
-                    reason = "You clocked in to %d shift%s in the week of %s; at least %d are required every week." % (
-                        attended_count, "" if attended_count == 1 else "s", week_monday.strftime("%d %b %Y"), HUMAN_SHIFT_MIN_WEEKLY)
-                    await _human_shift_demote_worker(uid, profile, reason)
-                    profile.update({"workerApproved": False, "role": "trainee", "worker_retraining_required": True, "is_available": False})
-                    profile["humanShiftLastEvaluatedDate"] = current_date.isoformat()
-                    await asyncio.to_thread(user_ref.set, {"humanShiftLastEvaluatedDate": current_date.isoformat(), "humanShiftMissesConsecutive": consecutive}, merge=True)
-                    return profile
+                break
         current_date += timedelta(days=1)
     await asyncio.to_thread(user_ref.set, {
         "humanShiftMissesConsecutive": consecutive,
@@ -8076,7 +7858,6 @@ async def human_worker_shift_status(request: Request):
     _, shift = await _human_shift_current_record(actor["uid"])
     result = _human_shift_status_payload(actor["uid"], profile, shift)
     result["has_active_assignment"] = await _human_worker_has_active_assignment(actor["uid"])
-    result.update(await _human_shift_week_summary(actor["uid"]))
     return result
 
 
@@ -8191,8 +7972,6 @@ async def human_admin_shift_attendance(request: Request):
         row = _human_shift_status_payload(uid, profile, shift, now)
         if profile.get("workerApproved") is not True:
             row.update({"status": "retraining", "online": False, "can_clock_in": False, "can_claim": False, "message": "This worker has returned to the Training Room for shift retraining."})
-        if profile.get("workerApproved") is True:
-            row.update(await _human_shift_week_summary(uid, now))
         row.update({
             "name": profile.get("name") or profile.get("displayName") or profile.get("email") or "Worker",
             "email": profile.get("email") or "", "rating": profile.get("workerRating"),
@@ -8206,7 +7985,6 @@ async def human_admin_shift_attendance(request: Request):
         "shift_start": "15:00", "shift_end": "20:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
         "scheduled_now": _human_shift_is_scheduled(now), "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
         "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
-        "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
     }
 
 
@@ -8400,6 +8178,8 @@ async def _human_reclaim_expired_job(job_id: str, job: dict, split_expected=None
     except Exception as exc:
         logger.warning("Could not transactionally return expired Human Work %s: %s", job_id, exc)
         return job
+    for uid in result.get("locked_workers") or []:
+        await _human_archive_retraining_attempts(uid)
     for event in result.get("events") or []:
         worker_uid = str(event.get("worker_uid") or "")
         role = str(event.get("role") or "transcriber")
@@ -8630,20 +8410,6 @@ async def _human_worker_job_snapshots(worker_uid, include_legacy_segments=False)
             if any(str((item or {}).get("worker_uid") or "") == str(worker_uid) for item in (job.get("segments") or [])):
                 found[snapshot.id] = snapshot
     return list(found.values())
-
-
-HUMAN_STARTER_JOBS_REQUIRED = 3  # a new worker is rated by the Rating Agent on their 3rd submitted job
-
-
-async def _human_worker_submitted_jobs(worker_uid):
-    """How many jobs this worker has submitted (the Rating Agent's counter)."""
-    if not db or not worker_uid:
-        return 0
-    try:
-        snap = await asyncio.to_thread(db.collection("human_worker_rating_counters").document(str(worker_uid)).get)
-        return max(0, int(((snap.to_dict() or {}) if snap.exists else {}).get("count") or 0))
-    except Exception:
-        return 0
 
 
 async def _human_worker_rating_summary(worker_uid, profile=None, force_refresh=False):
@@ -9404,7 +9170,7 @@ def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None, segm
             shift_action_at = _human_shift_parse_datetime(assigned_at) or now_local
         else:
             continue
-        if not beneficiary_uid or not _human_shift_is_scheduled(shift_action_at):
+        if not beneficiary_uid or not _human_subadmin_shift_active(beneficiary_email, shift_action_at):
             continue
 
         if is_image:
@@ -9466,6 +9232,77 @@ def _pay_period_bounds(dt):
         start = datetime(year, month, 16)
         end = datetime(year, month, last_day, 23, 59, 59, 999999)
     return label, start, end
+
+
+def _pay_period_dates(label):
+    """Turn an internal period key such as 2026-10-A into its two real dates."""
+    try:
+        year_text, month_text, half = str(label or "").split("-")
+        year, month = int(year_text), int(month_text)
+        last_day = calendar.monthrange(year, month)[1]
+        if half.upper() == "A":
+            return datetime(year, month, 1), datetime(year, month, 15)
+        return datetime(year, month, 16), datetime(year, month, last_day)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _pay_period_date_text(value):
+    return "%d %s %d" % (value.day, value.strftime("%B"), value.year)
+
+
+def _pay_period_fields(label, paid=False):
+    """Plain-language period text for workers and admins (never the raw key)."""
+    start, end = _pay_period_dates(label)
+    if not start:
+        return {"period_range": "", "period_title": ""}
+    span = "%s to %s" % (_pay_period_date_text(start), _pay_period_date_text(end))
+    return {
+        "period_range": span,
+        "period_start_date": start.date().isoformat(),
+        "period_end_date": end.date().isoformat(),
+        "period_title": ("Payout for %s" if paid else "Pending payout for %s") % span,
+    }
+
+
+async def _notify_payout_paid(recipient_uid, recipient_email, recipient_name, label, amount_kes, payout_id, route="human_worker"):
+    """Tell a worker or sub-admin, in the app and by email, that a payout was paid.
+
+    Each channel fails on its own so a notice problem never undoes the payment.
+    """
+    fields = _pay_period_fields(label, paid=True)
+    span = fields.get("period_range") or "the completed pay period"
+    amount_text = "KES {:,.2f}".format(float(amount_kes or 0)).replace(".00", "")
+    title = "Your payment has been processed"
+    body = "%s for %s has been marked as paid." % (amount_text, span)
+    if recipient_uid:
+        try:
+            await _create_user_notification(
+                recipient_uid, "payout-paid:%s" % payout_id, "payout_paid", title, body,
+                route=route, target_id=str(payout_id),
+            )
+        except Exception as exc:
+            logger.warning("Payout in-app notice failed for %s: %s", payout_id, exc)
+    address = str(recipient_email or "").strip()
+    if address:
+        first = (str(recipient_name or "").strip().split(" ") or [""])[0] or "there"
+        subject = "Your TypeMyworDz payment for %s has been processed" % span
+        html = (
+            '<!doctype html><html><body style="margin:0;padding:0;background:#f8f8f9;">'
+            '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="background:#f8f8f9;padding:32px 16px;"><tr><td align="center">'
+            '<table role="presentation" width="100%%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border:1px solid #e5e6ea;border-radius:10px;padding:32px;font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;">'
+            '<tr><td style="font-size:20px;font-weight:700;color:#14161a;padding-bottom:20px;"><span style="color:#5b44cf;">Type</span><span style="color:#28a745;">My</span><span style="color:#5b44cf;">worDz</span></td></tr>'
+            '<tr><td style="font-size:22px;font-weight:700;color:#14161a;padding-bottom:12px;">Hi %s, your payment has been processed</td></tr>'
+            '<tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:12px;">We have marked your payout of <strong>%s</strong> for the period <strong>%s</strong> as paid.</td></tr>'
+            '<tr><td style="font-size:15px;line-height:1.6;color:#3f434c;padding-bottom:20px;">You can see the full breakdown by job category under Payments in your account.</td></tr>'
+            '<tr><td style="font-size:12px;color:#858a95;padding-top:20px;border-top:1px solid #e5e6ea;">Questions? Reply to this email or write to %s.</td></tr>'
+            '</table></td></tr></table></body></html>'
+        ) % (escape(first), escape(amount_text), escape(span), SUPPORT_EMAIL)
+        text = "Hi %s,\n\nYour payout of %s for %s has been marked as paid.\nYou can see the breakdown under Payments in your account.\n\nQuestions? Write to %s.\n" % (first, amount_text, span, SUPPORT_EMAIL)
+        try:
+            await _send_resend_message(address, subject, html, text, "Payment processed email")
+        except Exception as exc:
+            logger.warning("Payout email failed for %s: %s", payout_id, exc)
 
 
 def _human_worker_earning_items(job_id, job, include_processed=False):
@@ -9665,7 +9502,7 @@ async def _human_actor(request: Request):
     profile = await _heal_profile_identity(uid, email, profile)
     # A trainee belongs in the private Training Room until an admin explicitly
     # promotes them.  Only approved workers may see assigned human jobs.
-    if profile.get("workerApproved") is True and str(profile.get("workerTermsStatus") or "") not in {"pending", "declined"}:
+    if profile.get("workerApproved") is True:
         role = "worker"
     return {"uid": uid, "email": email, "role": role, "profile": profile}
 
@@ -10220,7 +10057,7 @@ async def human_list_jobs(request: Request, scope: str = "mine", owner: str = ""
             claim_block_reason = (
                 f"Your current average is {average:.2f}/5; a rating of at least 3.5/5 is required to see Available Jobs."
                 if average is not None else
-                "New workers complete 3 supervised starter jobs assigned by an admin. The Rating Agent rates you after the third, and a rating of at least 3.5/5 opens Available Jobs."
+                "A rating of at least 3.5/5 is required to see Available Jobs. Ask an admin about a supervised starter assignment."
             )
         elif worker_active_assignment:
             claim_block_reason = "Finish your current assignment before claiming another."
@@ -11487,6 +11324,7 @@ async def human_subadmin_payment_history(request: Request):
     payout_rows = [{
         "payout_id": snap.id,
         "period_label": (snap.to_dict() or {}).get("period_label"),
+        **_pay_period_fields((snap.to_dict() or {}).get("period_label"), paid=((snap.to_dict() or {}).get("status") == "paid")),
         "status": (snap.to_dict() or {}).get("status") or "pending",
         "total_amount_kes": _human_subadmin_kes((snap.to_dict() or {}).get("total_amount_kes_milli")),
         "category_totals_kes": {key: _human_subadmin_kes(value) for key, value in ((snap.to_dict() or {}).get("category_totals_milli_kes") or {}).items()},
@@ -11848,6 +11686,7 @@ async def human_admin_subadmin_payouts(request: Request, subadmin_uid: str = "",
             "subadmin_uid": raw.get("subadmin_uid"),
             "subadmin_email": raw.get("subadmin_email") or "",
             "period_label": raw.get("period_label"),
+            **_pay_period_fields(raw.get("period_label"), paid=(payout_status == "paid")),
             "period_start": _human_iso(raw.get("period_start")),
             "period_end": _human_iso(raw.get("period_end")),
             "total_amount_kes": _human_subadmin_kes(total_milli),
@@ -11889,6 +11728,10 @@ async def human_admin_mark_subadmin_payout_paid(payout_id: str, request: Request
                 {"payout_status": "paid", "paid_at": paid_at, "updatedAt": firestore.SERVER_TIMESTAMP},
                 merge=True,
             )
+    await _notify_payout_paid(
+        payout.get("subadmin_uid"), payout.get("subadmin_email"), "", payout.get("period_label"),
+        _human_subadmin_kes(payout.get("total_amount_kes_milli")), payout_id, route="human_ops",
+    )
     return {"status": "paid", "payout_id": payout_id, "paid_at": _human_iso(paid_at)}
 
 
@@ -11977,6 +11820,7 @@ async def human_worker_payment_history(request: Request):
         pending_payouts.append({
             "payout_id": snap.id,
             "period_label": payout.get("period_label"),
+            **_pay_period_fields(payout.get("period_label"), paid=(payout.get("status") == "paid")),
             "period_start": _human_iso(payout.get("period_start")),
             "period_end": _human_iso(payout.get("period_end")),
             "total_minutes": int(payout.get("total_minutes") or 0),
@@ -12006,6 +11850,8 @@ async def human_worker_payment_history(request: Request):
         },
         "current_period": {
             "label": label, "start": start_dt.isoformat(), "end": end_dt.isoformat(),
+            **{key: value for key, value in _pay_period_fields(label).items() if key == "period_range"},
+            "period_title": "Accruing for %s" % _pay_period_fields(label).get("period_range", ""),
             "accrued_kes": current_breakdown["total_kes"],
             "accrued_minutes": current_breakdown["total_minutes"],
             "transcription_kes": current_breakdown["transcription_kes"],
@@ -12050,8 +11896,6 @@ async def human_list_workers(request: Request):
             "available": data.get("is_available") is True,
             "rating": rating.get("average"),
             "rating_count": rating.get("count") or 0,
-            "submitted_jobs": await _human_worker_submitted_jobs(snap.id),
-            "starter_jobs_required": HUMAN_STARTER_JOBS_REQUIRED,
             "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
     return {
@@ -12084,15 +11928,6 @@ async def human_worker_set_availability(request: Request):
         "is_available": available,
         "availability_updated_at": firestore.SERVER_TIMESTAMP,
     }, merge=True)
-    if available:
-        # Show the worker as online to admins immediately, not on the next heartbeat.
-        try:
-            now = _human_shift_local_now()
-            ref, shift = await _human_shift_current_record(actor["uid"], now)
-            clocked_in = bool(shift.get("clockedInAt") and not shift.get("clockedOutAt"))
-            await asyncio.to_thread(ref.set, {"uid": actor["uid"], "shift_date": now.date().isoformat(), "lastPresenceAt": now.isoformat(), **({} if clocked_in else {"status": "online"})}, merge=True)
-        except Exception as exc:
-            logger.warning("Could not record immediate presence for %s: %s", actor["uid"], exc)
     return {"saved": True, "available": available}
 
 
@@ -12265,6 +12100,7 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
             "worker_email": payout.get("worker_email") or "",
             "worker_name": payout.get("worker_name") or "",
             "period_label": payout.get("period_label"),
+            **_pay_period_fields(payout.get("period_label"), paid=(payout.get("status") == "paid")),
             "period_start": _human_iso(payout.get("period_start")),
             "period_end": _human_iso(payout.get("period_end")),
             "total_minutes": int(payout.get("total_minutes") or 0),
@@ -12338,6 +12174,10 @@ async def admin_mark_payout_paid(payout_id: str, request: Request):
         for job_id in job_ids:
             batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {"payout_status": "paid", "workerPaymentStatus": "paid", "workerPaidAt": now, "updatedAt": firestore.SERVER_TIMESTAMP})
         await asyncio.to_thread(batch.commit)
+    await _notify_payout_paid(
+        payout.get("worker_uid"), payout.get("worker_email"), payout.get("worker_name"), payout.get("period_label"),
+        payout.get("total_amount_kes"), payout_id,
+    )
     return {"status": "paid", "payout_id": payout_id, "jobs_marked_paid": len(items) or len(job_ids)}
 
 
@@ -12874,10 +12714,6 @@ async def human_admin_take_back(job_id: str, request: Request):
 
 @app.post("/human-transcription/jobs/{job_id}/extend-tat")
 async def human_admin_extend_tat(job_id: str, request: Request):
-    """Admins may add time only to a whole job they assigned to a worker.
-
-    Part-level deadlines are worker self-service only. Proofreading deadlines
-    cannot be extended through this admin endpoint."""
     _require_human_job_admin(request)
     payload = await request.json()
     try:
@@ -12887,14 +12723,44 @@ async def human_admin_extend_tat(job_id: str, request: Request):
     if extra_minutes not in HUMAN_TAT_EXTENSION_OPTIONS:
         raise HTTPException(status_code=400, detail="Choose a 5, 10, 15, or 20 minute extension.")
     job = await _human_job(job_id)
-    if str(payload.get("target") or "").strip() or str(payload.get("segment_id") or "").strip():
-        raise HTTPException(status_code=409, detail="Admin extensions do not apply to part or proofreading deadlines.")
-    if _human_is_split_job(job) or bool(job.get("segments")) or job.get("whole_job_assignment") is not True:
-        raise HTTPException(status_code=409, detail="Admins can extend deadlines only for whole jobs they assigned. Part and proofreading deadlines cannot be extended by admins.")
     now = datetime.now()
+    segment_id = str(payload.get("segment_id") or "").strip()
+    if job.get("proofreader_uid") and str(payload.get("target") or "") == "proofreader":
+        deadline = _as_dt(job.get("proofreader_deadlineAt"))
+        if job.get("proofreader_status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
+            raise HTTPException(status_code=409, detail="The proofreader deadline is no longer active.")
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
+            "proofreader_deadlineAt": deadline + timedelta(minutes=extra_minutes),
+            "proofreader_tat_seconds": int(job.get("proofreader_tat_seconds") or 0) + extra_minutes * 60,
+            "proofreader_tat_extension_minutes": int(job.get("proofreader_tat_extension_minutes") or 0) + extra_minutes,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        await _create_user_notification(
+            str(job.get("proofreader_uid") or ""), f"deadline-extended:{job_id}:proofreader:{now.isoformat()}",
+            "deadline_extended", "Proofreading time extended", f"Your deadline was extended by {extra_minutes} minutes.",
+            route="human_worker", job_id=job_id, target_id=job_id,
+        )
+        return {"status": "extended", "job_id": job_id, "target": "proofreader", "minutes_added": extra_minutes}
+    if _human_is_split_job(job):
+        segments = [dict(item or {}) for item in (job.get("segments") or [])]
+        target = next((item for item in segments if item.get("id") == segment_id), None) if segment_id else None
+        if not target:
+            raise HTTPException(status_code=400, detail="Choose the part whose deadline should be extended.")
+        if target.get("status") not in {"assigned", "in_progress"} or not _as_dt(target.get("deadlineAt")) or _as_dt(target.get("deadlineAt")) <= now:
+            raise HTTPException(status_code=409, detail="That part is no longer active, so its deadline cannot be extended.")
+        target["deadlineAt"] = _as_dt(target.get("deadlineAt")) + timedelta(minutes=extra_minutes)
+        target["tat_seconds"] = int(target.get("tat_seconds") or 0) + extra_minutes * 60
+        target["tat_extension_minutes"] = int(target.get("tat_extension_minutes") or 0) + extra_minutes
+        await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "updatedAt": firestore.SERVER_TIMESTAMP})
+        await _create_user_notification(
+            str(target.get("worker_uid") or ""), f"deadline-extended:{job_id}:{segment_id}:{now.isoformat()}",
+            "deadline_extended", "Your job deadline was extended", f"Your deadline was extended by {extra_minutes} minutes.",
+            route="human_worker", job_id=job_id, target_id=job_id,
+        )
+        return {"status": "extended", "job_id": job_id, "segment_id": segment_id, "minutes_added": extra_minutes}
     deadline = _as_dt(job.get("deadlineAt"))
-    if job.get("status") not in {"assigned", "in_progress"} or not job.get("worker_uid") or not deadline or deadline <= now:
-        raise HTTPException(status_code=409, detail="This whole-job assignment's deadline is no longer active.")
+    if job.get("status") not in {"assigned", "in_progress"} or not deadline or deadline <= now:
+        raise HTTPException(status_code=409, detail="This job's deadline is no longer active.")
     await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {
         "deadlineAt": deadline + timedelta(minutes=extra_minutes),
         "tat_seconds": int(job.get("tat_seconds") or 0) + extra_minutes * 60,
@@ -12907,46 +12773,6 @@ async def human_admin_extend_tat(job_id: str, request: Request):
         route="human_worker", job_id=job_id, target_id=job_id,
     )
     return {"status": "extended", "job_id": job_id, "minutes_added": extra_minutes}
-
-
-@app.post("/human-transcription/jobs/{job_id}/worker-extend-tat")
-async def human_worker_extend_own_tat(job_id: str, request: Request):
-    """A worker extends the deadline of their own split-job part, once.
-
-    Not available for whole-job or proofreading assignments."""
-    actor = await _human_actor(request)
-    if actor["role"] != "worker":
-        raise HTTPException(status_code=403, detail="Worker access is required.")
-    job = await _human_job(job_id)
-    await _human_assert_access(job, actor, allow_admin=False)
-    if not _human_is_split_job(job) or job.get("whole_job_assignment") is True:
-        raise HTTPException(status_code=409, detail="Deadline extensions are only available on job parts, not whole jobs or proofreading.")
-    segments = [dict(item or {}) for item in (job.get("segments") or [])]
-    target = next((item for item in segments if item.get("worker_uid") == actor["uid"] and item.get("status") in {"assigned", "in_progress"}), None)
-    if not target:
-        raise HTTPException(status_code=409, detail="You have no active part on this job to extend.")
-    if target.get("worker_tat_extended_at"):
-        raise HTTPException(status_code=409, detail="You have already extended this part's deadline once.")
-    now = datetime.now()
-    deadline = _as_dt(target.get("deadlineAt"))
-    if not deadline or deadline <= now:
-        raise HTTPException(status_code=409, detail="This part's deadline has already passed, so it can no longer be extended.")
-    extra_minutes = _human_part_worker_extension_offer(job, target)
-    if extra_minutes <= 0:
-        raise HTTPException(status_code=409, detail="This part cannot be extended.")
-    target["deadlineAt"] = deadline + timedelta(minutes=extra_minutes)
-    target["tat_seconds"] = int(target.get("tat_seconds") or 0) + extra_minutes * 60
-    target["tat_extension_minutes"] = int(target.get("tat_extension_minutes") or 0) + extra_minutes
-    target["worker_tat_extended_at"] = now
-    target["worker_tat_extension_minutes"] = extra_minutes
-    await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).update, {"segments": segments, "updatedAt": firestore.SERVER_TIMESTAMP})
-    claim_ref = db.collection(HUMAN_WORKER_CLAIM_COLLECTION).document(str(actor["uid"])) if "HUMAN_WORKER_CLAIM_COLLECTION" in globals() else None
-    if claim_ref is not None:
-        try:
-            await asyncio.to_thread(claim_ref.set, {"deadlineAt": target["deadlineAt"], "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
-        except Exception:
-            logger.exception("Could not sync worker claim deadline after extension")
-    return {"status": "extended", "job_id": job_id, "segment_id": target.get("id"), "minutes_added": extra_minutes, "deadlineAt": target["deadlineAt"]}
 
 
 @app.post("/human-transcription/jobs/{job_id}/start")
@@ -13585,83 +13411,6 @@ async def human_admin_bulk_cleanup(request: Request):
     return {"deleted": results, "failures": failures, "deleted_count": len(results), "failure_count": len(failures)}
 
 
-def _human_admin_finished_lane(job, now=None):
-    """Mirror adminQueueLaneFor() so Finished bulk deletion matches the UI."""
-    job = job or {}
-    now = (now or datetime.now()).replace(second=0, microsecond=0)
-    status = str(job.get("status") or "").lower()
-    if job.get("admin_finishedAt") or status in {"released", "cancelled"}:
-        return True
-
-    internal = job.get("admin_uploaded") is True or str(job.get("job_type") or "").lower() in {"pdf_job", "letter_job"}
-    proofread_done = bool(
-        job.get("ai_review_applied") is True or job.get("proofreader_status") == "submitted"
-        or job.get("reviewer_status") == "completed" or job.get("letter_ai_review_status") == "completed"
-        or job.get("admin_proofread_at")
-    )
-    limit = timedelta(hours=24)
-    entered_at = None
-    if status in {"submitted", "client_review"}:
-        if status == "submitted" and internal and not proofread_done:
-            return False
-        limit = timedelta(hours=12)
-        fields = ("submittedAt", "reviewedAt", "proofreader_completedAt", "ai_review_appliedAt", "admin_proofread_at", "workerCompletedAt")
-        entered_at = max((value for value in (_as_dt(job.get(field)) for field in fields) if value), default=None)
-        if not entered_at:
-            entered_at = max((value for value in (_as_dt(job.get(field)) for field in ("updatedAt", "createdAt")) if value), default=None)
-    elif status in {"assigned", "in_progress", "split_assigned", "split_in_progress", "proofreading_assigned", "proofreading_in_progress"} and job.get("routing_status") != "pending":
-        return False
-    else:
-        entered_at = max((value for value in (_as_dt(job.get(field)) for field in ("routingDecidedAt", "returnedToQueueAt", "createdAt")) if value), default=None)
-    return bool(entered_at and now - entered_at > limit)
-
-
-@app.post("/api/admin/human-jobs/delete-finished")
-async def human_admin_delete_finished(request: Request):
-    """Delete the selected jobs currently shown in Finished, regardless of status.
-
-    Worker earnings and payment history are preserved. Finished-lane membership
-    is rechecked server-side to avoid deleting unrelated or stale selections."""
-    _require_admin(request)
-    if not db:
-        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
-    payload = await request.json()
-    job_ids = payload.get("job_ids") if isinstance(payload.get("job_ids"), list) else []
-    job_ids = list(dict.fromkeys(str(item).strip() for item in job_ids if str(item).strip()))
-    if not job_ids:
-        raise HTTPException(status_code=400, detail="Select at least one finished job.")
-    if len(job_ids) > 1000:
-        raise HTTPException(status_code=400, detail="Delete at most 1000 jobs at a time.")
-    results, failures = [], []
-    for job_id in job_ids:
-        try:
-            snapshot = await asyncio.to_thread(db.collection(HUMAN_JOB_COLLECTION).document(job_id).get)
-            if not snapshot.exists:
-                failures.append({"job_id": job_id, "error": "Job no longer exists."})
-                continue
-            job = snapshot.to_dict() or {}
-            if not _human_admin_finished_lane(job):
-                failures.append({"job_id": job_id, "error": "This job is no longer in the Finished tab."})
-                continue
-            # If a Finished item has an active claim (for example a job manually
-            # marked finished), release the worker lock before removing it.
-            for part in job.get("segments") or []:
-                part = part or {}
-                if part.get("worker_uid"):
-                    await _human_release_worker_claim(str(part["worker_uid"]), job_id, str(part.get("id") or ""), "transcriber")
-            if job.get("worker_uid"):
-                await _human_release_worker_claim(str(job["worker_uid"]), job_id, "", "transcriber")
-            if job.get("proofreader_uid"):
-                await _human_release_worker_claim(str(job["proofreader_uid"]), job_id, "proofreader", "proofreader")
-            results.append(await _human_delete_job_safely(job_id, job))
-        except HTTPException as exc:
-            failures.append({"job_id": job_id, "error": exc.detail})
-        except Exception as exc:
-            logger.error("Could not delete finished human job %s: %s", job_id, exc)
-            failures.append({"job_id": job_id, "error": "Deletion did not finish; review this job."})
-    return {"deleted": results, "failures": failures, "deleted_count": len(results), "failure_count": len(failures)}
-
-
 @app.delete("/human-transcription/jobs/{job_id}")
 async def human_admin_delete(job_id: str, request: Request):
     """Permanently remove a human/proofreading job while preserving earnings."""
@@ -13676,19 +13425,6 @@ async def human_admin_delete(job_id: str, request: Request):
     except Exception:
         logger.exception("Could not delete human job %s", job_id)
         raise HTTPException(status_code=500, detail="The job could not be fully removed. Worker payment history is protected; please retry, and contact support if the issue continues.")
-
-
-def _human_conversation_closed(job):
-    """The worker conversation is read-only once the job has moved to Submitted
-    (or beyond) and no worker has live work on it. History stays visible."""
-    job = job or {}
-    if str(job.get("status") or "") not in {"submitted", "proofreading_available", "client_review", "client_approved", "released", "cancelled"}:
-        return False
-    if str(job.get("proofreader_status") or "") in {"assigned", "in_progress"}:
-        return False
-    if any(str((item or {}).get("status") or "") in {"assigned", "in_progress"} for item in (job.get("segments") or [])):
-        return False
-    return True
 
 
 def _human_assert_job_conversation_access(job, actor):
@@ -13781,28 +13517,7 @@ async def human_messages(job_id: str, request: Request, thread: str = ""):
             batch.update(message_ref, {"readBy": firestore.ArrayUnion([actor["uid"]])})
         await asyncio.to_thread(batch.commit)
     await _update_user_notification_states(actor["uid"], thread_id=f"job:{job_id}:{target_thread}", kinds={"job_message"}, read=True)
-    if actor.get("role") == "admin":
-        # Super admins see the worker's real name; sub-admins only the Human Worker number.
-        sender_uids = sorted({str(m.get("sender_uid") or "") for m in messages if m.get("sender_role") == "worker" and m.get("sender_uid")})
-        names = {}
-        try:
-            aliases, _needles = await _human_worker_aliases(sender_uids) if sender_uids else ({}, [])
-        except Exception:
-            aliases = {}
-        subadmin_view = is_human_subadmin(str(actor.get("email") or ""))
-        for uid in sender_uids:
-            if subadmin_view:
-                names[uid] = aliases.get(uid) or "Assigned worker"
-                continue
-            try:
-                profile = await _load_profile(uid) or {}
-            except Exception:
-                profile = {}
-            names[uid] = str(profile.get("name") or profile.get("full_name") or profile.get("displayName") or aliases.get(uid) or "Assigned worker")
-        for m in messages:
-            if m.get("sender_role") == "worker":
-                m["sender_name"] = names.get(str(m.get("sender_uid") or ""), "Assigned worker")
-    return {"messages": messages, "thread": target_thread, "closed": _human_conversation_closed(job)}
+    return {"messages": messages, "thread": target_thread}
 
 
 @app.post("/human-transcription/jobs/{job_id}/messages")
@@ -13814,8 +13529,6 @@ async def human_send_message(job_id: str, request: Request, attachment: UploadFi
     target_thread = _human_thread_for(actor, thread)
     if not _human_job_worker_uids(job):
         raise HTTPException(status_code=409, detail="The worker conversation opens after a worker claims a job or part.")
-    if _human_conversation_closed(job):
-        raise HTTPException(status_code=409, detail="This job has moved to Submitted, so its conversation is closed. Earlier messages stay visible.")
     text = (message or "").strip()
     attachment_meta = await _human_store_upload(job_id, attachment, "chat") if attachment else None
     if not text and not attachment_meta:
@@ -14635,10 +14348,6 @@ async def admin_workers(request: Request):
         return {"workers": []}
     snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerApproved", "==", True)).stream()))
     rows = []
-    try:
-        alias_map, _needles = await _human_worker_aliases([snap.id for snap in snapshots])
-    except Exception:
-        alias_map = {}
     for snap in snapshots:
         data = snap.to_dict() or {}
         try:
@@ -14648,12 +14357,6 @@ async def admin_workers(request: Request):
         data = await _admin_fill_identity(snap.id, data)
         rows.append({
             "uid": snap.id,
-            "alias": alias_map.get(snap.id) or "",
-            "retraining_review_required": data.get("worker_retraining_review_required") is True,
-            "retraining_review_reason": data.get("worker_retraining_review_reason") or "",
-            "retraining_review_at": _human_iso(data.get("worker_retraining_review_at")),
-            "supervised_job_required": data.get("supervisedJobRequired") is True,
-            "terms_status": data.get("workerTermsStatus") or "",
             "name": data.get("name") or data.get("full_name") or data.get("displayName") or "Unnamed worker",
             "email": data.get("email") or "",
             "country": data.get("country") or "Kenya",
@@ -14662,30 +14365,28 @@ async def admin_workers(request: Request):
             "phone": data.get("mpesaNumber") or data.get("phone") or "",
             "rating": rating.get("average"),
             "rating_count": rating.get("count") or 0,
-            "submitted_jobs": await _human_worker_submitted_jobs(snap.id),
-            "starter_jobs_required": HUMAN_STARTER_JOBS_REQUIRED,
             "is_available": data.get("is_available") is True,
             "approved_at": _human_iso(data.get("workerApprovedAt")),
             "can_proofread": (rating.get("average") or 0) >= MIN_PROOFREADER_RATING,
         })
-    rows.sort(key=lambda item: (not item["retraining_review_required"], -(item["rating"] or 0), item["name"].lower()))
+    rows.sort(key=lambda item: (-(item["rating"] or 0), item["name"].lower()))
     return {"workers": rows, "min_claim_rating": MIN_HUMAN_WORKER_RATING, "min_proofread_rating": MIN_PROOFREADER_RATING}
 
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
-HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
-HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("claude-opus-5-5", "claude"))
-HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
-HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"))
+AI_REVIEW_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-sol", "openai"))
+HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-5.6-sol", "openai"), ("claude-opus-5-5", "claude"))
+HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
+HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini"))
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
 HUMAN_AUDIO_TRANSCRIPTION_RULES = (
     "AUDIO TRANSCRIPTION FIDELITY (applies to General, Template, Letter, and worker audio drafts/proofreads): Preserve the dictated wording, order, meaning, grammar, pronouns, contractions, and awkward phrasing. Never paraphrase, rearrange, professionalize, summarize, add words, or infer missing content. Correct only clear recognition/spelling errors or explicit self-corrections allowed by the job instructions. Preserve ordinary repetition and emphasis. Remove only clearly non-semantic fillers such as `um` and `uh`, and `you know`/`like` only when plainly used as empty fillers; retain those words whenever they carry meaning. Do not remove meaningful phrasing or rewrite the sentence around a filler.\n"
     "RESEARCH (strict): Research only unfamiliar, distinctive proper nouns actually dictated in the source: specific agencies, programs, organizations, companies, schools, databases/software, addresses/streets, locations, or professionals when their professional identity matters. Do not research ordinary personal names just because they appear; do so only when the speaker identifies a professional role. Do not research common/everyday words, common abbreviations, familiar places/agencies, role names, or terms already confirmed in client instructions/word lists or prior job research. Search once per distinct eligible term, not once per occurrence. Never turn this into general research or add background facts. Use research only to confirm spelling/capitalization of the exact dictated term; never add, expand, shorten, replace, reword, or otherwise change the dictated information. If no unfamiliar term qualifies, do not search and omit both `I researched:` and `Research Notes:` entirely.\n"
-    "CLOSING SPELLINGS AND NOTES: Put one consolidated paragraph at the very end, using only non-empty sections in this order: `Client spellings: ...; My spellings: ...; I researched: ...`. Use comma-separated individual word/name tokens and deduplicate. Client spellings are terms explicitly spelled letter-by-letter by the client. My spellings contains only individual people-name tokens not explicitly spelled by the client; names inferred from a filename belong here. I researched contains only distinctive terms actually searched for this job, excluding terms researched previously. Omit empty categories; never print `None`, `N/A`, or placeholders. Add `Research Notes:` only when an eligible term was actually researched; use one short line per term saying what it refers to and why it fits the audio/job, with `(confidence: yes/no)`. Include only dictated terms and no added wording in the I researched list. A client word list only verifies terms that actually occur in the dictation; ignore unused entries, and, when applicable, list only the dictated matches under a brief `Client Word List:` subsection at the end of Research Notes, never in the spellings line.\n"
+    "CLOSING SPELLINGS AND NOTES: Put one consolidated paragraph at the very end, using only non-empty sections in this order: `Client spellings: ...; My spellings: ...; I researched: ...`. Use comma-separated individual word/name tokens and deduplicate. Client spellings are terms explicitly spelled letter-by-letter by the client. My spellings contains only individual people-name tokens not explicitly spelled by the client; names inferred from a filename belong here. I researched contains only distinctive terms actually searched for this job, excluding terms researched previously. Omit empty categories; never print `None`, `N/A`, or placeholders. Add `Research Notes:` only when an eligible term was actually researched; use one short line per term saying what it refers to and why it fits the audio/job, with `(confidence: yes/no)`. Include only dictated terms and no added wording in the I researched list. A client word list only verifies terms that actually occur in the dictation; ignore unused entries, and, when applicable, list only the dictated matches on their own `Client Word List: ...` line right after the spellings paragraph and before Research Notes. Words found on a client word list must NOT also appear under Client spellings, My spellings, I researched or Research Notes.\n"
     "OTHER FORMAT RULES: Use strict American English. Do not invent headings or paragraph breaks; use one body block unless a break is dictated or a template requires separate fields. Use straight ASCII quotes/apostrophes and preserve reported speech. Preserve dictated dates/numbers and apply the explicit TypeMyworDz rules for ordinals, numeric dates, quantities, measurements, times, identifiers, currency, abbreviations, and percentages. Follow the attached template for template jobs. Do not bold unless the template or bracketed staff-instruction rule requires it. The final response is only the formatted transcript plus applicable non-empty closing sections; no preface or analysis.\n"
 )
 
@@ -14749,17 +14450,17 @@ HUMAN_AI_AGENTS = {
     "general-gpt": {
         "id": "general-gpt", "name": "General Transcription Agent",
         "display": "Set by the Super admin in Admin > Model routing", "job_types": ["audio", "general_job"],
-        "models": ["gemini-3.8-flash", "gpt-6.1-sol"],
+        "models": ["gemini-3.8-flash", "gpt-5.6-terra"],
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
-        "display": "GPT-6.1 Sol + Claude Opus 5.5 fallback", "job_types": ["audio", "template_job"],
-        "models": ["gpt-6.1-sol", "claude-opus-5-5"],
+        "display": "GPT-5.6 Sol + Claude Opus 5.5 fallback", "job_types": ["audio", "template_job"],
+        "models": ["gpt-5.6-sol", "claude-opus-5-5"],
     },
     "letter-opus": {
         "id": "letter-opus", "name": "Letter Agent",
-        "display": "GPT-6.1 Sol + Claude Opus 5.5 fallback", "job_types": ["letter_job"],
-        "models": ["gpt-6.1-sol", "claude-opus-5-5"],
+        "display": "GPT-5.6 Sol + Claude Opus 5.5 fallback", "job_types": ["letter_job"],
+        "models": ["gpt-5.6-sol", "claude-opus-5-5"],
     },
     "pdf-gemini": {
         "id": "pdf-gemini", "name": "PDF and Image Agent",
@@ -14981,10 +14682,85 @@ async def _general_job_guidelines_text():
     return text or await _admin_guidelines_text()
 
 
+CLIENT_WORD_LIST_DOC = ("admin_settings", "client_word_lists")
+_CLIENT_WORD_LIST_MASTER = ""
+_CLIENT_WORD_LIST_LOADED_AT = 0.0
+
+
+async def _client_word_list_refresh(force=False):
+    """Keep the saved Client Word Lists in memory (re-read at most once a minute)."""
+    global _CLIENT_WORD_LIST_MASTER, _CLIENT_WORD_LIST_LOADED_AT
+    if not db:
+        return _CLIENT_WORD_LIST_MASTER
+    if not force and time.time() - _CLIENT_WORD_LIST_LOADED_AT < 60:
+        return _CLIENT_WORD_LIST_MASTER
+    try:
+        snap = await asyncio.to_thread(db.collection(CLIENT_WORD_LIST_DOC[0]).document(CLIENT_WORD_LIST_DOC[1]).get)
+        _CLIENT_WORD_LIST_MASTER = str(((snap.to_dict() if snap.exists else None) or {}).get("text") or "")
+        _CLIENT_WORD_LIST_LOADED_AT = time.time()
+    except Exception as exc:
+        logger.warning("Client Word Lists could not be read: %s", exc)
+    return _CLIENT_WORD_LIST_MASTER
+
+
+async def _guidelines_with_word_lists(text):
+    """Add the super admin's saved Client Word Lists to what an agent reads."""
+    master = (await _client_word_list_refresh()).strip()
+    if not master:
+        return text
+    return (str(text or "").rstrip() + "\n\nCLIENT WORD LISTS (saved by the super admin). Use these only to confirm the spelling and capitalization of words that were actually dictated; never add them if they were not spoken. "
+            "Words matched here are reported on the separate Client Word List line and are not repeated under Client spellings, My spellings, I researched or Research Notes.\n" + master[:60000])
+
+
 async def _guidelines_for_job(job):
     if str((job or {}).get("job_type") or "").strip().lower() == "general_job":
-        return await _general_job_guidelines_text()
-    return await _admin_guidelines_text()
+        return await _guidelines_with_word_lists(await _general_job_guidelines_text())
+    return await _guidelines_with_word_lists(await _admin_guidelines_text())
+
+
+@app.get("/api/admin/client-word-lists")
+async def admin_get_client_word_lists(request: Request):
+    _require_admin(request)
+    ref = db.collection(CLIENT_WORD_LIST_DOC[0]).document(CLIENT_WORD_LIST_DOC[1])
+    snap = await asyncio.to_thread(ref.get)
+    data = (snap.to_dict() if snap.exists else None) or {}
+    text = str(data.get("text") or "")
+    return {"text": text, "updated_at": _human_iso(data.get("updatedAt")), "entry_count": len(_human_client_word_list_master_entries(text))}
+
+
+@app.put("/api/admin/client-word-lists")
+async def admin_put_client_word_lists(request: Request):
+    _require_admin(request)
+    payload = await request.json()
+    text = str(payload.get("text") or "").replace("\r\n", "\n")[:400000]
+    ref = db.collection(CLIENT_WORD_LIST_DOC[0]).document(CLIENT_WORD_LIST_DOC[1])
+    await asyncio.to_thread(ref.set, {"text": text, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    await _client_word_list_refresh(force=True)
+    return {"status": "saved", "length": len(text), "entry_count": len(_human_client_word_list_master_entries(text))}
+
+
+@app.post("/api/admin/client-word-lists/extract")
+async def admin_extract_client_word_list_docx(request: Request, file: UploadFile = File(...)):
+    """Read a Word (.docx) word list so the admin can review it before saving."""
+    _require_admin(request)
+    name = str(file.filename or "").lower()
+    if not name.endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Upload a Word document (.docx), or paste the list instead.")
+    raw = await file.read()
+    if len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="That Word file is too large.")
+    try:
+        document = await asyncio.to_thread(lambda: Document(BytesIO(raw)))
+    except Exception:
+        raise HTTPException(status_code=400, detail="That file could not be read as a Word document.")
+    lines = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                lines.append(", ".join(cells))
+    text = "\n".join(lines)
+    return {"text": text, "entry_count": len(_human_client_word_list_master_entries(text))}
 
 
 @app.get("/api/admin/general-job-guidelines")
@@ -15831,7 +15607,14 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
             logger.info("Proofreading Agent dropped worker spelling entries: %s", ", ".join(dropped)[:500])
         client_spellings = unique_items(model_client)
         my_spellings = unique_items(model_my)
-    client_keys = {normalized(item) for item in client_spellings}
+    # Words that came from the saved Client Word List are reported once, on their
+    # own "Client Word List:" paragraph, and never repeated in the spellings
+    # or the research sections.
+    dictated_source = body if dictated_text is None else dictated_text
+    matched_client_words = _human_client_word_list_matches(dictated_source, client_word_list)
+    wordlist_keys = {normalized(item) for item in matched_client_words}
+    client_spellings = [item for item in client_spellings if normalized(item) not in wordlist_keys]
+    client_keys = {normalized(item) for item in client_spellings} | wordlist_keys
     client_tokens = {token for item in client_keys for token in item.split()}
     my_spellings = [
         item for item in my_spellings
@@ -15854,11 +15637,10 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
         output = str(body_text or "").rstrip()
         if footer_sections:
             output = (output + "\n\n" if output else "") + "; ".join(footer_sections)
+        if matched_client_words:
+            output = (output + "\n\n" if output else "") + "Client Word List: " + ", ".join(matched_client_words) + "."
         notes = str(notes_text or "").strip()
         return output + (("\n\n" if output else "") + notes if notes else "")
-
-    dictated_source = body if dictated_text is None else dictated_text
-    matched_client_words = _human_client_word_list_matches(dictated_source, client_word_list)
 
     def add_researched_terms(extra_terms=None):
         terms_to_add = []
@@ -15876,6 +15658,8 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
         note_lines, seen_notes = [], set()
         for note in worker_research_notes:
             key = normalized(note)
+            if normalized(note.split(":")[0]) in wordlist_keys:
+                continue
             if key and key not in seen_notes:
                 note_lines.append("- " + note)
                 seen_notes.add(key)
@@ -15884,8 +15668,6 @@ def _human_ai_agent_research_footer(transcript, research, source_parts=None, cli
             if key and key not in seen_notes:
                 note_lines.append(finding)
                 seen_notes.add(key)
-        if matched_client_words:
-            note_lines.append("Client Word List: " + ", ".join(matched_client_words))
         return "Research Notes:\n" + "\n".join(note_lines) if note_lines else ""
 
     research = str(research or "").strip()
@@ -16428,6 +16210,10 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
                 )
         else:
             answer = _review_enforce_indent(_review_normalise_sentence_spacing(answer), [answer])
+        # Show real formatting, never the symbols that asked for it.
+        answer = _human_resolve_tab_tokens(answer)
+        answer_markup = answer
+        answer = _human_strip_inline_markup(answer)
         if template_bytes:
             rendered_docx = await asyncio.to_thread(_human_template_render_docx, template_bytes, answer)
             template_basename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(str(job.get("job_name") or job.get("title") or "transcript")))[:120].strip("._-") or "transcript"
@@ -16435,11 +16221,7 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
                 _human_store_raw_bytes, job_id, f"{template_basename}-formatted-draft.docx", rendered_docx,
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "ai-drafts",
             )
-        if agent_id == "text-messages-gemini":
-            clean_html = _sanitize_editor_html(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _review_text_to_html(answer)))
-            answer = answer.replace("**", "")
-        else:
-            clean_html = _sanitize_editor_html(_review_text_to_html(answer))
+        clean_html = _sanitize_editor_html(_review_text_to_html(answer_markup))
         snap = await asyncio.to_thread(ref.get)
         current = snap.to_dict() if snap.exists else None
         if not current:
@@ -16941,7 +16723,7 @@ async def _human_run_letter_ai_review(job_id):
         context = context_data["text"]
         if context_data["issues"]:
             context += "\n\nREFERENCE FILE ALERTS (do not guess at unreadable reference content):\n" + "\n".join(context_data["issues"])
-        guidelines = await _admin_guidelines_text()
+        guidelines = await _guidelines_with_word_lists(await _admin_guidelines_text())
         template_bytes = _human_letter_template_bytes()
         template_profile = await asyncio.to_thread(_human_template_docx_profile, template_bytes)
         system = _human_ai_agent_system("letter-opus", "independent Word-document review", guidelines, context)
@@ -17509,8 +17291,23 @@ async def human_worker_ai_draft(job_id: str, request: Request):
     }
 
 
+def _human_client_word_list_master_entries(master):
+    """Words and phrases from the saved Client Word Lists (headings starting with # are ignored)."""
+    entries, seen = [], set()
+    for line in str(master or "").splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for value in re.split(r"[,;]+", line):
+            item = re.sub(r"^\s*(?:[-*\u2022]\s*)?", "", value).strip(" .;:-\t")
+            key = re.sub(r"[^a-z0-9]+", " ", item.casefold()).strip()
+            if item and key not in {"none", "n a", "na"} and key not in seen:
+                seen.add(key)
+                entries.append(item)
+    return entries
+
+
 def _human_client_word_list_entries(instructions):
-    """Read only the explicitly labeled Client Word List from job instructions."""
+    """Entries from the job notes plus the super admin's saved Client Word Lists."""
     lines = str(instructions or "").splitlines()
     entries = []
     for index, line in enumerate(lines):
@@ -17531,6 +17328,14 @@ def _human_client_word_list_entries(instructions):
             if item and key not in {"none", "n a", "na", "not provided", "unknown"} and all(re.sub(r"[^a-z0-9]+", " ", prior.casefold()).strip() != key for prior in entries):
                 entries.append(item)
         break
+    for line in str(globals().get("_CLIENT_WORD_LIST_MASTER", "") or "").splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for value in re.split(r"[,;]+", line):
+            item = re.sub(r"^\s*(?:[-*\u2022]\s*)?", "", value).strip(" .;:-\t")
+            key = re.sub(r"[^a-z0-9]+", " ", item.casefold()).strip()
+            if item and key not in {"none", "n a", "na"} and all(re.sub(r"[^a-z0-9]+", " ", prior.casefold()).strip() != key for prior in entries):
+                entries.append(item)
     return entries
 
 def _human_client_word_list_matches(dictation, instructions):
@@ -18108,10 +17913,33 @@ def _review_restore_dictation_boundaries(text, deepgram_transcript, safe=False):
     return output, restored
 
 
+_TAB_TOKEN_RE = re.compile(r"(?i:<tab>|\[tab\])|\\t|(?<![\w/\\])/t(?![a-z/])")
+_INLINE_MARKUP_RE = re.compile(r"</?(?:u|b|i|strong|em)\s*>", re.IGNORECASE)
+
+
+def _human_resolve_tab_tokens(text):
+    """Turn typed tab stand-ins (<tab>, [tab], /t, \\t) into a real tab character."""
+    return _TAB_TOKEN_RE.sub("\t", str(text or ""))
+
+
+def _human_strip_inline_markup(text):
+    """Plain text with no leftover formatting symbols (**bold**, <u>, <b>, <i>)."""
+    value = _INLINE_MARKUP_RE.sub("", str(text or ""))
+    return re.sub(r"\*\*(.+?)\*\*", r"\1", value, flags=re.DOTALL).replace("**", "")
+
+
+def _human_inline_markup_to_html(escaped_line):
+    """Apply bold/underline/italic marks to an already HTML-escaped line."""
+    line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped_line)
+    for tag, html_tag in (("u", "u"), ("b", "strong"), ("strong", "strong"), ("i", "em"), ("em", "em")):
+        line = re.sub(r"&lt;%s&gt;(.*?)&lt;/%s&gt;" % (tag, tag), r"<%s>\1</%s>" % (html_tag, html_tag), line, flags=re.IGNORECASE)
+    return re.sub(r"&lt;/?(?:u|b|i|strong|em)&gt;", "", line, flags=re.IGNORECASE)
+
+
 def _review_text_to_html(text):
     from html import escape
-    lines = str(text or "").split("\n")
-    return "".join(f"<div>{escape(line) if line else '<br>'}</div>" for line in lines)
+    lines = _human_resolve_tab_tokens(text).split("\n")
+    return "".join(f"<div>{_human_inline_markup_to_html(escape(line)) if line else '<br>'}</div>" for line in lines)
 
 
 def _review_enforce_indent(text, source_texts):
@@ -18846,7 +18674,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "deepseek-v4-pro": "DeepSeek V4 Pro", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5"}
+    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-sol": "GPT-5.6 Sol", "claude-haiku-5-5": "Claude Haiku 5.5"}
     ordered = [names[m] for m in names if m in used_model_ids]
     if len(ordered) > 1:
         model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
@@ -19783,13 +19611,11 @@ async def _proofreading_agent_image(job_id, job, progress):
         model_spellings_authoritative=True,
     )
     if is_text:
-        text = re.sub(r"<tab>|\[tab\]", "\t", str(text), flags=re.IGNORECASE)
+        text = _human_resolve_tab_tokens(text)
         text = _review_normalise_sentence_spacing(text)
         text = _human_collapse_duplicate_image_page_blocks(text, [], (job.get("pdf_review") or {}).get("page_texts"))
-        html = _sanitize_editor_html(re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _review_text_to_html(text)))
-        text = text.replace("**", "")
-    else:
-        html = _sanitize_editor_html(_review_text_to_html(text))
+    html = _sanitize_editor_html(_review_text_to_html(text))
+    text = _human_strip_inline_markup(_human_resolve_tab_tokens(text))
     return {
         "combined_text": text, "combined_html": html, "changes": [], "issues": image_issues, "research": str(research or "")[:16000],
         "research_status": research_result["status"], "summary": "", "models_used": list(dict.fromkeys(models or [])),
@@ -19809,7 +19635,7 @@ async def human_proofreading_agent(job_id, actor, progress):
     names = {
         "claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.5-flash": "Gemini 3.5 Flash",
         "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra",
-        "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "deepseek-v4-pro": "DeepSeek V4 Pro", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5",
+        "gpt-5.6-sol": "GPT-5.6 Sol", "claude-haiku-5-5": "Claude Haiku 5.5",
     }
     used = [names.get(str(m).strip().casefold(), str(m)) for m in result.get("models_used") or []]
     saved = {
@@ -20089,6 +19915,8 @@ async def _advance_legacy_training_progress(uid, profile):
 @app.get("/human-transcription/trainee/status")
 async def trainee_status(request: Request):
     actor = await _trainee_actor(request)
+    if (actor.get("profile") or {}).get("worker_retraining_required") is True:
+        await _human_archive_retraining_attempts(actor["uid"])
     profile = await _advance_legacy_training_progress(actor["uid"], actor["profile"])
     actor["profile"] = profile
     results = await _load_training_submissions(actor["uid"])
@@ -20112,8 +19940,6 @@ async def trainee_status(request: Request):
         },
         "levels": TRAINING_LEVELS,
         "guidelines": TRAINING_GUIDELINES,
-        "terms_declined": str(profile.get("workerTermsStatus") or "") == "declined",
-        "deletion_scheduled_at": _human_iso(profile.get("accountDeletionScheduledAt")),
         "is_worker": bool(profile.get("workerApproved") or str(profile.get("role") or "").lower() == "worker"),
     }
 
@@ -20247,7 +20073,7 @@ async def admin_trainee_decision(uid: str, request: Request):
     payload = await request.json()
     decision = str(payload.get("decision") or "").strip().lower()
     payment_status = str(payload.get("payment_status") or "").strip().lower()
-    if decision not in {"reject", "promote_worker", "reinstate", "approve_level", "invite_redo", "waitlist"}:
+    if decision not in {"reject", "promote_worker", "approve_level", "invite_redo", "waitlist"}:
         raise HTTPException(status_code=400, detail="That trainee decision is not supported.")
     if decision == "approve_level":
         raise HTTPException(status_code=409, detail="Module progression is automatic; admins review only after all six modules are submitted.")
@@ -20307,182 +20133,25 @@ async def admin_trainee_decision(uid: str, request: Request):
             "trainingWaitlistedAt": firestore.SERVER_TIMESTAMP,
             "workerApproved": False,
         })
-    elif decision in {"promote_worker", "reinstate"}:
+    elif decision == "promote_worker":
         results = await _load_training_submissions(uid)
-        returning = profile.get("worker_retraining_required") is True or decision == "reinstate"
-        final_level = len(TRAINING_LEVELS)
-        final_transcript = str((results.get(str(final_level)) or {}).get("transcript") or "").strip()
-        if returning:
-            # A returning worker only retakes the final module; modules 1-5 always stay passed.
-            final_done = str((results.get(str(final_level)) or {}).get("status") or "").lower() == "submitted" and final_transcript
-            if decision == "promote_worker" and not final_done:
-                raise HTTPException(status_code=409, detail="The returning worker must submit Module 6 before reinstatement.")
-            for level in range(1, final_level):
-                await asyncio.to_thread(db.collection("training_submissions").document(f"{uid}-{level}").set, {
-                    "uid": uid, "level": level, "status": "submitted", "updatedAt": firestore.SERVER_TIMESTAMP,
-                }, merge=True)
-        else:
-            complete = all(str(results.get(str(level), {}).get("status") or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
-            if not complete or not final_transcript:
-                raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
+        complete = all(str(results.get(str(level), {}).get("status") or "").lower() == "submitted" for level in range(1, len(TRAINING_LEVELS) + 1))
+        final_transcript = str((results.get(str(len(TRAINING_LEVELS))) or {}).get("transcript") or "").strip()
+        if not complete or not final_transcript:
+            raise HTTPException(status_code=409, detail="The trainee must submit all six modules, including the final audio transcript, before promotion.")
         updates.update({
             "role": "worker", "traineeStatus": "enrolled", "trainingStatus": "completed",
             "trainingRoomAccess": False, "workerApproved": True, "workerApprovedAt": firestore.SERVER_TIMESTAMP,
-            "trainingSubmissions": {str(level): "submitted" for level in range(1, final_level + 1)},
             "trainingRedoLevels": [], "trainingRedoMessage": "", "worker_retraining_required": False,
-            "worker_retraining_review_required": False,
             "deadline_return_count": 0, "worker_qualification_cycle": uuid.uuid4().hex,
             "humanShiftMissesConsecutive": 0, "humanShiftWarning": False,
             "humanShiftLastEvaluatedDate": _human_shift_local_now().date().isoformat(),
             "humanShiftCallInExpiresAt": "", "humanShiftReinstatedAt": firestore.SERVER_TIMESTAMP,
-            "workerTermsStatus": "pending", "workerTermsVersion": WORKER_TERMS_VERSION,
         })
     await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
     if decision == "invite_redo":
         await _notify_trainee_redo_invite(uid, profile, levels, message)
     return {"status": "updated", "uid": uid, "decision": decision}
-
-
-WORKER_TERMS_VERSION = "2026-10"
-WORKER_TERMS_DECLINE_DELETE_DAYS = 3
-
-
-@app.post("/api/admin/workers/{uid}/retraining-decision")
-async def admin_worker_retraining_decision(uid: str, request: Request):
-    """Super admin decides what happens to a worker flagged for retraining.
-
-    retrain: back to the Training Room, Module 6 only (modules 1-5 stay passed).
-    supervised_job: stay a worker; the admin assigns one supervised job to rebuild the rating.
-    dismiss: keep working, clear the flag and counters.
-    """
-    _require_admin(request)
-    payload = await request.json()
-    decision = str(payload.get("decision") or "").strip().lower()
-    if decision not in {"retrain", "supervised_job", "dismiss"}:
-        raise HTTPException(status_code=400, detail="Choose retrain, supervised_job or dismiss.")
-    profile = await _load_profile(uid)
-    if profile is None:
-        raise HTTPException(status_code=404, detail="That worker account was not found.")
-    if profile.get("workerApproved") is not True:
-        raise HTTPException(status_code=409, detail="This account is not currently an approved worker.")
-    message = str(payload.get("message") or "").strip()[:1000]
-    final_level = len(TRAINING_LEVELS)
-    updates = {"updatedAt": firestore.SERVER_TIMESTAMP, "worker_retraining_review_required": False}
-    if decision == "retrain":
-        for level in range(1, final_level):
-            await asyncio.to_thread(db.collection("training_submissions").document(f"{uid}-{level}").set, {
-                "uid": uid, "level": level, "status": "submitted", "updatedAt": firestore.SERVER_TIMESTAMP,
-            }, merge=True)
-        await _human_archive_retraining_attempts(uid, [final_level])
-        note = message or "Your work access is paused. Please retake Module %d only; your other modules stay passed and you do not pay for training again." % final_level
-        updates.update({
-            "role": "trainee", "workerApproved": False, "trainingRoomAccess": True,
-            "trainingStatus": "active", "traineeStatus": "enrolled", "trainingPaymentStatus": "paid",
-            "trainingLevel": final_level,
-            "trainingSubmissions": {**{str(level): "submitted" for level in range(1, final_level)}, str(final_level): "redo_requested"},
-            "trainingRedoLevels": [final_level], "trainingRedoMessage": note,
-            "trainingRedoInvitedAt": firestore.SERVER_TIMESTAMP,
-            "worker_retraining_required": True, "worker_retraining_required_at": firestore.SERVER_TIMESTAMP,
-            "is_available": False, "workerTermsStatus": firestore.DELETE_FIELD,
-        })
-    else:
-        updates.update({
-            "deadline_return_count": 0, "humanShiftMissesConsecutive": 0, "humanShiftWarning": False,
-            "humanShiftLastEvaluatedDate": _human_shift_local_now().date().isoformat(),
-            "worker_qualification_cycle": uuid.uuid4().hex,
-        })
-        if decision == "supervised_job":
-            updates.update({"supervisedJobRequired": True, "supervisedJobRequestedAt": firestore.SERVER_TIMESTAMP, "supervisedJobNote": message})
-    await asyncio.to_thread(db.collection("users").document(uid).set, updates, merge=True)
-    _human_list_cache_bump()
-    if decision == "retrain":
-        await _notify_trainee_redo_invite(uid, profile, [final_level], updates["trainingRedoMessage"])
-    elif decision == "supervised_job":
-        try:
-            await _create_user_notification(
-                uid, "supervised-job:%s" % uuid.uuid4().hex[:12], "worker_notice",
-                "Your next job will be supervised",
-                message or "An admin will assign you one supervised job to rebuild your rating. You keep your worker access.",
-                route="human", requires_action=False,
-            )
-        except Exception as exc:
-            logger.warning("Supervised-job notification failed for %s: %s", uid, exc)
-    return {"status": "updated", "uid": uid, "decision": decision}
-
-
-@app.post("/api/admin/workers/{uid}/supervised-job-done")
-async def admin_worker_supervised_job_done(uid: str, request: Request):
-    _require_admin(request)
-    await asyncio.to_thread(db.collection("users").document(uid).set, {
-        "supervisedJobRequired": False, "supervisedJobCompletedAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
-    return {"status": "updated", "uid": uid}
-
-
-@app.post("/human-transcription/worker/terms")
-async def worker_terms_response(request: Request):
-    """A newly promoted worker accepts or declines the work terms before entering the Work Room."""
-    decoded = _verified_user(request)
-    uid = str(decoded.get("uid") or decoded.get("user_id") or decoded.get("sub") or "")
-    payload = await request.json()
-    accept = payload.get("accept") is True
-    profile = await _load_profile(uid)
-    if profile is None or str(profile.get("workerTermsStatus") or "") != "pending":
-        raise HTTPException(status_code=409, detail="There are no worker terms waiting for your response.")
-    if accept:
-        await asyncio.to_thread(db.collection("users").document(uid).set, {
-            "workerTermsStatus": "accepted", "workerTermsAcceptedAt": firestore.SERVER_TIMESTAMP,
-            "workerTermsAcceptedVersion": WORKER_TERMS_VERSION, "updatedAt": firestore.SERVER_TIMESTAMP,
-        }, merge=True)
-        return {"status": "accepted"}
-    delete_at = datetime.now(timezone.utc) + timedelta(days=WORKER_TERMS_DECLINE_DELETE_DAYS)
-    await asyncio.to_thread(db.collection("users").document(uid).set, {
-        "role": "trainee", "workerApproved": False, "trainingRoomAccess": False, "is_available": False,
-        "traineeStatus": "enrolled", "trainingStatus": "terms_declined",
-        "workerTermsStatus": "declined", "workerTermsDeclinedAt": firestore.SERVER_TIMESTAMP,
-        "accountDeletionScheduledAt": delete_at.isoformat(), "updatedAt": firestore.SERVER_TIMESTAMP,
-    }, merge=True)
-    _human_list_cache_bump()
-    return {"status": "declined", "deletion_scheduled_at": delete_at.isoformat()}
-
-
-async def _purge_declined_terms_accounts():
-    """Delete accounts whose owners declined the worker terms once the 3 day window ends."""
-    if not db:
-        return 0
-    snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("workerTermsStatus", "==", "declined")).stream()))
-    now = datetime.now(timezone.utc)
-    removed = 0
-    admin_emails = {item.lower() for item in ADMIN_EMAILS}
-    for snap in snapshots:
-        data = snap.to_dict() or {}
-        due = _human_shift_parse_datetime(data.get("accountDeletionScheduledAt"))
-        if not due or due.astimezone(timezone.utc) > now:
-            continue
-        if str(data.get("email") or "").lower() in admin_emails:
-            continue
-        try:
-            try:
-                await asyncio.to_thread(firebase_auth.delete_user, snap.id)
-            except firebase_auth.UserNotFoundError:
-                pass
-            await asyncio.to_thread(_delete_matching_documents, "transcriptions", "userId", snap.id)
-            await asyncio.to_thread(_delete_matching_documents, "askChats", "userId", snap.id)
-            await asyncio.to_thread(db.collection("users").document(snap.id).delete)
-            removed += 1
-            logger.warning("Deleted account %s after worker terms were declined", snap.id)
-        except Exception as exc:
-            logger.warning("Could not delete declined-terms account %s: %s", snap.id, exc)
-    return removed
-
-
-async def _declined_terms_monitor():
-    while True:
-        try:
-            await _purge_declined_terms_accounts()
-        except Exception as exc:
-            logger.warning("Declined-terms cleanup failed: %s", exc)
-        await asyncio.sleep(3600)
 
 
 @app.post("/human-transcription/trainee/training/{level}/submit")
@@ -21448,7 +21117,7 @@ FORMAT_SYSTEM_PROMPT = (
 async def format_transcript_with_guidelines(request: Request):
     decoded = _verified_user(request)
     email = (decoded.get("email") or "").strip().lower()
-    allowed_formatters = {PDF_JOB_ADMIN_EMAIL, "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com"}
+    allowed_formatters = {PDF_JOB_ADMIN_EMAIL, "typemywordz@gmail.com", "gracenyaitara@gmail.com", "donotgrowweary95@gmail.com", "priscillamuthoni010@gmail.com"}
     if email not in allowed_formatters:
         raise HTTPException(status_code=403, detail="This option is not available on your account.")
     payload = await request.json()
