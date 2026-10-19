@@ -1499,6 +1499,17 @@ def credits_exempt(user_email: str) -> bool:
     return is_admin_user(user_email) or is_comp_access_user(user_email)
 
 
+def transcription_credits_exempt(user_email: str) -> bool:
+    """Audio transcription is charged to every account, admins included.
+
+    Only a complimentary account (an explicitly approved free account, kept
+    empty by default) skips the charge. The admin is deliberately NOT exempt:
+    transcription credits are deducted from the admin exactly as from any
+    other user. Ask TypeMyworDz and Human Work keep their own rules.
+    """
+    return is_comp_access_user(user_email)
+
+
 # Extra accounts that can run the human-transcription pipeline solo: approve a
 # request, assign it straight to a worker, and sign off finished work on a
 # client's behalf, all without a separate client account clicking anything.
@@ -3629,7 +3640,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                               or (duration_minutes or 0) * 60)
             cost = minutes_to_credits(billed_seconds)
             charge = await charge_credits(
-                job_data.get("user_id") or "", user_email, cost, f"transcription {job_id}"
+                job_data.get("user_id") or "", user_email, cost, f"transcription {job_id}",
+                force_charge=not transcription_credits_exempt(user_email),
             )
             job_data["credits_charged"] = charge.get("charged", 0)
             job_data["credits_remaining"] = charge.get("remaining")
@@ -5112,7 +5124,7 @@ async def credits_balance(
             or verified_email != str(user_email or "").strip().lower()
         ):
             raise HTTPException(status_code=403, detail="You can view only your own AI credit balance.")
-    elif credits_exempt(user_email):
+    elif transcription_credits_exempt(user_email):
         return {"exempt": True, "unlimited": True, "planCredits": None,
                 "topUpCredits": None, "total": None,
                 "costs": {"transcription_per_minute": 1},
@@ -5155,7 +5167,7 @@ async def credits_quote(seconds: float = 0, user_id: str = "", user_email: str =
     than after waiting for a transcript they cannot have.
     """
     cost = minutes_to_credits(seconds)
-    if credits_exempt(user_email):
+    if transcription_credits_exempt(user_email):
         return {"cost": 0, "affordable": True, "exempt": True, "balance": None}
 
     if not user_id and user_email:
