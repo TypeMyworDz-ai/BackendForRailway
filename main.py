@@ -93,6 +93,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+for _noisy in ("httpx", "httpcore", "urllib3", "google", "grpc", "hpack", "multipart"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 logger.info("=== STARTING FASTAPI APPLICATION (MAIN BACKEND) ===")
 
@@ -2586,18 +2588,21 @@ def get_payment_channels(country_code: str, plan_name: str = None) -> list[str]:
     return COUNTRY_CHANNELS_MAP.get(country_code, ['card'])
 
 async def health_monitor():
+    """Light memory watch. Runs every 5 minutes (it used to run every 30 seconds
+    and block for a second each time) and only writes a log line when memory is
+    high, because Railway bills for log volume as well as CPU and memory."""
     logger.info("Starting health monitor background task")
     while True:
         try:
+            await asyncio.sleep(300)
             import psutil
             memory_info = psutil.virtual_memory()
-            cpu_percent = psutil.cpu_percent(interval=1)
-            logger.info(f"Health Check - Memory: {memory_info.percent}% used, CPU: {cpu_percent}%, Available RAM: {memory_info.available / (1024**3):.2f} GB")
-            logger.info(f"Active jobs: {len(jobs)}, Active background tasks: {len(active_background_tasks)}, Cancellation flags: {len(cancellation_flags)}")
-            await asyncio.sleep(30)
+            if memory_info.percent >= 80:
+                logger.warning(f"Health Check - high memory: {memory_info.percent}% used, available RAM: {memory_info.available / (1024**3):.2f} GB, active jobs: {len(jobs)}, background tasks: {len(active_background_tasks)}")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Health monitor error: {e}")
-            await asyncio.sleep(30)
 
 async def verify_paystack_payment(reference: str) -> dict:
     """Verify Paystack payment using reference"""
@@ -9225,7 +9230,7 @@ async def human_expiry_monitor():
             await human_expiry_sweep()
         except Exception as exc:
             logger.warning("Human job expiry monitor iteration failed: %s", exc)
-        await asyncio.sleep(60)
+        await asyncio.sleep(120)
 
 
 # ===================== Human worker bi-monthly payouts =====================
@@ -9789,7 +9794,10 @@ async def human_payout_monitor():
             await _human_subadmin_close_due_pay_periods()
         except Exception as exc:
             logger.warning("Human payout monitor iteration failed: %s", exc)
-        await asyncio.sleep(900)
+        # A half-month only closes twice a month, and the payout screens close
+        # due periods on demand, so an hourly sweep is plenty. Each sweep reads
+        # every job and earning record, which is what Railway/Firestore bill for.
+        await asyncio.sleep(3600)
 
 
 async def _human_actor(request: Request):
