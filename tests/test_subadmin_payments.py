@@ -33,7 +33,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "_human_subadmin_ai_used", "_human_job_owner_of", "_human_subadmin_assignment_metadata",
             "_human_subadmin_submission_actor",
             "_human_subadmin_earning_specs", "_human_admin_finish_job_eligible", "_human_shift_local_now",
-            "_human_shift_parse_datetime", "_human_shift_is_scheduled",
+            "_human_shift_parse_datetime", "_human_shift_is_scheduled", "_human_subadmin_shift_active",
             "is_human_subadmin",
         }
         functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted]
@@ -53,6 +53,11 @@ class SubadminPaymentTests(unittest.TestCase):
             "firestore": _FakeFirestore,
             "HUMAN_JOB_ADMIN_EMAILS": ["info@typemywordz.ai"],
             "HUMAN_SHIFT_TIMEZONE": ZoneInfo("Africa/Nairobi"),
+            "HUMAN_SUBADMIN_PAYMENT_SHIFTS": {
+                "info@typemywordz.ai": ((datetime_time(15, 0), datetime_time(20, 0)),),
+                "donotgrowweary95@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
+                "priscillamuthoni010@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
+            },
             "HUMAN_SHIFT_START": datetime_time(15, 0),
             "HUMAN_SHIFT_END": datetime_time(20, 0),
             "is_admin_user": _is_admin_user,
@@ -356,6 +361,49 @@ class SubadminPaymentTests(unittest.TestCase):
         self.assertIn("client_review", route_text)
         self.assertIn("admin_proofread_at", route_text)
         self.assertNotIn("charge_credits", route_text)
+
+
+class SubadminShiftWindowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        SubadminPaymentTests.setUpClass.__func__(cls)
+
+    def at(self, text):
+        return datetime.fromisoformat(text).replace(tzinfo=ZoneInfo("Africa/Nairobi"))
+
+    def test_priscilla_two_windows(self):
+        f = self.namespace["_human_subadmin_shift_active"]
+        email = "priscillamuthoni010@gmail.com"
+        self.assertTrue(f(email, self.at("2026-10-19T15:30:00")))
+        self.assertFalse(f(email, self.at("2026-10-19T20:00:00")))
+        self.assertFalse(f(email, self.at("2026-10-19T20:59:00")))
+        self.assertTrue(f(email, self.at("2026-10-19T21:00:00")))
+        self.assertTrue(f(email, self.at("2026-10-20T00:30:00")))
+        self.assertFalse(f(email, self.at("2026-10-20T01:00:00")))
+        self.assertFalse(f(email, self.at("2026-10-19T22:00:00").replace(day=17)))  # Saturday
+        self.assertTrue(f(email, self.at("2026-10-23T23:00:00")))   # Friday night counts
+        self.assertTrue(f(email, self.at("2026-10-24T00:30:00")))   # spills into Saturday, belongs to Friday
+        self.assertFalse(f(email, self.at("2026-10-24T22:00:00")))  # Saturday night
+
+    def test_donotgrowweary_two_windows(self):
+        f = self.namespace["_human_subadmin_shift_active"]
+        email = "donotgrowweary95@gmail.com"
+        self.assertTrue(f(email, self.at("2026-10-19T16:00:00")))
+        self.assertFalse(f(email, self.at("2026-10-19T20:00:00")))
+        self.assertTrue(f(email, self.at("2026-10-19T23:00:00")))
+        self.assertTrue(f(email, self.at("2026-10-20T00:59:00")))
+        self.assertFalse(f(email, self.at("2026-10-19T14:00:00")))
+        self.assertFalse(f(email, self.at("2026-10-24T22:00:00")))
+
+    def test_info_keeps_single_window(self):
+        f = self.namespace["_human_subadmin_shift_active"]
+        self.assertTrue(f("info@typemywordz.ai", self.at("2026-10-19T16:00:00")))
+        self.assertFalse(f("info@typemywordz.ai", self.at("2026-10-19T22:00:00")))
+
+    def test_grace_never_accrues(self):
+        f = self.namespace["_human_subadmin_shift_active"]
+        for hour in ("16:00:00", "23:00:00"):
+            self.assertFalse(f("gracenyaitara@gmail.com", self.at("2026-10-19T" + hour)))
 
 
 if __name__ == "__main__":
