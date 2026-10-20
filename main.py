@@ -7803,28 +7803,32 @@ def _human_shift_is_scheduled(now=None):
 # but accrues no payments. A window that ends earlier than it starts runs past
 # midnight and belongs to the day it started on.
 HUMAN_SUBADMIN_PAYMENT_SHIFTS = {
-    "info@typemywordz.ai": (datetime_time(15, 0), datetime_time(20, 0)),
-    "donotgrowweary95@gmail.com": (datetime_time(15, 0), datetime_time(20, 0)),
-    "priscillamuthoni010@gmail.com": (datetime_time(22, 0), datetime_time(1, 0)),
+    "info@typemywordz.ai": ((datetime_time(15, 0), datetime_time(20, 0)),),
+    "donotgrowweary95@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
+    "priscillamuthoni010@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
 }
 
 
 def _human_subadmin_shift_active(email, when=None):
-    """True when `when` falls inside this sub-admin's own paid shift window."""
-    window = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(str(email or "").strip().lower())
-    if not window:
+    """True when `when` falls inside one of this sub-admin's own paid shift windows (Mon-Fri)."""
+    windows = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(str(email or "").strip().lower())
+    if not windows:
         return False
+    if windows and not isinstance(windows[0][0], datetime_time):
+        windows = (windows,)
     when = when or _human_shift_local_now()
     local = when.astimezone(HUMAN_SHIFT_TIMEZONE) if getattr(when, "tzinfo", None) else when.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
-    start, end = window
     clock = local.timetz().replace(tzinfo=None)
-    if start < end:
-        shift_day = local
-        inside = start <= clock < end
-    else:
-        inside = clock >= start or clock < end
-        shift_day = local if clock >= start else local - timedelta(days=1)
-    return inside and shift_day.weekday() < 5
+    for start, end in windows:
+        if start < end:
+            shift_day = local
+            inside = start <= clock < end
+        else:
+            inside = clock >= start or clock < end
+            shift_day = local if clock >= start else local - timedelta(days=1)
+        if inside and shift_day.weekday() < 5:
+            return True
+    return False
 
 
 def _human_shift_call_in_active(profile, now=None):
