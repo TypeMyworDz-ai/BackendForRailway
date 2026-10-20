@@ -12,14 +12,15 @@ from docx.shared import Inches, Pt
 
 def _load():
     src = Path(__file__).resolve().parents[1].joinpath("main.py").read_text()
-    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_client_word_list_entries", "_human_client_word_list_matches", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output", "_review_normalize_note_list", "_review_validate_output"]
+    names = ["_SENTENCE_ABBREVIATIONS", "_review_two_space_style", "_review_normalise_sentence_spacing", "_review_text_to_html", "_human_resolve_tab_tokens", "_human_strip_inline_markup", "_human_inline_markup_to_html", "_review_enforce_indent", "_human_review_spelling_notes", "_human_review_candidate_terms", "_human_review_missing_research_terms", "_human_research_parse_findings", "_human_research_unverified_terms", "_human_client_word_list_entries", "_human_client_word_list_matches", "_human_ai_agent_research_footer", "_human_worker_feedback", "_review_strip_model_footer", "_review_split_output", "_review_normalize_note_list", "_review_validate_output"]
     chunks = []
     for name in names:
         start = src.index(name + " =") if name.startswith("_SENT") else src.index("def " + name)
         nxt = src.index("\n\n\n", start)
         chunks.append(src[start:nxt])
     json = __import__("json")
-    ns = {"re": re, "math": math, "json": json, "logger": __import__("logging").getLogger("test.review"), "_parse_json_object": json.loads}
+    ns = {"re": re, "math": math, "json": json, "logger": __import__("logging").getLogger("test.review"), "_parse_json_object": json.loads,
+          "_TAB_TOKEN_RE": re.compile(r"(?i:<tab>|\[tab\])|\\t|(?<![\w/\\])/t(?![a-z/])"), "_INLINE_MARKUP_RE": re.compile(r"</?(?:u|b|i|strong|em)\s*>", re.IGNORECASE)}
     exec("\n\n".join(chunks), ns)
     return ns
 

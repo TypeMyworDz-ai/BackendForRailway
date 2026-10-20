@@ -29,7 +29,7 @@ def _routing(**overrides):
     base = {
         "MISTRAL_API_KEY": "k", "ASSEMBLYAI_API_KEY": "k", "OPENAI_WHISPER_SERVICE_RAILWAY_URL": "u", "DEEPGRAM_SERVICE_RAILWAY_URL": "u",
         "ADMIN_EMAILS": ["typemywordz@gmail.com"], "VOXTRAL_TESTER_EMAIL": "njokigituku@gmail.com",
-        "DEEPGRAM_TESTER_EMAIL": "info@typemywordz.ai",
+        "DEEPGRAM_TESTER_EMAIL": "info@typemywordz.ai", "OPENAI_TESTER_EMAIL": "openai-tester@example.com",
     }
     base.update(overrides)
     ns = _load({"is_admin_user", "get_transcription_services"}, base)
