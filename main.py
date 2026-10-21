@@ -768,9 +768,9 @@ CUSTOM_TOPUP_MAX = 50000
 CUSTOM_TOPUP_RATE = {'africa': 0.01, 'global': 0.0133333333}
 TRAINEE_PRODUCT = 'trainee-training'
 # Training enrollment test price; keep checkout and displayed pricing aligned.
-TRAINEE_PRICE_USD = 1.00
+TRAINEE_PRICE_USD = 10.00
 TRAINEE_COUNTRY = 'KE'
-TRAINEE_MIN_WPM = 40.0
+TRAINEE_MIN_WPM = 50.0
 
 
 def _validated_trainee_typing_test(value):
@@ -5240,6 +5240,69 @@ async def human_admin_update_transcriber_rate(
         "proofreading_rate_kes_per_minute": HUMAN_PROOFREADING_PAYOUT_KES,
         "applies_to": "new_jobs_only",
     }
+
+
+IMAGE_RATE_FIELDS = {
+    "pdf_job_rate_kes": ("PDF job", "PDF_JOB_WORKER_PAY_KES"),
+    "text_messages_rate_kes": ("Text Messages job", "TEXT_MESSAGES_WORKER_PAY_KES"),
+    "pdf_review_rate_kes_per_page": ("PDF review per page", "PDF_JOB_REVIEW_PAY_KES_PER_PAGE"),
+}
+IMAGE_RATE_MAX_KES = 5000
+
+
+def _image_rate_values():
+    return {key: int(globals()[name]) for key, (_label, name) in IMAGE_RATE_FIELDS.items()}
+
+
+def _image_rate_validate(value):
+    text = str(value).strip() if value is not None else ""
+    if not re.fullmatch(r"[0-9]+", text) or not 1 <= int(text) <= IMAGE_RATE_MAX_KES:
+        raise ValueError(f"Each image rate must be a whole number of KES between 1 and {IMAGE_RATE_MAX_KES}.")
+    return int(text)
+
+
+async def _human_refresh_image_rates():
+    """Load saved image-job pay into the module settings. Safe to call often; failures keep current values."""
+    if not db:
+        return
+    try:
+        ref = db.collection(HUMAN_RATE_SETTINGS_COLLECTION).document(HUMAN_RATE_SETTINGS_DOCUMENT)
+        snapshot = await asyncio.to_thread(ref.get)
+        saved = ((snapshot.to_dict() or {}).get("image_rates") or {}) if snapshot.exists else {}
+        for key, (_label, name) in IMAGE_RATE_FIELDS.items():
+            if key in saved:
+                globals()[name] = _image_rate_validate(saved[key])
+    except Exception as exc:
+        logger.warning("Could not load image job rates: %s", exc)
+
+
+@app.get("/human-transcription/admin/image-rates")
+async def human_admin_get_image_rates(request: Request):
+    _require_admin(request)
+    await _human_refresh_image_rates()
+    return {**_image_rate_values(), "maximum_rate_kes": IMAGE_RATE_MAX_KES, "applies_to": "work_completed_after_the_change"}
+
+
+@app.put("/human-transcription/admin/image-rates")
+async def human_admin_update_image_rates(request: Request):
+    admin = _require_admin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
+    body = await request.json()
+    try:
+        values = {key: _image_rate_validate((body or {}).get(key)) for key in IMAGE_RATE_FIELDS}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    ref = db.collection(HUMAN_RATE_SETTINGS_COLLECTION).document(HUMAN_RATE_SETTINGS_DOCUMENT)
+    await asyncio.to_thread(ref.set, {
+        "image_rates": values,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "updatedBy": str(admin.get("email") or "").strip().lower(),
+    }, merge=True)
+    for key, (_label, name) in IMAGE_RATE_FIELDS.items():
+        globals()[name] = values[key]
+    logger.info("Main admin %s set image job rates to %s", admin.get("email"), values)
+    return {**_image_rate_values(), "maximum_rate_kes": IMAGE_RATE_MAX_KES, "applies_to": "work_completed_after_the_change"}
 
 
 @app.get("/human-transcription/admin/worker-rates")
@@ -9790,6 +9853,7 @@ async def human_payout_monitor():
     open the dashboard first."""
     while True:
         try:
+            await _human_refresh_image_rates()
             await _close_due_pay_periods()
             await _human_subadmin_close_due_pay_periods()
         except Exception as exc:
@@ -14843,6 +14907,11 @@ HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-s
 HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("claude-opus-5-5", "claude"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
 HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"))
+# Only this sub-admin gets her own General Jobs route (Gemini first, GPT Terra as fallback);
+# the Super admin can change it under Admin > Model routing.
+HUMAN_GENERAL_GRACE_EMAIL = "gracenyaitara@gmail.com"
+HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
+GENERAL_ROUTE_KEYS = {"general", "general_subadmin", "general_grace"}
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
 WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
 WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
@@ -14947,6 +15016,7 @@ _IMAGE_AGENT_SEMAPHORE = asyncio.Semaphore(4)
 MODEL_ROUTES = {
     "general": ("General Jobs agent (Super Admin)", lambda: HUMAN_GENERAL_AGENT_MODEL_CHAIN),
     "general_subadmin": ("General Jobs agent (Sub-admins)", lambda: HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN),
+    "general_grace": ("General Jobs agent (Grace Nyaitara only)", lambda: HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN),
     "template": ("Template Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "letter": ("Letter Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "pdf": ("PDF and image Jobs agent", lambda: HUMAN_PDF_AGENT_MODEL_CHAIN),
@@ -15001,6 +15071,8 @@ def _human_ai_agent_model_route_key(agent_id, assigning_email):
     """General Jobs routing is split by the verified Human Work assigner role."""
     if agent_id != "general-gpt":
         return ""
+    if str(assigning_email or "").strip().lower() == HUMAN_GENERAL_GRACE_EMAIL:
+        return "general_grace"
     return "general_subadmin" if is_human_subadmin(assigning_email) else "general"
 
 
@@ -16581,12 +16653,11 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
             "Use the PRIMARY transcript (a COMPARISON ONLY transcript, if present, is only a cross-check); preserve dictated wording and paragraph breaks. Return only the complete letter text for the .docx renderer.\n\n"
             "SOURCE TRANSCRIPT:\n" + raw_text[:350000]
         )
-    general_route_key = model_route_key if model_route_key in {"general", "general_subadmin"} else "general"
-    general_default_chain = (
-        HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN
-        if general_route_key == "general_subadmin"
-        else HUMAN_GENERAL_AGENT_MODEL_CHAIN
-    )
+    general_route_key = model_route_key if model_route_key in GENERAL_ROUTE_KEYS else "general"
+    general_default_chain = {
+        "general_subadmin": HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN,
+        "general_grace": HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN,
+    }.get(general_route_key, HUMAN_GENERAL_AGENT_MODEL_CHAIN)
     if agent_id == "general-gpt":
         audio_agent_chain = _route_chain(general_route_key, general_default_chain)
     else:
@@ -16637,7 +16708,7 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
         job_specific_guidelines = str(run_data.get("template_job_guidelines") or "") if agent_id == "template-claude" else ""
         private_reference_files = list(run_data.get("template_reference_files") or []) if agent_id == "template-claude" else []
         model_route_key = str(run_data.get("model_route_key") or "") if agent_id == "general-gpt" else ""
-        if agent_id == "general-gpt" and model_route_key not in {"general", "general_subadmin"}:
+        if agent_id == "general-gpt" and model_route_key not in GENERAL_ROUTE_KEYS:
             model_route_key = "general"
         segments = [dict(item or {}) for item in (job.get("segments") or [])]
         segment = next((item for item in segments if str(item.get("id") or "") == segment_id), None)
