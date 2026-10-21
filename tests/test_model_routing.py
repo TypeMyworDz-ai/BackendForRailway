@@ -35,7 +35,7 @@ class ModelRouting(unittest.TestCase):
     def test_general_defaults_are_separate_for_super_admin_and_sub_admins(self):
         self.assertIn('HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))', SRC)
         self.assertIn('HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"))', SRC)
-        self.assertIn('"general_subadmin": ("General Jobs agent (Sub-admins)"', SRC)
+        self.assertIn('"general_subadmin": ("General Jobs agent: all other sub-admins"', SRC)
 
     def test_general_route_overrides_are_independent(self):
         ns = load()
