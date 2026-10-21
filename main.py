@@ -15015,8 +15015,8 @@ _IMAGE_AGENT_SEMAPHORE = asyncio.Semaphore(4)
 # defaults and never blocks a job.
 MODEL_ROUTES = {
     "general": ("General Jobs agent (Super Admin)", lambda: HUMAN_GENERAL_AGENT_MODEL_CHAIN),
-    "general_subadmin": ("General Jobs agent (Sub-admins)", lambda: HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN),
-    "general_grace": ("General Jobs agent (Grace Nyaitara only)", lambda: HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN),
+    "general_subadmin": ("General Jobs agent: all other sub-admins", lambda: HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN),
+    "general_grace": ("General Jobs agent: Grace Nyaitara only (gracenyaitara@gmail.com)", lambda: HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN),
     "template": ("Template Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "letter": ("Letter Jobs agent", lambda: HUMAN_AUDIO_AGENT_MODEL_CHAIN),
     "pdf": ("PDF and image Jobs agent", lambda: HUMAN_PDF_AGENT_MODEL_CHAIN),
