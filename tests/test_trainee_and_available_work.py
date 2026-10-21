@@ -88,7 +88,8 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         cls.tree = tree
 
     def test_prices_trial_allowance_and_worker_threshold_match_product_policy(self):
-        self.assertEqual(self.namespace["TRAINEE_PRICE_USD"], 1.0)
+        self.assertEqual(self.namespace["TRAINEE_PRICE_USD"], 10.0)
+        self.assertEqual(self.namespace["TRAINEE_MIN_WPM"], 50.0)
         self.assertEqual(self.namespace["FREE_TRIAL_CREDITS"], 30)
         self.assertEqual(self.namespace["HUMAN_AVAILABLE_SLICE_MINUTES"], 2)
         self.assertEqual(self.namespace["MIN_HUMAN_WORKER_RATING"], 3.5)
@@ -122,12 +123,12 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         used = fix({"planCredits": 2, "planCreditsExpireAt": now + timedelta(days=20)}, True, now)
         self.assertEqual(used["planCredits"], 27)
 
-    def test_typing_gate_requires_full_thirty_seconds_and_at_least_forty_wpm(self):
+    def test_typing_gate_requires_full_thirty_seconds_and_at_least_fifty_wpm(self):
         validate = self.namespace["_validated_trainee_typing_test"]
-        self.assertEqual(validate({"correct_chars": 100, "elapsed_ms": 30000})["wpm"], 40.0)
+        self.assertEqual(validate({"correct_chars": 125, "elapsed_ms": 30000})["wpm"], 50.0)
         for value in (
-            {"correct_chars": 99, "elapsed_ms": 30000},
-            {"correct_chars": 100, "elapsed_ms": 29999},
+            {"correct_chars": 124, "elapsed_ms": 30000},
+            {"correct_chars": 125, "elapsed_ms": 29999},
             None,
         ):
             with self.subTest(value=value), self.assertRaises(FakeHTTPException):
