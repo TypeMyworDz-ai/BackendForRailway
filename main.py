@@ -7,6 +7,7 @@ import os
 import time
 import json
 import base64
+import io
 import hashlib
 import hmac
 import calendar
@@ -121,7 +122,13 @@ OPENAI_TESTER_EMAIL = ''
 # tester. It runs Voxtral only, with no fallback, so a Voxtral failure shows up
 # in testing instead of being masked by another provider. It is not
 # payment-exempt.
-VOXTRAL_TESTER_EMAIL = 'njokigituku@gmail.com'
+# njokigituku@gmail.com moved from the Voxtral test to the xAI speech-to-text test.
+# Voxtral stays in the normal fallback order; it just has no dedicated tester now.
+VOXTRAL_TESTER_EMAIL = ''
+XAI_STT_TESTER_EMAIL = 'njokigituku@gmail.com'
+XIAOMI_STT_TESTER_EMAIL = 'jaymoest2@gmail.com'
+XAI_STT_MODEL = "grok-voice-transcribe-2.0"
+XIAOMI_STT_MODEL = "mimo-v2.5-asr"
 VOXTRAL_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
 # Dedicated Deepgram test account. It pays through the normal plan/credit
 # path, starts on Deepgram, and falls back to OpenAI so both services can be
@@ -413,18 +420,9 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "gpt-5.6-luna",
-        "provider": "openai",
-        "label": "ChatGPT 5.6 Luna",
-        "blurb": "Fast, sharp, and reads very long transcripts. The best all-round choice.",
-        "tier": "standard",
-        "credits": 1,
-        "transcript_only": False,
-    },
-    {
-        "id": "deepseek-v4-flash",
+        "id": "deepseek-v4-1-flash",
         "provider": "deepseek",
-        "label": "DeepSeek V4 Flash",
+        "label": "DeepSeek V4.1 Flash",
         "blurb": "Our most economical model. Good for everyday questions, summaries and long transcripts. Pictures are read by ChatGPT Luna automatically.",
         "tier": "standard",
         "credits": 1,
@@ -452,42 +450,33 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "claude-haiku-4-5-20251001",
-        "provider": "claude",
-        "label": "Claude Haiku 4.5",
-        "blurb": "Claude's quick model. Strong at careful reading and quoting.",
-        "tier": "standard",
-        "credits": 5,
-        "transcript_only": False,
-    },
-    {
-        "id": "gemini-3.1-flash-lite",
-        "provider": "gemini",
-        "label": "Gemini 3.1 Flash-Lite",
-        "blurb": "Google's quick model. Available when you are working on a transcript.",
-        "tier": "standard",
-        "credits": 2,
-        "transcript_only": True,
-    },
-    {
         "id": "gemini-3.5-flash-lite",
         "provider": "gemini",
         "label": "Gemini 3.5 Flash-Lite",
-        "blurb": "Google's economical 3.5 model for fast, high-volume work.",
+        "blurb": "Google's economical 3.5 model for fast, high-volume work. Available when you are working on a transcript.",
         "tier": "standard",
         "credits": 2,
         "transcript_only": True,
     },
-    # -- premium: what the Monthly and Yearly plans are for -----------------
     {
-        "id": "gpt-5.6-terra",
-        "provider": "openai",
-        "label": "ChatGPT 5.6 Terra",
-        "blurb": "A step up in reasoning. Good for long or complicated material.",
-        "tier": "premium",
-        "credits": 10,
+        "id": "glm-5.3-flash",
+        "provider": "zai",
+        "label": "GLM 5.3 Flash",
+        "blurb": "Z.ai's fast, low-cost model for everyday questions, summaries and long documents. Pictures are read by ChatGPT Luna automatically.",
+        "tier": "standard",
+        "credits": 1,
         "transcript_only": False,
     },
+    {
+        "id": "mimo-v2.6-flash",
+        "provider": "xiaomi",
+        "label": "MiMo V2.6 Flash",
+        "blurb": "Xiaomi's fast, low-cost reasoning model with a 1M-token window. Good for high-volume questions and long transcripts.",
+        "tier": "standard",
+        "credits": 1,
+        "transcript_only": False,
+    },
+    # -- premium: the advanced model list, for Monthly and Yearly plans ------
     {
         "id": "mistral-large-4",
         "provider": "mistral",
@@ -501,18 +490,9 @@ ASK_MODEL_CATALOGUE = [
         "id": "gpt-6.1-sol",
         "provider": "openai",
         "label": "ChatGPT 6.1 Sol",
-        "blurb": "OpenAI's newest flagship, with a 1M-token window. Stronger than 5.6 Terra at a similar cost; good for difficult reasoning and long documents.",
+        "blurb": "OpenAI's newest flagship, with a 1M-token window. Good for difficult reasoning and long documents.",
         "tier": "premium",
         "credits": 10,
-        "transcript_only": False,
-    },
-    {
-        "id": "deepseek-v4-pro",
-        "provider": "deepseek",
-        "label": "DeepSeek V4 Pro",
-        "blurb": "DeepSeek's deeper reasoning model at a fraction of Western flagship prices. Pictures are read by ChatGPT Luna automatically.",
-        "tier": "premium",
-        "credits": 5,
         "transcript_only": False,
     },
     {
@@ -534,24 +514,6 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "claude-opus-5-5",
-        "provider": "claude",
-        "label": "Claude Opus 5.5",
-        "blurb": "The most capable Claude for everyday use. Best for difficult work.",
-        "tier": "premium",
-        "credits": 18,
-        "transcript_only": False,
-    },
-    {
-        "id": "gpt-5.6-sol",
-        "provider": "openai",
-        "label": "ChatGPT 5.6 Sol",
-        "blurb": "OpenAI's most capable model. For the hardest questions.",
-        "tier": "premium",
-        "credits": 18,
-        "transcript_only": False,
-    },
-    {
         "id": "gemini-3.8-flash",
         "provider": "gemini",
         "label": "Gemini 3.8 Flash",
@@ -560,27 +522,63 @@ ASK_MODEL_CATALOGUE = [
         "credits": 10,
         "transcript_only": True,
     },
+    {
+        "id": "mimo-v2.6-pro",
+        "provider": "xiaomi",
+        "label": "MiMo V2.6 Pro",
+        "blurb": "Xiaomi's flagship reasoning model with a 1M-token window, at a fraction of Western flagship prices.",
+        "tier": "premium",
+        "credits": 5,
+        "transcript_only": False,
+    },
+    {
+        "id": "grok-4.3",
+        "provider": "xai",
+        "label": "Grok 4.3",
+        "blurb": "xAI's capable reasoning model. A strong all-rounder for long or complicated material.",
+        "tier": "premium",
+        "credits": 5,
+        "transcript_only": False,
+    },
+    {
+        "id": "grok-4.7",
+        "provider": "xai",
+        "label": "Grok 4.7",
+        "blurb": "xAI's newest and most capable model. For difficult questions and long documents.",
+        "tier": "premium",
+        "credits": 10,
+        "transcript_only": False,
+    },
 ]
 
 # Model ids that were renamed or replaced. A client who saved one in Settings
 # is moved to its successor instead of being dropped back to the default.
 ASK_MODEL_ALIASES = {
     "claude-sonnet-5": "claude-sonnet-5-5",
-    "claude-opus-4-6": "claude-opus-5-5",
+    "claude-opus-4-6": "claude-sonnet-5-5",
     "gemini-3.6-flash": "gemini-3.8-flash",
+    # Streamlined model list: removed models move to their closest successor.
+    "gpt-5.6-luna": "gpt-6-luna",
+    "gpt-5.6-terra": "gpt-6.1-sol",
+    "gpt-5.6-sol": "gpt-6.1-sol",
+    "claude-opus-5-5": "claude-sonnet-5-5",
+    "claude-haiku-4-5-20251001": "claude-haiku-5-5",
+    "gemini-3.1-flash-lite": "gemini-3.5-flash-lite",
+    "deepseek-v4-flash": "deepseek-v4-1-flash",
+    "deepseek-v4-pro": "deepseek-v4-1-flash",
 }
 
 # DeepSeek Flash is the cheapest capable model we offer (about $0.18 in and
 # $0.73 out per million tokens on a weekly average, against $0.20 and $1.20 for
 # ChatGPT Luna). If it is unavailable for any reason the call quietly falls
 # back to ChatGPT Luna, so a client never sees a failure because of it.
-ASK_DEFAULT_MODEL = "deepseek-v4-flash"
-ASK_LUNA_MODEL = "gpt-5.6-luna"
+ASK_DEFAULT_MODEL = "deepseek-v4-1-flash"
+ASK_LUNA_MODEL = "gpt-6-luna"
 # Used for questions inside a transcript when the client has not chosen a model.
-ASK_TRANSCRIPT_DEFAULT_MODEL = "gemini-3.1-flash-lite"
+ASK_TRANSCRIPT_DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # A safe fallback for each provider, used if the default is somehow missing.
-ASK_FALLBACK_MODEL = "claude-haiku-4-5-20251001"
+ASK_FALLBACK_MODEL = "claude-haiku-5-5"
 
 # Plans that also get the premium models.
 PREMIUM_AI_PLANS = ['Monthly Plan', 'Yearly Plan']
@@ -591,7 +589,7 @@ PREMIUM_AI_PLANS = ['Monthly Plan', 'Yearly Plan']
 # what clients were seeing. Give Gemini plenty of room, and switch thinking
 # off on the models that allow it.
 GEMINI_MIN_OUTPUT_TOKENS = 8000
-GEMINI_THINKING_OFF = {"gemini-3.1-flash-lite"}
+GEMINI_THINKING_OFF = set()
 
 
 def _ask_provider_ready(provider: str) -> bool:
@@ -604,6 +602,12 @@ def _ask_provider_ready(provider: str) -> bool:
         return bool(os.environ.get("DEEPSEEK_API_KEY"))
     if provider == "mistral":
         return bool(os.environ.get("MISTRAL_API_KEY"))
+    if provider == "zai":
+        return bool(os.environ.get("ZAI_API_KEY"))
+    if provider == "xiaomi":
+        return bool(os.environ.get("XIAOMI_API_KEY"))
+    if provider == "xai":
+        return bool(os.environ.get("XAI_API_KEY"))
     return True
 
 
@@ -685,7 +689,7 @@ def resolve_ask_model(requested: str, user_plan: str, user_email: str = "", has_
         if m["id"] == wanted:
             return m["id"], m["provider"]
     # Older versions of the page sent a provider name rather than an id.
-    if wanted in ("claude", "gemini", "openai", "mistral"):
+    if wanted in ("claude", "gemini", "openai", "mistral", "zai", "xiaomi", "xai", "deepseek"):
         for m in allowed:
             if m["provider"] == wanted:
                 return m["id"], m["provider"]
@@ -2025,7 +2029,8 @@ def is_admin_user(user_email: str) -> bool:
 def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, user_email: str = None):
     """
     Speech-to-text order for the transcription page.
-    - njokigituku@gmail.com: dedicated Voxtral tester, Voxtral only with no fallback (pays like any client).
+    - njokigituku@gmail.com: dedicated xAI speech-to-text tester, xAI only with no fallback.
+    - jaymoest2@gmail.com: dedicated Xiaomi speech-to-text tester, Xiaomi only with no fallback.
     - info@typemywordz.ai: dedicated OpenAI STT tester, OpenAI only with no fallback.
     - info@typemywordztest.com: dedicated Deepgram tester, Deepgram then OpenAI.
     - Everyone else (every plan, with or without speaker labels): AssemblyAI > Voxtral > OpenAI > Deepgram.
@@ -2033,7 +2038,10 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     """
 
     is_admin = is_admin_user(user_email) if user_email else False
-    is_voxtral_tester = (user_email and user_email.lower().strip() == VOXTRAL_TESTER_EMAIL.lower())
+    is_voxtral_tester = bool(VOXTRAL_TESTER_EMAIL and user_email and user_email.lower().strip() == VOXTRAL_TESTER_EMAIL.lower())
+    _email_key = (user_email or "").lower().strip()
+    is_xai_tester = bool(_email_key and _email_key == XAI_STT_TESTER_EMAIL.lower())
+    is_xiaomi_tester = bool(_email_key and _email_key == XIAOMI_STT_TESTER_EMAIL.lower())
     is_deepgram_tester = (user_email and user_email.lower().strip() == DEEPGRAM_TESTER_EMAIL.lower())
     is_openai_tester = (user_email and user_email.lower().strip() == OPENAI_TESTER_EMAIL.lower())
 
@@ -2043,6 +2051,12 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     tier_3 = None
     tier_4 = None
     reason = "default_logic"
+
+    # --- Dedicated xAI and Xiaomi speech-to-text testers: that service only, no fallback ---
+    if is_xai_tester:
+        return {"tier_1": "xai", "tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xai_stt_tester"}
+    if is_xiaomi_tester:
+        return {"tier_1": "xiaomi", "tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xiaomi_stt_tester"}
 
     # --- Dedicated Voxtral Tester Logic ---
     # Placed before the speaker-label override on purpose: this account exists
@@ -2148,13 +2162,13 @@ class FormattedWordDownloadRequest(BaseModel):
 class UserAIRequest_Pydantic(BaseModel):
     transcript: str
     user_prompt: str
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-haiku-5-5"
     max_tokens: int = 1000
 
 class AdminAIFormatRequest_Pydantic(BaseModel):
     transcript: str
     formatting_instructions: str = "Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "claude-haiku-5-5"
     max_tokens: int = 4000
 
 # Pydantic model for Gemini User queries (now available for all paid users)
@@ -3227,6 +3241,171 @@ def _voxtral_result_from_payload(payload: dict, speaker_labels_enabled: bool) ->
     }
 
 
+def _xai_result_from_payload(payload: dict, speaker_labels_enabled: bool) -> dict:
+    """Turn an xAI /v1/stt response (word-level timings) into the shared transcript shape."""
+    payload = payload or {}
+    text = str(payload.get("text") or "").strip()
+    words = [w for w in (payload.get("words") or []) if isinstance(w, dict) and str(w.get("text") or "").strip()]
+    if not text and words:
+        text = " ".join(str(w["text"]).strip() for w in words)
+    if not text:
+        raise RuntimeError("xAI returned an empty transcript")
+
+    def seconds(value):
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return 0.0
+
+    has_speakers = bool(speaker_labels_enabled and any(w.get("speaker") not in (None, "") for w in words))
+    segments, lines, speaker_numbers = [], [], {}
+    current = None
+
+    def flush():
+        nonlocal current
+        if current and current["text"].strip():
+            segments.append({"start": current["start"], "end": current["end"], "speaker": current["speaker"],
+                             "text": current["text"].strip(), "confidence": None})
+            if has_speakers:
+                lines.append(f"<strong>{current['speaker']}:</strong> {current['text'].strip()}")
+        current = None
+
+    for w in words:
+        label = None
+        if has_speakers:
+            key = str(w.get("speaker") if w.get("speaker") not in (None, "") else "unknown")
+            label = f"Speaker {speaker_numbers.setdefault(key, len(speaker_numbers) + 1)}"
+        piece = str(w["text"]).strip()
+        if current and has_speakers and current["speaker"] != label:
+            flush()
+        if current is None:
+            current = {"start": seconds(w.get("start")), "end": seconds(w.get("end")), "speaker": label, "text": piece, "count": 1}
+        else:
+            current["text"] += " " + piece
+            current["end"] = seconds(w.get("end"))
+            current["count"] += 1
+        if piece[-1:] in ".?!" or current["count"] >= 30:
+            if not has_speakers:
+                flush()
+            elif current["count"] >= 60:
+                flush()
+    flush()
+    if has_speakers:
+        text = "\n".join(lines)
+    duration = seconds(payload.get("duration")) or (segments[-1]["end"] if segments else 0)
+    return {
+        "status": "completed",
+        "transcription": text,
+        "language": payload.get("language") or "en",
+        "duration": duration,
+        "word_count": len(text.split()),
+        "has_speaker_labels": has_speakers,
+        "segments": segments,
+        "timings_source": "xAI",
+        "model_used": XAI_STT_MODEL,
+    }
+
+
+async def transcribe_with_xai(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
+    """xAI Grok speech-to-text (POST /v1/stt). Tester-only; no fallback is attempted."""
+    key = os.environ.get("XAI_API_KEY")
+    if not key:
+        return {"status": "failed", "error": "xAI speech-to-text is not configured (the xAI API key is missing)."}
+    try:
+        with open(audio_path, "rb") as f:
+            audio_content = f.read()
+        form = {"model": XAI_STT_MODEL}
+        if speaker_labels_enabled:
+            form["diarize"] = "true"
+        lang = str(language_code or "").strip().lower()
+        if re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", lang):
+            form["language"] = lang
+            form["format"] = "true"
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.x.ai/v1/stt",
+                headers={"Authorization": f"Bearer {key}"},
+                data=form,
+                files={"file": (os.path.basename(audio_path), audio_content, "audio/mpeg")},
+                timeout=900.0,
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"xAI returned HTTP {response.status_code}: {response.text[:300]}")
+        return _xai_result_from_payload(response.json(), speaker_labels_enabled)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"xAI transcription failed for job {job_id}: {str(e)[:400]}")
+        return {"status": "failed", "error": f"xAI transcription failed: {str(e)[:200]}"}
+
+
+XIAOMI_STT_CHUNK_SECONDS = 240  # the model's output limit is about 2,000 tokens per request
+
+
+async def transcribe_with_xiaomi(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
+    """Xiaomi MiMo speech recognition. Tester-only; no fallback is attempted.
+
+    The model reads one short clip per request, so the audio is cut into
+    four-minute pieces and the pieces are joined. It gives no word timings,
+    so each piece is one timestamp segment. It has no speaker labels."""
+    key = os.environ.get("XIAOMI_API_KEY")
+    if not key:
+        return {"status": "failed", "error": "Xiaomi speech recognition is not configured (the Xiaomi API key is missing)."}
+    try:
+        def cut_pieces():
+            audio = AudioSegment.from_file(audio_path)
+            step = XIAOMI_STT_CHUNK_SECONDS * 1000
+            pieces = []
+            for start_ms in range(0, max(len(audio), 1), step):
+                buf = io.BytesIO()
+                audio[start_ms:start_ms + step].set_channels(1).export(buf, format="mp3", bitrate="64k")
+                pieces.append((start_ms / 1000.0, min(start_ms + step, len(audio)) / 1000.0, base64.b64encode(buf.getvalue()).decode("ascii")))
+            return pieces, len(audio) / 1000.0
+
+        pieces, total_seconds = await asyncio.to_thread(cut_pieces)
+        lang = str(language_code or "").strip().lower()
+        asr_language = lang if lang in ("zh", "en") else "auto"
+        texts, segments = [], []
+        async with httpx.AsyncClient() as client:
+            for start, end, b64 in pieces:
+                body = {
+                    "model": XIAOMI_STT_MODEL,
+                    "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": f"data:audio/mpeg;base64,{b64}"}}]}],
+                    "asr_options": {"language": asr_language},
+                }
+                response = await client.post(
+                    "https://api.xiaomimimo.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=body, timeout=300.0,
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(f"Xiaomi returned HTTP {response.status_code}: {response.text[:300]}")
+                choice = (response.json().get("choices") or [{}])[0]
+                piece_text = _openai_format_content_text((choice.get("message") or {}).get("content"))
+                if piece_text:
+                    texts.append(piece_text)
+                    segments.append({"start": round(start, 3), "end": round(end, 3), "speaker": None, "text": piece_text, "confidence": None})
+        text = "\n\n".join(texts).strip()
+        if not text:
+            raise RuntimeError("Xiaomi returned an empty transcript")
+        return {
+            "status": "completed",
+            "transcription": text,
+            "language": "en" if asr_language == "auto" else asr_language,
+            "duration": round(total_seconds, 2),
+            "word_count": len(text.split()),
+            "has_speaker_labels": False,
+            "segments": segments,
+            "timings_source": "Xiaomi (four-minute pieces)",
+            "model_used": XIAOMI_STT_MODEL,
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"Xiaomi transcription failed for job {job_id}: {str(e)[:400]}")
+        return {"status": "failed", "error": f"Xiaomi transcription failed: {str(e)[:200]}"}
+
+
 async def transcribe_with_deepgram(audio_path: str, language_code: str, speaker_labels_enabled: bool, job_id: str) -> dict:
     """Calls the dedicated Deepgram service deployed on Render."""
     if not DEEPGRAM_SERVICE_RAILWAY_URL:
@@ -3372,6 +3551,31 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 services_attempted.append(f"Voxtral_tier{tier_number}")
                 return None
 
+        async def attempt_tester_stt(service_name, tier_number):
+            """xAI and Xiaomi speech-to-text testers: one attempt, no fallback."""
+            label = f"tier_{tier_number}"
+            try:
+                path, stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                logger.info(f"Audio compressed for {service_name}: {stats}")
+                fn = transcribe_with_xai if service_name == "xai" else transcribe_with_xiaomi
+                result = await fn(path, language_code, speaker_labels_enabled, job_id)
+                if result.get("status") == "failed":
+                    job_data[f"{label}_error"] = str(result.get("error") or f"{service_name} failed")
+                    job_data[f"{label}_success"] = False
+                else:
+                    job_data[f"{label}_used"] = service_name
+                    job_data[f"{label}_success"] = True
+                services_attempted.append(f"{service_name}_tier{tier_number}")
+                return result
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.error(f"{service_name} (Tier {tier_number}) failed: {error}")
+                job_data[f"{label}_error"] = str(error)
+                job_data[f"{label}_success"] = False
+                services_attempted.append(f"{service_name}_tier{tier_number}")
+                return None
+
         # --- ATTEMPT TIER 1 SERVICE ---
         if tier_1_service == "assemblyai":
             if not ASSEMBLYAI_API_KEY:
@@ -3411,6 +3615,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         
         elif tier_1_service == "voxtral":
             transcription_result = await attempt_voxtral(1)
+
+        elif tier_1_service in ("xai", "xiaomi"):
+            transcription_result = await attempt_tester_stt(tier_1_service, 1)
 
         elif tier_1_service is not None and tier_1_service not in ("assemblyai", "openai_whisper", "deepgram"):
             # Belt and braces. If the router ever names a service the runner
@@ -3619,6 +3826,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 model_used = "deepgram-nova"
             elif service_used_name == "voxtral":
                 model_used = transcription_result.get("model_used") or VOXTRAL_TRANSCRIPTION_MODEL
+            elif service_used_name in ("xai", "xiaomi"):
+                model_used = transcription_result.get("model_used") or service_used_name
 
             logger.info(f"📊 Job {job_id} for user {user_email} completed. Service: {service_used_name}, Model: {model_used}")
 
@@ -4711,7 +4920,7 @@ ASK_SYSTEM_PROMPT = ASK_SYSTEM_PROMPT_GENERAL
 async def ai_user_query(
     transcript: str = Form(...),
     user_prompt: str = Form(...),
-    model: str = Form("claude-haiku-4-5-20251001"),
+    model: str = Form("claude-haiku-5-5"),
     max_tokens: int = Form(1000),
     user_plan: str = Form("free"),
     user_email: str = Form("")
@@ -4809,7 +5018,16 @@ OPENAI_FORMAT_ENDPOINTS = {
     "openai": ("https://api.openai.com/v1/chat/completions", lambda: OPENAI_API_KEY),
     "mistral": ("https://api.mistral.ai/v1/chat/completions", lambda: MISTRAL_API_KEY),
     "deepseek": ("https://api.deepseek.com/chat/completions", lambda: os.environ.get("DEEPSEEK_API_KEY")),
+    # Keys live only in the server's environment variables, never in the code.
+    "zai": ("https://api.z.ai/api/paas/v4/chat/completions", lambda: os.environ.get("ZAI_API_KEY")),
+    "xiaomi": ("https://api.xiaomimimo.com/v1/chat/completions", lambda: os.environ.get("XIAOMI_API_KEY")),
+    "xai": ("https://api.x.ai/v1/chat/completions", lambda: os.environ.get("XAI_API_KEY")),
 }
+# Providers whose answer-length field is max_completion_tokens (reasoning tokens
+# count against it) rather than max_tokens.
+OPENAI_FORMAT_COMPLETION_TOKEN_PROVIDERS = {"openai", "xiaomi", "xai"}
+# Models that read text only: a question with pictures goes to ChatGPT Luna.
+TEXT_ONLY_OPENAI_FORMAT_MODELS = {"glm-5.3-flash"}
 
 # Keep the admin-facing selector stable while sending Mistral's canonical API id.
 MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}  # zai-glm-5-3 is sent as-is
@@ -4899,6 +5117,8 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         # unavailable (for example an empty balance), so clients see no error.
         if images or time.time() < _DEEPSEEK_DOWN_UNTIL[0]:
             return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
+    if model_id in TEXT_ONLY_OPENAI_FORMAT_MODELS and images:
+        return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
     if model_id == "zai-glm-5-3" and images:
         # GLM 5.3 reads text only; pictures go to Mistral Large 4, which sees images.
         return _ask_openai_format("mistral", "mistral-large-4", system_prompt, turns, question, images, max_tokens, auto_continue)
@@ -4931,9 +5151,15 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             # The retired v4 names are still accepted, but the current name is
             # deepseek-flash. Reasoning is switched off: its tokens are billed as
             # output and a chat answer does not need them.
-            payload["model"] = "deepseek-v4-pro" if model_id == "deepseek-v4-pro" else "deepseek-flash"
+            payload["model"] = "deepseek-flash"
+            payload["thinking"] = {"type": "disabled"}
+        if provider == "zai" or model_id == "mimo-v2.6-flash":
+            # Fast, cheap models: reasoning off, so tokens go to the visible answer.
             payload["thinking"] = {"type": "disabled"}
         budget = max(max_tokens, 16000 if auto_continue else 4000)
+        if model_id in ("mimo-v2.6-pro", "grok-4.3", "grok-4.7"):
+            # These reason before answering and the reasoning counts against the budget.
+            budget = max(budget, 32000)
         if provider == "mistral" and model_id in MISTRAL_REASONING_MODELS:
             budget = max(budget, 32000)
         if provider == "openai":
@@ -4941,6 +5167,8 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             # keep reasoning light for chat and give the answer room to finish.
             payload["max_completion_tokens"] = budget
             payload["reasoning_effort"] = "low"
+        elif provider in OPENAI_FORMAT_COMPLETION_TOKEN_PROVIDERS:
+            payload["max_completion_tokens"] = budget
         else:
             payload["max_tokens"] = budget
 
@@ -6056,7 +6284,7 @@ async def ai_user_query_gemini(
 async def ai_admin_format(
     transcript: str = Form(...),
     formatting_instructions: str = Form("Format the transcript for readability, correct grammar, and identify main sections with headings. Ensure a professional tone."),
-    model: str = Form("claude-haiku-4-5-20251001"),
+    model: str = Form("claude-haiku-5-5"),
     max_tokens: int = Form(4000),
     user_plan: str = Form("free"),
     user_email: str = Form("")
@@ -14902,19 +15130,19 @@ async def admin_workers(request: Request):
 
 # Internal AI workers are workflow identities, not Firebase users. They have
 # no sign-in, mailbox, payout profile, or client-facing permissions.
-AI_REVIEW_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai"))
+AI_REVIEW_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-6-luna", "openai"))
 HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
-HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("claude-opus-5-5", "claude"))
+HUMAN_AUDIO_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("claude-sonnet-5-5", "claude"))
 HUMAN_GENERAL_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
 HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN = (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"))
-# Only this sub-admin gets her own General Jobs route (Gemini first, GPT Terra as fallback);
+# Only this sub-admin gets her own General Jobs route (Gemini first, GPT-6.1 Sol as fallback);
 # the Super admin can change it under Admin > Model routing.
 HUMAN_GENERAL_GRACE_EMAIL = "gracenyaitara@gmail.com"
-HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai"))
+HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai"))
 GENERAL_ROUTE_KEYS = {"general", "general_subadmin", "general_grace"}
 HUMAN_PDF_AGENT_MODEL_CHAIN = (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini"))
-WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
-WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai"))
+WORKER_DRAFT_FORMAT_MODEL_CHAIN = (("gpt-6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini"))
+WORKER_DRAFT_PROOFREAD_MODEL_CHAIN = (("claude-haiku-5-5", "claude"), ("gpt-6-luna", "openai"))
 HUMAN_AUDIO_TRANSCRIPTION_RULES = (
     "AUDIO TRANSCRIPTION FIDELITY (applies to General, Template, Letter, and worker audio drafts/proofreads): Preserve the dictated wording, order, meaning, grammar, pronouns, contractions, and awkward phrasing. Never paraphrase, rearrange, professionalize, summarize, add words, or infer missing content. Correct only clear recognition/spelling errors or explicit self-corrections allowed by the job instructions. Preserve ordinary repetition and emphasis. Remove only clearly non-semantic fillers such as `um` and `uh`, and `you know`/`like` only when plainly used as empty fillers; retain those words whenever they carry meaning. Do not remove meaningful phrasing or rewrite the sentence around a filler.\n"
     "RESEARCH (strict): Research only unfamiliar, distinctive proper nouns actually dictated in the source: specific agencies, programs, organizations, companies, schools, databases/software, addresses/streets, locations, or professionals when their professional identity matters. Do not research ordinary personal names just because they appear; do so only when the speaker identifies a professional role. Do not research common/everyday words, common abbreviations, familiar places/agencies, role names, or terms already confirmed in client instructions/word lists or prior job research. Search once per distinct eligible term, not once per occurrence. Never turn this into general research or add background facts. Use research only to confirm spelling/capitalization of the exact dictated term; never add, expand, shorten, replace, reword, or otherwise change the dictated information. If no unfamiliar term qualifies, do not search and omit both `I researched:` and `Research Notes:` entirely.\n"
@@ -14986,13 +15214,13 @@ HUMAN_AI_AGENTS = {
     },
     "template-claude": {
         "id": "template-claude", "name": "Template Transcription Agent",
-        "display": "GPT-6.1 Sol + Claude Opus 5.5 fallback", "job_types": ["audio", "template_job"],
-        "models": ["gpt-6.1-sol", "claude-opus-5-5"],
+        "display": "GPT-6.1 Sol + Claude Sonnet 5.5 fallback", "job_types": ["audio", "template_job"],
+        "models": ["gpt-6.1-sol", "claude-sonnet-5-5"],
     },
     "letter-opus": {
         "id": "letter-opus", "name": "Letter Agent",
-        "display": "GPT-6.1 Sol + Claude Opus 5.5 fallback", "job_types": ["letter_job"],
-        "models": ["gpt-6.1-sol", "claude-opus-5-5"],
+        "display": "GPT-6.1 Sol + Claude Sonnet 5.5 fallback", "job_types": ["letter_job"],
+        "models": ["gpt-6.1-sol", "claude-sonnet-5-5"],
     },
     "pdf-gemini": {
         "id": "pdf-gemini", "name": "PDF and Image Agent",
@@ -15026,7 +15254,8 @@ MODEL_ROUTES = {
     "proofreading_agent": ("Proofreading Agent", lambda: HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN),
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
-MODEL_ROUTE_EXTRA_MODELS = {"claude-sonnet-5-5": ("claude", "Claude Sonnet 5.5")}
+# Test-only models: selectable in Human Work routing, never shown in Ask TypeMyworDz.
+MODEL_ROUTE_EXTRA_MODELS = {"gemini-4-argon": ("gemini", "Gemini 4 Argon (testing)")}
 # Every model in the shared catalogue is available on each independently
 # configured Human Work agent route; each route still keeps its own saved chain.
 _MODEL_ROUTE_CACHE = {"at": 0.0, "routes": {}, "human_work_stt": {}}
@@ -15062,6 +15291,7 @@ def _route_chain(key, default_chain):
     ids = (_model_route_overrides() or {}).get(key)
     chain = []
     for model_id in ids if isinstance(ids, list) else []:
+        model_id = ASK_MODEL_ALIASES.get(model_id, model_id)
         if model_id in options and all(model_id != c[0] for c in chain):
             chain.append((model_id, options[model_id][0]))
     return tuple(chain) or default_chain
@@ -15085,7 +15315,11 @@ async def admin_get_model_routing(request: Request):
     for key, (label, default_fn) in MODEL_ROUTES.items():
         route_options = _model_route_options()
         default_ids = [c[0] for c in default_fn()]
-        chosen = [m for m in (overrides.get(key) or []) if m in route_options] if isinstance(overrides.get(key), list) else []
+        chosen = []
+        for m in (overrides.get(key) if isinstance(overrides.get(key), list) else []):
+            m = ASK_MODEL_ALIASES.get(m, m)
+            if m in route_options and m not in chosen:
+                chosen.append(m)
         routes.append({
             "key": key, "label": label, "default": default_ids, "models": chosen or default_ids,
             "customised": bool(chosen),
@@ -19305,7 +19539,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "deepseek-v4-pro": "DeepSeek V4 Pro", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5"}
+    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-6-luna": "GPT-6 Luna", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "glm-5.3-flash": "GLM 5.3 Flash", "deepseek-v4-1-flash": "DeepSeek V4.1 Flash", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5", "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gemini-4-argon": "Gemini 4 Argon", "mimo-v2.6-pro": "MiMo V2.6 Pro", "mimo-v2.6-flash": "MiMo V2.6 Flash", "grok-4.3": "Grok 4.3", "grok-4.7": "Grok 4.7"}
     ordered = [names[m] for m in names if m in used_model_ids]
     if len(ordered) > 1:
         model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
@@ -20265,8 +20499,9 @@ async def human_proofreading_agent(job_id, actor, progress):
     html = result.get("combined_html") or _sanitize_editor_html(_review_text_to_html(combined))
     names = {
         "claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.5-flash": "Gemini 3.5 Flash",
-        "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gpt-5.6-luna": "GPT-5.6 Luna", "gpt-5.6-terra": "GPT-5.6 Terra",
-        "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "deepseek-v4-pro": "DeepSeek V4 Pro", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5",
+        "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gpt-6-luna": "GPT-6 Luna",
+        "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "glm-5.3-flash": "GLM 5.3 Flash", "deepseek-v4-1-flash": "DeepSeek V4.1 Flash", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5",
+        "gemini-4-argon": "Gemini 4 Argon", "mimo-v2.6-pro": "MiMo V2.6 Pro", "mimo-v2.6-flash": "MiMo V2.6 Flash", "grok-4.3": "Grok 4.3", "grok-4.7": "Grok 4.7",
     }
     used = [names.get(str(m).strip().casefold(), str(m)) for m in result.get("models_used") or []]
     saved = {
