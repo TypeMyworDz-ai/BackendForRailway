@@ -15203,6 +15203,103 @@ async def admin_put_model_routing(request: Request):
     _MODEL_ROUTE_CACHE["at"] = 0.0
     return {"status": "reset" if reset else "saved", "key": key, "models": ids}
 
+BROADCAST_DOC = ("admin_settings", "human_work_broadcasts")
+BROADCAST_AUDIENCES = ("worker", "subadmin")
+BROADCAST_MAX_ITEMS = 12
+BROADCAST_DEFAULTS = {
+    "worker": [{
+        "id": "monday-shifts", "title": "Monday shifts", "active": True, "link_label": "", "link_url": "",
+        "text": "Mondays are our slow shift days, so please do not expect much work on a Monday. This does not mean you can skip your shift: log in and clock in on time as usual, because attendance and tardiness are still tracked every day.",
+    }],
+    "subadmin": [],
+}
+_BROADCAST_CACHE = {"at": 0.0, "data": None}
+
+
+def _broadcast_clean_items(raw):
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=400, detail="Messages must be a list.")
+    items = []
+    for entry in raw[:BROADCAST_MAX_ITEMS]:
+        if not isinstance(entry, dict):
+            continue
+        title = re.sub(r"\s+", " ", str(entry.get("title") or "")).strip()[:80]
+        text = str(entry.get("text") or "").replace("\r\n", "\n").strip()[:2000]
+        link_url = str(entry.get("link_url") or "").strip()[:500]
+        link_label = re.sub(r"\s+", " ", str(entry.get("link_label") or "")).strip()[:80]
+        if not title and not text:
+            continue
+        if link_url and (not re.match(r"^https://[^\s]+$", link_url, re.I)):
+            raise HTTPException(status_code=400, detail="Links must start with https:// and contain no spaces.")
+        if link_url and not link_label:
+            link_label = "Open link"
+        item_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(entry.get("id") or ""))[:40] or uuid.uuid4().hex[:10]
+        items.append({
+            "id": item_id, "title": title, "text": text, "link_label": link_label if link_url else "",
+            "link_url": link_url, "active": entry.get("active") is not False,
+        })
+    return items
+
+
+async def _broadcast_load(force=False):
+    if not force and _BROADCAST_CACHE["data"] is not None and time.time() - _BROADCAST_CACHE["at"] < 20:
+        return _BROADCAST_CACHE["data"]
+
+    def read():
+        snap = db.collection(BROADCAST_DOC[0]).document(BROADCAST_DOC[1]).get()
+        return (snap.to_dict() or {}) if snap.exists else {}
+
+    try:
+        stored = await asyncio.to_thread(read)
+    except Exception as exc:  # a settings problem must never break the work room
+        logger.warning("Broadcast messages could not be read: %s", exc)
+        stored = {}
+    out = {}
+    for audience in BROADCAST_AUDIENCES:
+        block = stored.get(audience)
+        if isinstance(block, dict) and isinstance(block.get("items"), list):
+            out[audience] = {"items": block["items"], "updated_at": str(block.get("updated_at") or ""), "updated_by": str(block.get("updated_by") or "")}
+        else:
+            out[audience] = {"items": [dict(item) for item in BROADCAST_DEFAULTS[audience]], "updated_at": "", "updated_by": ""}
+    _BROADCAST_CACHE.update({"at": time.time(), "data": out})
+    return out
+
+
+@app.get("/human-transcription/broadcast")
+async def human_get_broadcast(request: Request):
+    """Messages shown in the bar at the top of the worker room and the sub-admin dashboard."""
+    actor = await _human_actor(request)
+    if actor["role"] == "worker":
+        audience = "worker"
+    elif actor["role"] == "admin" and is_human_subadmin(actor.get("email")):
+        audience = "subadmin"
+    else:
+        return {"audience": "", "items": []}
+    data = await _broadcast_load()
+    return {"audience": audience, "items": [item for item in data[audience]["items"] if isinstance(item, dict) and item.get("active") is not False]}
+
+
+@app.get("/api/admin/broadcasts")
+async def admin_get_broadcasts(request: Request):
+    _require_admin(request)
+    return await _broadcast_load(force=True)
+
+
+@app.put("/api/admin/broadcasts")
+async def admin_put_broadcasts(request: Request):
+    admin = _require_admin(request)
+    payload = await request.json()
+    audience = str(payload.get("audience") or "")
+    if audience not in BROADCAST_AUDIENCES:
+        raise HTTPException(status_code=400, detail="Unknown audience.")
+    items = _broadcast_clean_items(payload.get("items"))
+    block = {"items": items, "updated_at": datetime.now(timezone.utc).isoformat(), "updated_by": str(admin.get("email") or "").strip().lower()}
+    ref = db.collection(BROADCAST_DOC[0]).document(BROADCAST_DOC[1])
+    await asyncio.to_thread(ref.set, {audience: block, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    _BROADCAST_CACHE["at"] = 0.0
+    return {"status": "saved", "audience": audience, **block}
+
+
 GENERAL_JOB_GUIDELINES_DOC = ("admin_settings", "general_job_guidelines")
 
 
