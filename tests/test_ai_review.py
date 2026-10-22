@@ -329,7 +329,7 @@ class AiAgentCatalog(unittest.TestCase):
         self.assertEqual(set(self.agents), {
             "general-gpt", "template-claude", "pdf-gemini", "text-messages-gemini", "letter-opus",
         })
-        expected_audio_models = ["gpt-6.1-sol", "claude-opus-5-5"]
+        expected_audio_models = ["gpt-6.1-sol", "claude-sonnet-5-5"]
         self.assertEqual(self.agents["general-gpt"]["models"], ["gemini-3.8-flash", "gpt-6.1-sol"])
         self.assertEqual(self.agents["template-claude"]["models"], expected_audio_models)
         image_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
@@ -386,15 +386,15 @@ class AiModelRouting(unittest.TestCase):
         self.assertIn("Do not add a footer to an individual batch", prompt)
 
     def test_requested_model_chains_are_primary_then_fallback(self):
-        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["AI_REVIEW_MODEL_CHAIN"], (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini"), ("gpt-6-luna", "openai")))
         self.assertEqual(self.assignments["HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai")))
-        self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-6.1-sol", "openai"), ("claude-opus-5-5", "claude")))
+        self.assertEqual(self.assignments["HUMAN_AUDIO_AGENT_MODEL_CHAIN"], (("gpt-6.1-sol", "openai"), ("claude-sonnet-5-5", "claude")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_AGENT_MODEL_CHAIN"], (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai")))
         self.assertEqual(self.assignments["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"], (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_PDF_AGENT_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
         self.assertEqual(self.assignments["HUMAN_TEXT_MESSAGES_MODEL_CHAIN"], (("gemini-3.5-flash-lite", "gemini"), ("gemini-3.8-flash", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-5.6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
-        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-5.6-luna", "openai")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_FORMAT_MODEL_CHAIN"], (("gpt-6-luna", "openai"), ("gemini-3.5-flash-lite", "gemini")))
+        self.assertEqual(self.assignments["WORKER_DRAFT_PROOFREAD_MODEL_CHAIN"], (("claude-haiku-5-5", "claude"), ("gpt-6-luna", "openai")))
         flash_lite = next(model for model in self.assignments["ASK_MODEL_CATALOGUE"] if model["id"] == "gemini-3.5-flash-lite")
         self.assertEqual((flash_lite["provider"], flash_lite["tier"], flash_lite["credits"], flash_lite["transcript_only"]), ("gemini", "standard", 2, True))
 

@@ -13,18 +13,20 @@ def load():
         "time": __import__("time"),
         "ASK_MODEL_CATALOGUE": [
             {"id": "gemini-3.8-flash", "provider": "gemini", "label": "G"},
-            {"id": "gpt-5.6-terra", "provider": "openai", "label": "T"},
+            {"id": "gpt-6.1-sol", "provider": "openai", "label": "T"},
             {"id": "mistral-large-4", "provider": "mistral", "label": "Mistral Large 4 (Preview)"},
+            {"id": "claude-sonnet-5-5", "provider": "claude", "label": "Claude Sonnet 5.5"},
         ],
-        "HUMAN_GENERAL_AGENT_MODEL_CHAIN": (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")),
-        "HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN": (("gpt-5.6-terra", "openai"), ("gemini-3.8-flash", "gemini")),
+        "HUMAN_GENERAL_AGENT_MODEL_CHAIN": (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai")),
+        "HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN": (("gpt-6.1-sol", "openai"), ("gemini-3.8-flash", "gemini")),
         "HUMAN_GENERAL_GRACE_EMAIL": "gracenyaitara@gmail.com",
-        "HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN": (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")),
+        "HUMAN_GENERAL_GRACE_AGENT_MODEL_CHAIN": (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai")),
         "is_human_subadmin": lambda email: str(email or "").strip().lower().startswith("subadmin@"),
         "HUMAN_AUDIO_AGENT_MODEL_CHAIN": (("a", "x"),), "HUMAN_PDF_AGENT_MODEL_CHAIN": (("a", "x"),),
         "HUMAN_TEXT_MESSAGES_MODEL_CHAIN": (("a", "x"),), "WORKER_DRAFT_FORMAT_MODEL_CHAIN": (("a", "x"),),
         "WORKER_DRAFT_PROOFREAD_MODEL_CHAIN": (("a", "x"),), "HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN": (("a", "x"),),
         "AI_REVIEW_MODEL_CHAIN": (("a", "x"),),
+        "ASK_MODEL_ALIASES": {"gpt-5.6-terra": "gpt-6.1-sol"},
         "logger": __import__("logging").getLogger("t"),
     }
     exec(SRC[start:end], ns)
@@ -40,10 +42,10 @@ class ModelRouting(unittest.TestCase):
     def test_general_route_overrides_are_independent(self):
         ns = load()
         ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {
-            "general": ["gemini-3.8-flash"], "general_subadmin": ["gpt-5.6-terra"],
+            "general": ["gemini-3.8-flash"], "general_subadmin": ["gpt-6.1-sol"],
         }})
         self.assertEqual(ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"]), (("gemini-3.8-flash", "gemini"),))
-        self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), (("gpt-5.6-terra", "openai"),))
+        self.assertEqual(ns["_route_chain"]("general_subadmin", ns["HUMAN_GENERAL_SUBADMIN_AGENT_MODEL_CHAIN"]), (("gpt-6.1-sol", "openai"),))
 
     def test_mistral_large_4_is_available_to_every_human_work_route(self):
         ns = load()
@@ -76,13 +78,13 @@ class ModelRouting(unittest.TestCase):
         self.assertEqual(route_key("template-claude", "subadmin@example.com"), "")
         self.assertEqual(route_key("general-gpt", " GraceNyaitara@gmail.com "), "general_grace")
         self.assertEqual(route_key("template-claude", "gracenyaitara@gmail.com"), "")
-        self.assertEqual(ns["MODEL_ROUTES"]["general_grace"][1](), (("gemini-3.8-flash", "gemini"), ("gpt-5.6-terra", "openai")))
+        self.assertEqual(ns["MODEL_ROUTES"]["general_grace"][1](), (("gemini-3.8-flash", "gemini"), ("gpt-6.1-sol", "openai")))
 
     def test_override_used_and_unknown_ignored(self):
         ns = load()
-        ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {"general": ["gpt-5.6-terra", "bogus", "claude-sonnet-5-5"]}})
+        ns["_MODEL_ROUTE_CACHE"].update({"at": __import__("time").time(), "routes": {"general": ["gpt-6.1-sol", "bogus", "claude-sonnet-5-5"]}})
         chain = ns["_route_chain"]("general", ns["HUMAN_GENERAL_AGENT_MODEL_CHAIN"])
-        self.assertEqual(chain, (("gpt-5.6-terra", "openai"), ("claude-sonnet-5-5", "claude")))
+        self.assertEqual(chain, (("gpt-6.1-sol", "openai"), ("claude-sonnet-5-5", "claude")))
 
     def test_default_when_no_override(self):
         ns = load()

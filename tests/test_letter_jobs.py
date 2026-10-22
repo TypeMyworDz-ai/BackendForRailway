@@ -68,7 +68,7 @@ class LetterJobTests(unittest.TestCase):
     def test_letter_agent_has_an_explicit_correspondence_override_and_opus_first_models(self):
         agent = self.ns['HUMAN_AI_AGENTS']['letter-opus']
         self.assertEqual(agent['job_types'], ['letter_job'])
-        self.assertEqual(agent['models'], ['gpt-6.1-sol', 'claude-opus-5-5'])
+        self.assertEqual(agent['models'], ['gpt-6.1-sol', 'claude-sonnet-5-5'])
         system = self.ns['_human_ai_agent_system']('letter-opus', 'formatting', '', '')
         self.assertIn('dedicated LETTER JOB', system)
         self.assertIn('never refuse it', system)

@@ -55,6 +55,7 @@ class ModelsAndAudioTests(unittest.TestCase):
             "re": re, "os": __import__("os"), "json": __import__("json"),
             "logger": __import__("logging").getLogger("test.models"),
             "TYPEMYWORDZ_AI_NAME": "TypeMyworDz",
+            "TEXT_ONLY_OPENAI_FORMAT_MODELS": {"glm-5.3-flash"}, "OPENAI_FORMAT_COMPLETION_TOKEN_PROVIDERS": {"openai", "xiaomi", "xai"},
             "OPENAI_FORMAT_ENDPOINTS": {"mistral": ("https://api.mistral.ai/v1/chat/completions", lambda: "test-key")},
             "requests": None, "Response": FakeResponse, "Request": FakeRequest,
             "is_ai_allowed": lambda plan, email, credits: True,
@@ -66,22 +67,22 @@ class ModelsAndAudioTests(unittest.TestCase):
 
     def test_old_model_ids_move_to_their_successors(self):
         resolve = self.ns["resolve_ask_model"]
-        self.assertEqual(resolve("claude-opus-4-6", "Monthly Plan", "a@b.c", True, True)[0], "claude-opus-5-5")
+        self.assertEqual(resolve("claude-opus-4-6", "Monthly Plan", "a@b.c", True, True)[0], "claude-sonnet-5-5")
         self.assertEqual(resolve("claude-sonnet-5", "Monthly Plan", "a@b.c", True, True)[0], "claude-sonnet-5-5")
         self.assertEqual(resolve("gemini-3.6-flash", "Monthly Plan", "a@b.c", True, True)[0], "gemini-3.8-flash")
 
     def test_unknown_model_falls_back_to_default(self):
-        self.assertEqual(self.ns["resolve_ask_model"]("nope", "Monthly Plan", "a@b.c", True, True)[0], "gpt-5.6-luna")
+        self.assertEqual(self.ns["resolve_ask_model"]("nope", "Monthly Plan", "a@b.c", True, True)[0], "gpt-6-luna")
 
     def test_deepseek_is_hidden_until_its_key_is_set(self):
         import os
         os.environ.pop("DEEPSEEK_API_KEY", None)
         ids = [m["id"] for m in self.ns["ask_models_for"]("Monthly Plan", "a@b.c", True, True)]
-        self.assertNotIn("deepseek-v4-flash", ids)
+        self.assertNotIn("deepseek-v4-1-flash", ids)
         os.environ["DEEPSEEK_API_KEY"] = "x"
         try:
             ids = [m["id"] for m in self.ns["ask_models_for"]("Monthly Plan", "a@b.c", True, True)]
-            self.assertIn("deepseek-v4-flash", ids)
+            self.assertIn("deepseek-v4-1-flash", ids)
         finally:
             os.environ.pop("DEEPSEEK_API_KEY", None)
 
@@ -89,14 +90,14 @@ class ModelsAndAudioTests(unittest.TestCase):
         import os
         resolve = self.ns["resolve_ask_model"]
         os.environ.pop("DEEPSEEK_API_KEY", None)
-        self.assertEqual(resolve("", "Monthly Plan", "a@b.c", False, True)[0], "gpt-5.6-luna")
+        self.assertEqual(resolve("", "Monthly Plan", "a@b.c", False, True)[0], "gpt-6-luna")
         os.environ["DEEPSEEK_API_KEY"] = "x"
         try:
-            self.assertEqual(resolve("", "Monthly Plan", "a@b.c", False, True)[0], "deepseek-v4-flash")
-            self.assertEqual(resolve("", "One-Week Plan", "a@b.c", True, True)[0], "deepseek-v4-flash")
+            self.assertEqual(resolve("", "Monthly Plan", "a@b.c", False, True)[0], "deepseek-v4-1-flash")
+            self.assertEqual(resolve("", "One-Week Plan", "a@b.c", True, True)[0], "deepseek-v4-1-flash")
             # Questions inside a transcript default to Gemini, but a chosen model wins.
-            self.assertEqual(resolve("", "One-Week Plan", "a@b.c", True, True, True)[0], "gemini-3.1-flash-lite")
-            self.assertEqual(resolve("gpt-5.6-luna", "One-Week Plan", "a@b.c", True, True, True)[0], "gpt-5.6-luna")
+            self.assertEqual(resolve("", "One-Week Plan", "a@b.c", True, True, True)[0], "gemini-3.5-flash-lite")
+            self.assertEqual(resolve("gpt-6-luna", "One-Week Plan", "a@b.c", True, True, True)[0], "gpt-6-luna")
         finally:
             os.environ.pop("DEEPSEEK_API_KEY", None)
 
@@ -209,9 +210,9 @@ class ModelsAndAudioTests(unittest.TestCase):
 
     def test_standard_plan_does_not_get_premium_models(self):
         ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", True, True)]
-        self.assertIn("gpt-5.6-luna", ids)
+        self.assertIn("gpt-6-luna", ids)
         self.assertIn("gemini-3.5-flash-lite", ids)
-        self.assertNotIn("claude-opus-5-5", ids)
+        self.assertNotIn("claude-sonnet-5-5", ids)
         research_ids = [m["id"] for m in self.ns["ask_models_for"]("One-Week Plan", "a@b.c", False, True)]
         self.assertNotIn("gemini-3.5-flash-lite", research_ids)
 
@@ -249,7 +250,7 @@ class NewModelConfigTests(unittest.TestCase):
         self.src = (pathlib.Path(__file__).resolve().parents[1] / "main.py").read_text()
 
     def test_catalogue_has_new_models(self):
-        for model_id in ("gpt-6.1-sol", "claude-sonnet-5-5", "zai-glm-5-3", "deepseek-v4-pro", "mistral-large-4"):
+        for model_id in ("gpt-6.1-sol", "claude-sonnet-5-5", "zai-glm-5-3", "deepseek-v4-1-flash", "glm-5.3-flash", "mimo-v2.6-pro", "mimo-v2.6-flash", "grok-4.3", "grok-4.7", "mistral-large-4"):
             self.assertIn('"id": "%s"' % model_id, self.src)
 
     def test_reasoning_settings(self):
