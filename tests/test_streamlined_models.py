@@ -57,7 +57,7 @@ class StreamlinedModelTests(unittest.TestCase):
 
     def test_stt_testers_are_wired(self):
         self.assertIn("XAI_STT_TESTER_EMAIL = 'njokigituku@gmail.com'", SRC)
-        self.assertIn("XIAOMI_STT_TESTER_EMAIL = 'jaymoest2@gmail.com'", SRC)
+        self.assertIn("XIAOMI_STT_TESTER_EMAIL = ''", SRC)
         self.assertIn("attempt_tester_stt(tier_1_service, 1)", SRC)
 
 

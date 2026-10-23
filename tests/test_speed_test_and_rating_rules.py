@@ -59,11 +59,16 @@ class RatingRuleTests(unittest.TestCase):
         self.assertIn("/api/admin/rating-agent-instructions", SRC)
 
 
-class TesterNoFallbackTests(unittest.TestCase):
-    def test_both_spellings_reach_xiaomi_only(self):
-        self.assertIn("'jaymoesta2@gmail.com'", SRC)
-        self.assertIn('"tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xiaomi_stt_tester"', SRC)
+class SttRoutingTests(unittest.TestCase):
+    def test_xai_tester_super_admin_and_default_order(self):
         self.assertIn('"tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xai_stt_tester"', SRC)
+        self.assertIn('"tier_1": "xai", "tier_2": "assemblyai"', SRC)
+        self.assertIn('order = ["assemblyai", "xai", "voxtral", "openai_whisper", "deepgram"]', SRC)
+        self.assertIn("XIAOMI_STT_TESTER_EMAILS = set()", SRC)
+
+    def test_human_work_can_route_to_xai_and_xiaomi(self):
+        self.assertIn('HUMAN_WORK_STT_PROVIDERS = ("assemblyai", "deepgram", "voxtral", "openai", "xai", "xiaomi")', SRC)
+        self.assertIn("result = await transcribe_with_xiaomi(audio_path", SRC)
 
 
 if __name__ == "__main__":

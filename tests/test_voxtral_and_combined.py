@@ -28,8 +28,8 @@ def _load(names, extra=None):
 def _routing(**overrides):
     base = {
         "MISTRAL_API_KEY": "k", "ASSEMBLYAI_API_KEY": "k", "OPENAI_WHISPER_SERVICE_RAILWAY_URL": "u", "DEEPGRAM_SERVICE_RAILWAY_URL": "u",
-        "ADMIN_EMAILS": ["typemywordz@gmail.com"], "VOXTRAL_TESTER_EMAIL": "voxtral-tester@example.com", "XAI_STT_TESTER_EMAIL": "njokigituku@gmail.com", "XIAOMI_STT_TESTER_EMAIL": "jaymoest2@gmail.com", "XIAOMI_STT_TESTER_EMAILS": {"jaymoest2@gmail.com", "jaymoesta2@gmail.com"},
-        "DEEPGRAM_TESTER_EMAIL": "info@typemywordz.ai", "OPENAI_TESTER_EMAIL": "openai-tester@example.com",
+        "ADMIN_EMAILS": ["typemywordz@gmail.com"], "VOXTRAL_TESTER_EMAIL": "voxtral-tester@example.com", "XAI_STT_TESTER_EMAIL": "njokigituku@gmail.com", "XIAOMI_STT_TESTER_EMAIL": "", "XIAOMI_STT_TESTER_EMAILS": set(),
+        "os": __import__("os"), "DEEPGRAM_TESTER_EMAIL": "info@typemywordz.ai", "OPENAI_TESTER_EMAIL": "openai-tester@example.com",
     }
     base.update(overrides)
     ns = _load({"is_admin_user", "get_transcription_services"}, base)
@@ -37,13 +37,18 @@ def _routing(**overrides):
 
 
 class RoutingTests(unittest.TestCase):
-    def test_clients_get_assemblyai_then_voxtral_openai_deepgram(self):
+    def setUp(self):
+        import os
+        os.environ["XAI_API_KEY"] = "test"
+
+    def test_clients_get_assemblyai_then_xai_voxtral_openai_deepgram(self):
         f = _routing()
         for plan in ("free", "Monthly Plan", "Yearly Plan", "One-Week Plan"):
             for labels in (False, True):
                 r = f(plan, labels, "client@example.com")
-                self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]], ["assemblyai", "voxtral", "openai_whisper", "deepgram"], plan)
-        self.assertEqual(f("free", True, "typemywordz@gmail.com")["tier_1"], "assemblyai")
+                self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"], r["tier_5"]], ["assemblyai", "xai", "voxtral", "openai_whisper", "deepgram"], plan)
+        r = f("free", True, "typemywordz@gmail.com")
+        self.assertEqual((r["tier_1"], r["tier_2"], r["tier_3"]), ("xai", "assemblyai", None))
 
     def test_voxtral_tester_has_no_fallback(self):
         r = _routing()("Monthly Plan", True, "voxtral-tester@example.com")
@@ -52,8 +57,9 @@ class RoutingTests(unittest.TestCase):
     def test_xai_and_xiaomi_testers_have_no_fallback(self):
         r = _routing()("Monthly Plan", True, "NjokiGituku@gmail.com")
         self.assertEqual((r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]), ("xai", None, None, None))
-        r = _routing()("free", False, "jaymoest2@gmail.com")
-        self.assertEqual((r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]), ("xiaomi", None, None, None))
+        for email in ("jaymoest2@gmail.com", "jaymoesta2@gmail.com"):
+            r = _routing()("free", False, email)
+            self.assertEqual(r["tier_1"], "assemblyai", email)
 
     def test_deepgram_tester_unchanged(self):
         r = _routing()("free", False, "info@typemywordz.ai")
@@ -61,7 +67,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_missing_mistral_key_skips_voxtral(self):
         r = _routing(MISTRAL_API_KEY=None)("free", False, "client@example.com")
-        self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]], ["assemblyai", "openai_whisper", "deepgram", None])
+        self.assertEqual([r["tier_1"], r["tier_2"], r["tier_3"], r["tier_4"]], ["assemblyai", "xai", "openai_whisper", "deepgram"])
 
 
 class VoxtralParsingTests(unittest.TestCase):
