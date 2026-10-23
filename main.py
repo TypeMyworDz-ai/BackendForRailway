@@ -20001,8 +20001,37 @@ _PROOFREADING_AGENT_SYSTEM = (
 # All other proofreading requirements come from the super-admin dashboard and this job's own instructions.
 _PROOFREADING_AGENT_ADDENDUM = (
     "The selected speech transcript is comparison-only. Use it to preserve dictated paragraph breaks and make minimal contextual corrections only. "
-    "For all other proofreading decisions, follow only the super-admin Proofreading Agent instructions and this job's instructions."
+    "Follow, in this order of priority: this job's own instructions, the super-admin Proofreading Agent instructions, the overall TypeMyworDz guidelines, "
+    "and the TypeMyworDz default formatting. A higher item overrides a lower one only where they genuinely conflict; otherwise apply all of them. "
+    "Always finish with two spaces after every sentence and a real tab at the start of every body paragraph unless a higher item says otherwise."
 )
+
+# The company default layout every Human Work agent works to. Instructions on the job or from the
+# super admin override it where they conflict (for example "no indents").
+HUMAN_DEFAULT_FORMATTING_RULES = (
+    "TYPEMYWORDZ DEFAULT FORMATTING (applies unless the job or the super-admin instructions say otherwise):\n"
+    "- Two spaces after every sentence, including at the end of a paragraph.\n"
+    "- A real TAB character at the start of every body paragraph (not spaces). Never convert tabs to spaces.\n"
+    "- One blank line between paragraphs; no extra spacing.\n"
+    "- Headings in ALL CAPS, flush left, plain (no bold, italic or underline), with a blank line before and after.\n"
+    "- Numbered paragraphs: tab, number, period, tab, then the text.\n"
+    "- Straight ASCII quotes and apostrophes only. Do not bold anything unless the job or template says so.\n"
+    "- The closing spellings section is one paragraph, flush left, directly after the transcript.\n"
+)
+
+
+async def _proofreading_reference_block(job):
+    """The overall guidelines (with client word lists) plus the default formatting, for the Proofreading Agent."""
+    try:
+        guidelines = await _guidelines_for_job(job)
+    except Exception as exc:
+        logger.warning("Proofreading Agent could not read the overall guidelines: %s", exc)
+        guidelines = ""
+    return (
+        "OVERALL TYPEMYWORDZ GUIDELINES (read and apply every rule that is relevant to this job):\n"
+        + (str(guidelines or "").strip()[:60000] or "Not available; rely on the instructions below.")
+        + "\n\n" + HUMAN_DEFAULT_FORMATTING_RULES + "\n"
+    )
 
 _PROOFREADING_AGENT_IMAGE_ADDENDUM = ""
 
@@ -20638,8 +20667,10 @@ async def _proofreading_agent_audio(job_id, job, progress):
         issues.append("Online research could not be fully completed; street and location names that were not verified keep the dictated spelling.")
 
     await progress("Proofreading and joining the parts", 55)
+    reference_block = await _proofreading_reference_block(job)
     shared = (
-        "SUPER-ADMIN PROOFREADING INSTRUCTIONS AND JOB-SPECIFIC INSTRUCTIONS (follow these for all proofreading decisions):\n"
+        reference_block + "\n"
+        + "SUPER-ADMIN PROOFREADING INSTRUCTIONS AND JOB-SPECIFIC INSTRUCTIONS (follow these for all proofreading decisions):\n"
         + (custom_instructions or "No standing super-admin instructions are saved. Follow the instructions included with this job.")
         + "\n\nJOB NOTES AND REFERENCE MATERIALS:\n" + (context or "None supplied.")
         + "\n\nRESEARCH RESULTS (reference material only):\n" + (research_text[:16000] or "None available.") + "\n\n"
@@ -20702,6 +20733,10 @@ async def _proofreading_agent_audio(job_id, job, progress):
     combined = "\n\n".join(chunk.strip("\n") for chunk in final_chunks)
     combined, restored_boundaries = _review_restore_dictation_boundaries(combined, reference_text, safe=True)
     combined = _proofreading_heal_paragraph_cuts(combined)
+    single_space = bool(re.search(r"\b(?:one|single|1)\s+space\b", " ".join([custom_instructions, context]), re.I))
+    if not single_space:
+        combined = _review_normalise_sentence_spacing(combined)
+    combined = _proofreading_enforce_indent(combined, indent=not no_indent)
     combined = _human_ai_agent_research_footer(
         combined, research_text,
         source_parts=parts, client_word_list=context, dictated_text=worker_transcript, thorough=True,
@@ -20743,7 +20778,7 @@ async def _proofreading_agent_image(job_id, job, progress):
     if context_data["issues"]:
         context += "\n\nREFERENCE FILE ALERTS (do not guess at unreadable reference content):\n" + "\n".join(context_data["issues"])
     custom_instructions = await _proofreading_agent_custom_instructions()
-    system = _PROOFREADING_AGENT_SYSTEM + _proofreading_custom_instructions_block(custom_instructions)
+    system = _PROOFREADING_AGENT_SYSTEM + "\n\n" + await _proofreading_reference_block(job) + _proofreading_custom_instructions_block(custom_instructions)
     system += _PROOFREADING_AGENT_IMAGE_ADDENDUM
     no_indent = _proofreading_no_indent_requested([context])
     # The Proofreading Agent's saved instructions, not hidden built-in formatting rules, determine paragraph layout.
