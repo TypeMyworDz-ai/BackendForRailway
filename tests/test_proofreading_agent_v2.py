@@ -139,7 +139,7 @@ class WiringTests(unittest.TestCase):
         self.assertIn("comparison-only", block.lower())
         self.assertIn("paragraph breaks", block)
         self.assertIn("minimal contextual corrections", block)
-        self.assertIn("follow only the super-admin", block.lower())
+        self.assertIn("overall typemywordz guidelines", block.lower())
         for needle in ("STREETS, ADDRESSES AND LOCATIONS", "FORMATTING COMMANDS", "INSTRUCTION AUDIT", "INDENTATION", "SINGLE-PART JOBS"):
             self.assertNotIn(needle, block)
 

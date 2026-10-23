@@ -71,5 +71,18 @@ class SttRoutingTests(unittest.TestCase):
         self.assertIn("result = await transcribe_with_xiaomi(audio_path", SRC)
 
 
+class ProofreadingReadsEverythingTests(unittest.TestCase):
+    def test_audio_and_image_paths_load_guidelines_default_format_and_enforce_layout(self):
+        a = SRC.index("async def _proofreading_agent_audio(")
+        b = SRC.index("async def _proofreading_agent_image(")
+        c = SRC.index("async def human_proofreading_agent(")
+        self.assertIn("_proofreading_reference_block(job)", SRC[a:b])
+        self.assertIn("_proofreading_reference_block(job)", SRC[b:c])
+        self.assertIn("_review_normalise_sentence_spacing(combined)", SRC[a:b])
+        self.assertIn("_proofreading_enforce_indent(combined, indent=not no_indent)", SRC[a:b])
+        self.assertIn("_guidelines_for_job(job)", SRC[SRC.index("async def _proofreading_reference_block"):a])
+        self.assertIn("Two spaces after every sentence", SRC)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -53,7 +53,7 @@ class ProofreadingAgentTests(unittest.TestCase):
         self.assertIn("comparison-only", prompt.lower())
         self.assertIn("paragraph breaks", prompt)
         self.assertIn("minimal contextual corrections", prompt)
-        self.assertIn("follow only the super-admin", prompt.lower())
+        self.assertIn("overall typemywordz guidelines", prompt.lower())
         self.assertNotIn("HUMAN_GENERAL_SELF_CORRECTION_GUIDANCE + _PROOFREADING_AGENT_ADDENDUM", SRC)
         self.assertIn("_proofreading_agent_custom_instructions()", SRC)
         self.assertIn("_human_work_stt_config(\"proofreading_agent\")", SRC)

@@ -158,7 +158,7 @@ class CombinedPartsTests(unittest.TestCase):
         prompt = SRC[start:end]
         self.assertIn("paragraph breaks", prompt)
         self.assertIn("minimal contextual corrections", prompt)
-        self.assertIn("follow only the super-admin", prompt.lower())
+        self.assertIn("overall typemywordz guidelines", prompt.lower())
         for removed_rule in ("SINGLE-PART JOBS", "STREETS, ADDRESSES AND LOCATIONS", "INDENTATION:", "A. You receive every part"):
             self.assertNotIn(removed_rule, prompt)
 
