@@ -126,9 +126,9 @@ OPENAI_TESTER_EMAIL = ''
 # Voxtral stays in the normal fallback order; it just has no dedicated tester now.
 VOXTRAL_TESTER_EMAIL = ''
 XAI_STT_TESTER_EMAIL = 'njokigituku@gmail.com'
-XIAOMI_STT_TESTER_EMAIL = 'jaymoest2@gmail.com'
-# The tester's address has been typed both ways; both reach the Xiaomi-only path.
-XIAOMI_STT_TESTER_EMAILS = {'jaymoest2@gmail.com', 'jaymoesta2@gmail.com'}
+XIAOMI_STT_TESTER_EMAIL = ''
+# Xiaomi testing has ended; Xiaomi is now only a Human Work routing choice.
+XIAOMI_STT_TESTER_EMAILS = set()
 XAI_STT_MODEL = "grok-voice-transcribe-2.0"
 XIAOMI_STT_MODEL = "mimo-v2.5-asr"
 VOXTRAL_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
@@ -924,7 +924,7 @@ HUMAN_PROOFREADING_AGENT_CREDIT_COST = 3
 HUMAN_WORKER_STT_ORDER = ("deepgram", "voxtral", "openai")
 HUMAN_AGENT_STT_ORDER = ("assemblyai",)
 HUMAN_PROOFREADING_STT_ORDER = ("deepgram",)
-HUMAN_WORK_STT_PROVIDERS = ("assemblyai", "deepgram", "voxtral", "openai")
+HUMAN_WORK_STT_PROVIDERS = ("assemblyai", "deepgram", "voxtral", "openai", "xai", "xiaomi")
 HUMAN_WORK_STT_DEFAULTS = {
     "worker_draft": {"order": HUMAN_WORKER_STT_ORDER, "comparison": ""},
     "audio_agent": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
@@ -2032,10 +2032,10 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     """
     Speech-to-text order for the transcription page.
     - njokigituku@gmail.com: dedicated xAI speech-to-text tester, xAI only with no fallback.
-    - jaymoest2@gmail.com: dedicated Xiaomi speech-to-text tester, Xiaomi only with no fallback.
+    - typemywordz@gmail.com (Super admin): xAI first, AssemblyAI only if xAI fails.
     - info@typemywordz.ai: dedicated OpenAI STT tester, OpenAI only with no fallback.
     - info@typemywordztest.com: dedicated Deepgram tester, Deepgram then OpenAI.
-    - Everyone else (every plan, with or without speaker labels): AssemblyAI > Voxtral > OpenAI > Deepgram.
+    - Everyone else (every plan, with or without speaker labels): AssemblyAI > xAI > Voxtral > OpenAI > Deepgram.
     Human Work stages use the Super-admin-editable human_work_stt settings; the constants below are defaults.
     """
 
@@ -2059,6 +2059,11 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         return {"tier_1": "xai", "tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xai_stt_tester"}
     if is_xiaomi_tester:
         return {"tier_1": "xiaomi", "tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xiaomi_stt_tester"}
+
+    # --- Super admin: xAI first, AssemblyAI only if xAI fails ---
+    if _email_key == "typemywordz@gmail.com":
+        return {"tier_1": "xai", "tier_2": "assemblyai" if ASSEMBLYAI_API_KEY else None, "tier_3": None, "tier_4": None, "tier_5": None,
+                "reason": "super_admin_xai_then_assemblyai"}
 
     # --- Dedicated Voxtral Tester Logic ---
     # Placed before the speaker-label override on purpose: this account exists
@@ -2101,12 +2106,13 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         "assemblyai": bool(ASSEMBLYAI_API_KEY),
         "openai_whisper": bool(OPENAI_WHISPER_SERVICE_RAILWAY_URL),
         "deepgram": bool(DEEPGRAM_SERVICE_RAILWAY_URL),
+        "xai": bool(os.environ.get("XAI_API_KEY")),
     }
 
     # Clients (and admins using the transcription page): AssemblyAI first, then Voxtral,
     # OpenAI and Deepgram. Any plan, any speaker-label setting.
-    order = ["assemblyai", "voxtral", "openai_whisper", "deepgram"]
-    reason = "assemblyai_primary_with_voxtral_openai_deepgram_fallbacks"
+    order = ["assemblyai", "xai", "voxtral", "openai_whisper", "deepgram"]
+    reason = "assemblyai_primary_with_xai_voxtral_openai_deepgram_fallbacks"
 
     final_tiers_list = [name for name in order if available.get(name)]
     return {
@@ -2114,6 +2120,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
         "tier_2": final_tiers_list[1] if len(final_tiers_list) > 1 else None,
         "tier_3": final_tiers_list[2] if len(final_tiers_list) > 2 else None,
         "tier_4": final_tiers_list[3] if len(final_tiers_list) > 3 else None,
+        "tier_5": final_tiers_list[4] if len(final_tiers_list) > 4 else None,
         "reason": reason
     }
 
@@ -3498,6 +3505,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         tier_2_service = service_config["tier_2"]
         tier_3_service = service_config["tier_3"]
         tier_4_service = service_config.get("tier_4")
+        tier_5_service = service_config.get("tier_5")
 
         logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service}, Tier4={tier_4_service} ({service_config['reason']})")
 
@@ -3655,6 +3663,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             if tier_2_service == "voxtral":
                 transcription_result = await attempt_voxtral(2)
 
+            elif tier_2_service in ("xai", "xiaomi"):
+                transcription_result = await attempt_tester_stt(tier_2_service, 2)
+
             elif tier_2_service == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
                     logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 2 for job {job_id}")
@@ -3721,6 +3732,9 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             if tier_3_service == "voxtral":
                 transcription_result = await attempt_voxtral(3)
 
+            elif tier_3_service in ("xai", "xiaomi"):
+                transcription_result = await attempt_tester_stt(tier_3_service, 3)
+
             elif tier_3_service == "assemblyai":
                 if not ASSEMBLYAI_API_KEY:
                     logger.error(f"{TYPEMYWORDZ1_NAME} API Key not configured, skipping Tier 3 for job {job_id}")
@@ -3783,6 +3797,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             logger.warning(f"Tier 3 service failed, trying Tier 4 fallback ({tier_4_service}) for job {job_id}")
             if tier_4_service == "voxtral":
                 transcription_result = await attempt_voxtral(4)
+            elif tier_4_service in ("xai", "xiaomi"):
+                transcription_result = await attempt_tester_stt(tier_4_service, 4)
             else:
                 try:
                     if compressed_path is None:
@@ -3803,6 +3819,33 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                     job_data["tier_4_success"] = False
                 services_attempted.append(f"{tier_4_service}_tier4")
 
+        # --- ATTEMPT TIER 5 SERVICE (LAST FALLBACK) ---
+        if (not transcription_result or transcription_result.get("status") == "failed") and tier_5_service:
+            logger.warning(f"Tier 4 service failed, trying Tier 5 fallback ({tier_5_service}) for job {job_id}")
+            if tier_5_service == "voxtral":
+                transcription_result = await attempt_voxtral(5)
+            elif tier_5_service in ("xai", "xiaomi"):
+                transcription_result = await attempt_tester_stt(tier_5_service, 5)
+            else:
+                try:
+                    if compressed_path is None:
+                        compressed_path, compression_stats = compress_audio_for_transcription(tmp_path, job_id=job_id)
+                    if tier_5_service == "assemblyai" and ASSEMBLYAI_API_KEY:
+                        transcription_result = await transcribe_with_assemblyai(compressed_path, language_code, speaker_labels_enabled, assemblyai_model, job_id)
+                    elif tier_5_service == "openai_whisper" and OPENAI_WHISPER_SERVICE_RAILWAY_URL:
+                        transcription_result = await transcribe_with_openai_whisper(compressed_path, language_code, job_id)
+                    elif tier_5_service == "deepgram" and DEEPGRAM_SERVICE_RAILWAY_URL:
+                        transcription_result = await transcribe_with_deepgram(compressed_path, language_code, speaker_labels_enabled, job_id)
+                    else:
+                        raise RuntimeError(f"{tier_5_service} is not configured")
+                    job_data["tier_5_used"] = tier_5_service
+                    job_data["tier_5_success"] = bool(transcription_result and transcription_result.get("status") != "failed")
+                except Exception as error:
+                    logger.error(f"Tier 5 ({tier_5_service}) failed: {error}")
+                    job_data["tier_5_error"] = str(error)
+                    job_data["tier_5_success"] = False
+                services_attempted.append(f"{tier_5_service}_tier5")
+
         check_cancellation()
 
         # Final result processing
@@ -3816,7 +3859,7 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
             })
         else:
             logger.info(f"✅ Transcription completed successfully for job {job_id}")
-            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used"))
+            service_used_name = (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used") or job_data.get("tier_5_used"))
             model_used = "N/A"
 
             if service_used_name == "assemblyai":
@@ -3828,6 +3871,8 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
                 model_used = "deepgram-nova"
             elif service_used_name == "voxtral":
                 model_used = transcription_result.get("model_used") or VOXTRAL_TRANSCRIPTION_MODEL
+            elif service_used_name in ("xai", "xiaomi"):
+                model_used = transcription_result.get("model_used") or ("grok-voice-transcribe-2.0" if service_used_name == "xai" else "mimo-v2.5-asr")
             elif service_used_name in ("xai", "xiaomi"):
                 model_used = transcription_result.get("model_used") or service_used_name
 
@@ -6625,7 +6670,7 @@ async def list_jobs():
             "user_email": job_data.get("user_email", ""),
             "is_admin": is_admin_user(job_data.get("user_email", "")),
             "primary_service": job_data.get("tier_1_service"),
-            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used")),
+            "service_used": (job_data.get("tier_1_used") or job_data.get("tier_2_used") or job_data.get("tier_3_used") or job_data.get("tier_4_used") or job_data.get("tier_5_used")),
             "model_used": job_data.get("model_used", "N/A"),
             "has_background_task": job_id in active_background_tasks,
             "is_cancellation_flagged": cancellation_flags.get(job_id, False),
@@ -15471,7 +15516,7 @@ async def admin_get_human_work_stt_routing(request: Request):
             "key": key, "label": labels[key], "default": {"order": list(defaults["order"]), "comparison": defaults["comparison"]},
             "order": list(cfg["order"]), "comparison": cfg["comparison"], "customised": bool(raw),
         })
-    return {"stages": stages, "providers": [{"id": key, "label": {"assemblyai": "AssemblyAI", "deepgram": "Deepgram", "voxtral": "Voxtral", "openai": "OpenAI"}[key]} for key in HUMAN_WORK_STT_PROVIDERS]}
+    return {"stages": stages, "providers": [{"id": key, "label": {"assemblyai": "AssemblyAI", "deepgram": "Deepgram", "voxtral": "Voxtral", "openai": "OpenAI", "xai": "xAI Grok STT", "xiaomi": "Xiaomi MiMo ASR"}[key]} for key in HUMAN_WORK_STT_PROVIDERS]}
 
 
 @app.put("/api/admin/human-work-stt-routing")
@@ -16325,6 +16370,16 @@ async def _human_stt_chain(audio_path, order, audio_id):
                 result = await transcribe_with_deepgram(audio_path, "en", False, audio_id)
             elif provider == "openai":
                 result = await transcribe_with_openai_whisper(audio_path, "en", audio_id)
+            elif provider == "xai":
+                if not os.environ.get("XAI_API_KEY"):
+                    errors.append("xai: not configured")
+                    continue
+                result = await transcribe_with_xai(audio_path, "en", False, audio_id)
+            elif provider == "xiaomi":
+                if not os.environ.get("XIAOMI_API_KEY"):
+                    errors.append("xiaomi: not configured")
+                    continue
+                result = await transcribe_with_xiaomi(audio_path, "en", False, audio_id)
             else:
                 continue
         except asyncio.CancelledError:
@@ -16353,7 +16408,7 @@ def _human_ai_assembly_transcript(assembly_result):
     text = str(assembly_result.get("transcription") or assembly_result.get("transcript") or assembly_result.get("text") or "").strip()
     if not text:
         raise RuntimeError("The configured speech transcript is required for the AI agent but came back empty.")
-    label = {"voxtral": "Voxtral", "assemblyai": "AssemblyAI", "deepgram": "Deepgram", "openai": "OpenAI"}.get(str(assembly_result.get("provider") or ""), "AssemblyAI")
+    label = {"voxtral": "Voxtral", "assemblyai": "AssemblyAI", "deepgram": "Deepgram", "openai": "OpenAI", "xai": "xAI Grok STT", "xiaomi": "Xiaomi MiMo ASR"}.get(str(assembly_result.get("provider") or ""), "AssemblyAI")
     return {label: text}
 
 
@@ -16418,7 +16473,7 @@ async def _human_ai_transcribe_audio(job_id, job, segment, stage="rating_agent")
                 comparison_result = await comparison_task
                 comparison_text = str((comparison_result or {}).get("transcription") or (comparison_result or {}).get("transcript") or (comparison_result or {}).get("text") or "").strip()
                 comparison_provider_actual = str((comparison_result or {}).get("provider") or comparison_provider)
-                comparison_name = {"voxtral": "Voxtral", "assemblyai": "AssemblyAI", "deepgram": "Deepgram", "openai": "OpenAI"}.get(comparison_provider_actual, comparison_provider_actual.title())
+                comparison_name = {"voxtral": "Voxtral", "assemblyai": "AssemblyAI", "deepgram": "Deepgram", "openai": "OpenAI", "xai": "xAI Grok STT", "xiaomi": "Xiaomi MiMo ASR"}.get(comparison_provider_actual, comparison_provider_actual.title())
                 if str((comparison_result or {}).get("status") or "").casefold() == "completed" and comparison_text and comparison_name not in transcripts:
                     transcripts[comparison_name] = comparison_text
             except asyncio.CancelledError:
@@ -20516,7 +20571,7 @@ async def _proofreading_agent_full_audio_transcripts(job_id, job):
                 other = await task
                 other_text = str((other or {}).get("transcription") or (other or {}).get("transcript") or (other or {}).get("text") or "").strip()
                 provider = str((other or {}).get("provider") or config["comparison"])
-                label = {"assemblyai": "AssemblyAI", "deepgram": "Deepgram", "voxtral": "Voxtral", "openai": "OpenAI"}.get(provider, provider.title())
+                label = {"assemblyai": "AssemblyAI", "deepgram": "Deepgram", "voxtral": "Voxtral", "openai": "OpenAI", "xai": "xAI Grok STT", "xiaomi": "Xiaomi MiMo ASR"}.get(provider, provider.title())
                 if other_text and (other or {}).get("status") == "completed" and label not in transcripts:
                     transcripts[label] = other_text
             except Exception as exc:
