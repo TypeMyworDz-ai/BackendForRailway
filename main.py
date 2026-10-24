@@ -7236,11 +7236,14 @@ HUMAN_SPEED_TEST_PASSAGE = (
 HUMAN_AVAILABLE_SLICE_MINUTES = 2
 HUMAN_JOB_DASHBOARD_RETENTION_DAYS = 3
 
-# Human Work's regular weekday shift runs 3:00–8:00 p.m. East Africa Time.
+# Human Work's regular weekday shifts run 4:00-8:00 p.m. and 10:00 p.m.-1:00 a.m.
+# East Africa Time (the late shift belongs to the day it starts on).
 # Attendance is recorded per scheduled weekday; call-ins authorize overtime.
 HUMAN_SHIFT_TIMEZONE = ZoneInfo("Africa/Nairobi")
-HUMAN_SHIFT_START = datetime_time(15, 0)
+HUMAN_SHIFT_START = datetime_time(16, 0)
 HUMAN_SHIFT_END = datetime_time(20, 0)
+HUMAN_SHIFT_SECOND_START = datetime_time(22, 0)
+HUMAN_SHIFT_SECOND_END = datetime_time(1, 0)
 HUMAN_SHIFT_ADMIN_EMAIL = "typemywordz@gmail.com"
 HUMAN_SHIFT_WARNING_MISSES = 5
 HUMAN_SHIFT_LOCKOUT_MISSES = 6
@@ -8144,11 +8147,35 @@ def _human_shift_parse_datetime(value):
         return None
 
 
-def _human_shift_is_scheduled(now=None):
+def _human_shift_window(now=None):
+    """Which regular shift `now` falls in: ("first"|"second", shift_date) or (None, None).
+    The second shift runs past midnight and belongs to the weekday it started on."""
     now = now or _human_shift_local_now()
     local_now = now.astimezone(HUMAN_SHIFT_TIMEZONE)
-    local_time = local_now.timetz().replace(tzinfo=None)
-    return local_now.weekday() < 5 and HUMAN_SHIFT_START <= local_time < HUMAN_SHIFT_END
+    clock = local_now.timetz().replace(tzinfo=None)
+    if local_now.weekday() < 5 and HUMAN_SHIFT_START <= clock < HUMAN_SHIFT_END:
+        return "first", local_now.date()
+    if clock >= HUMAN_SHIFT_SECOND_START:
+        if local_now.weekday() < 5:
+            return "second", local_now.date()
+    elif clock < HUMAN_SHIFT_SECOND_END:
+        previous = local_now - timedelta(days=1)
+        if previous.weekday() < 5:
+            return "second", previous.date()
+    return None, None
+
+
+def _human_shift_is_scheduled(now=None):
+    return _human_shift_window(now)[0] is not None
+
+
+def _human_shift_effective_date(now=None):
+    """Shift day a moment belongs to: after midnight but before the late shift ends, still the previous day."""
+    now = now or _human_shift_local_now()
+    local_now = now.astimezone(HUMAN_SHIFT_TIMEZONE)
+    if local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_SECOND_END:
+        return (local_now - timedelta(days=1)).date()
+    return local_now.date()
 
 
 # Paid shift windows (Nairobi time) for each sub-admin. Work finished outside
@@ -8158,8 +8185,8 @@ def _human_shift_is_scheduled(now=None):
 # midnight and belongs to the day it started on.
 HUMAN_SUBADMIN_PAYMENT_SHIFTS = {
     "info@typemywordz.ai": ((datetime_time(15, 0), datetime_time(20, 0)),),
-    "donotgrowweary95@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
-    "priscillamuthoni010@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
+    "donotgrowweary95@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(22, 0), datetime_time(1, 0))),
+    "priscillamuthoni010@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(22, 0), datetime_time(1, 0))),
 }
 
 
@@ -8200,9 +8227,12 @@ async def _human_shift_week_attended(uid, week_monday):
     async def one(day):
         snap = await asyncio.to_thread(db.collection(HUMAN_SHIFT_COLLECTION).document(_human_shift_doc_id(uid, day.isoformat())).get)
         data = snap.to_dict() if snap.exists else {}
-        return bool(data.get("clockedInAt"))
+        if not data.get("clockedInAt"):
+            return 0
+        # Two regular shifts a day (4-8 p.m. and 10 p.m.-1 a.m.) each count.
+        return max(1, len([w for w in (data.get("windows_clocked") or []) if w in ("first", "second")]))
     results = await asyncio.gather(*[one(week_monday + timedelta(days=i)) for i in range(5)])
-    return sum(1 for item in results if item)
+    return sum(results)
 
 
 def _human_shift_tracking_start(profile):
@@ -8274,7 +8304,8 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
     if profile.get("workerApproved") is not True:
         return profile
     local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
-    through = local_now.date() if local_now.timetz().replace(tzinfo=None) >= HUMAN_SHIFT_END else local_now.date() - timedelta(days=1)
+    # A shift day is complete once the late shift has ended (1:00 a.m. next day).
+    through = (local_now - timedelta(hours=1)).date() - timedelta(days=1)
     last_evaluated = str(profile.get("humanShiftLastEvaluatedDate") or "").strip()
     if not last_evaluated:
         # Start attendance tracking with the first observed date; do not backdate
@@ -8359,7 +8390,7 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
 
 async def _human_shift_current_record(uid, now=None):
     local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
-    ref = db.collection(HUMAN_SHIFT_COLLECTION).document(_human_shift_doc_id(uid, local_now.date().isoformat()))
+    ref = db.collection(HUMAN_SHIFT_COLLECTION).document(_human_shift_doc_id(uid, _human_shift_effective_date(local_now).isoformat()))
     snapshot = await asyncio.to_thread(ref.get)
     return ref, snapshot.to_dict() if snapshot.exists else {}
 
@@ -8391,7 +8422,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         status = "called_in_not_clocked_in"
     elif scheduled:
         status = "not_arrived"
-    elif local_now.weekday() < 5 and local_now.timetz().replace(tzinfo=None) >= HUMAN_SHIFT_END:
+    elif local_now.weekday() < 5 and HUMAN_SHIFT_END <= local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_SECOND_START:
         status = "missed"
     else:
         status = "off_shift"
@@ -8426,8 +8457,9 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
     else:
         message = "Your online toggle is off. Clock in during a scheduled shift or after an admin call-in before claiming work."
     return {
-        "uid": uid, "date": local_now.date().isoformat(), "status": status,
-        "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
+        "uid": uid, "date": _human_shift_effective_date(local_now).isoformat(), "status": status,
+        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00",
+        "current_shift_window": _human_shift_window(local_now)[0] or "", "timezone": "Africa/Nairobi",
         "scheduled_now": scheduled, "call_in_active": active_call_in,
         "clocked_in": clocked_in, "online": is_online, "workroom_online": workroom_online,
         "available_for_work": available_for_work,
@@ -8521,10 +8553,13 @@ async def human_worker_shift_clock_in(request: Request):
     if not shift.get("clockedInAt") or shift.get("clockedOutAt"):
         updates = {
             "uid": actor["uid"], "email": actor.get("email") or "",
-            "shift_date": local_now.date().isoformat(), "status": "clocked_in",
+            "shift_date": _human_shift_effective_date(local_now).isoformat(), "status": "clocked_in",
             "clockedInAt": local_now.isoformat(), "lastPresenceAt": local_now.isoformat(),
             "call_in": active_call_in, "missed_consecutive_after": None,
         }
+        window_name = _human_shift_window(local_now)[0]
+        if window_name:
+            updates["windows_clocked"] = firestore.ArrayUnion([window_name])
         if shift.get("clockedOutAt"):
             # A worker may be called back after clocking out. Preserve this
             # finished session and reopen the daily record only after they
@@ -8566,8 +8601,12 @@ async def human_worker_shift_presence(request: Request):
     updates = {"lastPresenceAt": now.isoformat()}
     # A heartbeat is presence only; it never creates or changes attendance.
     updates["status"] = "clocked_in" if clocked_in else "online"
+    window_name = _human_shift_window(now)[0]
+    if clocked_in and window_name:
+        # Staying clocked in through the late shift counts as that shift too.
+        updates["windows_clocked"] = firestore.ArrayUnion([window_name])
     await asyncio.to_thread(ref.set, updates, merge=True)
-    shift.update(updates)
+    shift.update({key: value for key, value in updates.items() if key != "windows_clocked"})
     return _human_shift_status_payload(actor["uid"], profile, shift, now)
 
 
@@ -8628,7 +8667,7 @@ async def human_admin_shift_attendance(request: Request):
     workers.sort(key=lambda item: (0 if item.get("online") else 1, order.get(item["status"], 9), item["name"].lower()))
     return {
         "workers": workers, "date": now.date().isoformat(), "timezone": "Africa/Nairobi",
-        "shift_start": "15:00", "shift_end": "20:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
         "scheduled_now": _human_shift_is_scheduled(now), "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
         "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
         "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
@@ -12010,6 +12049,174 @@ async def human_subadmin_payment_history(request: Request):
     }
 
 
+# ---- Sub-admin "Words" table -------------------------------------------------
+# Sub-admins log the words they finish as they work. Each counted entry becomes
+# an ordinary accruing earning (category "words_entry", shown as "Words Payment")
+# so it rolls into the half-month invoice with every other payment.
+HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION = "human_subadmin_word_entries"
+HUMAN_SUBADMIN_WORD_RATES_MILLI_KES = {
+    "donotgrowweary95@gmail.com": 350,      # KES 0.35 per word
+    "priscillamuthoni010@gmail.com": 300,   # KES 0.30 per word
+    "gracenyaitara@gmail.com": 400,         # KES 0.40 per word
+}
+# Only these sub-admins are paid solely for work done inside their own shifts.
+HUMAN_SUBADMIN_WORD_SHIFT_GATED = {"donotgrowweary95@gmail.com", "priscillamuthoni010@gmail.com"}
+HUMAN_SUBADMIN_WORD_ENTRY_MAX = 500000
+
+
+def _human_subadmin_word_rate_milli(email):
+    return int(HUMAN_SUBADMIN_WORD_RATES_MILLI_KES.get(str(email or "").strip().lower(), 0))
+
+
+def _human_subadmin_word_entry_counts(email, when):
+    """Whether an entry made at `when` earns pay."""
+    email = str(email or "").strip().lower()
+    if _human_subadmin_word_rate_milli(email) <= 0:
+        return False
+    if email in HUMAN_SUBADMIN_WORD_SHIFT_GATED:
+        return _human_subadmin_shift_active(email, when)
+    return True
+
+
+def _human_subadmin_word_entry_public(item, doc_id=None):
+    item = dict(item or {})
+    return {
+        "entry_id": doc_id or item.get("entry_id"),
+        "date": item.get("shift_date") or "",
+        "job_id": item.get("job_id") or "",
+        "total_words": int(item.get("total_words") or 0),
+        "counted": bool(item.get("counted")),
+        "amount_kes": _human_subadmin_kes(item.get("amount_kes_milli") or 0),
+        "created_at": _human_iso(_as_dt(item.get("created_at"))) if item.get("created_at") else "",
+    }
+
+
+async def _human_subadmin_words_summary(uid, email, now=None):
+    now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
+    today = _human_shift_effective_date(now)
+    period_label, period_start, period_end = _pay_period_bounds(datetime(today.year, today.month, today.day))
+    snaps = await asyncio.to_thread(lambda: list(db.collection(HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION).where(filter=FieldFilter("subadmin_uid", "==", uid)).stream()))
+    month_prefix = f"{today.year:04d}-{today.month:02d}"
+    entries, days = [], {}
+    half_words = half_milli = 0
+    for snap in snaps:
+        raw = snap.to_dict() or {}
+        date_text = str(raw.get("shift_date") or "")
+        if not date_text.startswith(month_prefix):
+            continue
+        public = _human_subadmin_word_entry_public(raw, snap.id)
+        entries.append(public)
+        day = days.setdefault(date_text, {"date": date_text, "words": 0, "amount_milli": 0, "entries": 0})
+        day["entries"] += 1
+        if public["counted"]:
+            day["words"] += public["total_words"]
+            day["amount_milli"] += int(raw.get("amount_kes_milli") or 0)
+            try:
+                entry_day = datetime.strptime(date_text, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if period_start <= entry_day <= period_end:
+                half_words += public["total_words"]
+                half_milli += int(raw.get("amount_kes_milli") or 0)
+    entries.sort(key=lambda item: (item["date"], item["created_at"]), reverse=True)
+    day_rows = [{"date": d["date"], "entries": d["entries"], "words": d["words"], "amount_kes": _human_subadmin_kes(d["amount_milli"])} for d in sorted(days.values(), key=lambda d: d["date"], reverse=True)]
+    today_row = days.get(today.isoformat(), {"words": 0, "amount_milli": 0})
+    rate_milli = _human_subadmin_word_rate_milli(email)
+    return {
+        "today": today.isoformat(),
+        "month": today.strftime("%B %Y"),
+        "rate_kes_per_word": _human_subadmin_kes(rate_milli),
+        "shift_gated": str(email or "").strip().lower() in HUMAN_SUBADMIN_WORD_SHIFT_GATED,
+        "in_paid_shift_now": _human_subadmin_word_entry_counts(email, now),
+        "entries": entries,
+        "daily_totals": day_rows,
+        "today_totals": {"words": int(today_row["words"]), "amount_kes": _human_subadmin_kes(today_row["amount_milli"])},
+        "half_month": {
+            "label": period_label, "start": period_start.date().isoformat(), "end": period_end.date().isoformat(),
+            "words": half_words, "amount_kes": _human_subadmin_kes(half_milli),
+        },
+    }
+
+
+@app.get("/human-transcription/subadmin/words-log")
+async def human_subadmin_words_log(request: Request):
+    actor = _require_human_subadmin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    return await _human_subadmin_words_summary(str(actor.get("uid") or ""), (actor.get("email") or "").strip().lower())
+
+
+@app.post("/human-transcription/subadmin/words-log")
+async def human_subadmin_words_log_add(request: Request):
+    actor = _require_human_subadmin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    uid = str(actor.get("uid") or "")
+    email = (actor.get("email") or "").strip().lower()
+    payload = await request.json()
+    job_id = re.sub(r"\s+", " ", str((payload or {}).get("job_id") or "")).strip()[:80]
+    try:
+        words = int(str((payload or {}).get("total_words")).replace(",", "").strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Enter the total words as a whole number.")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Enter the Job ID.")
+    if words < 1 or words > HUMAN_SUBADMIN_WORD_ENTRY_MAX:
+        raise HTTPException(status_code=400, detail=f"Total words must be between 1 and {HUMAN_SUBADMIN_WORD_ENTRY_MAX:,}.")
+    now = _human_shift_local_now()
+    shift_date = _human_shift_effective_date(now).isoformat()
+    counted = _human_subadmin_word_entry_counts(email, now)
+    rate_milli = _human_subadmin_word_rate_milli(email)
+    amount_milli = words * rate_milli if counted else 0
+    entry_id = uuid.uuid4().hex
+    now_naive = now.replace(tzinfo=None)
+    await asyncio.to_thread(db.collection(HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION).document(entry_id).set, {
+        "entry_id": entry_id, "subadmin_uid": uid, "subadmin_email": email, "job_id": job_id,
+        "total_words": words, "shift_date": shift_date, "counted": counted,
+        "rate_milli_kes_per_unit": rate_milli, "amount_kes_milli": amount_milli,
+        "created_at": now_naive, "createdAt": firestore.SERVER_TIMESTAMP,
+    })
+    if counted:
+        await asyncio.to_thread(db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(entry_id).set, {
+            "earning_id": entry_id, "subadmin_uid": uid, "subadmin_email": email,
+            "job_id": job_id, "job_name": f"Words entry: {job_id}"[:240], "job_type": "words_entry", "job_category": "",
+            "segment_id": None, "category": "words_entry", "work_source": "manual", "measure": "words",
+            "quantity": words, "rate_milli_kes_per_unit": rate_milli, "amount_kes_milli": amount_milli,
+            "completed_at": now_naive, "shift_action_at": now_naive, "shift_date": shift_date,
+            "payout_status": "accruing", "payout_period_id": None,
+            "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+    result = await _human_subadmin_words_summary(uid, email, now)
+    result["added"] = {"entry_id": entry_id, "counted": counted}
+    return result
+
+
+@app.delete("/human-transcription/subadmin/words-log/{entry_id}")
+async def human_subadmin_words_log_delete(entry_id: str, request: Request):
+    """Remove a mistaken entry made today, while its pay is still accruing."""
+    actor = _require_human_subadmin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    uid = str(actor.get("uid") or "")
+    email = (actor.get("email") or "").strip().lower()
+    ref = db.collection(HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION).document(entry_id)
+    snap = await asyncio.to_thread(ref.get)
+    entry = snap.to_dict() if snap.exists else None
+    if not entry or entry.get("subadmin_uid") != uid:
+        raise HTTPException(status_code=404, detail="That entry was not found.")
+    if entry.get("shift_date") != _human_shift_effective_date().isoformat():
+        raise HTTPException(status_code=409, detail="Only today's entries can be removed.")
+    earning_ref = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(entry_id)
+    earning_snap = await asyncio.to_thread(earning_ref.get)
+    if earning_snap.exists:
+        if str((earning_snap.to_dict() or {}).get("payout_status") or "accruing") != "accruing":
+            raise HTTPException(status_code=409, detail="This entry has already been invoiced.")
+        await asyncio.to_thread(earning_ref.delete)
+    await asyncio.to_thread(ref.delete)
+    return await _human_subadmin_words_summary(uid, email)
+
+
+
 @app.get("/api/admin/subadmin-rates")
 async def human_admin_get_subadmin_rates(request: Request):
     _require_admin(request)
@@ -12291,7 +12498,7 @@ async def human_admin_subadmin_earnings(
     snapshots = await asyncio.to_thread(lambda: list(query.stream()))
     rows = []
     daily = {}
-    totals = {"audio_human": 0, "audio_ai": 0, "image_human": 0, "image_ai": 0}
+    totals = {"audio_human": 0, "audio_ai": 0, "image_human": 0, "image_ai": 0, "words_entry": 0}
     for snap in snapshots:
         item = snap.to_dict() or {}
         public = _human_subadmin_public_earning(item, snap.id)
@@ -12570,7 +12777,7 @@ async def human_list_workers(request: Request):
         })
     return {
         "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
-        "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
+        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00", "timezone": "Africa/Nairobi",
     }
 
 
@@ -14836,7 +15043,7 @@ TRAINING_GUIDELINES = {
         {"title": "8. Numbers, dates, and times", "body": "Generally spell out single-digit numbers and use numerals for larger numbers. Use numerals for money, years, ages, percentages, measurements, equations, dates, times, telephone numbers, and mixed-number sentences when the context calls for them. Write percent in transcript text unless a client brief says otherwise. Use capitalized AM and PM for times. Formal series remain capitalized, such as Grade 8, Section B, Chapter 1, and Article VI."},
         {"title": "9. Names, research, and consistency", "body": "Research only unfamiliar, distinctive proper nouns actually dictated; do not research ordinary names, common terms, familiar agencies/places, generic roles, or specialist vocabulary. Research confirms spelling/capitalization of the exact dictated term only and never authorizes adding background, expanding a name, or changing the speaker's wording. Keep confirmed forms consistent and ask an admin when identity remains unclear."},
         {"title": "10. Privacy, review, and delivery", "body": "Treat every recording, transcript, name, and client instruction as confidential. Use approved tools and do not share files casually. Before delivery, check the brief, completeness, speaker turns, timestamps, uncertain passages, names, numbers, punctuation, and formatting from beginning to end. Submit work only when another person can use it without needing to reconstruct what you meant."},
-        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts run Monday to Friday from 3:00 p.m. to 8:00 p.m. Kenya time (Africa/Nairobi). Clock in to register attendance; during a scheduled shift, your Available for work toggle does not control queue claims. The Available for work toggle only marks you online or offline for admins; it does not record attendance or allow job claims. Claim during your scheduled shift after clocking in, or after an admin call-in once you have clocked in. You may start or submit an already accepted assignment outside shift hours; do not clock out while assigned work is active. Five consecutive missed scheduled shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
+        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts run Monday to Friday, 4:00 p.m. to 8:00 p.m. and 10:00 p.m. to 1:00 a.m. Kenya time (Africa/Nairobi). You must clock in to at least four shifts every week. Clock in to register attendance; during a scheduled shift, your Available for work toggle does not control queue claims. The Available for work toggle only marks you online or offline for admins; it does not record attendance or allow job claims. Claim during your scheduled shift after clocking in, or after an admin call-in once you have clocked in. You may start or submit an already accepted assignment outside shift hours; do not clock out while assigned work is active. Five consecutive missed scheduled shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
     ],
 }
 
@@ -20071,8 +20278,15 @@ def _proofreading_agent_scope(job):
     return ""
 
 
+# The Proofreading Agent is paused for General Jobs while it is being tested.
+# Flip to True to reinstate it; nothing else needs to change.
+HUMAN_GENERAL_PROOFREADING_ENABLED = False
+
+
 def _proofreading_agent_blocker(job):
     """Plain-language reason the agent cannot run yet, or an empty string."""
+    if not HUMAN_GENERAL_PROOFREADING_ENABLED and str((job or {}).get("job_type") or "").strip().lower() == "general_job":
+        return "The Proofreading Agent is paused for General Jobs while it is being tested."
     scope = _proofreading_agent_scope(job)
     if not scope:
         return "The Proofreading Agent handles General Jobs, Text Messages and PDF jobs only."
@@ -22309,7 +22523,7 @@ async def human_admin_worker_options(request: Request):
     workers.sort(key=lambda item: str(item["name"]).lower())
     return {
         "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
-        "shift_start": "15:00", "shift_end": "20:00", "timezone": "Africa/Nairobi",
+        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00", "timezone": "Africa/Nairobi",
     }
 
 
