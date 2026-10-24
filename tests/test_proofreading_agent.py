@@ -33,6 +33,7 @@ class ProofreadingAgentTests(unittest.TestCase):
 
     def test_blocker_needs_every_part_submitted(self):
         ns = _ns()
+        ns["HUMAN_GENERAL_PROOFREADING_ENABLED"] = True
         ns["_human_is_split_job"] = lambda job: bool(job.get("segments"))
         b = ns["_proofreading_agent_blocker"]
         done = {"status": "submitted", "transcript": "x"}

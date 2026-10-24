@@ -44,8 +44,10 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
             "timezone": timezone,
             "ZoneInfo": ZoneInfo,
             "HUMAN_SHIFT_TIMEZONE": timezone_nairobi,
-            "HUMAN_SHIFT_START": datetime_time(15, 0),
+            "HUMAN_SHIFT_START": datetime_time(16, 0),
             "HUMAN_SHIFT_END": datetime_time(20, 0),
+            "HUMAN_SHIFT_SECOND_START": datetime_time(22, 0),
+            "HUMAN_SHIFT_SECOND_END": datetime_time(1, 0),
             "HUMAN_SHIFT_WARNING_MISSES": 5,
             "HUMAN_SHIFT_ONLINE_TTL_SECONDS": 150,
             "HUMAN_SHIFT_CALL_TTL_HOURS": 4,
@@ -58,7 +60,7 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
         wanted = [
             "_human_claim_item_key", "_human_claim_attempt_document_id",
             "_human_deadline_event_id", "_human_worker_retraining_updates",
-            "_human_shift_parse_datetime", "_human_shift_is_scheduled",
+            "_human_shift_parse_datetime", "_human_shift_window", "_human_shift_effective_date", "_human_shift_is_scheduled",
             "_human_shift_call_in_active", "_human_shift_status_payload",
             "_human_job_dashboard_archived",
             "_human_ai_draft_finish_eligible", "_human_collapse_duplicate_image_page_blocks",
@@ -101,8 +103,8 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
     def test_shift_window_uses_nairobi_time_and_excludes_8pm(self):
         scheduled = self.namespace["_human_shift_is_scheduled"]
         zone = self.namespace["HUMAN_SHIFT_TIMEZONE"]
-        self.assertFalse(scheduled(datetime(2026, 10, 5, 14, 59, tzinfo=zone)))
-        self.assertTrue(scheduled(datetime(2026, 10, 5, 15, 0, tzinfo=zone)))
+        self.assertFalse(scheduled(datetime(2026, 10, 5, 15, 59, tzinfo=zone)))
+        self.assertTrue(scheduled(datetime(2026, 10, 5, 16, 0, tzinfo=zone)))
         self.assertTrue(scheduled(datetime(2026, 10, 5, 19, 59, tzinfo=zone)))
         self.assertFalse(scheduled(datetime(2026, 10, 5, 20, 0, tzinfo=zone)))
         self.assertFalse(scheduled(datetime(2026, 10, 10, 16, 0, tzinfo=zone)))
@@ -295,6 +297,7 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
 
         class FakeFirestore:
             DELETE_FIELD = object()
+            ArrayUnion = staticmethod(lambda items: list(items))
 
         class ShiftRef:
             def __init__(self):
@@ -322,6 +325,7 @@ class AdminUploadWorkerPolicyTests(unittest.TestCase):
             "firestore": FakeFirestore, "_human_actor": actor, "_human_shift_reconcile": reconcile,
             "_human_shift_call_in_active": lambda *_args: False,
             "_human_shift_is_scheduled": lambda *_args: True,
+            "_human_shift_effective_date": lambda now=None: (now or datetime.now()).date(), "_human_shift_window": lambda now=None: ("first", None),
             "_human_shift_local_now": lambda: datetime(2026, 10, 5, 16, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
             "_human_shift_current_record": current_record, "_human_shift_status_payload": payload,
         }
@@ -398,6 +402,7 @@ class ShiftAuthorizationRules(unittest.TestCase):
             "_human_shift_status_payload": status_payload,
             "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
             "_human_shift_is_scheduled": lambda _now=None: False,
+            "_human_shift_effective_date": lambda now=None: (now or datetime.now()).date(), "_human_shift_window": lambda now=None: ("first", None),
             "_load_profile": lambda _uid: None,
         }
         exec(compile(ast.Module(body=[functions["_require_human_shift_admin"], functions["_human_shift_assert_can_start_assigned"], functions["_human_require_worker_online_for_overtime"]], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
@@ -426,6 +431,7 @@ class ShiftAuthorizationRules(unittest.TestCase):
 
         class FakeFirestore:
             DELETE_FIELD = object()
+            ArrayUnion = staticmethod(lambda items: list(items))
 
         class ShiftRef:
             def __init__(self):
@@ -453,6 +459,7 @@ class ShiftAuthorizationRules(unittest.TestCase):
             "firestore": FakeFirestore, "_human_actor": actor,
             "_human_shift_reconcile": reconcile, "_human_shift_call_in_active": lambda *_args: True,
             "_human_shift_is_scheduled": lambda *_args: False,
+            "_human_shift_effective_date": lambda now=None: (now or datetime.now()).date(), "_human_shift_window": lambda now=None: ("first", None),
             "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
             "_human_shift_current_record": current_record, "_human_shift_status_payload": payload,
         }
@@ -513,6 +520,7 @@ class ShiftAuthorizationRules(unittest.TestCase):
             "datetime": datetime, "ZoneInfo": ZoneInfo, "HUMAN_SHIFT_TIMEZONE": ZoneInfo("Africa/Nairobi"),
             "_human_shift_local_now": lambda: datetime(2026, 10, 5, 21, 0, tzinfo=ZoneInfo("Africa/Nairobi")),
             "_human_shift_is_scheduled": lambda _now=None: False,
+            "_human_shift_effective_date": lambda now=None: (now or datetime.now()).date(), "_human_shift_window": lambda now=None: ("first", None),
             "_human_shift_current_record": current_record, "_human_shift_status_payload": payload,
             "_load_profile": load_profile, "HTTPException": RequestError,
         }
@@ -591,7 +599,7 @@ class WeekendShiftReconciliation(unittest.TestCase):
             "workerApproved": True, "humanShiftLastEvaluatedDate": "2026-10-02",
             "humanShiftMissesConsecutive": 4,
         }
-        now = datetime(2026, 10, 5, 20, 0, tzinfo=ZoneInfo("Africa/Nairobi"))
+        now = datetime(2026, 10, 6, 1, 0, tzinfo=ZoneInfo("Africa/Nairobi"))
         updated = asyncio.run(namespace["_human_shift_reconcile"]("worker-1", profile, now))
         self.assertEqual(updated["humanShiftMissesConsecutive"], 5)
         self.assertEqual(updated["humanShiftLastEvaluatedDate"], "2026-10-05")
