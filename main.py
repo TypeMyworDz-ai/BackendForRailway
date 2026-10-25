@@ -12064,8 +12064,15 @@ HUMAN_SUBADMIN_WORD_SHIFT_GATED = set()  # Words Table entries are paid whenever
 HUMAN_SUBADMIN_WORD_ENTRY_MAX = 500000
 
 
+# Any other sub-admin is paid the lowest listed rate until a rate is set for them above.
+HUMAN_SUBADMIN_WORD_DEFAULT_RATE_MILLI_KES = 300
+
+
 def _human_subadmin_word_rate_milli(email):
-    return int(HUMAN_SUBADMIN_WORD_RATES_MILLI_KES.get(str(email or "").strip().lower(), 0))
+    email = str(email or "").strip().lower()
+    if not email:
+        return 0
+    return int(HUMAN_SUBADMIN_WORD_RATES_MILLI_KES.get(email, HUMAN_SUBADMIN_WORD_DEFAULT_RATE_MILLI_KES))
 
 
 def _human_subadmin_word_entry_counts(email, when):
@@ -12091,6 +12098,31 @@ def _human_subadmin_word_entry_public(item, doc_id=None):
     }
 
 
+async def _human_subadmin_words_credit_entry(entry_id, raw, uid, email):
+    """Words Table entries always earn pay; credit any entry that was saved as not counted."""
+    rate_milli = _human_subadmin_word_rate_milli(email)
+    words = int(raw.get("total_words") or 0)
+    amount_milli = words * rate_milli
+    when = _as_dt(raw.get("created_at")) or datetime.utcnow()
+    when = when.replace(tzinfo=None) if hasattr(when, "replace") else when
+    fixed = dict(raw, counted=True, rate_milli_kes_per_unit=rate_milli, amount_kes_milli=amount_milli)
+    try:
+        await asyncio.to_thread(db.collection(HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION).document(entry_id).set, {"counted": True, "rate_milli_kes_per_unit": rate_milli, "amount_kes_milli": amount_milli}, merge=True)
+        await asyncio.to_thread(db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(entry_id).set, {
+            "earning_id": entry_id, "subadmin_uid": uid, "subadmin_email": email,
+            "job_id": raw.get("job_id") or "", "job_name": f"Words entry: {raw.get('job_id') or ''}"[:240], "job_type": "words_entry", "job_category": "",
+            "segment_id": None, "category": "words_entry", "work_source": "manual", "measure": "words",
+            "quantity": words, "rate_milli_kes_per_unit": rate_milli, "amount_kes_milli": amount_milli,
+            "completed_at": when, "shift_action_at": when, "shift_date": raw.get("shift_date") or "",
+            "payout_status": "accruing", "payout_period_id": None,
+            "createdAt": firestore.SERVER_TIMESTAMP, "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+    except Exception:
+        logger.exception("Could not credit Words Table entry %s", entry_id)
+        return raw
+    return fixed
+
+
 async def _human_subadmin_words_summary(uid, email, now=None):
     now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
     today = _human_shift_effective_date(now)
@@ -12101,6 +12133,8 @@ async def _human_subadmin_words_summary(uid, email, now=None):
     half_words = half_milli = 0
     for snap in snaps:
         raw = snap.to_dict() or {}
+        if not raw.get("counted") and _human_subadmin_word_rate_milli(email) > 0:
+            raw = await _human_subadmin_words_credit_entry(snap.id, raw, uid, email)
         date_text = str(raw.get("shift_date") or "")
         if not date_text.startswith(month_prefix):
             continue
