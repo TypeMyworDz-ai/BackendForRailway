@@ -12060,7 +12060,7 @@ HUMAN_SUBADMIN_WORD_RATES_MILLI_KES = {
     "gracenyaitara@gmail.com": 400,         # KES 0.40 per word
 }
 # Only these sub-admins are paid solely for work done inside their own shifts.
-HUMAN_SUBADMIN_WORD_SHIFT_GATED = {"donotgrowweary95@gmail.com", "priscillamuthoni010@gmail.com"}
+HUMAN_SUBADMIN_WORD_SHIFT_GATED = set()  # Words Table entries are paid whenever they are made
 HUMAN_SUBADMIN_WORD_ENTRY_MAX = 500000
 
 
