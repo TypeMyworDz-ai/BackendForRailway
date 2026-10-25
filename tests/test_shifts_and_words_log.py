@@ -90,11 +90,11 @@ class WordsLogTests(unittest.TestCase):
         self.assertEqual(rate("someone@example.com"), 0)
         self.assertEqual(1000 * rate("donotgrowweary95@gmail.com"), 350000)  # 1,000 words = KES 350
 
-    def test_only_two_are_shift_gated(self):
+    def test_words_pay_any_time_for_rated_subadmins(self):
         counts = self.ns["_human_subadmin_word_entry_counts"]
         self.assertTrue(counts("donotgrowweary95@gmail.com", at(2026, 10, 26, 17, 0)))
-        self.assertFalse(counts("donotgrowweary95@gmail.com", at(2026, 10, 26, 21, 0)))
-        self.assertFalse(counts("priscillamuthoni010@gmail.com", at(2026, 10, 26, 8, 0)))
+        self.assertTrue(counts("donotgrowweary95@gmail.com", at(2026, 10, 26, 21, 0)))
+        self.assertTrue(counts("priscillamuthoni010@gmail.com", at(2026, 10, 26, 8, 0)))
         self.assertTrue(counts("gracenyaitara@gmail.com", at(2026, 10, 26, 8, 0)))
         self.assertFalse(counts("nobody@example.com", at(2026, 10, 26, 17, 0)))
 
