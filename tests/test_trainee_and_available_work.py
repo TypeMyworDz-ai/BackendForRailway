@@ -163,6 +163,9 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
         self.assertEqual(plan(420), [3, 3, 1])
         self.assertEqual(plan(600), [4, 4, 2])
         self.assertEqual(plan(1200), [4, 4, 4, 4, 4])
+        self.assertEqual(plan(1800), [4] * 7 + [2])
+        self.assertEqual(plan(1801), [5, 5, 5, 5, 5, 5.02])
+        self.assertEqual(plan(3000), [5] * 10)
         # Seconds past a full minute ride on the last slice only.
         self.assertEqual(plan(190), [2, 1.17])
         for seconds in (125, 190, 305, 425, 605, 1203, 2710):

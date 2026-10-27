@@ -36,7 +36,7 @@ class RatingAgentTests(unittest.TestCase):
             self.assertIn(key, routes)
             self.assertIn("_require_admin", ast.unparse(FUNCS[routes[key]]))
         self.assertIn('RATING_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"),)', SRC)
-        self.assertIn("HUMAN_RATING_EVERY_N = 10", SRC)
+        self.assertIn("HUMAN_RATING_EVERY_N = 4", SRC)
 
     def test_old_rating_routes_are_gone(self):
         routes = set(_routes())
