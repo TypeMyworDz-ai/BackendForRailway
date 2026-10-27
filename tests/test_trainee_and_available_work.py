@@ -144,13 +144,33 @@ class TraineeAndAvailableWorkTests(unittest.TestCase):
     def test_long_recording_is_split_into_open_balanced_slices(self):
         build = self.namespace["_human_build_available_segments"]
         segments = build({"seconds": 780, "minutes": 13}, None)
-        self.assertEqual(len(segments), 7)
-        self.assertEqual([item["minutes"] for item in segments], [2, 2, 2, 2, 2, 2, 1])
+        self.assertEqual([item["minutes"] for item in segments], [4, 4, 5])
         self.assertTrue(all(item["status"] == "available" for item in segments))
         self.assertTrue(all(item["worker_uid"] is None and item["deadlineAt"] is None for item in segments))
+
+    def test_slices_are_whole_minutes(self):
+        build = self.namespace["_human_build_available_segments"]
+
+        def plan(seconds):
+            return [round((x["end_seconds"] - x["start_seconds"]) / 60.0, 2) for x in build({"seconds": seconds, "minutes": -(-seconds // 60)}, None)]
+        self.assertEqual(build({"seconds": 45, "minutes": 1}, None), [])
         self.assertEqual(build({"seconds": 119, "minutes": 2}, None), [])
-        self.assertEqual([item["minutes"] for item in build({"seconds": 120, "minutes": 2}, None)], [1, 1])
-        self.assertEqual(len(build({"seconds": 300, "minutes": 5}, None)), 3)
+        self.assertEqual(plan(120), [1, 1])
+        self.assertEqual(plan(180), [2, 1])
+        self.assertEqual(plan(240), [2, 2])
+        self.assertEqual(plan(300), [3, 2])
+        self.assertEqual(plan(360), [2, 2, 2])
+        self.assertEqual(plan(420), [3, 3, 1])
+        self.assertEqual(plan(600), [4, 4, 2])
+        self.assertEqual(plan(1200), [4, 4, 4, 4, 4])
+        # Seconds past a full minute ride on the last slice only.
+        self.assertEqual(plan(190), [2, 1.17])
+        for seconds in (125, 190, 305, 425, 605, 1203, 2710):
+            segs = build({"seconds": seconds, "minutes": -(-seconds // 60)}, None)
+            self.assertEqual(sum(x["minutes"] for x in segs), -(-seconds // 60))
+            self.assertEqual(segs[-1]["end_seconds"], seconds)
+            for x in segs[:-1]:
+                self.assertEqual((x["end_seconds"] - x["start_seconds"]) % 60, 0)
 
     def test_available_job_serializer_hides_files_and_drafts_until_claimed(self):
         serialize = self.namespace["_human_available_public_for"]
