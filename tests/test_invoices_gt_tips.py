@@ -58,5 +58,22 @@ class InvoiceAndGtTests(unittest.TestCase):
         self.assertIn('BROADCAST_AUDIENCES = ("worker", "subadmin", "home")', SRC)
 
 
+class ZaiThinkingTests(unittest.TestCase):
+    def test_zai_never_sends_thinking_disabled(self):
+        self.assertIn('if provider == "zai":\n            # GLM 5.3 Flash cannot run with thinking off', SRC)
+        self.assertNotIn('if provider == "zai" or model_id == "mimo-v2.6-flash"', SRC)
+
+
+class WordTimingAndRatingRouteTests(unittest.TestCase):
+    def test_routes_and_word_times(self):
+        self.assertIn('"rating_agent": ("Rating Agent"', SRC)
+        self.assertIn('_route_chain("rating_agent", RATING_AGENT_MODEL_CHAIN)', SRC)
+        self.assertGreaterEqual(SRC.count('"wt"'), 4)
+        fn = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_word_start_times"][0]
+        local = {}
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), "main.py", "exec"), local)
+        self.assertEqual(local["_word_start_times"]([{"start": 1500}, {"start": 2250}]), [1.5, 2.25])
+
+
 if __name__ == "__main__":
     unittest.main()
