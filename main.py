@@ -2973,6 +2973,17 @@ async def transcribe_with_openai_whisper(audio_path: str, language_code: str, jo
     finally:
         pass
 
+def _word_start_times(words, scale=1000.0):
+    """Start time (seconds) of each word, in order, so the editor can play from any word."""
+    out = []
+    for w in words or []:
+        try:
+            out.append(round(float(w.get("start", 0)) / scale, 2))
+        except (TypeError, ValueError, AttributeError):
+            out.append(0.0)
+    return out
+
+
 def build_segments_from_words(words: list, max_chars: int = 240) -> list:
     """Group word-level timings into sentence-sized, clickable segments.
 
@@ -2998,7 +3009,8 @@ def build_segments_from_words(words: list, max_chars: int = 240) -> list:
             "end": round(current[-1].get("end", 0) / 1000.0, 3),
             "speaker": None,
             "text": text,
-            "confidence": round(min(confidences), 4) if confidences else None
+            "confidence": round(min(confidences), 4) if confidences else None,
+            "wt": _word_start_times(current),
         })
         current.clear()
 
@@ -3125,7 +3137,8 @@ async def transcribe_with_assemblyai(audio_path: str, language_code: str, speake
                             "end": round(utterance.get("end", 0) / 1000.0, 3),
                             "speaker": f"Speaker {speaker_num}",
                             "text": utterance.get("text", ""),
-                            "confidence": utterance.get("confidence")
+                            "confidence": utterance.get("confidence"),
+                            "wt": _word_start_times(utterance.get("words")),
                         })
                     transcription_text = formatted_transcript.strip()
                 else:
@@ -3274,7 +3287,7 @@ def _xai_result_from_payload(payload: dict, speaker_labels_enabled: bool) -> dic
         nonlocal current
         if current and current["text"].strip():
             segments.append({"start": current["start"], "end": current["end"], "speaker": current["speaker"],
-                             "text": current["text"].strip(), "confidence": None})
+                             "text": current["text"].strip(), "confidence": None, "wt": current["wt"]})
             if has_speakers:
                 lines.append(f"<strong>{current['speaker']}:</strong> {current['text'].strip()}")
         current = None
@@ -3288,11 +3301,12 @@ def _xai_result_from_payload(payload: dict, speaker_labels_enabled: bool) -> dic
         if current and has_speakers and current["speaker"] != label:
             flush()
         if current is None:
-            current = {"start": seconds(w.get("start")), "end": seconds(w.get("end")), "speaker": label, "text": piece, "count": 1}
+            current = {"start": seconds(w.get("start")), "end": seconds(w.get("end")), "speaker": label, "text": piece, "count": 1, "wt": [seconds(w.get("start"))]}
         else:
             current["text"] += " " + piece
             current["end"] = seconds(w.get("end"))
             current["count"] += 1
+            current["wt"].append(seconds(w.get("start")))
         if piece[-1:] in ".?!" or current["count"] >= 30:
             if not has_speakers:
                 flush()
@@ -16160,6 +16174,7 @@ MODEL_ROUTES = {
     "worker_format": ("Worker AI draft formatter", lambda: WORKER_DRAFT_FORMAT_MODEL_CHAIN),
     "worker_proofread": ("Worker AI proofreader", lambda: WORKER_DRAFT_PROOFREAD_MODEL_CHAIN),
     "proofreading_agent": ("Proofreading Agent", lambda: HUMAN_ADMIN_PROOFREAD_MODEL_CHAIN),
+    "rating_agent": ("Rating Agent", lambda: RATING_AGENT_MODEL_CHAIN),
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
 # Test-only models: selectable in Human Work routing, never shown in Ask TypeMyworDz.
@@ -16679,7 +16694,7 @@ async def _rating_agent_run(rating_id):
             f"{source_note}\n\nWORKER SUBMISSION TO RATE:\n{submitted[:150000]}"
         )
         answer, model_used = await _human_call_model_chain(
-            RATING_AGENT_MODEL_CHAIN, await _rating_agent_system_prompt(), question, context_data.get("images") or [], 3000,
+            _route_chain("rating_agent", RATING_AGENT_MODEL_CHAIN), await _rating_agent_system_prompt(), question, context_data.get("images") or [], 3000,
             response_validator=lambda text: _rating_agent_parse(text),
         )
         rating, comments = _rating_agent_parse(answer)
@@ -16757,7 +16772,7 @@ async def admin_list_worker_ratings(request: Request, status: str = "pending"):
     else:
         rows = [row for row in rows if wanted is None or row["status"] in wanted]
     rows.sort(key=lambda row: row.get("created_at") or "", reverse=True)
-    return {"ratings": rows[:200], "every_n": HUMAN_RATING_EVERY_N, "model": "Gemini 3.8 Flash", "open_disputes": sum(1 for d in docs if (d.to_dict() or {}).get("dispute_status") == "open")}
+    return {"ratings": rows[:200], "every_n": HUMAN_RATING_EVERY_N, "model": " then ".join(str(c[0]) for c in _route_chain("rating_agent", RATING_AGENT_MODEL_CHAIN)), "open_disputes": sum(1 for d in docs if (d.to_dict() or {}).get("dispute_status") == "open")}
 
 
 async def _rating_record(rating_id):
