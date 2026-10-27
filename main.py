@@ -13835,7 +13835,16 @@ async def human_worker_claim(job_id: str, request: Request):
 
 
 def _human_build_available_segments(job, now):
-    """Split approved recordings of two minutes or more into open slices of about two minutes."""
+    """Split an approved recording into slices of whole minutes.
+
+    Under two minutes stays whole. Under ten minutes the slices are about two
+    minutes; ten minutes and longer use bigger slices of about four minutes so a long
+    job does not become dozens of tiny parts. A slice is never a fraction of a
+    minute, except the last one, which also carries any seconds past the last
+    full minute (3:10 becomes 2:00 + 1:10). Only this function decides the plan,
+    and it runs once when a job is approved, so jobs already on the board keep
+    the slices they were created with.
+    """
     try:
         total_seconds = float(job.get("seconds") or 0)
         total_minutes = max(1, int(job.get("minutes") or math.ceil(total_seconds / 60.0)))
@@ -13843,25 +13852,48 @@ def _human_build_available_segments(job, now):
         raise ValueError("The audio length could not be read. Please review the job before approving it.")
     if total_seconds <= 0:
         raise ValueError("The audio length is missing. Please review the job before approving it.")
-    # Anything under two minutes stays whole. Everything else is cut into short
-    # parts (about two minutes each, never fewer than two) so more workers can earn.
     if total_seconds < 120:
         return []
-    count = min(total_minutes, max(2, int(math.ceil(total_minutes / float(HUMAN_AVAILABLE_SLICE_MINUTES)))))
+    whole = int(total_seconds // 60)
+    if whole < 10:
+        if whole % 2 == 0:
+            plan = [2] * (whole // 2) if whole > 2 else [1, 1]
+        elif whole == 3:
+            plan = [2, 1]
+        else:
+            plan = [3] * ((whole - 3) // 3 + 1)
+            left = whole - sum(plan)
+            while left >= 3:
+                plan.append(3); left -= 3
+            if left:
+                plan.append(left)
+    else:
+        size = 4
+        plan = [size] * (whole // size)
+        left = whole - sum(plan)
+        if left == 1:
+            plan[-1] += 1
+        elif left:
+            plan.append(left)
+    count = len(plan)
     if count <= 1:
         return []
-    minutes_per_part, extra_minutes = divmod(total_minutes, count)
+    boundaries = [0]
+    for minutes in plan:
+        boundaries.append(boundaries[-1] + minutes * 60)
+    boundaries[-1] = total_seconds
     segments = []
     for index in range(count):
-        start_seconds = total_seconds * index / count
-        end_seconds = total_seconds * (index + 1) / count
+        start_seconds = boundaries[index]
+        end_seconds = boundaries[index + 1]
+        slice_minutes = max(1, int(math.ceil((end_seconds - start_seconds) / 60.0 - 1e-9)))
         segments.append({
             "id": f"part_{index + 1}",
             "label": f"Part {index + 1} of {count}",
             "index": index + 1,
             "start_seconds": round(start_seconds, 2),
             "end_seconds": round(end_seconds, 2),
-            "minutes": minutes_per_part + (1 if index < extra_minutes else 0),
+            "minutes": slice_minutes,
             "worker_uid": None,
             "worker_email": "",
             "worker_name": "",
