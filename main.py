@@ -13838,7 +13838,8 @@ def _human_build_available_segments(job, now):
     """Split an approved recording into slices of whole minutes.
 
     Under two minutes stays whole. Under ten minutes the slices are about two
-    minutes; ten minutes and longer use bigger slices of about four minutes so a long
+    minutes; ten minutes and longer use bigger slices of about four minutes (five minutes
+    beyond thirty minutes) so a long
     job does not become dozens of tiny parts. A slice is never a fraction of a
     minute, except the last one, which also carries any seconds past the last
     full minute (3:10 becomes 2:00 + 1:10). Only this function decides the plan,
@@ -13868,7 +13869,7 @@ def _human_build_available_segments(job, now):
             if left:
                 plan.append(left)
     else:
-        size = 4
+        size = 5 if total_seconds > 1800 else 4
         plan = [size] * (whole // size)
         left = whole - sum(plan)
         if left == 1:
@@ -16576,7 +16577,7 @@ async def admin_put_general_job_guidelines(request: Request):
 RATING_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"),)
 HUMAN_RATING_COLLECTION = "human_worker_ratings"
 HUMAN_RATING_COUNTER_COLLECTION = "human_worker_rating_counters"
-HUMAN_RATING_EVERY_N = 10
+HUMAN_RATING_EVERY_N = 4
 RATING_AGENT_INSTRUCTIONS_DOC = ("admin_settings", "rating_agent_instructions")
 RATING_AGENT_DEFAULT_INSTRUCTIONS = (
     "You are the TypeMyworDz Rating Agent. You assess ONE submitted transcription assignment from a worker and rate the worker's work out of 5.\n"
@@ -16698,7 +16699,7 @@ async def _rating_agent_run(rating_id):
 
 
 async def _rating_agent_on_submission(background_tasks, job_id, worker_uid, role="transcriber", segment_id=""):
-    """Count a worker's submission and queue a rating on every tenth one. Never raises."""
+    """Count a worker's submission and queue a rating on every fourth one. Never raises."""
     try:
         worker_uid = str(worker_uid or "")
         if not worker_uid or not db:
