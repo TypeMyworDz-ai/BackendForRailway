@@ -5200,10 +5200,17 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             # output and a chat answer does not need them.
             payload["model"] = "deepseek-flash"
             payload["thinking"] = {"type": "disabled"}
-        if provider == "zai" or model_id == "mimo-v2.6-flash":
-            # Fast, cheap models: reasoning off, so tokens go to the visible answer.
+        if model_id == "mimo-v2.6-flash":
+            # Fast, cheap model: reasoning off, so tokens go to the visible answer.
             payload["thinking"] = {"type": "disabled"}
+        if provider == "zai":
+            # GLM 5.3 Flash cannot run with thinking off: Z.ai rejects "disabled"
+            # with an error, so every call failed. Send the only supported value.
+            payload["thinking"] = {"type": "enabled", "clear_thinking": False}
         budget = max(max_tokens, 16000 if auto_continue else 4000)
+        if provider == "zai":
+            # Thinking tokens count against the limit, so leave room for the answer.
+            budget = max(budget, 32000)
         if model_id in ("mimo-v2.6-pro", "grok-4.3", "grok-4.7"):
             # These reason before answering and the reasoning counts against the budget.
             budget = max(budget, 32000)
