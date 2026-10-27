@@ -8435,7 +8435,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
     elif reclocking_during_shift:
         message = "You have clocked out for now. You can clock in again while today's scheduled shift is open."
     elif status == "not_arrived":
-        message = "Your shift is open. Clock in before claiming work. The online toggle does not record attendance."
+        message = "Your shift is open. Press Clock in at the top of the Work Room before claiming work. The online toggle does not record attendance."
     elif status == "clocked_out":
         message = "You are clocked out for this shift. If admin calls you in after hours, clock in before claiming work."
     elif status == "missed":
@@ -12227,7 +12227,7 @@ async def human_subadmin_words_log_add(request: Request):
 
 @app.delete("/human-transcription/subadmin/words-log/{entry_id}")
 async def human_subadmin_words_log_delete(entry_id: str, request: Request):
-    """Remove a mistaken entry made today, while its pay is still accruing."""
+    """Remove a mistaken entry, while its pay is still accruing."""
     actor = _require_human_subadmin(request)
     if not db:
         raise HTTPException(status_code=503, detail="Storage is not available.")
@@ -12238,8 +12238,6 @@ async def human_subadmin_words_log_delete(entry_id: str, request: Request):
     entry = snap.to_dict() if snap.exists else None
     if not entry or entry.get("subadmin_uid") != uid:
         raise HTTPException(status_code=404, detail="That entry was not found.")
-    if entry.get("shift_date") != _human_shift_effective_date().isoformat():
-        raise HTTPException(status_code=409, detail="Only today's entries can be removed.")
     earning_ref = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(entry_id)
     earning_snap = await asyncio.to_thread(earning_ref.get)
     if earning_snap.exists:
@@ -12249,6 +12247,478 @@ async def human_subadmin_words_log_delete(entry_id: str, request: Request):
     await asyncio.to_thread(ref.delete)
     return await _human_subadmin_words_summary(uid, email)
 
+
+
+# ---- Invoice documents (PDF and Word) ------------------------------------------
+def _invoice_text_width(text, size):
+    total = 0.0
+    for ch in str(text):
+        if ch.isdigit():
+            total += 0.556
+        elif ch in " .,:;'|!il":
+            total += 0.278
+        elif ch.isupper() or ch in "mwMW@%":
+            total += 0.72
+        else:
+            total += 0.5
+    return total * size
+
+
+def _invoice_pdf_escape(text):
+    safe = str(text).encode("latin-1", "replace").decode("latin-1")
+    return safe.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _invoice_pdf_bytes(title, meta_lines, headers, rows, total_row, widths, aligns):
+    """A small dependency-free PDF: heading, meta lines, a ruled table and a bold total row."""
+    page_w, page_h, margin = 595, 842, 40
+    scale = (page_w - 2 * margin) / float(sum(widths))
+    widths = [w * scale for w in widths]
+    pages, ops = [], []
+    state = {"y": page_h - margin}
+
+    def text(x, y, value, size=10, bold=False, align="left", width=0):
+        value = str(value)
+        if align == "right":
+            x = x + width - _invoice_text_width(value, size) - 4
+        else:
+            x = x + 4
+        ops.append("BT /%s %s Tf %.1f %.1f Td (%s) Tj ET" % ("F2" if bold else "F1", size, x, y, _invoice_pdf_escape(value)))
+
+    def rule(y, gray=0.75):
+        ops.append("%.2f G 0.6 w %d %.1f m %d %.1f l S" % (gray, margin, y, page_w - margin, y))
+
+    def header_row():
+        y = state["y"]
+        ops.append("0.93 g %d %.1f %.1f 20 re f 0 g" % (margin, y - 15, page_w - 2 * margin))
+        x = margin
+        for head, w, al in zip(headers, widths, aligns):
+            text(x, y - 9, head, 9, True, al, w)
+            x += w
+        state["y"] = y - 20
+
+    def new_page(first=False):
+        if ops:
+            pages.append("\n".join(ops))
+            ops.clear()
+        state["y"] = page_h - margin
+        if first:
+            text(margin - 4, state["y"] - 14, "TypeMyworDz", 18, True)
+            text(margin - 4, state["y"] - 36, title, 13, True)
+            y = state["y"] - 56
+            for line in meta_lines:
+                text(margin - 4, y, line, 10)
+                y -= 14
+            state["y"] = y - 8
+        header_row()
+
+    new_page(first=True)
+    for index, row in enumerate(rows):
+        if state["y"] < margin + 60:
+            new_page()
+        y = state["y"]
+        x = margin
+        for value, w, al in zip(row, widths, aligns):
+            text(x, y - 10, value, 10, False, al, w)
+            x += w
+        rule(y - 16, 0.88)
+        state["y"] = y - 18
+    if state["y"] < margin + 40:
+        new_page()
+    y = state["y"] - 4
+    rule(y + 2, 0.2)
+    x = margin
+    for value, w, al in zip(total_row, widths, aligns):
+        text(x, y - 12, value, 10.5, True, al, w)
+        x += w
+    pages.append("\n".join(ops))
+    objects = []
+    objects.append("<< /Type /Catalog /Pages 2 0 R >>")
+    kids = " ".join("%d 0 R" % (5 + 2 * i) for i in range(len(pages)))
+    objects.append("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(pages)))
+    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+    objects.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>")
+    for i, content in enumerate(pages):
+        page_obj = 5 + 2 * i
+        objects.append("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents %d 0 R >>" % (page_w, page_h, page_obj + 1))
+        stream = content.encode("latin-1", "replace")
+        objects.append(("<< /Length %d >>\nstream\n" % len(stream)).encode("latin-1") + stream + b"\nendstream")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += ("%d 0 obj\n" % number).encode("latin-1")
+        out += obj if isinstance(obj, bytes) else obj.encode("latin-1")
+        out += b"\nendobj\n"
+    xref = len(out)
+    out += ("xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)).encode("latin-1")
+    for offset in offsets:
+        out += ("%010d 00000 n \n" % offset).encode("latin-1")
+    out += ("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)).encode("latin-1")
+    return bytes(out)
+
+
+def _invoice_docx_bytes(title, meta_lines, headers, rows, total_row, aligns):
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    document = Document()
+    document.add_heading("TypeMyworDz", level=1)
+    document.add_paragraph(title).runs[0].bold = True
+    for line in meta_lines:
+        document.add_paragraph(line)
+    table = document.add_table(rows=1, cols=len(headers))
+    table.style = "Table Grid"
+
+    def fill(cells, values, bold=False):
+        for cell, value, align in zip(cells, values, aligns):
+            paragraph = cell.paragraphs[0]
+            run = paragraph.add_run(str(value))
+            run.bold = bold
+            if align == "right":
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+    fill(table.rows[0].cells, headers, True)
+    for row in rows:
+        fill(table.add_row().cells, row)
+    fill(table.add_row().cells, total_row, True)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def _invoice_response(fmt, filename_base, title, meta_lines, headers, rows, total_row, widths, aligns):
+    fmt = (fmt or "pdf").strip().lower()
+    if fmt == "docx":
+        data = _invoice_docx_bytes(title, meta_lines, headers, rows, total_row, aligns)
+        media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        fmt = "pdf"
+        data = _invoice_pdf_bytes(title, meta_lines, headers, rows, total_row, widths, aligns)
+        media = "application/pdf"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", filename_base)
+    return Response(content=data, media_type=media, headers={"Content-Disposition": 'attachment; filename="%s.%s"' % (safe, fmt)})
+
+
+def _invoice_day_label(date_text):
+    try:
+        return datetime.strptime(str(date_text), "%Y-%m-%d").strftime("%a, %d %b %Y")
+    except ValueError:
+        return str(date_text or "")
+
+
+def _invoice_in_range(date_text, start, end):
+    date_text = str(date_text or "")
+    if start and date_text < start:
+        return False
+    if end and date_text > end:
+        return False
+    return True
+
+
+def _invoice_period_text(start, end):
+    if start and end:
+        return "Period: %s to %s" % (_invoice_day_label(start), _invoice_day_label(end))
+    if start:
+        return "Period: from %s" % _invoice_day_label(start)
+    if end:
+        return "Period: up to %s" % _invoice_day_label(end)
+    return "Period: all entries"
+
+
+def _invoice_clean_day(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must look like 2026-10-25.")
+    return value
+
+
+# ---- Words Table: edit, invoice, admin view ----------------------------------------
+def _words_parse_entry(payload):
+    job_id = re.sub(r"\s+", " ", str((payload or {}).get("job_id") or "")).strip()[:80]
+    try:
+        words = int(str((payload or {}).get("total_words")).replace(",", "").strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Enter the total words as a whole number.")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Enter the Job ID.")
+    if words < 1 or words > HUMAN_SUBADMIN_WORD_ENTRY_MAX:
+        raise HTTPException(status_code=400, detail=f"Total words must be between 1 and {HUMAN_SUBADMIN_WORD_ENTRY_MAX:,}.")
+    return job_id, words
+
+
+@app.put("/human-transcription/subadmin/words-log/{entry_id}")
+async def human_subadmin_words_log_edit(entry_id: str, request: Request):
+    """Correct a wrongly entered Job ID or word count while its pay is still accruing."""
+    actor = _require_human_subadmin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    uid = str(actor.get("uid") or "")
+    email = (actor.get("email") or "").strip().lower()
+    job_id, words = _words_parse_entry(await request.json())
+    ref = db.collection(HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION).document(entry_id)
+    snap = await asyncio.to_thread(ref.get)
+    entry = snap.to_dict() if snap.exists else None
+    if not entry or entry.get("subadmin_uid") != uid:
+        raise HTTPException(status_code=404, detail="That entry was not found.")
+    earning_ref = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(entry_id)
+    earning_snap = await asyncio.to_thread(earning_ref.get)
+    if earning_snap.exists and str((earning_snap.to_dict() or {}).get("payout_status") or "accruing") != "accruing":
+        raise HTTPException(status_code=409, detail="This entry has already been invoiced and can no longer be changed.")
+    rate_milli = _human_subadmin_word_rate_milli(email)
+    amount_milli = words * rate_milli
+    await asyncio.to_thread(ref.set, {"job_id": job_id, "total_words": words, "counted": True, "rate_milli_kes_per_unit": rate_milli, "amount_kes_milli": amount_milli, "edited_at": datetime.utcnow()}, merge=True)
+    await asyncio.to_thread(earning_ref.set, {
+        "job_id": job_id, "job_name": f"Words entry: {job_id}"[:240], "quantity": words, "rate_milli_kes_per_unit": rate_milli,
+        "amount_kes_milli": amount_milli, "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    return await _human_subadmin_words_summary(uid, email)
+
+
+async def _words_invoice_data(email, start="", end=""):
+    """Every Words Table entry for one sub-admin (oldest first), with running totals."""
+    email = str(email or "").strip().lower()
+    snaps = await asyncio.to_thread(lambda: list(db.collection(HUMAN_SUBADMIN_WORD_ENTRY_COLLECTION).where(filter=FieldFilter("subadmin_email", "==", email)).stream()))
+    rows, total_words, total_milli = [], 0, 0
+    items = []
+    for snap in snaps:
+        raw = snap.to_dict() or {}
+        if not _invoice_in_range(raw.get("shift_date"), start, end):
+            continue
+        if not raw.get("counted") and _human_subadmin_word_rate_milli(email) > 0:
+            raw = await _human_subadmin_words_credit_entry(snap.id, raw, str(raw.get("subadmin_uid") or ""), email)
+        items.append((str(raw.get("shift_date") or ""), _as_dt(raw.get("created_at")) if raw.get("created_at") else None, snap.id, raw))
+    items.sort(key=lambda item: (item[0], item[1] or datetime.min))
+    for date_text, _created, entry_id, raw in items:
+        words = int(raw.get("total_words") or 0)
+        milli = int(raw.get("amount_kes_milli") or 0)
+        total_words += words
+        total_milli += milli
+        rows.append({"entry_id": entry_id, "date": date_text, "date_label": _invoice_day_label(date_text), "job_id": raw.get("job_id") or "", "total_words": words, "total_kes": _human_subadmin_kes(milli),
+                     "editable": True})
+    return {"email": email, "rows": rows, "total_words": total_words, "total_kes": _human_subadmin_kes(total_milli), "rate_kes_per_word": _human_subadmin_kes(_human_subadmin_word_rate_milli(email)),
+            "start": start, "end": end}
+
+
+def _words_invoice_response(data, fmt):
+    headers = ["MONTH/DATE", "JOB ID", "WORDS", "TOTAL (KES)"]
+    rows = [[row["date_label"], row["job_id"], "{:,}".format(row["total_words"]), "{:,.2f}".format(row["total_kes"])] for row in data["rows"]]
+    total_row = ["ACCRUING TOTAL", "", "{:,}".format(data["total_words"]), "{:,.2f}".format(data["total_kes"])]
+    meta = ["Words Table invoice for %s" % data["email"], _invoice_period_text(data["start"], data["end"]), "Generated: %s" % _human_shift_local_now().strftime("%a, %d %b %Y %H:%M")]
+    return _invoice_response(fmt, "Words_invoice_%s" % data["email"].split("@")[0], "Words Table Invoice", meta, headers, rows, total_row, [150, 150, 90, 120], ["left", "left", "right", "right"])
+
+
+@app.get("/human-transcription/subadmin/words-invoice")
+async def human_subadmin_words_invoice(request: Request, start_date: str = "", end_date: str = "", format: str = "json"):
+    actor = _require_human_subadmin(request)
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    data = await _words_invoice_data(actor.get("email"), _invoice_clean_day(start_date), _invoice_clean_day(end_date))
+    if str(format or "json").lower() in {"pdf", "docx"}:
+        return _words_invoice_response(data, format)
+    return data
+
+
+@app.get("/api/admin/subadmin-words-invoice")
+async def admin_subadmin_words_invoice(request: Request, email: str = "", start_date: str = "", end_date: str = "", format: str = "json"):
+    _require_admin(request)
+    email = str(email or "").strip().lower()
+    if not email or not is_human_subadmin(email):
+        raise HTTPException(status_code=400, detail="Choose a sub-admin.")
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    data = await _words_invoice_data(email, _invoice_clean_day(start_date), _invoice_clean_day(end_date))
+    if str(format or "json").lower() in {"pdf", "docx"}:
+        return _words_invoice_response(data, format)
+    return data
+
+
+# ---- GT Work table (selected workers) -------------------------------------------------
+# Entries live in the worker earnings collection, so they roll into the same
+# half-month invoice as every other kind of work.
+HUMAN_GT_WORK_EMAILS = {"kenmelonia@gmail.com", "jaymoesta2@gmail.com"}
+HUMAN_GT_WORK_KES_PER_MINUTE = 15
+HUMAN_GT_WORK_SOURCE = "gt_work"
+
+
+def _gt_parse_length(value):
+    """'6', '6.5' (minutes) or '6:30', '1:02:03' (clock) -> whole seconds."""
+    text = str(value or "").strip().replace(",", ".")
+    if not text:
+        raise HTTPException(status_code=400, detail="Enter the audio length, for example 6:30 or 12.")
+    try:
+        if ":" in text:
+            parts = [float(p) for p in text.split(":")]
+            if len(parts) == 2:
+                seconds = parts[0] * 60 + parts[1]
+            elif len(parts) == 3:
+                seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            else:
+                raise ValueError
+        else:
+            seconds = float(text) * 60
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Audio length must look like 6:30 or 12 (minutes).")
+    seconds = int(round(seconds))
+    if seconds < 1 or seconds > 12 * 3600:
+        raise HTTPException(status_code=400, detail="Audio length must be between a second and twelve hours.")
+    return seconds
+
+
+def _gt_length_label(seconds):
+    seconds = int(seconds or 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return "%d:%02d:%02d" % (h, m, s) if h else "%d:%02d" % (m, s)
+
+
+def _gt_amount_kes(seconds):
+    return int(round(int(seconds or 0) * HUMAN_GT_WORK_KES_PER_MINUTE / 60.0))
+
+
+def _gt_entry_public(snap_id, raw):
+    return {
+        "entry_id": raw.get("gt_entry_id") or snap_id, "date": raw.get("entry_date") or "", "date_label": _invoice_day_label(raw.get("entry_date")),
+        "job_id": raw.get("job_id") or "", "audio_seconds": int(raw.get("audio_seconds") or 0), "audio_length": _gt_length_label(raw.get("audio_seconds")),
+        "total_kes": int(raw.get("amount_kes") or 0), "locked": str(raw.get("payout_status") or "unassigned").lower() not in ("", "unassigned"),
+    }
+
+
+async def _gt_entries_for(uid=None, email=None):
+    ref = db.collection(HUMAN_EARNING_ARCHIVE_COLLECTION)
+    if uid:
+        snaps = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_uid", "==", uid)).stream()))
+    else:
+        snaps = await asyncio.to_thread(lambda: list(ref.where(filter=FieldFilter("worker_email", "==", str(email or "").lower())).stream()))
+    rows = [(snap.id, snap.to_dict() or {}) for snap in snaps]
+    rows = [(i, r) for i, r in rows if r.get("source") == HUMAN_GT_WORK_SOURCE]
+    rows.sort(key=lambda pair: (str(pair[1].get("entry_date") or ""), str(pair[1].get("created_iso") or "")))
+    return rows
+
+
+def _gt_summary(rows):
+    entries = [_gt_entry_public(i, r) for i, r in rows]
+    today = _human_shift_local_now().date()
+    period_label, period_start, period_end = _pay_period_bounds(datetime(today.year, today.month, today.day))
+    half_seconds = half_kes = 0
+    for e in entries:
+        try:
+            day = datetime.strptime(e["date"], "%Y-%m-%d")
+        except ValueError:
+            continue
+        if period_start <= day <= period_end:
+            half_seconds += e["audio_seconds"]
+            half_kes += e["total_kes"]
+    today_entries = [e for e in entries if e["date"] == today.isoformat()]
+    return {
+        "today": today.isoformat(), "month": today.strftime("%B %Y"), "entries": entries,
+        "total_kes": sum(e["total_kes"] for e in entries), "total_seconds": sum(e["audio_seconds"] for e in entries),
+        "today_kes": sum(e["total_kes"] for e in today_entries), "today_seconds": sum(e["audio_seconds"] for e in today_entries),
+        "half_month": {"label": period_label, "start": period_start.date().isoformat(), "end": period_end.date().isoformat(), "kes": half_kes, "seconds": half_seconds},
+    }
+
+
+async def _gt_actor(request: Request):
+    actor = await _human_actor(request)
+    if actor.get("email") not in HUMAN_GT_WORK_EMAILS or actor["role"] != "worker":
+        raise HTTPException(status_code=403, detail="GT Work is not available for this account.")
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    return actor
+
+
+@app.get("/human-transcription/worker/gt-work")
+async def human_worker_gt_work(request: Request):
+    actor = await _gt_actor(request)
+    return _gt_summary(await _gt_entries_for(uid=actor["uid"]))
+
+
+@app.post("/human-transcription/worker/gt-work")
+async def human_worker_gt_work_add(request: Request):
+    actor = await _gt_actor(request)
+    payload = await request.json()
+    job_id = re.sub(r"\s+", " ", str((payload or {}).get("job_id") or "")).strip()[:80]
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Enter the Job ID.")
+    seconds = _gt_parse_length((payload or {}).get("audio_length"))
+    now = _human_shift_local_now()
+    naive = now.replace(tzinfo=None)
+    entry_id = uuid.uuid4().hex
+    amount = _gt_amount_kes(seconds)
+    profile = actor.get("profile") or {}
+    await asyncio.to_thread(db.collection(HUMAN_EARNING_ARCHIVE_COLLECTION).document("gt_" + entry_id).set, {
+        "job_id": job_id, "source": HUMAN_GT_WORK_SOURCE, "segment_id": entry_id, "gt_entry_id": entry_id,
+        "worker_uid": actor["uid"], "worker_email": actor["email"], "worker_name": str(profile.get("name") or profile.get("displayName") or "").strip(),
+        "minutes": int(round(seconds / 60.0)), "audio_seconds": seconds, "amount_kes": amount, "gross_amount_kes": amount, "deduction_kes": 0,
+        "completed_at": naive, "entry_date": now.date().isoformat(), "created_iso": naive.isoformat(), "payout_status": "unassigned",
+        "job_status": "gt_work", "createdAt": firestore.SERVER_TIMESTAMP,
+    })
+    return _gt_summary(await _gt_entries_for(uid=actor["uid"]))
+
+
+async def _gt_load_own(entry_id, actor):
+    ref = db.collection(HUMAN_EARNING_ARCHIVE_COLLECTION).document("gt_" + entry_id)
+    snap = await asyncio.to_thread(ref.get)
+    raw = snap.to_dict() if snap.exists else None
+    if not raw or raw.get("source") != HUMAN_GT_WORK_SOURCE or raw.get("worker_uid") != actor["uid"]:
+        raise HTTPException(status_code=404, detail="That entry was not found.")
+    if str(raw.get("payout_status") or "unassigned").lower() not in ("", "unassigned"):
+        raise HTTPException(status_code=409, detail="This entry has already been invoiced and can no longer be changed.")
+    return ref, raw
+
+
+@app.put("/human-transcription/worker/gt-work/{entry_id}")
+async def human_worker_gt_work_edit(entry_id: str, request: Request):
+    actor = await _gt_actor(request)
+    payload = await request.json()
+    job_id = re.sub(r"\s+", " ", str((payload or {}).get("job_id") or "")).strip()[:80]
+    if not job_id:
+        raise HTTPException(status_code=400, detail="Enter the Job ID.")
+    seconds = _gt_parse_length((payload or {}).get("audio_length"))
+    ref, _raw = await _gt_load_own(entry_id, actor)
+    amount = _gt_amount_kes(seconds)
+    await asyncio.to_thread(ref.set, {"job_id": job_id, "audio_seconds": seconds, "minutes": int(round(seconds / 60.0)), "amount_kes": amount, "gross_amount_kes": amount, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True)
+    return _gt_summary(await _gt_entries_for(uid=actor["uid"]))
+
+
+@app.delete("/human-transcription/worker/gt-work/{entry_id}")
+async def human_worker_gt_work_delete(entry_id: str, request: Request):
+    actor = await _gt_actor(request)
+    ref, _raw = await _gt_load_own(entry_id, actor)
+    await asyncio.to_thread(ref.delete)
+    return _gt_summary(await _gt_entries_for(uid=actor["uid"]))
+
+
+@app.get("/api/admin/gt-work-invoice")
+async def admin_gt_work_invoice(request: Request, email: str = "", start_date: str = "", end_date: str = "", format: str = "json"):
+    _require_admin(request)
+    email = str(email or "").strip().lower()
+    if email not in HUMAN_GT_WORK_EMAILS:
+        raise HTTPException(status_code=400, detail="Choose a GT Work worker.")
+    if not db:
+        raise HTTPException(status_code=503, detail="Storage is not available.")
+    start, end = _invoice_clean_day(start_date), _invoice_clean_day(end_date)
+    rows = [(i, r) for i, r in await _gt_entries_for(email=email) if _invoice_in_range(r.get("entry_date"), start, end)]
+    entries = [_gt_entry_public(i, r) for i, r in rows]
+    total_kes = sum(e["total_kes"] for e in entries)
+    total_seconds = sum(e["audio_seconds"] for e in entries)
+    data = {"email": email, "rows": entries, "total_kes": total_kes, "total_seconds": total_seconds, "total_length": _gt_length_label(total_seconds), "start": start, "end": end}
+    if str(format or "json").lower() in {"pdf", "docx"}:
+        headers = ["MONTH/DATE", "JOB ID", "AUDIO LENGTH", "TOTAL (KES)"]
+        table = [[e["date_label"], e["job_id"], e["audio_length"], "{:,}".format(e["total_kes"])] for e in entries]
+        total_row = ["ACCRUING TOTAL", "", data["total_length"], "{:,}".format(total_kes)]
+        meta = ["GT Work invoice for %s" % email, _invoice_period_text(start, end), "Generated: %s" % _human_shift_local_now().strftime("%a, %d %b %Y %H:%M")]
+        return _invoice_response(format, "GT_Work_invoice_%s" % email.split("@")[0], "GT Work Invoice", meta, headers, table, total_row, [150, 150, 100, 110], ["left", "left", "right", "right"])
+    return data
+
+
+# ---- Homepage tips (public) -----------------------------------------------------------
+@app.get("/api/public/home-tips")
+async def public_home_tips():
+    data = await _broadcast_load()
+    return {"items": [item for item in data["home"]["items"] if isinstance(item, dict) and item.get("active") is not False]}
 
 
 @app.get("/api/admin/subadmin-rates")
@@ -12669,7 +13139,7 @@ async def human_worker_payment_history(request: Request):
         if identity in seen_earnings:
             return
         seen_earnings.add(identity)
-        role = "Proofreader" if item.get("source") == "proofreader" else ("PDF Transcriber" if item.get("source") == "pdf" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber"))
+        role = "GT Work" if item.get("source") == "gt_work" else "Proofreader" if item.get("source") == "proofreader" else ("PDF Transcriber" if item.get("source") == "pdf" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber"))
         payout_status = item.get("payout_status") or "accruing"
         if payout_status == "unassigned":
             payout_status = "accruing"
@@ -12701,7 +13171,7 @@ async def human_worker_payment_history(request: Request):
     is_proofreading = lambda row: row.get("role") == "Proofreader"
     is_pdf_earning = lambda row: row.get("role") == "PDF Transcriber"
     def earning_breakdown(rows):
-        transcription_rows = [row for row in rows if not is_proofreading(row) and not is_pdf_earning(row)]
+        transcription_rows = [row for row in rows if not is_proofreading(row) and not is_pdf_earning(row) and row.get("role") != "GT Work"]
         proofreading_rows = [row for row in rows if is_proofreading(row)]
         pdf_rows = [row for row in rows if is_pdf_earning(row)]
         return {
@@ -12710,6 +13180,7 @@ async def human_worker_payment_history(request: Request):
             "proofreading_kes": sum(row["amount_kes"] for row in proofreading_rows),
             "proofreading_minutes": sum(row["minutes"] for row in proofreading_rows),
             "pdf_kes": sum(row["amount_kes"] for row in pdf_rows),
+            "gt_kes": sum(row["amount_kes"] for row in rows if row.get("role") == "GT Work"),
             "total_kes": sum(row["amount_kes"] for row in rows),
             "total_minutes": sum(row["minutes"] for row in rows),
         }
@@ -12723,7 +13194,7 @@ async def human_worker_payment_history(request: Request):
         if payout.get("status") == "paid":
             continue
         payout_items = payout.get("items") or []
-        transcription_items = [item for item in payout_items if item.get("source") not in {"proofreader", "pdf"}]
+        transcription_items = [item for item in payout_items if item.get("source") not in {"proofreader", "pdf", "gt_work"}]
         proofreading_items = [item for item in payout_items if item.get("source") == "proofreader"]
         pdf_items = [item for item in payout_items if item.get("source") == "pdf"]
         pending_payouts.append({
@@ -12739,6 +13210,7 @@ async def human_worker_payment_history(request: Request):
             "transcription_amount_kes": sum(int(item.get("amount_kes") or 0) for item in transcription_items),
             "proofreading_amount_kes": sum(int(item.get("amount_kes") or 0) for item in proofreading_items),
             "pdf_amount_kes": sum(int(item.get("amount_kes") or 0) for item in pdf_items),
+            "gt_amount_kes": sum(int(item.get("amount_kes") or 0) for item in payout_items if item.get("source") == "gt_work"),
             "status": payout.get("status") or "pending",
         })
         if not payout_items:
@@ -12756,6 +13228,8 @@ async def human_worker_payment_history(request: Request):
             "upcoming_proofreading_kes": upcoming_breakdown["proofreading_kes"],
             "paid_pdf_kes": paid_breakdown["pdf_kes"],
             "upcoming_pdf_kes": upcoming_breakdown["pdf_kes"],
+            "paid_gt_kes": paid_breakdown["gt_kes"],
+            "upcoming_gt_kes": upcoming_breakdown["gt_kes"],
         },
         "current_period": {
             "label": label, "start": start_dt.isoformat(), "end": end_dt.isoformat(),
@@ -12768,6 +13242,7 @@ async def human_worker_payment_history(request: Request):
             "proofreading_kes": current_breakdown["proofreading_kes"],
             "proofreading_minutes": current_breakdown["proofreading_minutes"],
             "pdf_kes": current_breakdown["pdf_kes"],
+            "gt_kes": current_breakdown["gt_kes"],
         },
         "pending_payouts": pending_payouts,
     }
@@ -13024,7 +13499,7 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
             payout_status = "paid"
         if status != "all" and payout_status != status:
             return
-        role = "Proofreader" if item.get("source") == "proofreader" else ("PDF Transcriber" if item.get("source") == "pdf" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber"))
+        role = "GT Work" if item.get("source") == "gt_work" else "Proofreader" if item.get("source") == "proofreader" else ("PDF Transcriber" if item.get("source") == "pdf" else ("Part " + str(item.get("segment_id")).split("_")[-1] if item.get("source") == "segment" and item.get("segment_id") else "Transcriber"))
         amount = int(item.get("amount_kes") or 0)
         seen.add(identity)
         rows.append({
@@ -13048,7 +13523,7 @@ async def admin_worker_payments_search(request: Request, worker_uid: str = "", s
         item = snap.to_dict() or {}
         append_admin_payment(item, item.get("job_status"))
     rows.sort(key=lambda item: str(item.get("completed_at") or ""), reverse=True)
-    transcription_rows = [item for item in rows if item["role"] not in {"Proofreader", "PDF Transcriber"}]
+    transcription_rows = [item for item in rows if item["role"] not in {"Proofreader", "PDF Transcriber", "GT Work"}]
     proofreading_rows = [item for item in rows if item["role"] == "Proofreader"]
     pdf_rows = [item for item in rows if item["role"] == "PDF Transcriber"]
     return {
@@ -13092,7 +13567,7 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
         if status != "all" and payout_status != status:
             continue
         invoice_items = payout.get("items") or []
-        transcription_items = [item for item in invoice_items if item.get("source") not in {"proofreader", "pdf"}]
+        transcription_items = [item for item in invoice_items if item.get("source") not in {"proofreader", "pdf", "gt_work"}]
         proofreading_items = [item for item in invoice_items if item.get("source") == "proofreader"]
         pdf_items = [item for item in invoice_items if item.get("source") == "pdf"]
         payouts.append({
@@ -13113,6 +13588,7 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
             "proofreading_minutes": sum(int(item.get("minutes") or 0) for item in proofreading_items),
             "proofreading_amount_kes": sum(int(item.get("amount_kes") or 0) for item in proofreading_items),
             "pdf_amount_kes": sum(int(item.get("amount_kes") or 0) for item in pdf_items),
+            "gt_amount_kes": sum(int(item.get("amount_kes") or 0) for item in invoice_items if item.get("source") == "gt_work"),
             "status": payout_status,
             "job_ids": payout.get("job_ids") or [],
             "paid_at": _human_iso(payout.get("paidAt")),
@@ -15830,7 +16306,7 @@ async def admin_put_model_routing(request: Request):
     return {"status": "reset" if reset else "saved", "key": key, "models": ids}
 
 BROADCAST_DOC = ("admin_settings", "human_work_broadcasts")
-BROADCAST_AUDIENCES = ("worker", "subadmin")
+BROADCAST_AUDIENCES = ("worker", "subadmin", "home")
 BROADCAST_MAX_ITEMS = 12
 BROADCAST_DEFAULTS = {
     "worker": [{
@@ -15838,6 +16314,11 @@ BROADCAST_DEFAULTS = {
         "text": "Mondays are our slow shift days, so please do not expect much work on a Monday. This does not mean you can skip your shift: log in and clock in on time as usual, because attendance and tardiness are still tracked every day.",
     }],
     "subadmin": [],
+    "home": [{
+        "id": "typescribe", "title": "", "active": True, "link_label": "Download our main tool, TypeScribe",
+        "link_url": "https://typemywordz.ai/tools/audio-recorder.html",
+        "text": ", and enjoy all-in-one transcription platform with Playback/Recording features.",
+    }],
 }
 _BROADCAST_CACHE = {"at": 0.0, "data": None}
 
@@ -16056,7 +16537,7 @@ async def admin_put_general_job_guidelines(request: Request):
 RATING_AGENT_MODEL_CHAIN = (("gemini-3.8-flash", "gemini"),)
 HUMAN_RATING_COLLECTION = "human_worker_ratings"
 HUMAN_RATING_COUNTER_COLLECTION = "human_worker_rating_counters"
-HUMAN_RATING_EVERY_N = 3
+HUMAN_RATING_EVERY_N = 10
 RATING_AGENT_INSTRUCTIONS_DOC = ("admin_settings", "rating_agent_instructions")
 RATING_AGENT_DEFAULT_INSTRUCTIONS = (
     "You are the TypeMyworDz Rating Agent. You assess ONE submitted transcription assignment from a worker and rate the worker's work out of 5.\n"
@@ -16178,7 +16659,7 @@ async def _rating_agent_run(rating_id):
 
 
 async def _rating_agent_on_submission(background_tasks, job_id, worker_uid, role="transcriber", segment_id=""):
-    """Count a worker's submission and queue a rating on every third one. Never raises."""
+    """Count a worker's submission and queue a rating on every tenth one. Never raises."""
     try:
         worker_uid = str(worker_uid or "")
         if not worker_uid or not db:
