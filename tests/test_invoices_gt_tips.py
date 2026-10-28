@@ -1,4 +1,4 @@
-import ast, re, unittest
+import ast, os, re, unittest
 from datetime import datetime
 from io import BytesIO
 
@@ -77,3 +77,10 @@ class WordTimingAndRatingRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaimUsesShiftDayRecordTests(unittest.TestCase):
+    def test_claim_looks_up_shift_record_by_effective_shift_day(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..", "main.py"), encoding="utf-8").read()
+        self.assertIn("_human_shift_doc_id(worker_uid, _human_shift_effective_date(claim_now).isoformat())", src)
+        self.assertNotIn("claim_now.date().isoformat()", src)

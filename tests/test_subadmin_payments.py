@@ -33,7 +33,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "_human_subadmin_ai_used", "_human_job_owner_of", "_human_subadmin_assignment_metadata",
             "_human_subadmin_submission_actor",
             "_human_subadmin_earning_specs", "_human_admin_finish_job_eligible", "_human_shift_local_now",
-            "_human_shift_parse_datetime", "_human_shift_is_scheduled", "_human_subadmin_shift_active",
+            "_human_shift_parse_datetime", "_human_shift_effective_date", "_human_shift_is_scheduled", "_human_subadmin_shift_active",
             "is_human_subadmin",
         }
         functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted]
@@ -53,6 +53,7 @@ class SubadminPaymentTests(unittest.TestCase):
             "firestore": _FakeFirestore,
             "HUMAN_JOB_ADMIN_EMAILS": ["info@typemywordz.ai"],
             "HUMAN_SHIFT_TIMEZONE": ZoneInfo("Africa/Nairobi"),
+            "HUMAN_SHIFT_SECOND_END": datetime_time(1, 0),
             "HUMAN_SUBADMIN_PAYMENT_SHIFTS": {
                 "info@typemywordz.ai": ((datetime_time(15, 0), datetime_time(20, 0)),),
                 "donotgrowweary95@gmail.com": ((datetime_time(15, 0), datetime_time(20, 0)), (datetime_time(21, 0), datetime_time(1, 0))),
