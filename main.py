@@ -9236,7 +9236,7 @@ def _human_claim_assignment_transaction(
             raise HTTPException(status_code=403, detail="Approved worker access is required.")
         claim_now = _human_shift_local_now()
         shift_ref = db.collection(HUMAN_SHIFT_COLLECTION).document(
-            _human_shift_doc_id(worker_uid, claim_now.date().isoformat())
+            _human_shift_doc_id(worker_uid, _human_shift_effective_date(claim_now).isoformat())
         )
         shift_snapshot = shift_ref.get(transaction=tx)
         shift_record = shift_snapshot.to_dict() if shift_snapshot.exists else {}
@@ -9929,7 +9929,7 @@ def _human_subadmin_earning_specs(job_id, job, actor, now=None, rates=None, segm
             "amount_kes_milli": quantity * rate,
             "completed_at": now_naive,
             "shift_action_at": shift_action_at,
-            "shift_date": shift_action_at.date().isoformat(),
+            "shift_date": _human_shift_effective_date(shift_action_at).isoformat(),
             "payout_status": "accruing",
             "payout_period_id": None,
             "createdAt": firestore.SERVER_TIMESTAMP,
@@ -13422,7 +13422,7 @@ async def human_worker_set_availability(request: Request):
             now = _human_shift_local_now()
             ref, shift = await _human_shift_current_record(actor["uid"], now)
             clocked_in = bool(shift.get("clockedInAt") and not shift.get("clockedOutAt"))
-            await asyncio.to_thread(ref.set, {"uid": actor["uid"], "shift_date": now.date().isoformat(), "lastPresenceAt": now.isoformat(), **({} if clocked_in else {"status": "online"})}, merge=True)
+            await asyncio.to_thread(ref.set, {"uid": actor["uid"], "shift_date": _human_shift_effective_date(now).isoformat(), "lastPresenceAt": now.isoformat(), **({} if clocked_in else {"status": "online"})}, merge=True)
         except Exception as exc:
             logger.warning("Could not record immediate presence for %s: %s", actor["uid"], exc)
     return {"saved": True, "available": available}
