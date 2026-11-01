@@ -81,9 +81,18 @@ import openai
 
 import google.generativeai as genai
 
-import firebase_admin
-from firebase_admin import auth as firebase_auth, credentials, firestore, initialize_app, storage as firebase_storage
-from google.cloud.firestore_v1.base_query import FieldFilter
+# Data and sign-in can live in Railway Postgres instead of Google. Set
+# USE_POSTGRES=1 (with DATABASE_URL and AUTH_JWT_SECRET) to switch; pgcompat
+# keeps the same call shapes the rest of this file already uses.
+USE_POSTGRES = os.environ.get("USE_POSTGRES", "0").strip() == "1" and bool(os.environ.get("DATABASE_URL"))
+if USE_POSTGRES:
+    import pgcompat
+    from pgcompat import firebase_auth, firestore, firebase_storage, FieldFilter
+    credentials = initialize_app = None
+else:
+    import firebase_admin
+    from firebase_admin import auth as firebase_auth, credentials, firestore, initialize_app, storage as firebase_storage
+    from google.cloud.firestore_v1.base_query import FieldFilter
 
 
 logging.basicConfig(
@@ -279,7 +288,14 @@ logger.info("Environment variables loaded successfully")
 
 # NEW: Initialize Firebase Admin SDK
 db = None
-if FIREBASE_ADMIN_SDK_CONFIG_BASE64:
+if USE_POSTGRES:
+    try:
+        pgcompat.init_schema()
+        db = pgcompat.client()
+        logger.info("Postgres data layer initialised (no Google services in use).")
+    except Exception as e:
+        logger.error(f"Postgres could not be initialised: {e}")
+elif FIREBASE_ADMIN_SDK_CONFIG_BASE64:
     try:
         service_account_info = json.loads(base64.b64decode(FIREBASE_ADMIN_SDK_CONFIG_BASE64).decode('utf-8'))
         cred = credentials.Certificate(service_account_info)
@@ -7121,6 +7137,23 @@ async def send_welcome_email(payload: WelcomeEmailRequest):
     return await _send_resend_message(payload.email, subject, html, text, "Welcome email")
 
 
+# Sign-in, the browser's document API and the one-off Google-to-Postgres copy.
+if os.environ.get("DATABASE_URL"):
+    try:
+        import ownauth_routes, db_api, pg_migrate
+        ownauth_routes.register(app, _send_resend_message)
+        db_api.register(app, lambda: ADMIN_EMAILS)
+        if not USE_POSTGRES and db is not None:
+            pg_migrate.register(
+                app, db, firebase_auth,
+                [(_human_bucket, ""), (_training_assets_bucket, "training/")],
+                _require_admin,
+            )
+        logger.info("Own sign-in and document routes registered (postgres mode: %s)", USE_POSTGRES)
+    except Exception:
+        logger.exception("Could not register the Postgres routes")
+
+
 @app.get("/health")
 async def health_check():
     # Keep the public platform probe deliberately minimal. Detailed diagnostics
@@ -7709,6 +7742,8 @@ def _human_available_public_for(data, actor_uid, claimable_parts, claimable_full
 
 
 def _human_bucket():
+    if USE_POSTGRES:
+        return firebase_storage.bucket()
     if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
         return None
     try:
@@ -7721,6 +7756,8 @@ def _human_bucket():
 
 def _training_assets_bucket():
     """Use a dedicated private bucket so training files never change job storage."""
+    if USE_POSTGRES:
+        return firebase_storage.bucket("training")
     if not FIREBASE_ADMIN_SDK_CONFIG_BASE64:
         return None
     try:
