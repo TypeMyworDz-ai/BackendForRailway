@@ -240,8 +240,9 @@ async def summary(request: Request):
         with conn.cursor() as cur:
             cur.execute("SELECT coll, count(*) FROM fs_docs GROUP BY coll ORDER BY coll")
             colls = {r[0]: r[1] for r in cur.fetchall()}
-            cur.execute("SELECT count(*) FROM auth_users")
-            users = cur.fetchone()[0]
+            cur.execute("SELECT count(*), count(fb_hash), count(password_hash) FROM auth_users")
+            ur = cur.fetchone()
+            users = {"total": ur[0], "with_firebase_hash": ur[1], "with_own_hash": ur[2]}
             cur.execute("SELECT count(*), COALESCE(sum(length(data)),0) FROM fs_blobs")
             blobs = cur.fetchone()
             cur.execute("SELECT pg_database_size(current_database())")

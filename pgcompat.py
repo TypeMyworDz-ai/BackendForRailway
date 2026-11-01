@@ -885,6 +885,13 @@ def hash_password(password):
     return "scrypt$%d$%d$%d$%s$%s" % (n, r, p, _b64u(salt), _b64u(dk))
 
 
+def _b64_any(value):
+    """Decode standard or URL-safe base64, with or without padding."""
+    value = (value or "").strip().replace("-", "+").replace("_", "/")
+    value += "=" * (-len(value) % 4)
+    return base64.b64decode(value)
+
+
 def _firebase_scrypt_check(password, fb_hash, fb_salt):
     """Verify a password against a hash exported from Firebase Auth.
 
@@ -893,17 +900,17 @@ def _firebase_scrypt_check(password, fb_hash, fb_salt):
     """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-    signer_key = base64.b64decode(os.environ["FIREBASE_HASH_SIGNER_KEY"])
-    salt_sep = base64.b64decode(os.environ["FIREBASE_HASH_SALT_SEPARATOR"])
+    signer_key = _b64_any(os.environ["FIREBASE_HASH_SIGNER_KEY"])
+    salt_sep = _b64_any(os.environ["FIREBASE_HASH_SALT_SEPARATOR"])
     rounds = int(os.environ.get("FIREBASE_HASH_ROUNDS", "8"))
     mem_cost = int(os.environ.get("FIREBASE_HASH_MEM_COST", "14"))
-    salt = base64.b64decode(fb_salt) + salt_sep
+    salt = _b64_any(fb_salt) + salt_sep
     dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** mem_cost, r=rounds, p=1,
                         dklen=32, maxmem=256 * 1024 * 1024)
     cipher = Cipher(algorithms.AES(dk), modes.CTR(b"\x00" * 16))
     enc = cipher.encryptor()
     candidate = enc.update(signer_key) + enc.finalize()
-    return hmac.compare_digest(candidate, base64.b64decode(fb_hash))
+    return hmac.compare_digest(candidate, _b64_any(fb_hash))
 
 
 def verify_password(password, row):
