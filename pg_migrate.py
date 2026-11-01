@@ -219,6 +219,10 @@ class StartBody(BaseModel):
 @router.post("/api/admin/pg-migrate/start")
 async def start(body: StartBody, request: Request):
     _guard(request)
+    import os
+    if os.environ.get("USE_POSTGRES") == "1":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="The one-off copy is switched off now that the app runs on Postgres.")
     if _state["running"]:
         return {"started": False, "reason": "already running"}
     parts = [p for p in body.parts if p in ("docs", "auth", "blobs")]
@@ -249,6 +253,192 @@ async def summary(request: Request):
             cur.execute("SELECT pg_database_size(current_database())")
             size = cur.fetchone()[0]
     return {"collections": colls, "auth_users": users, "blobs": {"files": blobs[0], "bytes": int(blobs[1])}, "db_bytes": size}
+
+
+# ---------------------------------------------------------------- reconcile
+_rec = {"running": False, "report": None, "error": None, "log": []}
+RECON_SKIP = {"trafficEvents", "transcriptions"}
+
+
+def _real_google():
+    """A direct Google connection, independent of the Postgres switch."""
+    import base64, os
+    import firebase_admin
+    from firebase_admin import credentials, firestore as real_fs, auth as real_auth
+    info = json.loads(base64.b64decode(os.environ["FIREBASE_ADMIN_SDK_CONFIG_BASE64"]).decode("utf-8"))
+    try:
+        app = firebase_admin.get_app("reconcile")
+    except ValueError:
+        app = firebase_admin.initialize_app(credentials.Certificate(info), name="reconcile")
+    return real_fs.client(app), real_auth, app
+
+
+def _pg_times(paths):
+    if not paths:
+        return {}
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT path, updated_at FROM fs_docs WHERE path = ANY(%s)", (list(paths),))
+            return {r[0]: r[1] for r in cur.fetchall()}
+
+
+def _recon_collection(col_ref, apply, report):
+    last = None
+    while True:
+        q = col_ref.order_by("__name__").limit(PAGE)
+        if last is not None:
+            q = q.start_after(last)
+        snaps = None
+        for attempt in range(5):
+            try:
+                snaps = list(q.stream())
+                break
+            except Exception as exc:
+                time.sleep(2 + attempt * 3)
+        if snaps is None:
+            raise RuntimeError("could not read " + col_ref.path)
+        if not snaps:
+            break
+        have = _pg_times([sn.reference.path for sn in snaps])
+        fix = []
+        for sn in snaps:
+            path = sn.reference.path
+            parts = path.split("/")
+            key = parts[0] if len(parts) == 2 else "/".join(["*" if i % 2 == 0 and i else x for i, x in enumerate(parts[:-1])])
+            entry = report["collections"].setdefault(key, {"google": 0, "missing": 0, "newer_in_google": 0, "fixed": 0, "samples": []})
+            entry["google"] += 1
+            updated = sn.update_time
+            status = None
+            if path not in have:
+                status = "missing"
+            elif updated and have[path] and updated > have[path] + _dt.timedelta(seconds=1):
+                status = "newer_in_google"
+            if status:
+                entry[status] += 1
+                if len(entry["samples"]) < 5:
+                    entry["samples"].append("%s %s" % (status, path))
+                if apply:
+                    data = _plain(sn.to_dict() or {})
+                    created = sn.create_time or _dt.datetime.now(_dt.timezone.utc)
+                    fix.append((path, "/".join(parts[:-1]), parts[-2], parts[-1], json.dumps(pg._encode(data)), created, updated or created))
+                    entry["fixed"] += 1
+            if col_ref.id not in LEAF_COLLECTIONS:
+                try:
+                    for sub in sn.reference.collections():
+                        _recon_collection(sub, apply, report)
+                except Exception:
+                    pass
+        if fix:
+            _upsert_docs(fix)
+        last = snaps[-1]
+        if len(snaps) < PAGE:
+            break
+
+
+def _recon_run(apply):
+    _rec.update({"running": True, "report": None, "error": None})
+    report = {"applied": apply, "collections": {}, "auth": {}, "started": time.time()}
+    _rec["report"] = report
+    try:
+        gdb, gauth, app = _real_google()
+        for col in gdb.collections():
+            if col.id in RECON_SKIP:
+                continue
+            _recon_collection(col, apply, report)
+        # accounts created in Google after the copy
+        with pg._Conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT uid FROM auth_users")
+                known = {r[0] for r in cur.fetchall()}
+        missing = []
+        page = gauth.list_users(app=app)
+        total = 0
+        while page:
+            for u in page.users:
+                total += 1
+                if u.uid not in known:
+                    missing.append(u)
+            page = page.get_next_page()
+        report["auth"] = {"google_accounts": total, "missing_in_postgres": [m.email for m in missing]}
+        if apply and missing:
+            with pg._Conn() as conn:
+                with conn.cursor() as cur:
+                    for u in missing:
+                        providers = [pi.provider_id for pi in (u.provider_data or [])] or ["password"]
+                        cur.execute(
+                            "INSERT INTO auth_users (uid,email,email_verified,display_name,photo_url,fb_hash,fb_salt,disabled,providers) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT (uid) DO NOTHING",
+                            (u.uid, (u.email or "").lower(), bool(u.email_verified), u.display_name, u.photo_url,
+                             getattr(u, "password_hash", None), getattr(u, "password_salt", None), bool(u.disabled), json.dumps(providers)),
+                        )
+        report["finished"] = time.time()
+    except Exception as exc:
+        logger.exception("reconcile failed")
+        _rec["error"] = str(exc)
+    finally:
+        _rec["running"] = False
+
+
+class ReconBody(BaseModel):
+    apply: bool = False
+
+
+@router.post("/api/admin/pg-migrate/reconcile")
+async def reconcile(body: ReconBody, request: Request):
+    _guard(request)
+    if _rec["running"]:
+        return {"started": False, "reason": "already running"}
+    threading.Thread(target=_recon_run, args=(body.apply,), daemon=True).start()
+    return {"started": True, "apply": body.apply}
+
+
+@router.get("/api/admin/pg-migrate/reconcile")
+async def reconcile_status(request: Request):
+    _guard(request)
+    return _rec
+
+
+# ---------------------------------------------------------------- clean-up (admin)
+_CLEAN = {
+    "transcriptions": ("coll = 'transcriptions' OR coll ~ '^users/[^/]+/transcriptions$'", "transcriptions"),
+    "notifications": ("coll = 'user_notifications'", "notifications"),
+    "messages": ("coll = 'user_chats' OR coll ~ '^user_chats/[^/]+/messages$'", "direct messages"),
+}
+
+
+@router.get("/api/admin/cleanup/counts")
+async def cleanup_counts(request: Request):
+    _ctx["require_admin"](request)
+    out = {}
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            for key, (where, _label) in _CLEAN.items():
+                cur.execute("SELECT count(*) FROM fs_docs WHERE " + where)
+                out[key] = cur.fetchone()[0]
+    return out
+
+
+class CleanBody(BaseModel):
+    what: str
+    confirm: str = ""
+
+
+@router.post("/api/admin/cleanup/delete-all")
+async def cleanup_delete_all(body: CleanBody, request: Request):
+    admin = _ctx["require_admin"](request)
+    if body.what not in _CLEAN:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Unknown item")
+    if body.confirm != "DELETE":
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm")
+    where, label = _CLEAN[body.what]
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM fs_docs WHERE " + where)
+            n = cur.rowcount
+    logger.warning("ADMIN CLEANUP: %s deleted %d %s", (admin or {}).get("email"), n, label)
+    return {"deleted": n, "what": body.what}
 
 
 def register(app, fs_db, fb_auth, fb_buckets, require_admin):

@@ -7143,7 +7143,7 @@ if os.environ.get("DATABASE_URL"):
         import ownauth_routes, db_api, pg_migrate
         ownauth_routes.register(app, _send_resend_message)
         db_api.register(app, lambda: ADMIN_EMAILS)
-        if not USE_POSTGRES and db is not None:
+        if db is not None:
             pg_migrate.register(
                 app, db, firebase_auth,
                 [(lambda: _human_bucket(), ""), (lambda: _training_assets_bucket(), "training/")],
