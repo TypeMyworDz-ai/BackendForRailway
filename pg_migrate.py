@@ -408,7 +408,7 @@ _CLEAN = {
 
 @router.get("/api/admin/cleanup/counts")
 async def cleanup_counts(request: Request):
-    _ctx["require_admin"](request)
+    _guard(request)
     out = {}
     with pg._Conn() as conn:
         with conn.cursor() as cur:
@@ -425,7 +425,7 @@ class CleanBody(BaseModel):
 
 @router.post("/api/admin/cleanup/delete-all")
 async def cleanup_delete_all(body: CleanBody, request: Request):
-    admin = _ctx["require_admin"](request)
+    admin = _guard(request)
     if body.what not in _CLEAN:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="Unknown item")
