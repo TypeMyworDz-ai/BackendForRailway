@@ -63,6 +63,7 @@ def _upsert_docs(rows):
 
 
 PAGE = 400
+LEAF_COLLECTIONS = {"trafficEvents", "transcriptions", "user_notifications", "paddleEvents", "payment_intents"}
 PROBE_LIMIT = 3000   # very large collections are only probed for sub-collections in their first docs
 
 
@@ -97,7 +98,7 @@ def _copy_collection(col_ref, counts):
             key = parts[0] if len(parts) == 2 else "/".join(parts[:-1])
             counts[key] = counts.get(key, 0) + 1
             seen += 1
-            if seen <= PROBE_LIMIT:
+            if seen <= PROBE_LIMIT and col_ref.id not in LEAF_COLLECTIONS:
                 try:
                     for sub in snap.reference.collections():
                         _copy_collection(sub, counts)
