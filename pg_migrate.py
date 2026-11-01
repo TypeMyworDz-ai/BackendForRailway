@@ -62,26 +62,51 @@ def _upsert_docs(rows):
             )
 
 
-def _copy_collection(col_ref, counts):
-    batch = []
-    for snap in col_ref.stream():
-        path = snap.reference.path
-        parts = path.split("/")
-        data = _plain(snap.to_dict() or {})
-        created = snap.create_time or _dt.datetime.now(_dt.timezone.utc)
-        updated = snap.update_time or created
-        batch.append((path, "/".join(parts[:-1]), parts[-2], parts[-1], json.dumps(pg._encode(data)), created, updated))
-        key = parts[0] if len(parts) == 2 else "/".join(parts[:-1])
-        counts[key] = counts.get(key, 0) + 1
-        if len(batch) >= 100:
-            _upsert_docs(batch)
-            batch = []
+PAGE = 400
+PROBE_LIMIT = 3000   # very large collections are only probed for sub-collections in their first docs
+
+
+def _fetch_page(col_ref, last):
+    q = col_ref.order_by("__name__").limit(PAGE)
+    if last is not None:
+        q = q.start_after(last)
+    for attempt in range(5):
         try:
-            for sub in snap.reference.collections():
-                _copy_collection(sub, counts)
+            return list(q.stream())
         except Exception as exc:
-            _log("could not list subcollections of %s: %s" % (path, exc))
-    _upsert_docs(batch)
+            _log("retry %d on %s: %s" % (attempt + 1, col_ref.path, exc))
+            time.sleep(2 + attempt * 3)
+    raise RuntimeError("could not read " + col_ref.path)
+
+
+def _copy_collection(col_ref, counts):
+    seen = 0
+    last = None
+    while True:
+        snaps = _fetch_page(col_ref, last)
+        if not snaps:
+            break
+        batch = []
+        for snap in snaps:
+            path = snap.reference.path
+            parts = path.split("/")
+            data = _plain(snap.to_dict() or {})
+            created = snap.create_time or _dt.datetime.now(_dt.timezone.utc)
+            updated = snap.update_time or created
+            batch.append((path, "/".join(parts[:-1]), parts[-2], parts[-1], json.dumps(pg._encode(data)), created, updated))
+            key = parts[0] if len(parts) == 2 else "/".join(parts[:-1])
+            counts[key] = counts.get(key, 0) + 1
+            seen += 1
+            if seen <= PROBE_LIMIT:
+                try:
+                    for sub in snap.reference.collections():
+                        _copy_collection(sub, counts)
+                except Exception as exc:
+                    _log("could not list subcollections of %s: %s" % (path, exc))
+        _upsert_docs(batch)
+        last = snaps[-1]
+        if len(snaps) < PAGE:
+            break
 
 
 def _copy_docs():

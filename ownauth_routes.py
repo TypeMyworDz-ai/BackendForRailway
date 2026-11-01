@@ -318,6 +318,57 @@ async def update_profile(body: ProfileBody, request: Request):
     return _session(_find("uid=%s", (row["uid"],)))
 
 
+class GoogleBody(BaseModel):
+    credential: str
+
+
+def _google_get(url, headers=None):
+    import urllib.request, json as _json
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return _json.loads(resp.read().decode("utf-8"))
+
+
+@router.post("/auth/google")
+async def google_sign_in(body: GoogleBody, request: Request):
+    """Sign in with a Google access token. Google only vouches for the email address;
+    the session itself is ours, so every other part of the app is Google-free."""
+    import os, urllib.parse
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    if not client_id:
+        _fail("auth/operation-not-allowed", "Google sign-in is not switched on.", 400)
+    _throttle("google:" + _client_ip(request), limit=30, window=900)
+    try:
+        info = _google_get("https://oauth2.googleapis.com/tokeninfo?access_token=" + urllib.parse.quote(body.credential))
+        if info.get("aud") != client_id and info.get("azp") != client_id:
+            _fail("auth/invalid-credential", "That Google sign-in was not meant for this app.", 401)
+        profile = _google_get("https://www.googleapis.com/oauth2/v3/userinfo", {"Authorization": "Bearer " + body.credential})
+    except HTTPException:
+        raise
+    except Exception:
+        _fail("auth/network-request-failed", "Could not confirm your Google sign-in. Please try again.", 502)
+    email = (profile.get("email") or "").strip().lower()
+    if not email or str(profile.get("email_verified")).lower() != "true":
+        _fail("auth/invalid-credential", "Your Google email address is not verified.", 401)
+    row = _find("lower(email)=%s", (email,))
+    if row and row["disabled"]:
+        _fail("auth/user-disabled", "This account has been disabled. Contact support.", 403)
+    if not row:
+        pg.create_user(email=email, password=None, display_name=(profile.get("name") or "")[:120] or None,
+                       email_verified=True, providers=["google.com"])
+        row = _find("lower(email)=%s", (email,))
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE auth_users SET email_verified=true, last_login_at=now(), "
+                "photo_url=COALESCE(photo_url,%s), display_name=COALESCE(NULLIF(display_name,''),%s), "
+                "providers=CASE WHEN providers @> '\"google.com\"'::jsonb THEN providers ELSE providers || '\"google.com\"'::jsonb END "
+                "WHERE uid=%s",
+                (profile.get("picture"), profile.get("name"), row["uid"]),
+            )
+    return _session(_find("uid=%s", (row["uid"],)))
+
+
 def register(app, send_email):
     global _send_email
     _send_email = send_email
