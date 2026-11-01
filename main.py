@@ -7146,7 +7146,7 @@ if os.environ.get("DATABASE_URL"):
         if not USE_POSTGRES and db is not None:
             pg_migrate.register(
                 app, db, firebase_auth,
-                [(_human_bucket, ""), (_training_assets_bucket, "training/")],
+                [(lambda: _human_bucket(), ""), (lambda: _training_assets_bucket(), "training/")],
                 _require_admin,
             )
         logger.info("Own sign-in and document routes registered (postgres mode: %s)", USE_POSTGRES)

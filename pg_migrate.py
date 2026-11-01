@@ -175,6 +175,16 @@ def _run(mode, parts):
         _state["finished"] = time.time()
 
 
+def _guard(request):
+    """Admin token, or the one-off MIGRATE_SECRET header (remove the variable afterwards)."""
+    import hmac, os
+    secret = os.environ.get("MIGRATE_SECRET", "")
+    sent = request.headers.get("x-migrate-secret", "")
+    if secret and sent and hmac.compare_digest(secret, sent):
+        return {"email": "migration"}
+    return _ctx["require_admin"](request)
+
+
 class StartBody(BaseModel):
     mode: str = "merge"
     parts: List[str] = ["docs", "auth", "blobs"]
@@ -182,7 +192,7 @@ class StartBody(BaseModel):
 
 @router.post("/api/admin/pg-migrate/start")
 async def start(body: StartBody, request: Request):
-    _ctx["require_admin"](request)
+    _guard(request)
     if _state["running"]:
         return {"started": False, "reason": "already running"}
     parts = [p for p in body.parts if p in ("docs", "auth", "blobs")]
@@ -192,14 +202,14 @@ async def start(body: StartBody, request: Request):
 
 @router.get("/api/admin/pg-migrate/status")
 async def status(request: Request):
-    _ctx["require_admin"](request)
+    _guard(request)
     return _state
 
 
 @router.get("/api/admin/pg-migrate/summary")
 async def summary(request: Request):
     """Row counts in Postgres (no Google reads)."""
-    _ctx["require_admin"](request)
+    _guard(request)
     pg.init_schema()
     with pg._Conn() as conn:
         with conn.cursor() as cur:
