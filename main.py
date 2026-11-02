@@ -498,8 +498,8 @@ ASK_MODEL_CATALOGUE = [
     {
         "id": "mistral-large-4",
         "provider": "mistral",
-        "label": "Mistral Large 4 (Preview)",
-        "blurb": "Mistral's Large 4 model is in preview. Try it for complex questions and long documents; each request uses 10 credits.",
+        "label": "Mistral Large 4",
+        "blurb": "Mistral's flagship open model. Strong at coding, complex questions and long documents; each request uses 10 credits.",
         "tier": "premium",
         "credits": 10,
         "transcript_only": False,
@@ -523,10 +523,10 @@ ASK_MODEL_CATALOGUE = [
         "transcript_only": False,
     },
     {
-        "id": "zai-glm-5-3",
-        "provider": "mistral",
-        "label": "GLM 5.3 (Z.ai)",
-        "blurb": "A Chinese open-weight reasoning model with a 1M-token window, served by Mistral. Strong at long documents, coding and step-by-step problems; it always thinks before it answers.",
+        "id": "glm-5.3",
+        "provider": "zai",
+        "label": "GLM 5.3",
+        "blurb": "Z.ai's flagship open-weight reasoning model with a 1M-token window. Strong at long documents, coding and step-by-step problems; it always thinks before it answers.",
         "tier": "premium",
         "credits": 10,
         "transcript_only": False,
@@ -584,6 +584,8 @@ ASK_MODEL_ALIASES = {
     "gemini-3.1-flash-lite": "gemini-3.5-flash-lite",
     "deepseek-v4-flash": "deepseek-v4-1-flash",
     "deepseek-v4-pro": "deepseek-v4-1-flash",
+    # GLM 5.3 is now called directly on Z.ai only; the Mistral-served copy is gone.
+    "zai-glm-5-3": "glm-5.3",
 }
 
 # DeepSeek Flash is the cheapest capable model we offer (about $0.18 in and
@@ -5107,12 +5109,12 @@ OPENAI_FORMAT_COMPLETION_TOKEN_PROVIDERS = {"openai", "xiaomi", "xai"}
 TEXT_ONLY_OPENAI_FORMAT_MODELS = {"glm-5.3-flash", "glm-5.3", "glm-5.3-flashx", "deepseek-v4-pro"}
 
 # Keep the admin-facing selector stable while sending Mistral's canonical API id.
-MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}  # zai-glm-5-3 is sent as-is
+MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}
 # Large 4's plain-text mode avoids reasoning-only SSE chunks in job drafts.
 MISTRAL_PLAIN_TEXT_MODELS = set()
 # Reasoning effort sent to Mistral-hosted models. Large 4 now reasons (high).
 # GLM 5.3 cannot switch reasoning off, so it runs at "low" to keep answers quick.
-MISTRAL_REASONING_EFFORT = {"mistral-large-4": "high", "mistral-large-4-0": "high", "zai-glm-5-3": "low"}
+MISTRAL_REASONING_EFFORT = {"mistral-large-4": "high", "mistral-large-4-0": "high"}
 MISTRAL_REASONING_MODELS = set(MISTRAL_REASONING_EFFORT)
 
 
@@ -5196,9 +5198,6 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
     if model_id in TEXT_ONLY_OPENAI_FORMAT_MODELS and images:
         return _ask_openai_format("openai", ASK_LUNA_MODEL, system_prompt, turns, question, images, max_tokens, auto_continue)
-    if model_id == "zai-glm-5-3" and images:
-        # GLM 5.3 reads text only; pictures go to Mistral Large 4, which sees images.
-        return _ask_openai_format("mistral", "mistral-large-4", system_prompt, turns, question, images, max_tokens, auto_continue)
     content = []
     for img in images:
         content.append({
@@ -16234,16 +16233,15 @@ MODEL_ROUTES = {
 }
 # Test-only models: selectable in Human Work routing, never shown in Ask TypeMyworDz.
 MODEL_ROUTE_EXTRA_MODELS = {
-    "gemini-4-argon": ("gemini", "Gemini 4 Argon (testing)"),
-    # Newer or cheaper models from our providers, for trying out in Model routing.
-    "deepseek-v4-pro": ("deepseek", "DeepSeek V4 Pro (testing)"),
-    "glm-5.3": ("zai", "GLM 5.3 direct from Z.ai (testing)"),
-    "glm-5.3-flashx": ("zai", "GLM 5.3 FlashX, fast (testing)"),
-    "gpt-6.1-terra": ("openai", "ChatGPT 6.1 Terra (testing)"),
-    "gpt-6-astra": ("openai", "ChatGPT 6 Astra, top tier (testing)"),
-    "claude-opus-5-5": ("claude", "Claude Opus 5.5 (testing)"),
-    "claude-fable-5-1": ("claude", "Claude Fable 5.1, top tier (testing)"),
-    "mimo-v2.6-pro-ultraspeed": ("xiaomi", "MiMo V2.6 Pro UltraSpeed (testing)"),
+    "gemini-4-argon": ("gemini", "Gemini 4 Argon"),
+    # Extra models for Model routing only; never shown in Ask TypeMyworDz.
+    "deepseek-v4-pro": ("deepseek", "DeepSeek V4 Pro"),
+    "glm-5.3-flashx": ("zai", "GLM 5.3 FlashX"),
+    "gpt-6.1-terra": ("openai", "ChatGPT 6.1 Terra"),
+    "gpt-6-astra": ("openai", "ChatGPT 6 Astra"),
+    "claude-opus-5-5": ("claude", "Claude Opus 5.5"),
+    "claude-fable-5-1": ("claude", "Claude Fable 5.1"),
+    "mimo-v2.6-pro-ultraspeed": ("xiaomi", "MiMo V2.6 Pro UltraSpeed"),
 }
 # Every model in the shared catalogue is available on each independently
 # configured Human Work agent route; each route still keeps its own saved chain.
@@ -20677,7 +20675,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         if isinstance(item, dict) and (item.get("why") or item.get("after")):
             clean_changes.append({"part": str(item.get("part") or "")[:80], "before": str(item.get("before") or "")[:300], "after": str(item.get("after") or "")[:300], "why": str(item.get("why") or "")[:400]})
     used_model_ids = {str(model).strip().casefold() for model in models_used}
-    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-6-luna": "GPT-6 Luna", "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "glm-5.3-flash": "GLM 5.3 Flash", "deepseek-v4-1-flash": "DeepSeek V4.1 Flash", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5", "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gemini-4-argon": "Gemini 4 Argon", "mimo-v2.6-pro": "MiMo V2.6 Pro", "mimo-v2.6-flash": "MiMo V2.6 Flash", "grok-4.3": "Grok 4.3", "grok-4.7": "Grok 4.7"}
+    names = {"claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gpt-6-luna": "GPT-6 Luna", "gpt-6.1-sol": "GPT-6.1 Sol", "glm-5.3": "GLM 5.3", "glm-5.3-flash": "GLM 5.3 Flash", "deepseek-v4-1-flash": "DeepSeek V4.1 Flash", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5", "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gemini-4-argon": "Gemini 4 Argon", "mimo-v2.6-pro": "MiMo V2.6 Pro", "mimo-v2.6-flash": "MiMo V2.6 Flash", "grok-4.3": "Grok 4.3", "grok-4.7": "Grok 4.7"}
     ordered = [names[m] for m in names if m in used_model_ids]
     if len(ordered) > 1:
         model_label = f"{ordered[0]} with {' and '.join(ordered[1:])} fallback"
@@ -21680,7 +21678,7 @@ async def human_proofreading_agent(job_id, actor, progress):
     names = {
         "claude-sonnet-5-5": "Claude Sonnet 5.5", "gemini-3.8-flash": "Gemini 3.8 Flash", "gemini-3.5-flash": "Gemini 3.5 Flash",
         "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite", "gpt-6-luna": "GPT-6 Luna",
-        "gpt-6.1-sol": "GPT-6.1 Sol", "zai-glm-5-3": "GLM 5.3", "glm-5.3-flash": "GLM 5.3 Flash", "deepseek-v4-1-flash": "DeepSeek V4.1 Flash", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5",
+        "gpt-6.1-sol": "GPT-6.1 Sol", "glm-5.3": "GLM 5.3", "glm-5.3-flash": "GLM 5.3 Flash", "deepseek-v4-1-flash": "DeepSeek V4.1 Flash", "mistral-large-4": "Mistral Large 4", "claude-haiku-5-5": "Claude Haiku 5.5",
         "gemini-4-argon": "Gemini 4 Argon", "mimo-v2.6-pro": "MiMo V2.6 Pro", "mimo-v2.6-flash": "MiMo V2.6 Flash", "grok-4.3": "Grok 4.3", "grok-4.7": "Grok 4.7",
     }
     used = [names.get(str(m).strip().casefold(), str(m)) for m in result.get("models_used") or []]
