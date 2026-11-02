@@ -5104,7 +5104,7 @@ OPENAI_FORMAT_ENDPOINTS = {
 # count against it) rather than max_tokens.
 OPENAI_FORMAT_COMPLETION_TOKEN_PROVIDERS = {"openai", "xiaomi", "xai"}
 # Models that read text only: a question with pictures goes to ChatGPT Luna.
-TEXT_ONLY_OPENAI_FORMAT_MODELS = {"glm-5.3-flash"}
+TEXT_ONLY_OPENAI_FORMAT_MODELS = {"glm-5.3-flash", "glm-5.3", "glm-5.3-flashx", "deepseek-v4-pro"}
 
 # Keep the admin-facing selector stable while sending Mistral's canonical API id.
 MISTRAL_API_MODEL_ALIASES = {"mistral-large-4": "mistral-large-4-0"}  # zai-glm-5-3 is sent as-is
@@ -5228,7 +5228,7 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
             # The retired v4 names are still accepted, but the current name is
             # deepseek-flash. Reasoning is switched off: its tokens are billed as
             # output and a chat answer does not need them.
-            payload["model"] = "deepseek-flash"
+            payload["model"] = "deepseek-v4-pro" if model_id == "deepseek-v4-pro" else "deepseek-flash"
             payload["thinking"] = {"type": "disabled"}
         if model_id == "mimo-v2.6-flash":
             # Fast, cheap model: reasoning off, so tokens go to the visible answer.
@@ -5241,7 +5241,7 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         if provider == "zai":
             # Thinking tokens count against the limit, so leave room for the answer.
             budget = max(budget, 32000)
-        if model_id in ("mimo-v2.6-pro", "grok-4.3", "grok-4.7"):
+        if model_id in ("mimo-v2.6-pro", "mimo-v2.6-pro-ultraspeed", "grok-4.3", "grok-4.7"):
             # These reason before answering and the reasoning counts against the budget.
             budget = max(budget, 32000)
         if provider == "mistral" and model_id in MISTRAL_REASONING_MODELS:
@@ -5256,13 +5256,31 @@ def _ask_openai_format(provider, model_id, system_prompt, turns, question, image
         else:
             payload["max_tokens"] = budget
 
-        r = requests.post(
-            url,
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=(15, 300) if use_stream else (300 if auto_continue else 180),
-            stream=use_stream,
-        )
+        # Z.ai and Xiaomi sometimes answer 429 (busy) or a brief 5xx, or drop the
+        # connection. One quiet retry or two usually clears it.
+        tries = 3 if provider in ("zai", "xiaomi") else 1
+        r = None
+        for try_no in range(tries):
+            try:
+                r = requests.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=(15, 300) if use_stream else (300 if (auto_continue or provider == "zai") else 180),
+                    stream=use_stream,
+                )
+            except requests.RequestException as exc:
+                logger.warning(f"{provider} request failed (try {try_no + 1}/{tries}): {exc}")
+                if try_no + 1 >= tries:
+                    raise
+                time.sleep(2 * (try_no + 1))
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and try_no + 1 < tries:
+                logger.warning(f"{provider} returned {r.status_code} (try {try_no + 1}/{tries}): {r.text[:200]}")
+                r.close()
+                time.sleep(2 * (try_no + 1))
+                continue
+            break
         if r.status_code != 200:
             logger.error(f"{provider} returned {r.status_code}: {r.text[:400]}")
             r.close()
@@ -16215,7 +16233,18 @@ MODEL_ROUTES = {
     "letter_review": ("Letter AI review", lambda: AI_REVIEW_MODEL_CHAIN),
 }
 # Test-only models: selectable in Human Work routing, never shown in Ask TypeMyworDz.
-MODEL_ROUTE_EXTRA_MODELS = {"gemini-4-argon": ("gemini", "Gemini 4 Argon (testing)")}
+MODEL_ROUTE_EXTRA_MODELS = {
+    "gemini-4-argon": ("gemini", "Gemini 4 Argon (testing)"),
+    # Newer or cheaper models from our providers, for trying out in Model routing.
+    "deepseek-v4-pro": ("deepseek", "DeepSeek V4 Pro (testing)"),
+    "glm-5.3": ("zai", "GLM 5.3 direct from Z.ai (testing)"),
+    "glm-5.3-flashx": ("zai", "GLM 5.3 FlashX, fast (testing)"),
+    "gpt-6.1-terra": ("openai", "ChatGPT 6.1 Terra (testing)"),
+    "gpt-6-astra": ("openai", "ChatGPT 6 Astra, top tier (testing)"),
+    "claude-opus-5-5": ("claude", "Claude Opus 5.5 (testing)"),
+    "claude-fable-5-1": ("claude", "Claude Fable 5.1, top tier (testing)"),
+    "mimo-v2.6-pro-ultraspeed": ("xiaomi", "MiMo V2.6 Pro UltraSpeed (testing)"),
+}
 # Every model in the shared catalogue is available on each independently
 # configured Human Work agent route; each route still keeps its own saved chain.
 _MODEL_ROUTE_CACHE = {"at": 0.0, "routes": {}, "human_work_stt": {}}
