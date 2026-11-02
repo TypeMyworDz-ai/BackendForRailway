@@ -441,6 +441,71 @@ async def cleanup_delete_all(body: CleanBody, request: Request):
     return {"deleted": n, "what": body.what}
 
 
+# ---- Backups -------------------------------------------------------------
+import gzip as _gzip
+import io as _io
+
+
+def _dump_bytes():
+    """All documents and accounts as gzipped JSON lines (files/audio excluded)."""
+    buf = _io.BytesIO()
+    with _gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        with pg._Conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT path, data, created_at, updated_at FROM fs_docs ORDER BY path")
+                for path, data, c, u in cur.fetchall():
+                    gz.write((json.dumps({"t": "doc", "path": path, "data": data, "c": str(c), "u": str(u)}, default=str) + "\n").encode())
+                cur.execute("SELECT to_jsonb(a) FROM auth_users a")
+                for (row,) in cur.fetchall():
+                    gz.write((json.dumps({"t": "auth", "row": row}, default=str) + "\n").encode())
+    return buf.getvalue()
+
+
+@router.get("/api/admin/backup/export")
+async def backup_export(request: Request):
+    _guard(request)
+    from fastapi.responses import Response
+    data = _dump_bytes()
+    return Response(content=data, media_type="application/gzip",
+                    headers={"Content-Disposition": "attachment; filename=tmwd-backup-%s.jsonl.gz" % _dt.date.today().isoformat()})
+
+
+def _daily_backup_once():
+    data = _dump_bytes()
+    path = "backups/%s.jsonl.gz" % _dt.date.today().isoformat()
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO fs_blobs(path, data, content_type) VALUES (%s, %s, 'application/gzip') "
+                "ON CONFLICT (path) DO UPDATE SET data = EXCLUDED.data", (path, data))
+            cur.execute("SELECT path FROM fs_blobs WHERE path LIKE 'backups/%%' ORDER BY path DESC OFFSET 7")
+            old = [r[0] for r in cur.fetchall()]
+            for o in old:
+                cur.execute("DELETE FROM fs_blobs WHERE path = %s", (o,))
+    logger.info("Daily backup saved: %s (%d bytes), pruned %d", path, len(data), len(old))
+
+
+def _backup_loop():
+    time.sleep(120)
+    while True:
+        try:
+            _daily_backup_once()
+        except Exception:
+            logger.exception("Daily backup failed")
+        time.sleep(24 * 3600)
+
+
+@router.post("/api/admin/backup/run")
+async def backup_run(request: Request):
+    _guard(request)
+    _daily_backup_once()
+    return {"ok": True}
+
+
 def register(app, fs_db, fb_auth, fb_buckets, require_admin):
     _ctx.update({"fs_db": fs_db, "fb_auth": fb_auth, "fb_buckets": fb_buckets, "require_admin": require_admin})
     app.include_router(router)
+    import os as _os
+    if _os.getenv('USE_POSTGRES') == '1' and not _ctx.get('_bk'):
+        _ctx['_bk'] = True
+        threading.Thread(target=_backup_loop, daemon=True).start()
