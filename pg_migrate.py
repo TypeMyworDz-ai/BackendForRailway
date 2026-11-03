@@ -521,6 +521,33 @@ async def hybrid_setup(body: HybridBody, request: Request):
             report["merge"].update({"docs_by_collection": per, "collisions": collisions, "changed": moved})
     return report
 
+
+class DelUserBody(BaseModel):
+    email: str
+    confirm: str = ""
+
+
+@router.post("/api/admin/auth-user/delete")
+async def auth_user_delete(body: DelUserBody, request: Request):
+    """Remove one sign-in account and its profile (used to clear a test account)."""
+    _guard(request)
+    from fastapi import HTTPException
+    if body.confirm != "DELETE":
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm")
+    email = body.email.strip().lower()
+    out = {}
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM fs_docs WHERE coll='users' AND lower(data->>'email')=%s", (email,))
+            uids = [r[0] for r in cur.fetchall()]
+            out["profiles"] = len(uids)
+            for uid in uids:
+                cur.execute("DELETE FROM fs_docs WHERE coll='users' AND id=%s", (uid,))
+                cur.execute("DELETE FROM auth_tokens WHERE uid=%s", (uid,))
+            cur.execute("DELETE FROM auth_users WHERE lower(email)=%s", (email,))
+            out["auth_rows"] = cur.rowcount
+    return out
+
 # ---- Backups -------------------------------------------------------------
 import gzip as _gzip
 import io as _io
