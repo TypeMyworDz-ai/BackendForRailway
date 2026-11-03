@@ -89,7 +89,7 @@ def _get_pool():
                 if not DATABASE_URL:
                     raise RuntimeError("DATABASE_URL is not set")
                 _pool = psycopg2.pool.ThreadedConnectionPool(
-                    1, int(os.environ.get("PG_POOL_MAX", "20")), DATABASE_URL, connect_timeout=15
+                    1, int(os.environ.get("PG_POOL_MAX", "40")), DATABASE_URL, connect_timeout=15
                 )
                 conn = _pool.getconn()
                 try:
@@ -110,7 +110,16 @@ class _Conn:
 
     def __enter__(self):
         if not self._external:
-            self.conn = _get_pool().getconn()
+            deadline = time.time() + 20
+            while True:
+                try:
+                    self.conn = _get_pool().getconn()
+                    break
+                except psycopg2.pool.PoolError:
+                    # Every connection is busy: wait for one instead of failing the request.
+                    if time.time() > deadline:
+                        raise
+                    time.sleep(0.05)
         return self.conn
 
     def __exit__(self, exc_type, exc, tb):
@@ -687,7 +696,7 @@ class Transaction:
         self._writes = []
 
     def _begin(self):
-        self._conn = _get_pool().getconn()
+        self._conn = _Conn().__enter__()
         self._conn.autocommit = False
         self._writes = []
 

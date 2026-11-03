@@ -8266,15 +8266,27 @@ HUMAN_SUBADMIN_PAYMENT_SHIFTS = {
 }
 
 
+# One-week override (Nairobi dates, inclusive): different paid windows for the
+# week of 2 to 8 November 2026 only. After that the normal windows above apply.
+HUMAN_SUBADMIN_SHIFT_OVERRIDE_DATES = (datetime_date(2026, 11, 2), datetime_date(2026, 11, 8))
+HUMAN_SUBADMIN_SHIFT_OVERRIDES = {
+    "priscillamuthoni010@gmail.com": ((datetime_time(20, 0), datetime_time(0, 0)),),
+    "donotgrowweary95@gmail.com": ((datetime_time(0, 0), datetime_time(5, 0)),),
+}
+
+
 def _human_subadmin_shift_active(email, when=None):
     """True when `when` falls inside one of this sub-admin's own paid shift windows (Mon-Fri)."""
-    windows = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(str(email or "").strip().lower())
+    key = str(email or "").strip().lower()
+    windows = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(key)
+    when = when or _human_shift_local_now()
+    local = when.astimezone(HUMAN_SHIFT_TIMEZONE) if getattr(when, "tzinfo", None) else when.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
+    if key in HUMAN_SUBADMIN_SHIFT_OVERRIDES and HUMAN_SUBADMIN_SHIFT_OVERRIDE_DATES[0] <= local.date() <= HUMAN_SUBADMIN_SHIFT_OVERRIDE_DATES[1]:
+        windows = HUMAN_SUBADMIN_SHIFT_OVERRIDES[key]
     if not windows:
         return False
     if windows and not isinstance(windows[0][0], datetime_time):
         windows = (windows,)
-    when = when or _human_shift_local_now()
-    local = when.astimezone(HUMAN_SHIFT_TIMEZONE) if getattr(when, "tzinfo", None) else when.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
     clock = local.timetz().replace(tzinfo=None)
     for start, end in windows:
         if start < end:
@@ -8504,7 +8516,16 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         status = "off_shift"
     can_clock_in = approved and not retraining and not clocked_in and (scheduled or active_call_in) and (not shift.get("clockedOutAt") or reclocking_after_call_in or scheduled)
     can_claim = bool(approved and not retraining and clocked_in and (scheduled or active_call_in))
-    if retraining:
+    # A sub-admin who is also a worker cannot claim or clock in as a worker while
+    # their own paid sub-admin window is running.
+    profile_email = str(profile.get("email") or "").strip().lower()
+    subadmin_busy = bool(_human_is_hybrid_email(profile_email) and _human_subadmin_shift_active(profile_email, local_now))
+    if subadmin_busy:
+        can_claim = False
+        can_clock_in = False
+    if subadmin_busy:
+        message = "Your sub-admin shift is running now, so worker claims are paused. Your Work Room opens when it ends."
+    elif retraining:
         message = "Your work access is paused. Please continue in the Training Room."
     elif status == "called_in_not_clocked_in":
         message = "An admin has called you in. Clock in before claiming or starting work."
