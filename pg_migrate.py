@@ -441,6 +441,86 @@ async def cleanup_delete_all(body: CleanBody, request: Request):
     return {"deleted": n, "what": body.what}
 
 
+
+# ---- One-off: hybrid accounts + merging a duplicate worker account ---------
+class HybridBody(BaseModel):
+    from_email: str = "pmuthoni5450@gmail.com"
+    to_email: str = "priscillamuthoni010@gmail.com"
+    hybrid_emails: List[str] = ["priscillamuthoni010@gmail.com", "info@typemywordz.ai"]
+    apply: bool = False
+
+
+def _uid_for(cur, email):
+    cur.execute("SELECT id FROM fs_docs WHERE coll='users' AND lower(data->>'email')=%s", (email.lower(),))
+    rows = [r[0] for r in cur.fetchall()]
+    return rows
+
+
+@router.post("/api/admin/hybrid-setup")
+async def hybrid_setup(body: HybridBody, request: Request):
+    _guard(request)
+    from fastapi import HTTPException
+    report = {"apply": body.apply, "hybrid": [], "merge": {}}
+    with pg._Conn() as conn:
+        with conn.cursor() as cur:
+            for email in body.hybrid_emails:
+                uids = _uid_for(cur, email)
+                for uid in uids:
+                    cur.execute("SELECT data FROM fs_docs WHERE coll='users' AND id=%s", (uid,))
+                    d = cur.fetchone()[0] or {}
+                    keys = {k: d.get(k) for k in ("role", "user_type", "workerApproved", "workerTermsStatus", "workerTermsAcceptedAt", "trainingRoomAccess")}
+                    report["hybrid"].append({"email": email, "uid": uid, "before": keys})
+                    if body.apply:
+                        patch = {"workerApproved": True}
+                        if str(d.get("workerTermsStatus") or "") in ("", "pending", "declined"):
+                            patch["workerTermsStatus"] = "accepted"
+                        cur.execute("UPDATE fs_docs SET data = data || %s::jsonb, updated_at=now() WHERE coll='users' AND id=%s", (json.dumps(patch), uid))
+                if not uids:
+                    report["hybrid"].append({"email": email, "uid": None})
+            old = _uid_for(cur, body.from_email)
+            new = _uid_for(cur, body.to_email)
+            report["merge"]["old_uids"], report["merge"]["new_uids"] = old, new
+            if len(old) != 1 or len(new) != 1:
+                return report
+            ou, nu = old[0], new[0]
+            oe, ne = body.from_email.lower(), body.to_email.lower()
+            cur.execute("SELECT path, coll, id, data::text FROM fs_docs WHERE coll <> 'users' AND (coll LIKE 'human\\_%%' OR coll LIKE 'training%%') AND (data::text LIKE %s OR id LIKE %s)", ("%" + ou + "%", "%" + ou + "%"))
+            rows = cur.fetchall()
+            per = {}
+            collisions = []
+            moved = 0
+            for path, coll, did, txt in rows:
+                per[coll] = per.get(coll, 0) + 1
+                new_id = did.replace(ou, nu)
+                new_txt = txt.replace(ou, nu).replace(oe, ne)
+                if new_id != did:
+                    cur.execute("SELECT data::text FROM fs_docs WHERE coll=%s AND id=%s", (coll, new_id))
+                    ex = cur.fetchone()
+                    if ex:
+                        collisions.append({"coll": coll, "from": did, "to": new_id})
+                        if body.apply and coll == "human_worker_payouts":
+                            a, b = json.loads(ex[0]), json.loads(new_txt)
+                            seen = {(i.get("job_id"), i.get("source"), i.get("segment_id")) for i in a.get("items") or []}
+                            add = [i for i in b.get("items") or [] if (i.get("job_id"), i.get("source"), i.get("segment_id")) not in seen]
+                            a["items"] = (a.get("items") or []) + add
+                            a["job_ids"] = sorted(set((a.get("job_ids") or []) + (b.get("job_ids") or [])))
+                            a["total_minutes"] = sum(int(i.get("minutes") or 0) for i in a["items"])
+                            a["total_amount_kes"] = sum(int(i.get("amount_kes") or 0) for i in a["items"])
+                            if a.get("status") != "paid" or b.get("status") != "paid":
+                                a["status"] = "pending"
+                                a["paidAt"] = None
+                                a["paidBy"] = None
+                            cur.execute("UPDATE fs_docs SET data=%s::jsonb, updated_at=now() WHERE coll=%s AND id=%s", (json.dumps(a), coll, new_id))
+                            cur.execute("DELETE FROM fs_docs WHERE coll=%s AND id=%s", (coll, did))
+                            moved += 1
+                        continue
+                if body.apply:
+                    cur.execute("UPDATE fs_docs SET path=%s, id=%s, data=%s::jsonb, updated_at=now() WHERE coll=%s AND id=%s",
+                                (path.rsplit("/", 1)[0] + "/" + new_id, new_id, new_txt, coll, did))
+                    moved += 1
+            report["merge"].update({"docs_by_collection": per, "collisions": collisions, "changed": moved})
+    return report
+
 # ---- Backups -------------------------------------------------------------
 import gzip as _gzip
 import io as _io

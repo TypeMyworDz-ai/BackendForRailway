@@ -7307,14 +7307,17 @@ HUMAN_SPEED_TEST_PASSAGE = (
 HUMAN_AVAILABLE_SLICE_MINUTES = 2
 HUMAN_JOB_DASHBOARD_RETENTION_DAYS = 3
 
-# Human Work's regular weekday shifts run 4:00-8:00 p.m. and 10:00 p.m.-1:00 a.m.
+# Human Work's regular weekday shift runs 4:00 p.m. to 5:00 a.m. (one long shift).
 # East Africa Time (the late shift belongs to the day it starts on).
 # Attendance is recorded per scheduled weekday; call-ins authorize overtime.
 HUMAN_SHIFT_TIMEZONE = ZoneInfo("Africa/Nairobi")
+# One long shift: 4:00 p.m. to 5:00 a.m. the next morning (Nairobi). It belongs
+# to the weekday it started on. The SECOND_* names are kept for older code and
+# tests: SECOND_END is the 5:00 a.m. finish.
 HUMAN_SHIFT_START = datetime_time(16, 0)
-HUMAN_SHIFT_END = datetime_time(20, 0)
-HUMAN_SHIFT_SECOND_START = datetime_time(22, 0)
-HUMAN_SHIFT_SECOND_END = datetime_time(1, 0)
+HUMAN_SHIFT_END = datetime_time(5, 0)
+HUMAN_SHIFT_SECOND_START = datetime_time(16, 0)
+HUMAN_SHIFT_SECOND_END = datetime_time(5, 0)
 HUMAN_SHIFT_ADMIN_EMAIL = "typemywordz@gmail.com"
 HUMAN_SHIFT_WARNING_MISSES = 5
 HUMAN_SHIFT_LOCKOUT_MISSES = 6
@@ -8223,20 +8226,18 @@ def _human_shift_parse_datetime(value):
 
 
 def _human_shift_window(now=None):
-    """Which regular shift `now` falls in: ("first"|"second", shift_date) or (None, None).
-    The second shift runs past midnight and belongs to the weekday it started on."""
+    """Which regular shift `now` falls in: ("first", shift_date) or (None, None).
+    The single long shift (4:00 p.m. to 5:00 a.m.) belongs to the weekday it started on."""
     now = now or _human_shift_local_now()
     local_now = now.astimezone(HUMAN_SHIFT_TIMEZONE)
     clock = local_now.timetz().replace(tzinfo=None)
-    if local_now.weekday() < 5 and HUMAN_SHIFT_START <= clock < HUMAN_SHIFT_END:
-        return "first", local_now.date()
-    if clock >= HUMAN_SHIFT_SECOND_START:
+    if clock >= HUMAN_SHIFT_START:
         if local_now.weekday() < 5:
-            return "second", local_now.date()
+            return "first", local_now.date()
     elif clock < HUMAN_SHIFT_SECOND_END:
         previous = local_now - timedelta(days=1)
         if previous.weekday() < 5:
-            return "second", previous.date()
+            return "first", previous.date()
     return None, None
 
 
@@ -8379,8 +8380,8 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
     if profile.get("workerApproved") is not True:
         return profile
     local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
-    # A shift day is complete once the late shift has ended (1:00 a.m. next day).
-    through = (local_now - timedelta(hours=1)).date() - timedelta(days=1)
+    # A shift day is complete once the long shift has ended (5:00 a.m. next day).
+    through = (local_now - timedelta(hours=5)).date() - timedelta(days=1)
     last_evaluated = str(profile.get("humanShiftLastEvaluatedDate") or "").strip()
     if not last_evaluated:
         # Start attendance tracking with the first observed date; do not backdate
@@ -8497,7 +8498,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         status = "called_in_not_clocked_in"
     elif scheduled:
         status = "not_arrived"
-    elif local_now.weekday() < 5 and HUMAN_SHIFT_END <= local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_SECOND_START:
+    elif local_now.weekday() < 5 and HUMAN_SHIFT_SECOND_END <= local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_START:
         status = "missed"
     else:
         status = "off_shift"
@@ -8533,7 +8534,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         message = "Your online toggle is off. Clock in during a scheduled shift or after an admin call-in before claiming work."
     return {
         "uid": uid, "date": _human_shift_effective_date(local_now).isoformat(), "status": status,
-        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00",
+        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "",
         "current_shift_window": _human_shift_window(local_now)[0] or "", "timezone": "Africa/Nairobi",
         "scheduled_now": scheduled, "call_in_active": active_call_in,
         "clocked_in": clocked_in, "online": is_online, "workroom_online": workroom_online,
@@ -8742,7 +8743,7 @@ async def human_admin_shift_attendance(request: Request):
     workers.sort(key=lambda item: (0 if item.get("online") else 1, order.get(item["status"], 9), item["name"].lower()))
     return {
         "workers": workers, "date": now.date().isoformat(), "timezone": "Africa/Nairobi",
-        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
         "scheduled_now": _human_shift_is_scheduled(now), "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
         "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
         "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
@@ -10282,6 +10283,9 @@ async def _human_actor(request: Request):
     # promotes them.  Only approved workers may see assigned human jobs.
     if profile.get("workerApproved") is True and str(profile.get("workerTermsStatus") or "") not in {"pending", "declined"}:
         role = "worker"
+        # Hybrid accounts (sub-admin AND approved worker) pick the hat per request.
+        if is_human_subadmin(email) and str(request.headers.get("x-work-mode") or "").strip().lower() != "worker":
+            role = "admin"
     return {"uid": uid, "email": email, "role": role, "profile": profile}
 
 
@@ -12103,16 +12107,19 @@ async def human_subadmin_payment_history(request: Request):
         asyncio.to_thread(lambda: list(payout_query.stream())),
     )
     earning_rows = [_human_subadmin_public_earning(snap.to_dict(), snap.id) for snap in earnings]
+    pairs = [(snap.id, snap.to_dict() or {}) for snap in payouts]
+    if _human_is_hybrid_email(actor.get("email")):
+        pairs = await _human_merge_hybrid_payouts(pairs, uid)
     payout_rows = [{
-        "payout_id": snap.id,
-        "period_label": (snap.to_dict() or {}).get("period_label"),
-        **_pay_period_fields((snap.to_dict() or {}).get("period_label"), paid=((snap.to_dict() or {}).get("status") == "paid")),
-        "status": (snap.to_dict() or {}).get("status") or "pending",
-        "total_amount_kes": _human_subadmin_kes((snap.to_dict() or {}).get("total_amount_kes_milli")),
-        "category_totals_kes": {key: _human_subadmin_kes(value) for key, value in ((snap.to_dict() or {}).get("category_totals_milli_kes") or {}).items()},
-        "paid_at": _human_iso((snap.to_dict() or {}).get("paidAt")),
-        "items": (snap.to_dict() or {}).get("items") or [],
-    } for snap in payouts]
+        "payout_id": pid,
+        "period_label": raw.get("period_label"),
+        **_pay_period_fields(raw.get("period_label"), paid=(raw.get("status") == "paid")),
+        "status": raw.get("status") or "pending",
+        "total_amount_kes": _human_subadmin_kes(raw.get("total_amount_kes_milli")),
+        "category_totals_kes": {key: _human_subadmin_kes(value) for key, value in (raw.get("category_totals_milli_kes") or {}).items()},
+        "paid_at": _human_iso(raw.get("paidAt")),
+        "items": raw.get("items") or [],
+    } for pid, raw in pairs]
     return {
         "earnings": sorted(earning_rows, key=lambda item: item.get("completed_at") or "", reverse=True),
         "payouts": sorted(payout_rows, key=lambda item: item.get("period_label") or "", reverse=True),
@@ -13111,6 +13118,79 @@ async def human_admin_subadmin_earnings(
     }
 
 
+
+# Sub-admins who are also approved workers. Their worker pay and their sub-admin
+# pay roll into ONE half-month invoice (the sub-admin invoice).
+HUMAN_HYBRID_WORKER_SUBADMIN_EMAILS = {"priscillamuthoni010@gmail.com", "info@typemywordz.ai"}
+
+
+def _human_is_hybrid_email(email):
+    return str(email or "").strip().lower() in HUMAN_HYBRID_WORKER_SUBADMIN_EMAILS
+
+
+def _human_worker_payout_as_subadmin_items(worker_payout):
+    """Worker invoice lines in the sub-admin invoice's line format (milli-KES)."""
+    items = []
+    for item in (worker_payout or {}).get("items") or []:
+        role = {"proofreader": "Proofreader", "pdf": "PDF Transcriber"}.get(item.get("source")) or ("Part" if item.get("source") == "segment" else "Transcriber")
+        amount = int(item.get("amount_kes") or 0)
+        items.append({
+            "earning_id": "worker_%s_%s_%s" % (item.get("job_id"), item.get("source"), item.get("segment_id") or ""),
+            "job_id": item.get("job_id"), "job_name": "Worker %s, job %s" % (role, str(item.get("job_id") or "")[:8]),
+            "segment_id": item.get("segment_id"), "category": "worker_jobs", "work_source": "worker",
+            "measure": "minutes", "quantity": int(item.get("minutes") or 0),
+            "rate_milli_kes_per_unit": 0, "amount_kes_milli": amount * 1000,
+            "completed_at": item.get("completed_at"),
+        })
+    return items
+
+
+async def _human_merge_hybrid_payouts(pairs, only_uid=""):
+    """pairs: list of (payout_id, raw sub-admin payout). Folds each hybrid account's
+    worker invoice for the same half-month into its sub-admin invoice and adds
+    invoices that exist only on the worker side."""
+    if not db:
+        return pairs
+    try:
+        snaps = await asyncio.to_thread(lambda: list(db.collection(HUMAN_PAYOUT_COLLECTION).stream()))
+    except Exception as exc:
+        logger.warning("Hybrid invoice merge could not list worker payouts: %s", exc)
+        return pairs
+    worker = {}
+    for snap in snaps:
+        data = snap.to_dict() or {}
+        if _human_is_hybrid_email(data.get("worker_email")) and (not only_uid or data.get("worker_uid") == only_uid):
+            worker[snap.id] = data
+    merged, seen = [], set()
+    for payout_id, raw in pairs:
+        raw = dict(raw or {})
+        w = worker.get(payout_id)
+        if w:
+            seen.add(payout_id)
+            extra = _human_worker_payout_as_subadmin_items(w)
+            extra_milli = int(w.get("total_amount_kes") or 0) * 1000
+            raw["items"] = list(raw.get("items") or []) + extra
+            cats = dict(raw.get("category_totals_milli_kes") or {})
+            cats["worker_jobs"] = cats.get("worker_jobs", 0) + extra_milli
+            raw["category_totals_milli_kes"] = cats
+            raw["total_amount_kes_milli"] = int(raw.get("total_amount_kes_milli") or 0) + extra_milli
+            if str(w.get("status") or "pending").lower() != "paid":
+                raw["status"] = "pending"
+        merged.append((payout_id, raw))
+    for payout_id, w in worker.items():
+        if payout_id in seen:
+            continue
+        extra_milli = int(w.get("total_amount_kes") or 0) * 1000
+        merged.append((payout_id, {
+            "subadmin_uid": w.get("worker_uid"), "subadmin_email": w.get("worker_email") or "",
+            "period_label": w.get("period_label"), "period_start": w.get("period_start"), "period_end": w.get("period_end"),
+            "items": _human_worker_payout_as_subadmin_items(w), "category_totals_milli_kes": {"worker_jobs": extra_milli},
+            "total_amount_kes_milli": extra_milli, "status": w.get("status") or "pending",
+            "job_ids": w.get("job_ids") or [], "paidAt": w.get("paidAt"), "paidBy": w.get("paidBy"),
+        }))
+    return merged
+
+
 @app.get("/api/admin/subadmin-payouts")
 async def human_admin_subadmin_payouts(request: Request, subadmin_uid: str = "", status: str = "all"):
     _require_admin(request)
@@ -13121,11 +13201,11 @@ async def human_admin_subadmin_payouts(request: Request, subadmin_uid: str = "",
     if subadmin_uid:
         query = query.where(filter=FieldFilter("subadmin_uid", "==", subadmin_uid))
     snapshots = await asyncio.to_thread(lambda: list(query.stream()))
+    pairs = await _human_merge_hybrid_payouts([(snap.id, snap.to_dict() or {}) for snap in snapshots], subadmin_uid)
     status = (status or "all").strip().lower()
     payouts = []
     pending_milli = paid_milli = 0
-    for snap in snapshots:
-        raw = snap.to_dict() or {}
+    for payout_doc_id, raw in pairs:
         payout_status = str(raw.get("status") or "pending").lower()
         total_milli = int(raw.get("total_amount_kes_milli") or 0)
         if payout_status == "paid":
@@ -13136,7 +13216,7 @@ async def human_admin_subadmin_payouts(request: Request, subadmin_uid: str = "",
             continue
         category_totals = raw.get("category_totals_milli_kes") or {}
         payouts.append({
-            "payout_id": snap.id,
+            "payout_id": payout_doc_id,
             "subadmin_uid": raw.get("subadmin_uid"),
             "subadmin_email": raw.get("subadmin_email") or "",
             "period_label": raw.get("period_label"),
@@ -13162,12 +13242,21 @@ async def human_admin_mark_subadmin_payout_paid(payout_id: str, request: Request
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     payout_ref = db.collection(HUMAN_SUBADMIN_PAYOUT_COLLECTION).document(payout_id)
     snapshot = await asyncio.to_thread(payout_ref.get)
-    if not snapshot.exists:
+    worker_snap = await asyncio.to_thread(db.collection(HUMAN_PAYOUT_COLLECTION).document(payout_id).get)
+    worker_payout = (worker_snap.to_dict() or {}) if worker_snap.exists else {}
+    worker_part = bool(worker_payout) and _human_is_hybrid_email(worker_payout.get("worker_email")) and str(worker_payout.get("status") or "pending").lower() != "paid"
+    if not snapshot.exists and not worker_part:
         raise HTTPException(status_code=404, detail="That sub-admin payout invoice was not found.")
-    payout = snapshot.to_dict() or {}
-    if str(payout.get("status") or "pending").lower() == "paid":
+    payout = (snapshot.to_dict() or {}) if snapshot.exists else {
+        "subadmin_uid": worker_payout.get("worker_uid"), "subadmin_email": worker_payout.get("worker_email"),
+        "period_label": worker_payout.get("period_label"), "items": [], "total_amount_kes_milli": 0,
+    }
+    if str(payout.get("status") or "pending").lower() == "paid" and not worker_part:
         raise HTTPException(status_code=409, detail="This payout has already been marked as paid.")
     paid_at = _human_shift_local_now().replace(tzinfo=None)
+    if worker_part:
+        await _mark_worker_payout_paid(payout_id, admin, notify=False)
+        payout["total_amount_kes_milli"] = int(payout.get("total_amount_kes_milli") or 0) + int(worker_payout.get("total_amount_kes") or 0) * 1000
     await asyncio.to_thread(payout_ref.set, {
         "status": "paid",
         "paidAt": paid_at,
@@ -13361,7 +13450,7 @@ async def human_list_workers(request: Request):
         })
     return {
         "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
-        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00", "timezone": "Africa/Nairobi",
+        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "", "timezone": "Africa/Nairobi",
     }
 
 
@@ -13633,6 +13722,8 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
     pending_total, paid_total = 0, 0
     for snap in snapshots:
         payout = snap.to_dict() or {}
+        if _human_is_hybrid_email(payout.get("worker_email")):
+            continue  # shown inside the combined sub-admin invoice
         payout_status = payout.get("status") or "pending"
         amount = int(payout.get("total_amount_kes") or 0)
         if payout_status == "paid":
@@ -13680,6 +13771,10 @@ async def admin_worker_payouts(request: Request, worker_uid: str = "", status: s
 async def admin_mark_payout_paid(payout_id: str, request: Request):
     """Main admin confirms a half-month invoice has actually been paid out."""
     admin = _require_admin(request)
+    return await _mark_worker_payout_paid(payout_id, admin, notify=True)
+
+
+async def _mark_worker_payout_paid(payout_id, admin, notify=True):
     if not db:
         raise HTTPException(status_code=503, detail="The workflow database is unavailable.")
     payout_ref = db.collection(HUMAN_PAYOUT_COLLECTION).document(payout_id)
@@ -13726,10 +13821,11 @@ async def admin_mark_payout_paid(payout_id: str, request: Request):
         for job_id in job_ids:
             batch.update(db.collection(HUMAN_JOB_COLLECTION).document(job_id), {"payout_status": "paid", "workerPaymentStatus": "paid", "workerPaidAt": now, "updatedAt": firestore.SERVER_TIMESTAMP})
         await asyncio.to_thread(batch.commit)
-    await _notify_payout_paid(
-        payout.get("worker_uid"), payout.get("worker_email"), payout.get("worker_name"), payout.get("period_label"),
-        payout.get("total_amount_kes"), payout_id,
-    )
+    if notify:
+        await _notify_payout_paid(
+            payout.get("worker_uid"), payout.get("worker_email"), payout.get("worker_name"), payout.get("period_label"),
+            payout.get("total_amount_kes"), payout_id,
+        )
     return {"status": "paid", "payout_id": payout_id, "jobs_marked_paid": len(items) or len(job_ids)}
 
 
@@ -15661,7 +15757,7 @@ TRAINING_GUIDELINES = {
         {"title": "8. Numbers, dates, and times", "body": "Generally spell out single-digit numbers and use numerals for larger numbers. Use numerals for money, years, ages, percentages, measurements, equations, dates, times, telephone numbers, and mixed-number sentences when the context calls for them. Write percent in transcript text unless a client brief says otherwise. Use capitalized AM and PM for times. Formal series remain capitalized, such as Grade 8, Section B, Chapter 1, and Article VI."},
         {"title": "9. Names, research, and consistency", "body": "Research only unfamiliar, distinctive proper nouns actually dictated; do not research ordinary names, common terms, familiar agencies/places, generic roles, or specialist vocabulary. Research confirms spelling/capitalization of the exact dictated term only and never authorizes adding background, expanding a name, or changing the speaker's wording. Keep confirmed forms consistent and ask an admin when identity remains unclear."},
         {"title": "10. Privacy, review, and delivery", "body": "Treat every recording, transcript, name, and client instruction as confidential. Use approved tools and do not share files casually. Before delivery, check the brief, completeness, speaker turns, timestamps, uncertain passages, names, numbers, punctuation, and formatting from beginning to end. Submit work only when another person can use it without needing to reconstruct what you meant."},
-        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts run Monday to Friday, 4:00 p.m. to 8:00 p.m. and 10:00 p.m. to 1:00 a.m. Kenya time (Africa/Nairobi). You must clock in to at least four shifts every week. Clock in to register attendance; during a scheduled shift, your Available for work toggle does not control queue claims. The Available for work toggle only marks you online or offline for admins; it does not record attendance or allow job claims. Claim during your scheduled shift after clocking in, or after an admin call-in once you have clocked in. You may start or submit an already accepted assignment outside shift hours; do not clock out while assigned work is active. Five consecutive missed scheduled shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
+        {"title": "11. Shift attendance and clocking out", "body": "Regular Human Work shifts run Monday to Friday, 4:00 p.m. to 5:00 a.m. the next morning Kenya time (Africa/Nairobi). You must clock in to at least four shifts every week. Clock in to register attendance; during a scheduled shift, your Available for work toggle does not control queue claims. The Available for work toggle only marks you online or offline for admins; it does not record attendance or allow job claims. Claim during your scheduled shift after clocking in, or after an admin call-in once you have clocked in. You may start or submit an already accepted assignment outside shift hours; do not clock out while assigned work is active. Five consecutive missed scheduled shifts trigger a warning; a sixth returns your account to the Training Room for retraining. Earlier training and payout history are preserved, and you do not pay again for retraining. Contact an admin promptly if you cannot attend."},
     ],
 }
 
@@ -23157,7 +23253,7 @@ async def human_admin_worker_options(request: Request):
     workers.sort(key=lambda item: str(item["name"]).lower())
     return {
         "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
-        "shift_start": "16:00", "shift_end": "20:00", "second_shift_start": "22:00", "second_shift_end": "01:00", "timezone": "Africa/Nairobi",
+        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "", "timezone": "Africa/Nairobi",
     }
 
 
