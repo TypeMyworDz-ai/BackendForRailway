@@ -5,6 +5,7 @@ import asyncio
 import subprocess
 import os
 import time
+import threading
 import json
 import base64
 import io
@@ -4002,6 +4003,7 @@ async def lifespan(app: FastAPI):
         anyio.to_thread.current_default_thread_limiter().total_tokens = 200
     except Exception as exc:
         logger.warning("Could not raise the worker thread limit: %s", exc)
+    _shift_cfg_start()
     resume_task = asyncio.create_task(_human_resume_orphans_after_start())
     health_task = asyncio.create_task(health_monitor())
     logger.info("Health monitor task created")
@@ -8231,6 +8233,10 @@ def _human_shift_window(now=None):
     now = now or _human_shift_local_now()
     local_now = now.astimezone(HUMAN_SHIFT_TIMEZONE)
     clock = local_now.timetz().replace(tzinfo=None)
+    if not _human_shift_overnight():
+        if HUMAN_SHIFT_START <= clock < HUMAN_SHIFT_SECOND_END and local_now.weekday() < 5:
+            return "first", local_now.date()
+        return None, None
     if clock >= HUMAN_SHIFT_START:
         if local_now.weekday() < 5:
             return "first", local_now.date()
@@ -8241,6 +8247,11 @@ def _human_shift_window(now=None):
     return None, None
 
 
+def _human_shift_overnight():
+    """True when the worker shift runs past midnight (start later than end)."""
+    return HUMAN_SHIFT_START > HUMAN_SHIFT_SECOND_END
+
+
 def _human_shift_is_scheduled(now=None):
     return _human_shift_window(now)[0] is not None
 
@@ -8249,7 +8260,7 @@ def _human_shift_effective_date(now=None):
     """Shift day a moment belongs to: after midnight but before the late shift ends, still the previous day."""
     now = now or _human_shift_local_now()
     local_now = now.astimezone(HUMAN_SHIFT_TIMEZONE)
-    if local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_SECOND_END:
+    if _human_shift_overnight() and local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_SECOND_END:
         return (local_now - timedelta(days=1)).date()
     return local_now.date()
 
@@ -8266,23 +8277,56 @@ HUMAN_SUBADMIN_PAYMENT_SHIFTS = {
 }
 
 
-# One-week override (Nairobi dates, inclusive): different paid windows for the
-# week of 2 to 8 November 2026 only. After that the normal windows above apply.
-HUMAN_SUBADMIN_SHIFT_OVERRIDE_DATES = (datetime_date(2026, 11, 2), datetime_date(2026, 11, 8))
-HUMAN_SUBADMIN_SHIFT_OVERRIDES = {
-    "priscillamuthoni010@gmail.com": ((datetime_time(20, 0), datetime_time(0, 0)),),
-    "donotgrowweary95@gmail.com": ((datetime_time(0, 0), datetime_time(5, 0)),),
+# Shift times are editable by the super admin (Admin dashboard, Shift schedule).
+# `_SHIFT_CFG` mirrors the saved settings; a background thread refreshes it.
+_SHIFT_CFG = {"subadmins": {}, "enforce_from": None}
+# Used until the super admin saves a schedule. Entries with `until` fall back to
+# the normal windows above once that Nairobi date has passed.
+HUMAN_SHIFT_SEED = {
+    "subadmins": {
+        "priscillamuthoni010@gmail.com": {"windows": [{"start": "20:00", "end": "00:00"}], "until": "2026-11-08"},
+        "donotgrowweary95@gmail.com": {"windows": [{"start": "00:00", "end": "05:00"}], "until": "2026-11-08"},
+    },
+    "enforce_from": "2026-11-03T11:30:00+03:00",
 }
+
+
+def _hhmm_to_time(value):
+    parts = str(value or "").strip().split(":")
+    if len(parts) < 2:
+        raise ValueError("bad time")
+    hour, minute = int(parts[0]), int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("bad time")
+    return datetime_time(hour, minute)
+
+
+def _human_subadmin_effective_windows(email, local_date=None):
+    """Windows in force for a sub-admin: saved custom ones (until their end date), else the defaults."""
+    key = str(email or "").strip().lower()
+    entry = (_SHIFT_CFG.get("subadmins") or {}).get(key)
+    if entry:
+        until = str(entry.get("until") or "").strip()
+        expired = False
+        if until and local_date is not None:
+            try:
+                expired = local_date > datetime.strptime(until, "%Y-%m-%d").date()
+            except ValueError:
+                expired = False
+        if not expired:
+            try:
+                return tuple((_hhmm_to_time(w.get("start")), _hhmm_to_time(w.get("end"))) for w in (entry.get("windows") or []))
+            except (ValueError, AttributeError):
+                pass
+    return HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(key)
 
 
 def _human_subadmin_shift_active(email, when=None):
     """True when `when` falls inside one of this sub-admin's own paid shift windows (Mon-Fri)."""
     key = str(email or "").strip().lower()
-    windows = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(key)
     when = when or _human_shift_local_now()
     local = when.astimezone(HUMAN_SHIFT_TIMEZONE) if getattr(when, "tzinfo", None) else when.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
-    if key in HUMAN_SUBADMIN_SHIFT_OVERRIDES and HUMAN_SUBADMIN_SHIFT_OVERRIDE_DATES[0] <= local.date() <= HUMAN_SUBADMIN_SHIFT_OVERRIDE_DATES[1]:
-        windows = HUMAN_SUBADMIN_SHIFT_OVERRIDES[key]
+    windows = _human_subadmin_effective_windows(key, local.date())
     if not windows:
         return False
     if windows and not isinstance(windows[0][0], datetime_time):
@@ -8393,7 +8437,9 @@ async def _human_shift_reconcile(uid, profile=None, now=None):
         return profile
     local_now = (now or _human_shift_local_now()).astimezone(HUMAN_SHIFT_TIMEZONE)
     # A shift day is complete once the long shift has ended (5:00 a.m. next day).
-    through = (local_now - timedelta(hours=5)).date() - timedelta(days=1)
+    through = (local_now - timedelta(hours=HUMAN_SHIFT_SECOND_END.hour, minutes=HUMAN_SHIFT_SECOND_END.minute)).date()
+    if _human_shift_overnight():
+        through = through - timedelta(days=1)
     last_evaluated = str(profile.get("humanShiftLastEvaluatedDate") or "").strip()
     if not last_evaluated:
         # Start attendance tracking with the first observed date; do not backdate
@@ -8510,7 +8556,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         status = "called_in_not_clocked_in"
     elif scheduled:
         status = "not_arrived"
-    elif local_now.weekday() < 5 and HUMAN_SHIFT_SECOND_END <= local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_START:
+    elif local_now.weekday() < 5 and _human_shift_overnight() and HUMAN_SHIFT_SECOND_END <= local_now.timetz().replace(tzinfo=None) < HUMAN_SHIFT_START:
         status = "missed"
     else:
         status = "off_shift"
@@ -8555,7 +8601,7 @@ def _human_shift_status_payload(uid, profile, shift, now=None):
         message = "Your online toggle is off. Clock in during a scheduled shift or after an admin call-in before claiming work."
     return {
         "uid": uid, "date": _human_shift_effective_date(local_now).isoformat(), "status": status,
-        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "",
+        "shift_start": HUMAN_SHIFT_START.strftime("%H:%M"), "shift_end": HUMAN_SHIFT_SECOND_END.strftime("%H:%M"), "second_shift_start": "", "second_shift_end": "",
         "current_shift_window": _human_shift_window(local_now)[0] or "", "timezone": "Africa/Nairobi",
         "scheduled_now": scheduled, "call_in_active": active_call_in,
         "clocked_in": clocked_in, "online": is_online, "workroom_online": workroom_online,
@@ -8764,7 +8810,7 @@ async def human_admin_shift_attendance(request: Request):
     workers.sort(key=lambda item: (0 if item.get("online") else 1, order.get(item["status"], 9), item["name"].lower()))
     return {
         "workers": workers, "date": now.date().isoformat(), "timezone": "Africa/Nairobi",
-        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "shift_start": HUMAN_SHIFT_START.strftime("%H:%M"), "shift_end": HUMAN_SHIFT_SECOND_END.strftime("%H:%M"), "second_shift_start": "", "second_shift_end": "", "working_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
         "scheduled_now": _human_shift_is_scheduled(now), "warning_after_misses": HUMAN_SHIFT_WARNING_MISSES,
         "retraining_after_misses": HUMAN_SHIFT_LOCKOUT_MISSES,
         "weekly_required": HUMAN_SHIFT_MIN_WEEKLY,
@@ -10118,6 +10164,8 @@ def _human_worker_earning_items(job_id, job, include_processed=False):
             payout_status = "paid"
         elif period_id and payout_status in ("", "unassigned"):
             payout_status = "invoiced"
+        if payout_status in ("", "unassigned") and not _human_worker_pay_time_ok(email, completed_at):
+            return None
         if not include_processed and (payout_status not in ("", "unassigned") or period_id or paid_at):
             return None
         try:
@@ -13471,7 +13519,7 @@ async def human_list_workers(request: Request):
         })
     return {
         "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
-        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "", "timezone": "Africa/Nairobi",
+        "shift_start": HUMAN_SHIFT_START.strftime("%H:%M"), "shift_end": HUMAN_SHIFT_SECOND_END.strftime("%H:%M"), "second_shift_start": "", "second_shift_end": "", "timezone": "Africa/Nairobi",
     }
 
 
@@ -16608,6 +16656,8 @@ async def _broadcast_load(force=False):
     return out
 
 
+
+
 @app.get("/human-transcription/broadcast")
 async def human_get_broadcast(request: Request):
     """Messages shown in the bar at the top of the worker room and the sub-admin dashboard."""
@@ -16620,6 +16670,156 @@ async def human_get_broadcast(request: Request):
         return {"audience": "", "items": []}
     data = await _broadcast_load()
     return {"audience": audience, "items": [item for item in data[audience]["items"] if isinstance(item, dict) and item.get("active") is not False]}
+
+
+
+def _human_worker_pay_time_ok(email, completed_at):
+    """Worker pay accrues only when the work was submitted inside the worker shift and,
+    for sub-admins who are also workers, outside their own sub-admin window."""
+    started = _SHIFT_CFG.get("enforce_from")
+    if not started:
+        return True
+    try:
+        moment = _as_dt(completed_at)
+        if moment is None:
+            return True
+        if getattr(moment, "tzinfo", None) is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        local = moment.astimezone(HUMAN_SHIFT_TIMEZONE)
+        if local < started:
+            return True
+        if not _human_shift_is_scheduled(local):
+            return False
+        if _human_is_hybrid_email(email) and _human_subadmin_shift_active(email, local):
+            return False
+    except Exception as exc:
+        logger.warning("Worker pay time check failed open: %s", exc)
+    return True
+
+
+def _shift_cfg_apply(data):
+    """Load saved (or seed) shift settings into the live globals."""
+    global HUMAN_SHIFT_START, HUMAN_SHIFT_END, HUMAN_SHIFT_SECOND_START, HUMAN_SHIFT_SECOND_END
+    data = data or HUMAN_SHIFT_SEED
+    worker = data.get("worker") or {}
+    try:
+        start, end = _hhmm_to_time(worker.get("start") or "16:00"), _hhmm_to_time(worker.get("end") or "05:00")
+        if start != end:
+            HUMAN_SHIFT_START, HUMAN_SHIFT_SECOND_START = start, start
+            HUMAN_SHIFT_END, HUMAN_SHIFT_SECOND_END = end, end
+    except ValueError:
+        pass
+    enforce = None
+    raw = str(data.get("enforce_from") or "").strip()
+    if raw:
+        try:
+            enforce = datetime.fromisoformat(raw)
+            if enforce.tzinfo is None:
+                enforce = enforce.replace(tzinfo=HUMAN_SHIFT_TIMEZONE)
+        except ValueError:
+            enforce = None
+    _SHIFT_CFG["subadmins"] = {str(k).strip().lower(): v for k, v in (data.get("subadmins") or {}).items() if isinstance(v, dict)}
+    _SHIFT_CFG["enforce_from"] = enforce
+
+
+def _shift_cfg_refresh_once():
+    if not db:
+        return
+    snap = db.collection("admin_settings").document("shift_schedule").get()
+    _shift_cfg_apply(snap.to_dict() if snap.exists else None)
+
+
+def _shift_cfg_loop():
+    while True:
+        try:
+            _shift_cfg_refresh_once()
+        except Exception as exc:
+            logger.warning("Shift schedule refresh failed: %s", exc)
+        time.sleep(20)
+
+
+def _shift_cfg_start():
+    if db and not os.environ.get("TMWD_NO_SHIFT_THREAD"):
+        threading.Thread(target=_shift_cfg_loop, daemon=True, name="shift-config").start()
+
+
+def _shift_cfg_public():
+    subs = []
+    for email in sorted(set(HUMAN_SUBADMIN_PAYMENT_SHIFTS) | set(_human_subadmin_email_list())):
+        default = HUMAN_SUBADMIN_PAYMENT_SHIFTS.get(email) or ()
+        entry = (_SHIFT_CFG.get("subadmins") or {}).get(email) or {}
+        subs.append({
+            "email": email,
+            "defaults": [{"start": a.strftime("%H:%M"), "end": b.strftime("%H:%M")} for a, b in default],
+            "windows": entry.get("windows") if entry else [{"start": a.strftime("%H:%M"), "end": b.strftime("%H:%M")} for a, b in default],
+            "until": entry.get("until") or "",
+            "custom": bool(entry),
+        })
+    started = _SHIFT_CFG.get("enforce_from")
+    return {
+        "worker": {"start": HUMAN_SHIFT_START.strftime("%H:%M"), "end": HUMAN_SHIFT_SECOND_END.strftime("%H:%M"), "days": "Monday to Friday"},
+        "subadmins": subs,
+        "enforce_worker_pay": bool(started),
+        "enforce_from": started.isoformat() if started else "",
+        "timezone": "Africa/Nairobi",
+    }
+
+
+def _human_subadmin_email_list():
+    return [str(e).strip().lower() for e in HUMAN_JOB_ADMIN_EMAILS if str(e).strip().lower() not in {x.lower() for x in ADMIN_EMAILS}]
+
+
+@app.get("/api/admin/shift-schedule")
+async def admin_get_shift_schedule(request: Request):
+    _require_admin(request)
+    return _shift_cfg_public()
+
+
+@app.put("/api/admin/shift-schedule")
+async def admin_put_shift_schedule(request: Request):
+    admin = _require_admin(request)
+    payload = await request.json()
+    worker = payload.get("worker") or {}
+    try:
+        w_start, w_end = _hhmm_to_time(worker.get("start")), _hhmm_to_time(worker.get("end"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter the worker shift as times like 16:00 and 05:00.")
+    if w_start == w_end:
+        raise HTTPException(status_code=400, detail="The worker shift must start and end at different times.")
+    allowed = set(_human_subadmin_email_list())
+    subs = {}
+    for email, entry in (payload.get("subadmins") or {}).items():
+        email = str(email).strip().lower()
+        if email not in allowed or not isinstance(entry, dict):
+            continue
+        windows = []
+        for w in (entry.get("windows") or [])[:4]:
+            try:
+                a, b = _hhmm_to_time(w.get("start")), _hhmm_to_time(w.get("end"))
+            except (ValueError, AttributeError):
+                raise HTTPException(status_code=400, detail="Check the times for %s." % email)
+            if a == b:
+                raise HTTPException(status_code=400, detail="A shift for %s starts and ends at the same time." % email)
+            windows.append({"start": a.strftime("%H:%M"), "end": b.strftime("%H:%M")})
+        until = str(entry.get("until") or "").strip()
+        if until:
+            try:
+                datetime.strptime(until, "%Y-%m-%d")
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Use the date format YYYY-MM-DD for 'until'.")
+        subs[email] = {"windows": windows, "until": until}
+    enforce_from = ""
+    if payload.get("enforce_worker_pay"):
+        existing = _SHIFT_CFG.get("enforce_from")
+        enforce_from = existing.isoformat() if existing else _human_shift_local_now().isoformat()
+    data = {
+        "worker": {"start": w_start.strftime("%H:%M"), "end": w_end.strftime("%H:%M")},
+        "subadmins": subs, "enforce_from": enforce_from,
+        "updated_by": str(admin.get("email") or "").strip().lower(), "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+    await asyncio.to_thread(db.collection("admin_settings").document("shift_schedule").set, data)
+    _shift_cfg_apply(data)
+    return _shift_cfg_public()
 
 
 @app.get("/api/admin/broadcasts")
@@ -23274,7 +23474,7 @@ async def human_admin_worker_options(request: Request):
     workers.sort(key=lambda item: str(item["name"]).lower())
     return {
         "workers": workers, "scheduled_now": _human_shift_is_scheduled(now),
-        "shift_start": "16:00", "shift_end": "05:00", "second_shift_start": "", "second_shift_end": "", "timezone": "Africa/Nairobi",
+        "shift_start": HUMAN_SHIFT_START.strftime("%H:%M"), "shift_end": HUMAN_SHIFT_SECOND_END.strftime("%H:%M"), "second_shift_start": "", "second_shift_end": "", "timezone": "Africa/Nairobi",
     }
 
 
