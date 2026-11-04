@@ -10156,6 +10156,8 @@ def _human_worker_earning_items(job_id, job, include_processed=False):
     quote = job.get("quote") or {}
     default_rate = int(quote.get("transcriber_payout_kes_per_minute") or HUMAN_LEGACY_STANDARD_PAYOUT_KES)
 
+    pick_fallback = job
+
     def normalize(source, raw, uid, email, name, minutes, completed_at, rate, payout_status, period_id, paid_at):
         if not uid or not completed_at:
             return None
@@ -10164,7 +10166,7 @@ def _human_worker_earning_items(job_id, job, include_processed=False):
             payout_status = "paid"
         elif period_id and payout_status in ("", "unassigned"):
             payout_status = "invoiced"
-        if payout_status in ("", "unassigned") and not _human_worker_pay_time_ok(email, completed_at):
+        if payout_status in ("", "unassigned") and not _human_worker_pay_time_ok(email, (raw.get("proofreader_assignedAt") if source == "proofreader" else raw.get("assignedAt")) or (pick_fallback.get("proofreader_assignedAt") if source == "proofreader" else None) or completed_at):
             return None
         if not include_processed and (payout_status not in ("", "unassigned") or period_id or paid_at):
             return None
@@ -16674,7 +16676,7 @@ async def human_get_broadcast(request: Request):
 
 
 def _human_worker_pay_time_ok(email, completed_at):
-    """Worker pay accrues only when the work was submitted inside the worker shift and,
+    """Worker pay accrues only when the job was PICKED (claimed) inside the worker shift and,
     for sub-admins who are also workers, outside their own sub-admin window."""
     started = _SHIFT_CFG.get("enforce_from")
     if not started:
@@ -16893,9 +16895,20 @@ async def _guidelines_for_job(job):
     return await _guidelines_with_word_lists(await _admin_guidelines_text())
 
 
+WORD_LIST_EDITOR_EMAILS = {"gracenyaitara@gmail.com"}
+
+
+def _require_word_list_editor(request: Request) -> dict:
+    decoded = _verified_user(request)
+    email = (decoded.get("email") or "").strip().lower()
+    if email not in {item.lower() for item in ADMIN_EMAILS} | WORD_LIST_EDITOR_EMAILS:
+        raise HTTPException(status_code=403, detail="Word list access is required.")
+    return decoded
+
+
 @app.get("/api/admin/client-word-lists")
 async def admin_get_client_word_lists(request: Request):
-    _require_admin(request)
+    _require_word_list_editor(request)
     ref = db.collection(CLIENT_WORD_LIST_DOC[0]).document(CLIENT_WORD_LIST_DOC[1])
     snap = await asyncio.to_thread(ref.get)
     data = (snap.to_dict() if snap.exists else None) or {}
@@ -16905,7 +16918,7 @@ async def admin_get_client_word_lists(request: Request):
 
 @app.put("/api/admin/client-word-lists")
 async def admin_put_client_word_lists(request: Request):
-    _require_admin(request)
+    _require_word_list_editor(request)
     payload = await request.json()
     text = str(payload.get("text") or "").replace("\r\n", "\n")[:400000]
     ref = db.collection(CLIENT_WORD_LIST_DOC[0]).document(CLIENT_WORD_LIST_DOC[1])
@@ -16917,7 +16930,7 @@ async def admin_put_client_word_lists(request: Request):
 @app.post("/api/admin/client-word-lists/extract")
 async def admin_extract_client_word_list_docx(request: Request, file: UploadFile = File(...)):
     """Read a Word (.docx) word list so the admin can review it before saving."""
-    _require_admin(request)
+    _require_word_list_editor(request)
     name = str(file.filename or "").lower()
     if not name.endswith(".docx"):
         raise HTTPException(status_code=400, detail="Upload a Word document (.docx), or paste the list instead.")
