@@ -16591,6 +16591,28 @@ async def admin_put_model_routing(request: Request):
     _MODEL_ROUTE_CACHE["at"] = 0.0
     return {"status": "reset" if reset else "saved", "key": key, "models": ids}
 
+@app.post("/api/admin/model-routing/test")
+async def admin_test_model_routing(request: Request):
+    """Super admin: send one tiny prompt to a model to check that it answers."""
+    _require_admin(request)
+    payload = await request.json()
+    model_id = ASK_MODEL_ALIASES.get(str(payload.get("model") or "").strip(), str(payload.get("model") or "").strip())
+    options = _model_route_options()
+    if model_id not in options:
+        raise HTTPException(status_code=400, detail="Unknown model.")
+    provider = options[model_id][0]
+    started = time.time()
+    try:
+        text = await asyncio.wait_for(
+            asyncio.to_thread(_run_ask_model, model_id, provider, "Reply with the single word OK.", "Say OK.", 20),
+            timeout=40,
+        )
+        return {"ok": bool(str(text or "").strip()), "model": model_id, "seconds": round(time.time() - started, 1), "reply": str(text or "").strip()[:40]}
+    except Exception as exc:
+        detail = re.sub(r"(key|token)=[^&\s]+", r"\1=hidden", str(exc) or exc.__class__.__name__)[:200]
+        return {"ok": False, "model": model_id, "seconds": round(time.time() - started, 1), "error": detail}
+
+
 BROADCAST_DOC = ("admin_settings", "human_work_broadcasts")
 BROADCAST_AUDIENCES = ("worker", "subadmin", "home")
 BROADCAST_MAX_ITEMS = 12
