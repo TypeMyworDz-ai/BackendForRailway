@@ -6822,7 +6822,7 @@ async def recorder_download_redirect():
         except Exception:
             logger.exception("Recorder download click could not be counted")
     return RedirectResponse(
-        "https://typemywordz.ai/downloads/TypeScribe.exe",
+        "https://typemywordz.ai/downloads/TypeMyworDz-App.exe",
         status_code=302,
     )
 
@@ -16623,8 +16623,8 @@ BROADCAST_DEFAULTS = {
     }],
     "subadmin": [],
     "home": [{
-        "id": "typescribe", "title": "", "active": True, "link_label": "Download our main tool, TypeScribe",
-        "link_url": "https://typemywordz.ai/tools/audio-recorder.html",
+        "id": "typescribe", "title": "", "active": True, "link_label": "TypeMyworDz App",
+        "text": "Download our main all-in-one transcription tool with Playback/Recording features on Windows",
         "text": ", and enjoy all-in-one transcription platform with Playback/Recording features.",
     }],
 }
