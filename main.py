@@ -146,7 +146,7 @@ VOXTRAL_TRANSCRIPTION_MODEL = "voxtral-mini-latest"
 # path, starts on Deepgram, and falls back to OpenAI so both services can be
 # tested without changing the experience for ordinary paying clients.
 DEEPGRAM_TESTER_EMAIL = 'info@typemywordztest.com'
-OPENAI_TESTER_EMAIL = 'info@typemywordz.ai'
+OPENAI_TESTER_EMAIL = ''
 
 # Complimentary accounts. Keep this list empty unless an account is explicitly
 # approved for free access. The Deepgram tester is intentionally a normal
