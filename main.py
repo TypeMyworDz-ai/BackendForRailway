@@ -21266,7 +21266,7 @@ def _proofreading_agent_scope(job):
 
 # The Proofreading Agent is paused for General Jobs while it is being tested.
 # Flip to True to reinstate it; nothing else needs to change.
-HUMAN_GENERAL_PROOFREADING_ENABLED = False
+HUMAN_GENERAL_PROOFREADING_ENABLED = True
 
 
 def _proofreading_agent_blocker(job):
