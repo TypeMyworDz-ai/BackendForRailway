@@ -18369,6 +18369,18 @@ async def _human_run_ai_agent(job_id, segment_id, agent_id, run_id):
             "elapsed_seconds": int(time.time() - started), "completedAt": firestore.SERVER_TIMESTAMP,
         })
         try:
+            # The draft has been delivered: now charge for it, once.
+            fresh_run = (await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).get)).to_dict() or {}
+            pending_cost = int(fresh_run.get("pending_credit_cost") or 0)
+            if pending_cost > 0 and not fresh_run.get("credit_charged"):
+                await _human_charge_ai_call(
+                    {"uid": fresh_run.get("assigned_by_uid"), "email": fresh_run.get("assigned_by_email")},
+                    job_id, str(fresh_run.get("pending_credit_label") or "AI agent"), credit_cost=pending_cost,
+                )
+                await asyncio.to_thread(db.collection("human_ai_agent_runs").document(run_id).update, {"credit_charged": True, "credits_charged": pending_cost})
+        except Exception:
+            logger.exception("Could not charge credits after AI draft delivered for job %s run %s", job_id, run_id)
+        try:
             await _human_subadmin_accrue_job_earnings(
                 job_id, {**current, **job_updates}, {}, segment_ids=[segment_id], ai_only=True,
             )
@@ -18780,11 +18792,15 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             if is_pdf_proofread
             else HUMAN_WORK_AI_CREDIT_COST + audio_minutes_charged
         )
-        credit_charge = await _human_charge_ai_call(
-            actor, job_id,
-            "AI proofreader" if is_pdf_proofread else (f"AI agent ({audio_minutes_charged} audio min + {HUMAN_WORK_AI_CREDIT_COST} draft)" if audio_minutes_charged else "AI agent"),
-            credit_cost=credit_cost,
-        )
+        # Charged only after the draft is delivered. Here we just make sure
+        # the balance covers it and remember what to charge on success.
+        await _human_require_ai_call_credits(actor, credit_cost)
+        pending_label = "AI proofreader" if is_pdf_proofread else (f"AI agent ({audio_minutes_charged} audio min + {HUMAN_WORK_AI_CREDIT_COST} draft)" if audio_minutes_charged else "AI agent")
+        await asyncio.to_thread(run_ref.update, {
+            "pending_credit_cost": int(credit_cost), "pending_credit_label": pending_label,
+            "credit_charged": False,
+        })
+        credit_charge = {"credits_pending": int(credit_cost), "charged_after_draft": True}
     except Exception:
         if job_updated:
             try:
