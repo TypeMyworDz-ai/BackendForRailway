@@ -923,7 +923,7 @@ HUMAN_WORK_AI_PROOFREAD_CREDIT_COST = 5
 # Credits for the formatting step of a worker's AI draft (audio minutes are charged on top, 1 per minute),
 # and for one run of the admin Proofreading Agent.
 HUMAN_WORKER_DRAFT_FORMATTING_CREDITS = 3
-HUMAN_PROOFREADING_AGENT_CREDIT_COST = 3
+HUMAN_PROOFREADING_AGENT_CREDIT_COST = 5
 # Speech-to-text order inside Human Work. Workers and trainees: Deepgram first (never AssemblyAI).
 # Admin category agents: Voxtral first. The Proofreading Agent's whole-audio reference stays AssemblyAI.
 HUMAN_WORKER_STT_ORDER = ("deepgram", "voxtral")
@@ -18769,13 +18769,20 @@ async def human_admin_assign_ai_agent(job_id: str, request: Request, background_
             await asyncio.to_thread(job_ref.update, updates)
         job_updated = True
         is_pdf_proofread = bool(is_pdf and job.get("pdf_review"))
+        # Audio goes through the agent: 1 credit per started audio minute plus
+        # the 2-credit draft fee. Image/PDF jobs have no audio minutes.
+        if is_pdf:
+            audio_minutes_charged = 0
+        else:
+            audio_minutes_charged = int(_human_worker_ai_draft_credit_cost(job, target if split_job else None)["audio_minutes"])
         credit_cost = (
             HUMAN_WORK_AI_PROOFREAD_CREDIT_COST
-            if is_pdf_proofread and is_human_subadmin(assignment_email)
-            else HUMAN_WORK_AI_CREDIT_COST
+            if is_pdf_proofread
+            else HUMAN_WORK_AI_CREDIT_COST + audio_minutes_charged
         )
         credit_charge = await _human_charge_ai_call(
-            actor, job_id, "AI proofreader" if is_pdf_proofread else "AI agent",
+            actor, job_id,
+            "AI proofreader" if is_pdf_proofread else (f"AI agent ({audio_minutes_charged} audio min + {HUMAN_WORK_AI_CREDIT_COST} draft)" if audio_minutes_charged else "AI agent"),
             credit_cost=credit_cost,
         )
     except Exception:
@@ -19079,7 +19086,7 @@ async def human_admin_retry_letter_ai_review(job_id: str, request: Request, back
         "letter_ai_review_attachment": None, "updatedAt": firestore.SERVER_TIMESTAMP,
     }
     await asyncio.to_thread(review_ref.update, review_updates)
-    letter_proofread_credit_cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin(actor.get("email")) else HUMAN_WORK_AI_CREDIT_COST
+    letter_proofread_credit_cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST
     try:
         credit_charge = await _human_charge_ai_call(
             actor, job_id, "Letter AI proofreader", credit_cost=letter_proofread_credit_cost,
@@ -20665,7 +20672,7 @@ async def human_admin_ai_review(job_id: str, request: Request = None, actor=None
         parts = [{"id": "main", "label": "Full transcript", "text": str(job.get("transcript") or "")}]
     if not any(p["text"].strip() for p in parts):
         raise HTTPException(status_code=409, detail="The submitted parts have no typed text. Attached files cannot be reviewed by the AI.")
-    proofread_credit_cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin(actor.get("email")) else HUMAN_WORK_AI_CREDIT_COST
+    proofread_credit_cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST
     await _human_require_ai_call_credits(actor, proofread_credit_cost)
     guidelines = await _guidelines_for_job(job)
     context_data = await _human_review_context(job_id, job)
@@ -20892,7 +20899,7 @@ async def human_admin_ai_review_start(job_id: str, request: Request, background_
         return {"started": False, "ai_review_run": job.get("ai_review_run")}
     if job.get("proofreader_status") in {"assigned", "in_progress"}:
         raise HTTPException(status_code=409, detail="A human proofreader is already working on this job.")
-    cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST if is_human_subadmin(actor.get("email")) else HUMAN_WORK_AI_CREDIT_COST
+    cost = HUMAN_WORK_AI_PROOFREAD_CREDIT_COST
     await _human_require_ai_call_credits(actor, cost)
     run_id = uuid.uuid4().hex
     run = {
