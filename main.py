@@ -933,6 +933,8 @@ HUMAN_WORK_STT_PROVIDERS = ("assemblyai", "deepgram", "voxtral", "xai", "xiaomi"
 HUMAN_WORK_STT_DEFAULTS = {
     "worker_draft": {"order": HUMAN_WORKER_STT_ORDER, "comparison": ""},
     "audio_agent": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
+    "audio_agent_grace": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
+    "audio_agent_super": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
     "proofreading_agent": {"order": HUMAN_PROOFREADING_STT_ORDER, "comparison": ""},
     "letter_review": {"order": ("assemblyai", "deepgram"), "comparison": ""},
     "rating_agent": {"order": ("voxtral", "assemblyai", "deepgram"), "comparison": ""},
@@ -16268,7 +16270,9 @@ async def admin_get_human_work_stt_routing(request: Request):
     stages = []
     labels = {
         "worker_draft": "Worker/trainee formatted audio draft",
-        "audio_agent": "Admin audio-job agent first draft",
+        "audio_agent_grace": "Grace's General Job agent: speech models",
+        "audio_agent_super": "Super admin's General Job agent: speech models",
+        "audio_agent": "All other admins' audio-job agent first draft",
         "proofreading_agent": "Proofreading Agent whole-audio reference",
         "letter_review": "Letter AI review source audio",
         "rating_agent": "Rating Agent source audio",
@@ -18214,7 +18218,11 @@ async def _human_ai_agent_generate(job_id, job, segment, agent_id, template_prof
         draft = _human_ai_agent_research_footer(draft, research, client_word_list=context, dictated_text=draft)
         return draft, 0.0, agent["models"]
 
-    asr_transcripts, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment, stage="audio_agent")
+    # General Job drafts started by Grace or the super admin use their own speech-model settings.
+    stt_stage = "audio_agent"
+    if agent_id == "general-gpt":
+        stt_stage = {"general_grace": "audio_agent_grace", "general": "audio_agent_super"}.get(model_route_key, "audio_agent")
+    asr_transcripts, audio_seconds = await _human_ai_transcribe_audio(job_id, job, segment, stage=stt_stage)
     raw_text = _human_asr_prompt_text(asr_transcripts)
     primary_asr_text = _human_asr_primary_text(asr_transcripts)
     research = await _human_ai_agent_research(raw_text, context)
