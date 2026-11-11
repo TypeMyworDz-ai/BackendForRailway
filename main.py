@@ -10565,6 +10565,10 @@ async def _human_subadmin_scope_middleware(request: Request, call_next):
     uid, email = _human_token_identity(request)
     if not email or not is_human_subadmin(email):
         return await call_next(request)
+    # A hybrid sub-admin/worker acting in Work Room (worker) mode is a worker for this request,
+    # so the "own uploads only" sub-admin scope must not block claiming other clients' jobs.
+    if _human_is_hybrid_email(email) and str(request.headers.get("x-work-mode") or "").strip().lower() == "worker":
+        return await call_next(request)
     match = _HUMAN_JOB_PATH_RE.match(path)
     if match:
         owner_uid, owner_email, found = await _human_job_owner_lookup(match.group(1))
