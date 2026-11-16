@@ -6282,6 +6282,21 @@ async def transcribe_audio(
             tmp_path = tmp.name
         
         file_size_mb = len(content) / (1024 * 1024)
+
+        # Duplicate guard: the same file from the same account that is still being transcribed
+        # must not be started (and billed) again.
+        _dup_key = (str(user_email or "").strip().lower(), file.filename, round(file_size_mb, 2))
+        for _other in list(jobs.values()):
+            if (
+                isinstance(_other, dict)
+                and _other.get("status") == "processing"
+                and (str(_other.get("user_email") or "").strip().lower(), _other.get("filename"), _other.get("file_size_mb")) == _dup_key
+            ):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise HTTPException(status_code=409, detail="This file is already being transcribed. Please wait for it to finish instead of uploading it again.")
         
         # Analyze audio to get duration
         audio_characteristics = await analyze_audio_characteristics(tmp_path)
@@ -6305,6 +6320,8 @@ async def transcribe_audio(
         cancellation_flags[job_id] = False
         logger.info(f"Job {job_id} initialized with status 'processing'")
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"ERROR processing file for job {job_id}: {str(e)}")
         if job_id in jobs:
