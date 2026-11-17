@@ -22509,12 +22509,102 @@ async def _purge_declined_terms_accounts():
     return removed
 
 
+RETRAINING_RETEST_DEADLINE_DAYS = 7
+
+
+def _human_retraining_started_at(profile):
+    """When the worker was returned to retraining (first usable timestamp)."""
+    for key in ("worker_retraining_required_at", "humanShiftAutoDemotedAt", "humanShiftLockoutAt", "trainingRedoInvitedAt"):
+        parsed = _human_shift_parse_datetime((profile or {}).get(key))
+        if parsed:
+            return parsed.astimezone(timezone.utc)
+    return None
+
+
+def _human_retest_submitted(profile):
+    submissions = (profile or {}).get("trainingSubmissions") or {}
+    return isinstance(submissions, dict) and str(submissions.get(str(len(TRAINING_LEVELS))) or "").lower() == "submitted"
+
+
+async def _lapsed_retraining_accounts():
+    """Workers returned to retraining who did not retest within the deadline."""
+    if not db:
+        return []
+    snapshots = await asyncio.to_thread(lambda: list(db.collection("users").where(filter=FieldFilter("worker_retraining_required", "==", True)).stream()))
+    now = datetime.now(timezone.utc)
+    lapsed = []
+    for snap in snapshots:
+        data = snap.to_dict() or {}
+        email = str(data.get("email") or "").strip().lower()
+        if email and (is_admin_user(email) or is_human_job_admin(email) or is_human_subadmin(email)):
+            continue
+        if data.get("workerApproved") is True or _human_retest_submitted(data):
+            continue
+        started = _human_retraining_started_at(data)
+        if not started or now - started < timedelta(days=RETRAINING_RETEST_DEADLINE_DAYS):
+            continue
+        lapsed.append({"uid": snap.id, "email": email, "name": data.get("name") or data.get("displayName") or "", "retraining_since": started.isoformat(), "days": (now - started).days, "profile": data})
+    return lapsed
+
+
+async def _remove_lapsed_retraining_privileges():
+    removed = []
+    for item in await _lapsed_retraining_accounts():
+        uid, profile = item["uid"], item["profile"]
+        try:
+            await asyncio.to_thread(db.collection("users").document(uid).set, {
+                "role": "client", "workerApproved": False, "trainingRoomAccess": False, "is_available": False,
+                "trainingStatus": "access_removed", "traineeStatus": firestore.DELETE_FIELD,
+                "worker_retraining_required": False, "worker_retraining_review_required": False,
+                "trainingRedoLevels": [], "trainingRedoMessage": "", "workerTermsStatus": firestore.DELETE_FIELD,
+                "workerAccessRemovedAt": firestore.SERVER_TIMESTAMP,
+                "workerAccessRemovedReason": "Did not retake the retraining test within %d days." % RETRAINING_RETEST_DEADLINE_DAYS,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+            }, merge=True)
+            removed.append({k: v for k, v in item.items() if k != "profile"})
+            logger.warning("Removed worker/trainee privileges for %s: retest not taken within %d days", uid, RETRAINING_RETEST_DEADLINE_DAYS)
+            try:
+                await _create_user_notification(
+                    uid, "retest-lapsed:%s" % uuid.uuid4().hex[:12], "worker_notice",
+                    "Your worker and Training Room access has ended",
+                    "You did not retake your retraining test within 7 days, so your worker and Training Room access has been removed. Your normal TypeMyworDz account and credits are unchanged.",
+                    route="", requires_action=False,
+                )
+            except Exception as exc:
+                logger.warning("Retest-lapsed notification failed for %s: %s", uid, exc)
+            if item["email"]:
+                name = str(item.get("name") or "").strip() or "there"
+                text = ("Hello %s,\n\nYou did not retake your retraining test within 7 days of being returned to retraining, so your worker and Training Room access has been removed. "
+                        "Your normal TypeMyworDz account and any credits stay as they are.\n\nIf you think this is a mistake, please reply to this email.\n\nTypeMyworDz") % name
+                html = "<p>Hello %s,</p><p>You did not retake your retraining test within 7 days of being returned to retraining, so your worker and Training Room access has been removed. Your normal TypeMyworDz account and any credits stay as they are.</p><p>If you think this is a mistake, please reply to this email.</p><p>TypeMyworDz</p>" % name
+                await _send_resend_message(item["email"], "Your TypeMyworDz worker access has ended", html, text, "Retest lapsed email")
+        except Exception as exc:
+            logger.warning("Could not remove lapsed retraining privileges for %s: %s", uid, exc)
+    if removed:
+        try:
+            _human_list_cache_bump()
+        except Exception:
+            pass
+    return removed
+
+
+@app.get("/api/admin/workers/lapsed-retraining")
+async def admin_lapsed_retraining(request: Request):
+    _require_admin(request)
+    return {"deadline_days": RETRAINING_RETEST_DEADLINE_DAYS, "accounts": [{k: v for k, v in i.items() if k != "profile"} for i in await _lapsed_retraining_accounts()]}
+
+
 async def _declined_terms_monitor():
+    await asyncio.sleep(300)
     while True:
         try:
             await _purge_declined_terms_accounts()
         except Exception as exc:
             logger.warning("Declined-terms cleanup failed: %s", exc)
+        try:
+            await _remove_lapsed_retraining_privileges()
+        except Exception as exc:
+            logger.warning("Lapsed-retraining cleanup failed: %s", exc)
         await asyncio.sleep(3600)
 
 
