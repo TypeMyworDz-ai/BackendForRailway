@@ -934,7 +934,7 @@ HUMAN_WORK_STT_DEFAULTS = {
     "worker_draft": {"order": HUMAN_WORKER_STT_ORDER, "comparison": ""},
     "audio_agent": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
     "audio_agent_grace": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
-    "audio_agent_super": {"order": HUMAN_AGENT_STT_ORDER, "comparison": ""},
+    "audio_agent_super": {"order": ("assemblyai", "xai"), "comparison": ""},
     "proofreading_agent": {"order": HUMAN_PROOFREADING_STT_ORDER, "comparison": ""},
     "letter_review": {"order": ("assemblyai", "deepgram"), "comparison": ""},
     "rating_agent": {"order": ("voxtral", "assemblyai", "deepgram"), "comparison": ""},
@@ -2039,7 +2039,7 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     """
     Speech-to-text order for the transcription page.
     - njokigituku@gmail.com: dedicated xAI speech-to-text tester, xAI only with no fallback.
-    - typemywordz@gmail.com (Super admin): xAI first, AssemblyAI only if xAI fails.
+    - typemywordz@gmail.com (Super admin): AssemblyAI first, xAI only if AssemblyAI fails.
     - info@typemywordz.ai: dedicated OpenAI STT tester, OpenAI only with no fallback.
     - info@typemywordztest.com: dedicated Deepgram tester, Deepgram then OpenAI.
     - Everyone else (every plan, with or without speaker labels): AssemblyAI > xAI > Voxtral > OpenAI > Deepgram.
@@ -2066,10 +2066,10 @@ def get_transcription_services(user_plan: str, speaker_labels_enabled: bool, use
     if is_xiaomi_tester:
         return {"tier_1": "xiaomi", "tier_2": None, "tier_3": None, "tier_4": None, "reason": "dedicated_xiaomi_stt_tester"}
 
-    # --- Super admin: xAI first, AssemblyAI only if xAI fails ---
+    # --- Super admin: AssemblyAI first, xAI only if AssemblyAI fails ---
     if _email_key == "typemywordz@gmail.com":
-        return {"tier_1": "xai", "tier_2": "assemblyai" if ASSEMBLYAI_API_KEY else None, "tier_3": None, "tier_4": None, "tier_5": None,
-                "reason": "super_admin_xai_then_assemblyai"}
+        return {"tier_1": "assemblyai" if ASSEMBLYAI_API_KEY else "xai", "tier_2": "xai" if ASSEMBLYAI_API_KEY else None, "tier_3": None, "tier_4": None, "tier_5": None,
+                "reason": "super_admin_assemblyai_then_xai"}
 
     # --- Dedicated Voxtral Tester Logic ---
     # Placed before the speaker-label override on purpose: this account exists
@@ -3376,10 +3376,10 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
 
         def get_assemblyai_model(plan: str) -> list:
             # Everyone, including free-trial users, gets the highest
-            # accuracy model. universal-2 is listed second so that
-            # languages universal-3-5-pro does not support still work
+            # accuracy model (AssemblyAI-STT-3.7). universal-2 is listed second so that
+            # languages assemblyai-stt-3-7 does not support still work
             # instead of failing outright.
-            return ["universal-3-5-pro", "universal-2"]
+            return ["assemblyai-stt-3-7", "universal-2"]
 
         assemblyai_model = get_assemblyai_model(user_plan)
 
@@ -3919,7 +3919,7 @@ async def root():
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME}",
             "voxtral_tester_transcription": f"Always use Voxtral (no fallback for {VOXTRAL_TESTER_EMAIL})",
             "deepgram_tester_transcription": f"Primary=Deepgram → Fallback=OpenAI for {DEEPGRAM_TESTER_EMAIL}",
-            "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
+            "assemblyai_models": f"{TYPEMYWORDZ1_NAME} assemblyai-stt-3-7, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
             "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
@@ -17341,7 +17341,7 @@ async def _human_stt_chain(audio_path, order, audio_id):
                 if not ASSEMBLYAI_API_KEY:
                     errors.append("assemblyai: not configured")
                     continue
-                result = await transcribe_with_assemblyai(audio_path, "en", False, ["universal-3-5-pro", "universal-2"], audio_id)
+                result = await transcribe_with_assemblyai(audio_path, "en", False, ["assemblyai-stt-3-7", "universal-2"], audio_id)
             elif provider == "deepgram":
                 if not DEEPGRAM_SERVICE_RAILWAY_URL:
                     errors.append("deepgram: not configured")
