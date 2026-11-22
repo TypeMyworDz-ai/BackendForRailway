@@ -3375,11 +3375,11 @@ async def process_transcription_job(job_id: str, tmp_path: str, filename: str, l
         logger.info(f"🎯 Job {job_id} service selection: Tier1={tier_1_service}, Tier2={tier_2_service}, Tier3={tier_3_service}, Tier4={tier_4_service} ({service_config['reason']})")
 
         def get_assemblyai_model(plan: str) -> list:
-            # Everyone, including free-trial users, gets the highest
-            # accuracy model (AssemblyAI-STT-3.7). universal-2 is listed second so that
-            # languages assemblyai-stt-3-7 does not support still work
-            # instead of failing outright.
-            return ["assemblyai-stt-3-7", "universal-2"]
+            # Everyone, including free-trial users, gets universal-3-5-pro.
+            # assemblyai-stt-3-7 was tried and reverted: it dropped spelled-out
+            # words such as W-O-R-D. universal-2 is listed second for languages
+            # the first model does not support.
+            return ["universal-3-5-pro", "universal-2"]
 
         assemblyai_model = get_assemblyai_model(user_plan)
 
@@ -3919,7 +3919,7 @@ async def root():
             "speaker_labels_transcription": f"Always use {TYPEMYWORDZ1_NAME} first → Fallback1={DEEPGRAM_NAME}",
             "voxtral_tester_transcription": f"Always use Voxtral (no fallback for {VOXTRAL_TESTER_EMAIL})",
             "deepgram_tester_transcription": f"Primary=Deepgram → Fallback=OpenAI for {DEEPGRAM_TESTER_EMAIL}",
-            "assemblyai_models": f"{TYPEMYWORDZ1_NAME} assemblyai-stt-3-7, falling back to universal-2 for other languages",
+            "assemblyai_models": f"{TYPEMYWORDZ1_NAME} universal-3-5-pro, falling back to universal-2 for other languages",
             "ai_features_access": "Only for Three-Day, One-Week, Monthly Plan, and Yearly Plan plans",
             "gemini_access": "NOW AVAILABLE FOR ALL PAID AI USERS (Three-Day, One-Week, Monthly Plan, Yearly Plan plans)",
             "assemblyai": f"TypeMyworDz1 (AssemblyAI)",
@@ -11930,6 +11930,7 @@ async def _human_subadmin_accrue_job_earnings(job_id, job, actor, segment_ids=No
     specs = _human_subadmin_earning_specs(
         job_id, job, actor, rates=rate_values, segment_ids=segment_ids, ai_only=ai_only,
     )
+    specs = [item for item in specs if not _human_is_words_only_subadmin(item.get("subadmin_email")) or item.get("category") == "words_entry"]
     created = 0
     for item in specs:
         ref = db.collection(HUMAN_SUBADMIN_EARNING_COLLECTION).document(item["earning_id"])
@@ -12976,6 +12977,16 @@ async def human_admin_subadmin_earnings(
 
 # Sub-admins who are also approved workers. Their worker pay and their sub-admin
 # pay roll into ONE half-month invoice (the sub-admin invoice).
+# Sub-admins who earn ONLY from Words Table entries: no AI-agent, image or
+# human-submitted earnings are registered, and they cannot send jobs to the
+# worker queue. Existing earnings are never touched.
+HUMAN_WORDS_ONLY_SUBADMIN_EMAILS = {"priscillamuthoni010@gmail.com"}
+
+
+def _human_is_words_only_subadmin(email):
+    return str(email or "").strip().lower() in HUMAN_WORDS_ONLY_SUBADMIN_EMAILS
+
+
 HUMAN_HYBRID_WORKER_SUBADMIN_EMAILS = {"priscillamuthoni010@gmail.com", "info@typemywordz.ai"}
 
 
@@ -17341,7 +17352,7 @@ async def _human_stt_chain(audio_path, order, audio_id):
                 if not ASSEMBLYAI_API_KEY:
                     errors.append("assemblyai: not configured")
                     continue
-                result = await transcribe_with_assemblyai(audio_path, "en", False, ["assemblyai-stt-3-7", "universal-2"], audio_id)
+                result = await transcribe_with_assemblyai(audio_path, "en", False, ["universal-3-5-pro", "universal-2"], audio_id)
             elif provider == "deepgram":
                 if not DEEPGRAM_SERVICE_RAILWAY_URL:
                     errors.append("deepgram: not configured")
@@ -18561,6 +18572,8 @@ async def human_admin_route_job(job_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Choose whether this job goes to workers or to an AI agent.")
     job = await _human_job(job_id)
     full_actor = await _human_actor(request)
+    if destination == "workers" and _human_is_words_only_subadmin(full_actor.get("email")):
+        raise HTTPException(status_code=403, detail="Your account sends jobs to AI agents only. Sending to the worker queue is turned off.")
     if not _human_admin_can_see_job(full_actor, job):
         raise HTTPException(status_code=403, detail="This job belongs to another admin.")
     job_type = str(job.get("job_type") or "").strip().lower()
